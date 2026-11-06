@@ -7,9 +7,12 @@ numbers say how they were measured; anything not measured says so.
 
 The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compile`, `pi-bolt update`) work as before.
 
-**Measured against stock Pi 1.4.0** with [harnessbench](bench/harness) (14 coding tasks with hidden tests, two models, 5
-runs each, 280 runs): the same tasks solved (137/140 vs 138/140) in **17% less time** (1,740 vs 2,099 s; 95% CI of the
-ratio 0.69–0.92), with fewer turns (median 4 vs 5) and 20% lower cost. [Details](#benchmark).
+**Measured against stock Pi 1.4.0** with [harnessbench](bench/harness) (14 coding tasks with hidden tests, two models, 10
+runs each, 560 runs): the same tasks solved (275/280 vs 277/280) in **15% less time** (3,349 vs 3,960 s; 95% CI of the
+ratio 0.71–0.93), with fewer turns (median 4–5 vs 5–6) and 21% lower cost. [Details](#benchmark).
+
+This repository is the agent: Pi-Bolt's packages that are not part of it (durable, chord, env, evals), its website and
+its runtime benchmarks are left out. Extensions, `pi-bolt compile` and the release tooling are unchanged.
 
 ## At a glance
 
@@ -20,7 +23,7 @@ ratio 0.69–0.92), with fewer turns (median 4 vs 5) and 20% lower cost. [Detail
 | [Editing](#compiler-diagnostics-after-every-edit) | The compiler's new errors after every `edit`/`write`, from ten languages' checkers in the background with no wait | Rust type error on Moebius: reported in **3 s** (rust-analyzer: none in 84 s) |
 | [Editing](#fewer-refused-edits) | An exact edit applies even to a file seen only through bash | 21% of real edits were refused before |
 | [Editing](#edit-matching) | Edits that miss by indentation still apply; a miss shows the closest lines | |
-| [Editing](#no-edits-behind-the-edit-tools-back) | `sed -i` and text redirected into files are sent to `edit`/`write`, which check what they change | 65 of 2,615 real commands |
+| [Editing](#no-edits-behind-the-edit-tools-back) | `sed -i` and text redirected into a file get what `edit` gets afterwards: the changed lines and the checks | 65 of 2,615 real commands |
 | [Commands](#background-jobs-instead-of-sleep) | Long commands become background jobs that wake the agent; a `wait` tool; no fixed `sleep` | 97 real `sleep` calls had waited 3.2 h |
 | [Commands](#job-hub) | A job hub (`alt+j`): every background job, its live output, stop with `x` | |
 | [Commands](#bash-output-and-speed) | Output keeps the first error *and* the summary; read-only commands start while the model still writes | |
@@ -231,7 +234,9 @@ every edit of a file the agent had seen through `cat` or `grep` into a refusal, 
 sessions (23 Oct – 1 Nov 2026) that was **21% of all edits** (49 of 232), 3.7 s each (median).
 
 - `edit` applies to an unread file when **every `oldText` matches it exactly once**: the file then counts as read, its
-  diagnostics before the edit are taken, and the result says so. Inexact edits and `write` still refuse.
+  diagnostics before the edit are taken, and the result says so. Inexact edits still refuse.
+- `write` over an existing file that was not read is refused with the file's content (up to 30,000 characters) in the
+  error, and the file then counts as read: the model sees what it would replace and writes again without a `read`.
 - A bash command that prints files whole with `cat` (output not cut) counts as reading them.
 - The same holds for a file that changed on disk since it was read: an exact, unique match applies without a re-read.
 - `touch`, or a formatter that changed nothing, is not a change (same content, newer time).
@@ -251,16 +256,22 @@ sessions (23 Oct – 1 Nov 2026) that was **21% of all edits** (49 of 232), 3.7 
 ### No edits behind the edit tool's back
 
 Models often change files through bash instead: Claude Opus changed files with bash 155 times and with `edit` 25 times
-in real sessions. Those changes skip everything above. While the `edit` tool is there, the bash tool refuses a command
-that changes a file as `edit` or `write` would and says to use them:
+in real sessions. Those changes skipped everything above. While the `edit` tool is there, a command that changes a
+file as `edit` or `write` would runs, and then gets what they get:
 
 - `sed -i` and `perl -i` on one file;
 - text the command spells out (`echo`, `printf`, a heredoc through `cat` or `tee`) written into a file that exists.
 
-The same replacement over many files (`sed -i … src/*.py`, `xargs sed -i`) runs: one `sed` beats 20 edits (in
-harnessbench, a rule against it made models 2.8–6× slower on such a task). New files, appends (`>>`, `tee -a`), files under `/tmp` (also after `cd /tmp`), a program's output redirected into a file
-(`make > build.log`) and anything inside quotes, such as a command run over `ssh`, still run. Scripts that rewrite files
-(`python3 - <<EOF … open(p, "w")`) are not caught.
+The result says which lines of the file changed, the file counts as read with its new content, and the background
+checks report the errors the change introduced. Refusing such commands, as the first version did, cost a turn each
+time: 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an edit. On a
+[remote machine](#working-on-another-machine), where what changed is not known here, they are still refused.
+
+The same replacement over many files (`sed -i … src/*.py`, `xargs sed -i`) is left alone: one `sed` beats 20 edits (in
+harnessbench, a rule against it made models 2.8–6× slower on such a task). So are new files, appends (`>>`, `tee -a`),
+files under `/tmp` (also after `cd /tmp`), a program's output redirected into a file (`make > build.log`) and anything
+inside quotes, such as a command run over `ssh`. Scripts that rewrite files (`python3 - <<EOF … open(p, "w")`) are not
+caught.
 
 ## Running commands
 
@@ -329,9 +340,10 @@ Enter shows a job's whole output to scroll through, `x` stops it. While jobs run
 `bash` to that folder on another machine over ssh; `/remote off` moves them back, `/remote` says where they work. The
 session remembers it, so resuming it works there again, and the status line shows `⇄ dev:/home/dev/Projects/Radiance`.
 
-- **The same checks there.** Read before edit, exact-unique edits of unread files, the closest-text hint, `sed -i` sent
-  to `edit`, background jobs, `wait` and the sleep guard all work on the remote files and commands. Compiler diagnostics
-  after edits do not (the compilers run on this machine).
+- **The same checks there.** Read before edit, exact-unique edits of unread files, the closest-text hint, background
+  jobs, `wait` and the sleep guard all work on the remote files and commands. `sed -i` on one file and text redirected
+  into one are refused there and go through `edit`/`write`. Compiler diagnostics after edits do not work there (the
+  compilers run on this machine).
 - **One login.** ssh keeps one master connection per host (ControlMaster), so every later call is a round trip on it.
   A key's passphrase or a password is asked for in Pi, not shown and not kept; the connection then lasts 4 hours. In
   `pi -p` nothing is asked: a key without passphrase or an ssh agent is needed.
@@ -397,6 +409,12 @@ run's time was the model's. So:
   your responses" (longer finishing rules made glm-5.3-flash deliberate more and run slower), no `grep`/`find` schemas by
   default, a two-line docs pointer. The first version of this fork carried 1,000 tokens more per request than Pi and was slower.
 - `cat` in bash counts as reading, so `write` and `edit` do not refuse a file the model has seen.
+- **Answers cut off at the output limit go on.** A response that hit the output limit with no tool call did nothing and used to end the run: the model is told and goes on, each time thinking one level less, up
+  to 3 times in a row. In Terminal-Bench 2.1, glm-5.3-flash ended 2 of its first 14 runs this way, after 65,536 tokens
+  of thinking, with most of the time left.
+- **`project_search` only where it helps.** In a project of 150 files or fewer (all listed in the prompt) the
+  docsearch extension takes `project_search` out of the tools: in such projects glm-5.3-flash called it once against
+  1,920 bash calls.
 
 ## Benchmark
 
@@ -419,6 +437,10 @@ median and mean. Failures: a rounding case for both harnesses, and twice glm pri
 arguments in a C task. The 75 s test suite of one task takes the same time in both. Provider latency varies by run:
 compare within a run, not across.</sub>
 
+Before a pull request, `--suite quick` compares two builds in about 3 minutes: 9 tasks (Python, C, Rust, TypeScript,
+search, a slow test suite) twice each, with the paired ratios of time, cost and turns and their bootstrap intervals in
+the report. See [bench/harness](bench/harness).
+
 ## System prompt
 
 - Rules: Pi's, minus the ones above made redundant, plus: put calls that need no answer in between into one response (an
@@ -429,7 +451,8 @@ compare within a run, not across.</sub>
 
 Provider `melious` (`MELIOUS_API_KEY`, `https://api.melious.ai/v1`), with 18 models built in and default model
 `glm-5.3`. With a key, context windows and prices are fetched from Melious when the model list is loaded (15 s timeout),
-and models Melious lists that are not built in are added. Without a connection, the built-in list is used.
+and models Melious lists that are not built in are added. Without a connection, the built-in list is used. Melious's
+transient "Failed to create energy hold" is retried like an overloaded provider.
 
 ## Switches
 

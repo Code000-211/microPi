@@ -52,7 +52,7 @@ There are no releases of µPi yet; it is built from source with Pi-Bolt's own sc
 22.19 or later. Tested on Linux x86-64.
 
 ```bash
-git clone https://github.com/Code000-211/Pi-Lightspeed.git && cd Pi-Lightspeed
+git clone https://github.com/Code000-211/microPi.git && cd microPi
 scripts/fetch-runtime.sh             # Pi-Bolt's runtime from its latest signed release -> .work/runtime/bun
 scripts/prepare-pi.sh                # builds Pi from this repository
 scripts/build-pi.sh --kit .work/kit  # -> out/pi-bolt/pi, and the kit for compiling extensions in

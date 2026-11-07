@@ -1,4 +1,4 @@
-// The `pi` of a macOS build: starts `pi-bin`, the Pi-Bolt executable beside it, in this same process, at its linked address.
+// The `pi` of a macOS build: starts `pi-bin`, the µPi executable beside it, in this same process, at its linked address.
 //
 // An executable with a static heap must run where it was linked to be (docs/ARCHITECTURE.md, "The macOS ARM64 port"). Started
 // directly, it starts again itself, once dyld has loaded it and its libraries; from here it is started that way at once, which

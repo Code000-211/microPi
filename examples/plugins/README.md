@@ -1,4 +1,4 @@
-# Example: plugins compiled into Pi-Bolt
+# Example: plugins compiled into µPi
 
 - `plugins.ts`: the manifest. Its default export lists the extensions to compile in.
 - `extensions/word-count.ts`: an ordinary Pi extension, with a `word_count` tool and a `/words` command.

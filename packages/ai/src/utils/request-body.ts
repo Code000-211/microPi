@@ -9,7 +9,7 @@
  * request's messages or input array) as a Blob of UTF-8 bytes. Each item is compared with a snapshot of the item at the
  * same index in the conversation's previous request; an equal item reuses that request's bytes, any other is
  * serialized again. Only the comparison walks the whole conversation, and it copies nothing. The parts are Blobs, and
- * the body is a Blob made of them: Pi-Bolt's runtime keeps such a Blob as its parts and fetch sends them one after the
+ * the body is a Blob made of them: µPi's runtime keeps such a Blob as its parts and fetch sends them one after the
  * other (other runtimes join them: one copy); fetch sends a Blob's bytes as they are (it would copy a string or a
  * Uint8Array once more).
  *

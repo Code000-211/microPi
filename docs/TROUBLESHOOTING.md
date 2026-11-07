@@ -38,7 +38,7 @@ pi-bolt: the executable's ahead-of-time compiled code is not used (<reason>); ru
 | `the address space for it is not available` | An address-space limit (`ulimit -v`, `RLIMIT_AS`, or `vm.overcommit_memory=2`) leaves no room for the fixed regions the code expects. | The compiled code needs about 10 GB of *virtual* address space. It is reserved, not used, so it costs no memory. Raise or remove the limit. Below it, Pi still works from bytecode, down to about 1.5 GB. |
 | `this CPU lacks an instruction set the code was compiled for` | A `linux-x64` build on a CPU without AVX2. | Use the `linux-x64-baseline` build (`PIBOLT_VARIANT=x64-baseline` with the installer). |
 | `the image is not one for this engine`, `the image could not be mapped executable`, `the prebuilt heap could not be mapped` | A damaged executable, or a system that forbids executable file mappings. | Re-download the release and check `SHA256SUMS`. Report it if it persists. On macOS, an executable re-signed with the hardened runtime needs `com.apple.security.cs.disable-library-validation` (see [macOS](#macos)). |
-| `the executable could not be loaded where its prebuilt heap expects it` | macOS: the executable could not be started where its prebuilt heap expects it (see [ARCHITECTURE.md](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/ARCHITECTURE.md#the-macos-arm64-port)). | Report it, with `sw_vers` and how Pi-Bolt was started. |
+| `the executable could not be loaded where its prebuilt heap expects it` | macOS: the executable could not be started where its prebuilt heap expects it (see [ARCHITECTURE.md](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/ARCHITECTURE.md#the-macos-arm64-port)). | Report it, with `sw_vers` and how µPi was started. |
 
 One failure is fatal instead: `the executable's ahead-of-time code image was rejected by the engine; run with BUN_AOT=0 to use
 the bytecode instead`. It should not happen with release builds. Run with `BUN_AOT=0` and report it.
@@ -83,7 +83,7 @@ To rule a compiler optimization in or out of a problem, build with it off (each 
 `export PATH="$HOME/.local/bin:$PATH"` to your shell profile.
 
 **`GLIBC_2.xx not found` or `No such file or directory` when starting.** The system is musl-based (Alpine), or older than
-glibc 2.17. Pi-Bolt needs glibc 2.17 or later (CentOS 7, Debian 8, Ubuntu 14.04 and anything newer).
+glibc 2.17. µPi needs glibc 2.17 or later (CentOS 7, Debian 8, Ubuntu 14.04 and anything newer).
 
 **`Illegal instruction` when starting.** The CPU has no SSE4.2 (older than Intel Nehalem, 2008, or AMD Bulldozer, 2011). No
 build runs on it; the installer says so.
@@ -133,7 +133,7 @@ extension on its own, `await` or not.
 
 **`pi-bolt compile` says an `import()` "does not resolve: left to run time".** The extension loads a package it does not
 declare with `import()`, usually for a feature that needs that package (#160). The build goes on, and when that code runs the
-`import()` finds the package from where the extension is installed, or fails as it does without Pi-Bolt. Nothing to do unless
+`import()` finds the package from where the extension is installed, or fails as it does without µPi. Nothing to do unless
 you want that feature: then install the package where the extension finds it. An extension with a static `import` of a package
 that is not there is left out of the build (above).
 
@@ -153,12 +153,12 @@ package the extension imports: one that names no extension stops the compile and
 **A run-time plugin is slow.** On the default build, plugins loaded at run time are interpreted. Compile them in
 ([PLUGINS.md](PLUGINS.md)) or use the `linux-x64-jit` build.
 
-**In a container (Docker).** Pi-Bolt needs nothing from the image but glibc 2.17 or later, and runs in tmux or zmx there as
+**In a container (Docker).** µPi needs nothing from the image but glibc 2.17 or later, and runs in tmux or zmx there as
 anywhere. With a memory limit, count the executable too: its code is file-backed memory that the kernel charges to the
-container and has to read again when the limit pushes it out. Pi-Bolt works from a limit of about 100 MB, at twice the CPU and
-with pauses of a second; 256 MB or more leaves it alone. A CPU limit (`--cpus`) lowers the number of threads Pi-Bolt starts.
+container and has to read again when the limit pushes it out. µPi works from a limit of about 100 MB, at twice the CPU and
+with pauses of a second; 256 MB or more leaves it alone. A CPU limit (`--cpus`) lowers the number of threads µPi starts.
 
-**A Herdr restart does not reopen the Pi-Bolt session.** Herdr runs the restore command with its server's `PATH`, which must
+**A Herdr restart does not reopen the µPi session.** Herdr runs the restore command with its server's `PATH`, which must
 include `pi-bolt`: start Herdr from a terminal, not with `brew services`. Agents that pi-herdr starts in other panes run stock
 Pi (`pi`), which must be installed.
 
@@ -168,18 +168,18 @@ factories. A cold page cache (the first start after boot or install) adds the ti
 ## macOS
 
 **"pi" is killed at once (`zsh: killed`), or macOS says it cannot verify the developer.** The executable carries a quarantine
-attribute: it was downloaded with a browser (or unpacked by something that keeps the attribute). Pi-Bolt's executables are signed
+attribute: it was downloaded with a browser (or unpacked by something that keeps the attribute). µPi's executables are signed
 ad hoc, which Gatekeeper does not accept for quarantined files. Install with the installer or npm, which do not quarantine, or
 remove the attribute from the unpacked folder: `xattr -dr com.apple.quarantine pi-bolt-darwin-arm64`.
 
-**"Pi-Bolt runs on Macs with Apple silicon only".** Pi-Bolt has no build for Intel Macs. From a terminal that runs under Rosetta on
+**"µPi runs on Macs with Apple silicon only".** µPi has no build for Intel Macs. From a terminal that runs under Rosetta on
 an Apple silicon Mac, the installer installs the ARM64 build, which runs natively.
 
-**Re-signing the executable.** `codesign` may re-sign it, keeping the whole file covered: Pi-Bolt maps its compiled code from the
+**Re-signing the executable.** `codesign` may re-sign it, keeping the whole file covered: µPi maps its compiled code from the
 file. With the hardened runtime (`-o runtime`), add the entitlement `com.apple.security.cs.disable-library-validation`: without
 it the executable runs from bytecode, with one notice. The `-jit` build also needs `com.apple.security.cs.allow-jit` for its JIT.
 
-**`pi`, `pi-bin` and `pi-spawn`.** In a macOS build `pi` is a small launcher, and `pi-bin` beside it the Pi-Bolt executable,
+**`pi`, `pi-bin` and `pi-spawn`.** In a macOS build `pi` is a small launcher, and `pi-bin` beside it the µPi executable,
 which runs from either; `pi-spawn` starts Pi's programs (above). Link `pi` (as the installer does) rather than copy it alone: it
 starts the `pi-bin` beside its real path. `BUN_STATIC_HEAP_VERBOSE=1 pi --version` reports on `pi-bin`. Re-sign `pi-bin` (above); the launcher needs nothing.
 
@@ -191,7 +191,7 @@ be on PATH, and npm must run the package's install script (`npm install -g pi-bo
 later).
 
 **The bash tool says "No bash shell found", or answers "Windows Subsystem for Linux has no installed distributions".** Pi's
-bash tool runs Git Bash. Install [Git for Windows](https://git-scm.com/download/win); Pi-Bolt finds it in Program Files, in
+bash tool runs Git Bash. Install [Git for Windows](https://git-scm.com/download/win); µPi finds it in Program Files, in
 `%LOCALAPPDATA%\Programs\Git` (installed for one user), scoop's, or through the `git.exe` on PATH (a portable Git). WSL's
 `bash.exe` is used only when there is no other bash. Or set `shellPath` in `~\.pi\agent\settings.json` to a `bash.exe` of your
 choice. The PowerShell tool needs nothing.
@@ -225,7 +225,7 @@ from it.
 **SmartScreen warns about `pi-bolt.exe` downloaded with a browser.** The executable has no Authenticode signature yet. The
 installers check the release's own signature and do not mark what they download; install with them rather than from the browser.
 
-**A crash on Windows.** The text Pi-Bolt prints includes an `Args:` line with the whole command line, `-p` prompt included:
+**A crash on Windows.** The text µPi prints includes an `Args:` line with the whole command line, `-p` prompt included:
 remove anything private from it before you post it.
 
 ## Reporting a problem
@@ -237,13 +237,13 @@ Please [open an issue](https://github.com/opensec-git/Pi-Bolt/issues/new) with:
 - on Linux, `ldd --version | head -1`; on Windows, the terminal (Windows Terminal, the console window, VS Code);
 - whether the problem also happens with `BUN_AOT=0 pi-bolt`, and with stock Pi.
 
-If it only happens with the compiled code, it is a Pi-Bolt bug. If it also happens with stock Pi, report it to
+If it only happens with the compiled code, it is a µPi bug. If it also happens with stock Pi, report it to
 [Pi](https://github.com/earendil-works/pi/issues).
 
 ### A crash
 
-When Pi-Bolt crashes it prints "Pi-Bolt has crashed", some lines about the system, and a link that starts with
+When µPi crashes it prints "µPi has crashed", some lines about the system, and a link that starts with
 `https://pi-bolt.opensec.in/crash/`. The link holds an encoded stack trace and nothing else: no file names, paths or data of
-yours. Please include it in the issue, with what you were doing. Pi-Bolt's maintainers decode it against the symbols of that
+yours. Please include it in the issue, with what you were doing. µPi's maintainers decode it against the symbols of that
 release. (In Pi-Bolt 0.3.0 and earlier the message named Bun and the link went to bun.report, which cannot decode Pi-Bolt
 traces: report those here too.)

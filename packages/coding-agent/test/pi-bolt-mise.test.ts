@@ -6,11 +6,17 @@ import { runDoctor } from "../src/cli/doctor.ts";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
 import type * as PiBolt from "../src/pi-bolt.ts";
-import { piBoltInstallMethod, piBoltJitSwitchCommand, piBoltMiseTool, piBoltUpdateCommand } from "../src/pi-bolt.ts";
+import {
+	MICROPI_HAS_RELEASES,
+	piBoltInstallMethod,
+	piBoltJitSwitchCommand,
+	piBoltMiseTool,
+	piBoltUpdateCommand,
+} from "../src/pi-bolt.ts";
 import { runPiBoltCompile } from "../src/pi-bolt-compile.ts";
 import type * as VersionCheck from "../src/utils/version-check.ts";
 
-// A Pi-Bolt build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
+// A µPi build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
 vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof PiBolt>()),
 	PIBOLT: { version: "1.0.0", variant: "arm64", jit: false },
@@ -49,7 +55,7 @@ function miseInstall(data: string, toolFolder = "github-opensec-git-pi-bolt"): s
 	return version;
 }
 
-/** Every file in mise's folder for Pi-Bolt, to tell that nothing was changed. */
+/** Every file in mise's folder for µPi, to tell that nothing was changed. */
 function filesIn(folder: string): string[] {
 	return readdirSync(folder, { recursive: true, encoding: "utf8" }).sort();
 }
@@ -69,7 +75,7 @@ afterEach(() => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-describe.skipIf(process.platform === "win32")("a Pi-Bolt installed with mise", () => {
+describe.skipIf(process.platform === "win32")("a µPi installed with mise", () => {
 	it("is told by where the executable really is, in mise's installs folder", () => {
 		const version = miseInstall(join(dir, ".local", "share", "mise"));
 		runningFrom(join(version, "pi-bin"));
@@ -105,16 +111,16 @@ describe.skipIf(process.platform === "win32")("a Pi-Bolt installed with mise", (
 		expect(piBoltUpdateCommand()).toBe("mise upgrade --bump pi-bolt");
 	});
 
-	it("update says to run mise upgrade, and changes nothing", async () => {
+	it.skipIf(!MICROPI_HAS_RELEASES)("update says to run mise upgrade, and changes nothing", async () => {
 		runningFrom(join(miseInstall(join(dir, "mise")), "pi-bin"));
 		const before = filesIn(installs);
 		const log = vi.spyOn(console, "log").mockImplementation(() => {});
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		expect(await handlePackageCommand(["update", "--self"])).toBe(true);
 		const output = log.mock.calls.flat().join("\n");
-		expect(output).toContain("This Pi-Bolt was installed with mise");
+		expect(output).toContain("This µPi was installed with mise");
 		expect(output).toContain(`mise upgrade --bump ${GITHUB_TOOL}`);
-		expect(output).not.toContain("Updating Pi-Bolt");
+		expect(output).not.toContain("Updating µPi");
 		expect(process.exitCode).toBe(1);
 		expect(filesIn(installs)).toEqual(before);
 	});
@@ -136,9 +142,7 @@ describe.skipIf(process.platform === "win32")("a Pi-Bolt installed with mise", (
 		const error = vi.spyOn(console, "error").mockImplementation(() => {});
 		const installAgain = vi.fn(async () => true);
 		expect(await runPiBoltCompile([], installAgain)).toBe(1);
-		expect(error.mock.calls.flat().join("\n")).toContain(
-			"this Pi-Bolt was installed with mise, whose folder mise owns",
-		);
+		expect(error.mock.calls.flat().join("\n")).toContain("this µPi was installed with mise, whose folder mise owns");
 		expect(installAgain).not.toHaveBeenCalled();
 		expect(filesIn(installs)).toEqual(before);
 	});

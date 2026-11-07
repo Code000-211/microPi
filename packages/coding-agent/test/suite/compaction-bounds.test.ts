@@ -21,7 +21,7 @@ import {
 } from "../../src/core/compaction/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
-/** The provider error from a Pi-Bolt session whose recovery gave up after one compact-and-retry. */
+/** The provider error from a µPi session whose recovery gave up after one compact-and-retry. */
 const CONTEXT_LENGTH_EXCEEDED =
 	'400: {"message":"[code=context_length_exceeded] Input is too long: the request exceeds the model\'s token context limit. Compact the conversation and retry. If compaction also exceeds the limit, shorten the history or start a new session.","type":"invalid_request_error","code":"context_length_exceeded","param":"messages"}';
 

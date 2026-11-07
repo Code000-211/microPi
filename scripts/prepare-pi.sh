@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds Pi for scripts/build-pi.sh. Pi-Bolt is a fork of Pi: by default this is the Pi of this repository, built in place and
+# Builds Pi for scripts/build-pi.sh. µPi is a fork of Pi: by default this is the Pi of this repository, built in place and
 # offline. Its model catalog (packages/ai/src/providers/data) is part of the repository, so the build needs no network and
 # gives the same Pi every time. --refresh-models first fetches the catalog again from the model providers (every provider must
 # answer); commit what it changes. With --tag, it clones another Pi release from upstream and builds that instead: upstream Pi

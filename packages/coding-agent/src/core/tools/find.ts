@@ -133,7 +133,7 @@ export function windowsGlobSeparators(glob: string): string {
 export interface FindToolDetails {
 	truncation?: TruncationResult;
 	resultLimitReached?: number;
-	/** No entry matched the pattern; the paths are the closest names (Pi-Bolt's in-process find). */
+	/** No entry matched the pattern; the paths are the closest names (µPi's in-process find). */
 	fuzzyFallback?: true;
 }
 
@@ -157,7 +157,7 @@ const defaultFindOperations: FindOperations = {
 export interface FindToolOptions {
 	/** Custom operations for find. Default: local filesystem plus fd */
 	operations?: FindOperations;
-	/** Search in-process instead of with fd (native-search.ts). Default: in Pi-Bolt builds, without custom operations. */
+	/** Search in-process instead of with fd (native-search.ts). Default: in µPi builds, without custom operations. */
 	native?: boolean;
 }
 
@@ -293,7 +293,7 @@ export function createFindToolDefinition(
 							return;
 						}
 
-						// Pi-Bolt: in-process (native-search.ts), with fd's rules and output.
+						// µPi: in-process (native-search.ts), with fd's rules and output.
 						if (native) {
 							let isDirectory = false;
 							try {

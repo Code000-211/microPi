@@ -131,7 +131,7 @@ describe("the release channel", () => {
 	});
 });
 
-describe("Pi itself (not a Pi-Bolt build) is unchanged", () => {
+describe("Pi itself (not a µPi build) is unchanged", () => {
 	test("update --rollback and --channel are unknown options", async () => {
 		const error = vi.spyOn(console, "error").mockImplementation(() => {});
 		try {

@@ -126,7 +126,7 @@ async function tryShareViaRadius(tmpFile: string, context: SessionShareContext):
 		const body = fs.readFileSync(tmpFile);
 		const url = new URL("/v1/artifacts", DEFAULT_RADIUS_GATEWAY);
 		url.searchParams.set("visibility", "organization");
-		url.searchParams.set("title", PIBOLT ? "Pi-Bolt session" : "Pi session");
+		url.searchParams.set("title", PIBOLT ? "µPi session" : "Pi session");
 		const response = await fetch(url, {
 			method: "POST",
 			headers: {

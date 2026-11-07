@@ -608,7 +608,7 @@ export class ExtensionRunner {
 				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts)),
 			editor: (title, prefill) => this.withUIPrompt("editor", title, () => ui.editor(title, prefill)),
 			custom: (factory, options) => this.withUIPrompt("custom", undefined, () => ui.custom(factory, options)),
-			// Pi-Bolt without the JIT: an extension's own notice of "bun:ffi requires the JIT" says which extension needs the JIT
+			// µPi without the JIT: an extension's own notice of "bun:ffi requires the JIT" says which extension needs the JIT
 			// build (core/extensions/jit-hint.ts). The extension is the one whose code called notify().
 			...(PIBOLT && !PIBOLT.jit
 				? {

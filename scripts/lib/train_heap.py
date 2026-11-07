@@ -1,4 +1,4 @@
-"""Records what of a Pi-Bolt build's prebuilt heap its runs touch, for the build to lay it out side by side, in a training profile:
+"""Records what of a µPi build's prebuilt heap its runs touch, for the build to lay it out side by side, in a training profile:
 - strings: put first in the profile's order file (its S lines), in the order the runs first touch them. The order file's strings
   are what decoding Pi's bytecode read first; a prebuilt heap has nothing left to decode, and what it touches as it starts is
   mostly what the engine looks up by name (its own identifiers, single characters, the global object's properties) and what Pi's
@@ -12,7 +12,7 @@ Windows only: the runs are traced as a debugger does it.
 
   python scripts/lib/train_heap.py EXE FUNCTION_CELLS PROFILE_DIR
 
-EXE: a Pi-Bolt build of the profile's Pi version, made with `scripts\build-pi.ps1 -FunctionCellsOut FUNCTION_CELLS`. The
+EXE: a µPi build of the profile's Pi version, made with `scripts\build-pi.ps1 -FunctionCellsOut FUNCTION_CELLS`. The
 profile's bytecode.order is rewritten in place, and its heap-functions.txt written. The runs: `--version`, a headless prompt, a
 TUI session of one prompt, each against the bench's fake model.
 
@@ -97,7 +97,7 @@ class Strings:
             sections.append((name.rstrip(b"\0"), rva, raw, raw_size))
         region = next((s for s in sections if s[0] == b".pbreg"), None)
         if region is None:
-            sys.exit(f"{exe} is not a Pi-Bolt executable (no .pbreg section)")
+            sys.exit(f"{exe} is not a µPi executable (no .pbreg section)")
         self.region_rva = (region[1] + 0xffff) & ~0xffff
         preferred_region = image_base + self.region_rva
 
@@ -290,7 +290,7 @@ def main():
                 sys.exit(f"{name}: the run did not complete")
             print(f"{name}: {len(touched[-1])} granules ({time.perf_counter() - t0:.0f} s)", flush=True)
 
-        plain("--version", ["--version"], "Pi-Bolt")
+        plain("--version", ["--version"], "µPi")
         plain("headless", ["-p", "--no-session", *MODEL_ARGS, PROMPT], DONE)
         # The TUI: started on this thread (a debuggee is the thread's that made it), driven from another.
         t0 = time.perf_counter()

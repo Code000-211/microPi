@@ -46,7 +46,7 @@ import {
 } from "./source-info.ts";
 import { resetTimings } from "./timings.ts";
 
-// Pi-Bolt shares Pi's agent directory, so a package installed for one runtime is loaded by the other too.
+// µPi shares Pi's agent directory, so a package installed for one runtime is loaded by the other too.
 const TOOL_CONFLICT_HINT =
 	". Two packages provide this tool: exclude one with pi-bolt remove --pi-bolt <source>" +
 	" (add --local for a project package; https://github.com/opensec-git/Pi-Bolt#pi-and-pi-bolt-side-by-side)";

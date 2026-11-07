@@ -230,7 +230,7 @@ with tempfile.TemporaryDirectory(prefix="pibolt-compile-") as tmp:
         check("pi-bolt compile succeeds", r.returncode == 0, r.stdout[-500:] + r.stderr[-1500:])
         check("it says what it does as it goes",
               all(phase in r.stderr for phase in ("finding the extensions", "bundling Pi", "compiling ahead of time"))
-              and re.search(r"Compiled into Pi-Bolt \S+ in \d+ s:", r.stdout), r.stdout[-300:] + r.stderr[-800:])
+              and re.search(r"Compiled into µPi \S+ in \d+ s:", r.stdout), r.stdout[-300:] + r.stderr[-800:])
         check("it removes the work folder of a compile that was killed, and the old compile.log",
               not (install / ".compile-Kil1ed").exists() and not (install / "compile.log").exists()
               and "removed what a compile that was killed left" in r.stderr, r.stderr[-800:])

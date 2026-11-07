@@ -1,4 +1,4 @@
-// For tests/termux/run.sh: what Pi-Bolt in Termux gives the programs it starts (Termux's LD_PRELOAD, back, and after it an empty
+// For tests/termux/run.sh: what µPi in Termux gives the programs it starts (Termux's LD_PRELOAD, back, and after it an empty
 // GLIBC_LD_PRELOAD, for a glibc program among them), its time zone, and that its event loop, timers and child processes work under
 // Android's system call filter.
 import { execFileSync, spawn } from "node:child_process";

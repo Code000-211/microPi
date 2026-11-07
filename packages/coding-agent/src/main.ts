@@ -583,7 +583,7 @@ async function promptForMissingSessionCwd(
 
 export interface MainOptions {
 	extensionFactories?: InlineExtension[];
-	/** Pi-Bolt: the extensions `pi-bolt compile` built into this executable (core/extensions/compiled.ts). */
+	/** µPi: the extensions `pi-bolt compile` built into this executable (core/extensions/compiled.ts). */
 	compiledExtensions?: CompiledExtension[];
 }
 
@@ -596,7 +596,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	ttiTrace("main.entered");
 	resetTimings();
-	// Pi-Bolt reports to Herdr itself (extensions/herdr); keep pi-herdr's report of the same pane out of its way.
+	// µPi reports to Herdr itself (extensions/herdr); keep pi-herdr's report of the same pane out of its way.
 	if (PIBOLT) quietOtherHerdrReporters();
 	// Commands and startup selectors can load user-authored themes before runtime creation.
 	setThemeJsonValidator(validateThemeJson);
@@ -640,7 +640,7 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	// `pi-bolt doctor` (Pi-Bolt only): a report for an issue. It exits: the extensions it loaded may keep timers running.
+	// `pi-bolt doctor` (µPi only): a report for an issue. It exits: the extensions it loaded may keep timers running.
 	if (PIBOLT && args[0] === "doctor") {
 		const { runDoctor } = await loadDoctor();
 		process.exit(await runDoctor(args.slice(1), { cwd, agentDir, extensionFactories }));

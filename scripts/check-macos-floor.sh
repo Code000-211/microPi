@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks that every Mach-O file under each DIR runs on macOS 13, the oldest Pi-Bolt supports (install.sh refuses older): its
+# Checks that every Mach-O file under each DIR runs on macOS 13, the oldest µPi supports (install.sh refuses older): its
 # minimum macOS (LC_BUILD_VERSION's minos, or LC_VERSION_MIN_MACOSX's version) is 13.0 or lower. Building on a newer macOS or
 # Xcode must not raise it.
 # Usage: scripts/check-macos-floor.sh DIR...

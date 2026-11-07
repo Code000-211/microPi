@@ -186,7 +186,7 @@ if ((Test-Path -LiteralPath $about) -and (Select-String -LiteralPath $about -Pat
 	if ($LASTEXITCODE -ne 0) { $script:status = 1 }
 }
 
-# Pi-Bolt's grep and find tools, in-process: on by default, and not with FFF loaded.
+# microPi's grep and find tools, in-process: on by default, and not with FFF loaded.
 & py -3 (Join-Path $here 'search-tools.py') $Pi
 if ($LASTEXITCODE -ne 0) { $script:status = 1 }
 

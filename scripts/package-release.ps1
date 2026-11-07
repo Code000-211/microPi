@@ -12,7 +12,7 @@
 # Archives (the names stay the same from release to release, so that releases/latest/download/<name> always works):
 #   pi-bolt-win32-x64.zip           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
 #   pi-bolt-win32-x64-jit.zip       JIT on, for extensions that do heavy JavaScript work at run time (docs/PLUGINS.md)
-#   pi-bolt-runtime-win32-x64.zip   the Pi-Bolt Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
+#   pi-bolt-runtime-win32-x64.zip   the microPi Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
 # .zip, which install.ps1 unpacks with what Windows has. In the archive the executable is pi-bolt.exe: the installer puts its
 # folder on PATH, and the command is then `pi-bolt` in cmd, PowerShell and any terminal, with no launcher in between.
 # A release puts the archives of every platform together with one SHA256SUMS (docs/RELEASING.md). An Authenticode signature,

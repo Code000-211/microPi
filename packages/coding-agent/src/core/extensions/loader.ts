@@ -68,7 +68,7 @@ function getVirtualModules(): Promise<Record<string, unknown>> {
 }
 
 /**
- * Packages that work only through bun:ffi and that their extensions have a Node.js alternative for. Pi-Bolt's build without the
+ * Packages that work only through bun:ffi and that their extensions have a Node.js alternative for. µPi's build without the
  * JIT makes no machine code at run time, and bun:ffi's calls into native code are made at run time. There, importing one of
  * these fails, so that the extension takes its alternative: pi-fff, which tries @ff-labs/fff-bun first, then uses
  * @ff-labs/fff-node (the same native library, through ffi-rs, a Node-API module).
@@ -82,7 +82,7 @@ function withoutJitOnlyPackages(modules: Record<string, unknown>): Record<string
 			enumerable: false,
 			get() {
 				throw new Error(
-					`${name} needs the JIT (bun:ffi), which this build of Pi-Bolt does not have: install the -jit build`,
+					`${name} needs the JIT (bun:ffi), which this build of µPi does not have: install the -jit build`,
 				);
 			},
 		});
@@ -688,7 +688,7 @@ async function loadExtension(
 ): Promise<{ extension: Extension | null; error: string | null; warning?: string }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
-	// Pi-Bolt: an extension `pi-bolt compile` built in, while its files are as they were then (core/extensions/compiled.ts).
+	// µPi: an extension `pi-bolt compile` built in, while its files are as they were then (core/extensions/compiled.ts).
 	const compiled = PIBOLT ? compiledExtensionFor(resolvedPath) : undefined;
 	let failedCompiledIn: string | undefined;
 	if (compiled && "factory" in compiled) {
@@ -778,7 +778,7 @@ async function loadExtensionsInternal(
 	const resolvedRuntime = runtime ?? createExtensionRuntime();
 
 	for (const extPath of paths) {
-		// Pi-Bolt's built-in Herdr extension takes the place of Herdr's Pi integration.
+		// µPi's built-in Herdr extension takes the place of Herdr's Pi integration.
 		if (PIBOLT && isHerdrPiIntegration(resolvePath(extPath, resolvedCwd))) continue;
 		const { extension, error, warning } = await loadExtension(
 			extPath,

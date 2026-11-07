@@ -33,18 +33,18 @@ Include:
 
 ## Scope
 
-In scope: what Pi-Bolt adds or changes:
+In scope: what µPi adds or changes:
 
 - the runtime and engine changes (`patches/`) and the release executables;
 - the installers (`install.sh`, `install.ps1`), `pi-bolt update`, the npm packages and the release signing;
-- `pi-bolt compile`, the built-in tools Pi-Bolt replaces (such as `grep` and `find`), and the other Pi-Bolt code in this
+- `pi-bolt compile`, the built-in tools µPi replaces (such as `grep` and `find`), and the other µPi code in this
   repository.
 
 Out of scope here:
 
 - Bugs that stock Pi has too: report them to [Pi](https://github.com/earendil-works/pi/security) (you are welcome to tell us as
   well).
-- Bugs in upstream Bun or JavaScriptCore that Pi-Bolt does not change: report them to those projects.
+- Bugs in upstream Bun or JavaScriptCore that µPi does not change: report them to those projects.
 - What an extension, skill or model does with the permissions you gave it (see "Extensions and projects" below), and social
   engineering.
 

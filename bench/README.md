@@ -2,7 +2,7 @@
 
 - [`harness/`](harness): harnessbench, coding tasks with hidden tests to compare coding-agent harnesses on the same model
   (see its README). This is how µPi's changes are measured.
-- `benchmark.py`, `harness.py`, `fake_model.py`, `fixtures/`, `orderfile_session.py`: Pi-Bolt's startup, headless and
+- `benchmark.py`, `harness.py`, `fake_model.py`, `fixtures/`, `orderfile_session.py`: µPi's startup, headless and
   interactive scenarios against a scripted model server. `scripts/train-runtime-hints.sh` runs `orderfile_session.py`
   to retrain the runtime profile in `profiles/`. Each tool takes the builds to compare as `--build name=command`.
 

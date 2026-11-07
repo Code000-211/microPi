@@ -511,12 +511,12 @@ describe("Herdr's own Pi integration file", () => {
 		expect(await loadedCommands(undefined, [herdrFile, other], dir)).toEqual(["herdr-file-loaded", "other"]);
 	});
 
-	test("Pi-Bolt leaves it out, and loads the rest", async () => {
+	test("µPi leaves it out, and loads the rest", async () => {
 		const { dir, herdrFile, other } = extensionsDir();
 		expect(await loadedCommands("0.7.5 arm64 jit-off", [herdrFile, other], dir)).toEqual(["other"]);
 	});
 
-	test("only Pi-Bolt has the built-in Herdr extension, and only in a Herdr pane", async () => {
+	test("only µPi has the built-in Herdr extension, and only in a Herdr pane", async () => {
 		const names = (list: { builtInExtensions: unknown[] }) =>
 			list.builtInExtensions.map((e) => (typeof e === "function" ? "" : (e as { name: string }).name));
 		vi.stubEnv("HERDR_ENV", "1");

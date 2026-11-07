@@ -8,7 +8,7 @@
  *
  * The discovery rules below are Pi's, and Pi is the source of truth for them:
  * packages/coding-agent/src/core/package-manager.ts, `collectAutoExtensionEntries` and `resolveExtensionEntries`. They are
- * repeated here rather than imported because this script belongs to Pi-Bolt and those functions are Pi's, and private.
+ * repeated here rather than imported because this script belongs to µPi and those functions are Pi's, and private.
  * `assertMatchesPiRules` in scripts/gen-plugin-manifest.test.mjs covers each rule, so a change in Pi shows up as a failing
  * test rather than as a short manifest.
  *
@@ -543,7 +543,7 @@ export function planPlugins(options) {
 
 	const skipped = [...passedOver, ...passedOverEntries, ...roots.flatMap((root) => describeSkipped(root.root, seen))];
 
-	// Each package: its folder, the name it is known by, and its entries. `pi-bolt compile` gives the packages Pi-Bolt loads
+	// Each package: its folder, the name it is known by, and its entries. `pi-bolt compile` gives the packages µPi loads
 	// (`options.packages`: piBolt.packages applied, each with its entries as Pi resolves them); without it, the npm: packages
 	// of the `packages` setting.
 	const installed = [];
@@ -776,7 +776,7 @@ function importsByName(previous, source, end) {
  *
  * Each copy therefore has those expressions replaced with what they are in the file it was copied from: the installed
  * extension, by the path Pi loads it from when it loads it from its files. With `pi-bolt compile` that is right for as long as
- * the compiled-in extension runs: Pi-Bolt uses it only while its installed copy is unchanged (core/extensions/compiled.ts),
+ * the compiled-in extension runs: µPi uses it only while its installed copy is unchanged (core/extensions/compiled.ts),
  * and loads the installed files instead once they change. A build from `build-pi.sh --plugins-from-installed` has no such
  * check, so its extensions read those files from where they are installed, and need to stay installed. Only the copies are
  * changed. A manifest written by hand (`--plugins`) is not this script's, and is built as it is: its folder may be anywhere,
@@ -1464,7 +1464,7 @@ export function forBuildWithoutJit(dir) {
 				writeFileSync(join(path, "package.json"), `${JSON.stringify({ name, main: "index.js" })}\n`);
 				writeFileSync(
 					join(path, "index.js"),
-					`throw new Error(${JSON.stringify(`${name} needs the JIT (bun:ffi), which this build of Pi-Bolt does not have: install the -jit build`)});\n`,
+					`throw new Error(${JSON.stringify(`${name} needs the JIT (bun:ffi), which this build of µPi does not have: install the -jit build`)});\n`,
 				);
 				continue;
 			}
@@ -1685,7 +1685,7 @@ export function defaultAgentDir(env = process.env) {
 
 /**
  * Whether this file is the command being run. Both sides through their links: `/var` is `/private/var` on macOS. (Its name
- * first: `pi-bolt compile` has this module in Pi-Bolt itself, which asks this at every start, without a file system call.)
+ * first: `pi-bolt compile` has this module in µPi itself, which asks this at every start, without a file system call.)
  */
 function isCommand() {
 	if (basename(process.argv[1] ?? "") !== "gen-plugin-manifest.mjs") return false;

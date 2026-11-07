@@ -470,7 +470,7 @@ jobs:
             gh release delete-asset "$TAG" SHA256SUMS.sshsig --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber release/*
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "Pi-Bolt $VERSION" --notes-file "docs/releases/$VERSION.md" release/*
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "µPi $VERSION" --notes-file "docs/releases/$VERSION.md" release/*
           fi
           sum=$(sha256sum release/SHA256SUMS | cut -c1-64)
           if [ "$AUTO_RELEASE" = true ]; then

@@ -10,7 +10,7 @@
 #   pi-bolt-linux-x64.tar.gz           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
 #   pi-bolt-linux-x64-baseline.tar.gz  JIT off, code for any x86-64 CPU
 #   pi-bolt-linux-x64-jit.tar.gz       JIT on, for code loaded at run time
-#   pi-bolt-runtime-linux-x64.tar.gz   the Pi-Bolt Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
+#   pi-bolt-runtime-linux-x64.tar.gz   the µPi Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
 #   pi-bolt-linux-arm64.tar.gz         on Linux ARM64: JIT off, code for any ARMv8.0 CPU
 #   pi-bolt-linux-arm64-jit.tar.gz     on Linux ARM64: JIT on
 #   pi-bolt-runtime-linux-arm64.tar.gz

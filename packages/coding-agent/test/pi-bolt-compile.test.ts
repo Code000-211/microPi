@@ -39,7 +39,7 @@ import {
 	resolveCompilePackages,
 } from "../src/pi-bolt-compile.ts";
 
-// (Pi-Bolt applies piBolt.packages to `packages` only in a Pi-Bolt build.)
+// (µPi applies piBolt.packages to `packages` only in a Pi-Bolt build.)
 vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
 	...(await importOriginal<object>()),
 	PIBOLT: { version: "1.0.0", variant: "arm64", jit: true },
@@ -319,7 +319,7 @@ describe("pi-bolt compile takes a release's files only with its signature", () =
 	});
 });
 
-describe("pi-bolt compile takes the packages Pi-Bolt loads", () => {
+describe("pi-bolt compile takes the packages µPi loads", () => {
 	/** A package folder: its package.json and the extension files it names. */
 	function packageAt(path: string, name: string, version: string, files: string[]): string {
 		mkdirSync(path, { recursive: true });

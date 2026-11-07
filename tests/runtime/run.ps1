@@ -1,4 +1,4 @@
-# Windows' tests/runtime/run.sh: tests of the Pi-Bolt runtime itself (the patched Bun), for what Pi and its extensions rely on:
+# Windows' tests/runtime/run.sh: tests of the microPi runtime itself (the patched Bun), for what Pi and its extensions rely on:
 #   stack       Error.captureStackTrace() and the default Error.prepareStackTrace on objects that are not Errors
 #   keepalive   a connection waits in fetch's keep-alive pool for 4 seconds, or for as long as the server's Keep-Alive header
 #               says less 2 seconds, and one that has waited longer is not used again: a connection that went dead while it

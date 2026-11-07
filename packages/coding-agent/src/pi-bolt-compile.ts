@@ -1,5 +1,5 @@
 /**
- * `pi-bolt compile`: compiles the extensions installed on this machine into this Pi-Bolt, as scripts/build-pi.sh
+ * `pi-bolt compile`: compiles the extensions installed on this machine into this µPi, as scripts/build-pi.sh
  * --plugins-from-installed does in a checkout of the repository, with nothing but what the release has.
  *
  * What a build needs besides the extensions: the runtime (pi-bolt-runtime-<platform>.tar.gz, the Bun with the compiler) and the
@@ -66,7 +66,7 @@ export interface CompileSelection {
 }
 
 interface CompileRecord extends CompileSelection {
-	/** The Pi-Bolt version they were compiled into, and the extensions that were. */
+	/** The µPi version they were compiled into, and the extensions that were. */
 	version: string;
 	extensions: string[];
 }
@@ -98,7 +98,7 @@ interface Kit {
 }
 
 /**
- * A package Pi-Bolt loads, with the extension files Pi loads from it: what gen-plugin-manifest.mjs takes with --packages.
+ * A package µPi loads, with the extension files Pi loads from it: what gen-plugin-manifest.mjs takes with --packages.
  * An npm package is fingerprinted by its version; a local folder or a git checkout, which can change without one, by its
  * files; a local file by itself (core/extensions/compiled.ts).
  */
@@ -109,10 +109,10 @@ export interface CompilePackage {
 	entries: string[];
 }
 
-/** The packages a compile takes, as Pi-Bolt loads them (piBolt.packages applied to `packages`). */
+/** The packages a compile takes, as µPi loads them (piBolt.packages applied to `packages`). */
 export interface CompilePackages {
 	packages: CompilePackage[];
-	/** Packages Pi-Bolt loads that have nothing to compile in, and why. */
+	/** Packages µPi loads that have nothing to compile in, and why. */
 	passedOver: Array<{ path: string; reason: string }>;
 	/** Packages of Pi's `packages` list that piBolt.packages removes. */
 	removed: string[];
@@ -253,7 +253,7 @@ const KIT_FOLDER = "@KIT@";
 
 const USAGE = `Usage: pi-bolt compile [options]
 
-Compile the extensions installed on this machine into Pi-Bolt: they then run as machine code, like Pi itself, and cost
+Compile the extensions installed on this machine into µPi: they then run as machine code, like Pi itself, and cost
 nothing to load. Each one compiled in is used while its installed copy is unchanged; a changed one is loaded from its files
 again until it is compiled in again. \`pi-bolt update\` compiles the same extensions into the release it installs.
 
@@ -306,7 +306,7 @@ function installation(): { installDir: string; buildDir: string } {
 	const installDir = piBoltInstallDir();
 	if (!installDir) {
 		throw new CompileError(
-			`this Pi-Bolt is not in an installation (${dirname(process.execPath)}): use --out DIR, or install it with the installer`,
+			`this µPi is not in an installation (${dirname(process.execPath)}): use --out DIR, or install it with the installer`,
 		);
 	}
 	return { installDir, buildDir: dirname(process.execPath) };
@@ -631,7 +631,7 @@ function buildEnvironment(kit: Kit, kitDir: string, maximumBytecodeSize: number 
 	if (build.variant === "x64-baseline" || (process.platform === "linux" && build.variant.startsWith("arm64"))) {
 		env.BUN_AOT_CPU = "baseline";
 	}
-	// (Nothing from a Pi-Bolt that started this one: the build is a Bun of its own.)
+	// (Nothing from a µPi that started this one: the build is a Bun of its own.)
 	delete env.BUN_BE_BUN;
 	delete env.BUN_INTERNAL_SPAWN_HELPER;
 	return env;
@@ -1579,7 +1579,7 @@ export function runBuild(
 const LOG_HEADER = "# pi-bolt compile: all of what the compiler printed";
 
 /**
- * Builds Pi-Bolt with the extensions of `plan` into `stage`, a folder like this build's. A failed build leaves all of
+ * Builds µPi with the extensions of `plan` into `stage`, a folder like this build's. A failed build leaves all of
  * what the compiler printed in `log`, outside the work folder that is removed after it. `chosen`: what the compile was asked
  * for, for the advice on leaving out an extension the bundler stopped at.
  */
@@ -1869,7 +1869,7 @@ async function planCompile(
 ): Promise<{ agentDir: string; packages: CompilePackages; plan: PluginPlan; selection: Selection }> {
 	const agentDir = getAgentDir();
 	process.stderr.write(chalk.dim("finding the extensions\n"));
-	// The packages as Pi-Bolt loads them, not the `packages` setting the generator reads by itself; and the other
+	// The packages as µPi loads them, not the `packages` setting the generator reads by itself; and the other
 	// extensions, with those the `extensions` setting turns off left out, as Pi leaves them out.
 	const resolved = await resolveCompilePackages(agentDir);
 	const packages: CompilePackages = options.noPackages
@@ -1958,7 +1958,7 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 		const kit = JSON.parse(readFileSync(join(kitDir, "kit.json"), "utf8")) as Kit;
 		if (kit.piBolt !== build.version || kit.platform !== platform) {
 			throw new CompileError(
-				`the kit is for Pi-Bolt ${kit.piBolt} on ${kit.platform}, and this is Pi-Bolt ${build.version} on ${platform}`,
+				`the kit is for µPi ${kit.piBolt} on ${kit.platform}, and this is µPi ${build.version} on ${platform}`,
 			);
 		}
 
@@ -2089,7 +2089,7 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 			renameSync(stage, options.out);
 			console.log(
 				chalk.green(
-					`Built Pi-Bolt ${build.version} with ${names.join(", ")} compiled in${leftNote}, in ${took}: ${options.out}`,
+					`Built µPi ${build.version} with ${names.join(", ")} compiled in${leftNote}, in ${took}: ${options.out}`,
 				),
 			);
 			return;
@@ -2107,7 +2107,7 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 				: {}),
 		};
 		writeFileSync(join(where!.installDir, "compile.json"), `${JSON.stringify(record, null, "\t")}\n`);
-		console.log(chalk.green(`Compiled into Pi-Bolt ${build.version} in ${took}: ${names.join(", ")}${leftNote}`));
+		console.log(chalk.green(`Compiled into µPi ${build.version} in ${took}: ${names.join(", ")}${leftNote}`));
 		if (!options.afterUpdate) {
 			console.log(chalk.dim(`The build before is kept: pi-bolt update --rollback puts it back.`));
 		}
@@ -2121,7 +2121,7 @@ function status(): void {
 	const record = readRecord(installDir);
 	const about = existsSync(join(buildDir, "pi-bolt.txt")) ? readFileSync(join(buildDir, "pi-bolt.txt"), "utf8") : "";
 	const line = about.split("\n").find((l) => l.startsWith("Extensions compiled in"));
-	console.log(line ?? "No extensions are compiled into this Pi-Bolt.");
+	console.log(line ?? "No extensions are compiled into this µPi.");
 	for (const state of compiledStateLines(compiledExtensionList(), record)) console.log(chalk.yellow(state));
 }
 
@@ -2192,7 +2192,7 @@ export async function runPiBoltCompile(args: string[], installAgain: () => Promi
 					throw new CompileError(`unknown option ${arg}\n\n${USAGE}`);
 			}
 		}
-		if (!PIBOLT) throw new CompileError("compiling extensions in is for Pi-Bolt builds");
+		if (!PIBOLT) throw new CompileError("compiling extensions in is for µPi builds");
 		if (process.platform === "win32")
 			throw new CompileError("compiling extensions in is not available on Windows yet");
 		if (process.env.PREFIX?.includes("com.termux"))
@@ -2202,13 +2202,13 @@ export async function runPiBoltCompile(args: string[], installAgain: () => Promi
 		const installs = !options.out && !options.list;
 		if (installs && method === "npm") {
 			throw new CompileError(
-				"this Pi-Bolt was installed with the npm package, whose folder npm owns: install it with the installer to compile extensions in",
+				"this µPi was installed with the npm package, whose folder npm owns: install it with the installer to compile extensions in",
 			);
 		}
 		const manager = piBoltPackageManager(method);
 		if (installs && manager) {
 			throw new CompileError(
-				`this Pi-Bolt was installed with ${manager.name}, whose folder ${manager.command} owns: install it with the installer to compile extensions in`,
+				`this µPi was installed with ${manager.name}, whose folder ${manager.command} owns: install it with the installer to compile extensions in`,
 			);
 		}
 		if (mode === "status") {

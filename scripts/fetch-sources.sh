@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clones oven-sh/WebKit and oven-sh/bun at the commits in sources.json and applies Pi-Bolt's patches on top.
+# Clones oven-sh/WebKit and oven-sh/bun at the commits in sources.json and applies µPi's patches on top.
 # Usage: scripts/fetch-sources.sh            Sources go to $PIBOLT_WORK (default .work/) as webkit/ and bun/.
 source "$(dirname "$0")/lib/common.sh"
 need git

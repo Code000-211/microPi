@@ -113,7 +113,7 @@ jit_on=""; "$PI" --version | grep -q "JIT on" && jit_on=1
 out=$(env -i HOME="$home" PATH=/usr/bin:/bin PI_CODING_AGENT_DIR="$home/agent" DO_NOT_TRACK=1 BUN_ENABLE_CRASH_REPORTING=0 \
 	"$PI" -ne -e "$needs/index.ts" --offline --no-session -p hi 2>&1 </dev/null)
 if { [ -n "$jit_on" ] && grep -q "^needs-jit: loaded" <<<"$out"; } ||
-	{ [ -z "$jit_on" ] && grep -q "bun:ffi requires the JIT\. needs-jit needs Pi-Bolt's JIT build (bun:ffi); switch with: .*PIBOLT_VARIANT=" <<<"$out"; }; then
+	{ [ -z "$jit_on" ] && grep -q "bun:ffi requires the JIT\. needs-jit needs µPi's JIT build (bun:ffi); switch with: .*PIBOLT_VARIANT=" <<<"$out"; }; then
 	echo "PASS an extension that needs the JIT ($([ -n "$jit_on" ] && echo "loads" || echo "says so"))"
 else
 	echo "FAIL an extension that needs the JIT"
@@ -124,9 +124,9 @@ out=$(cd "$home" && env -i HOME="$home" PATH=/usr/bin:/bin PI_CODING_AGENT_DIR="
 	"$PI" doctor --offline 2>&1 </dev/null)
 doctor_status=$?
 real_home=$(cd "$home" && pwd -P)
-if [ "$doctor_status" = 0 ] && grep -q "^Pi-Bolt doctor" <<<"$out" && grep -q "^  compiled code  *used" <<<"$out" &&
+if [ "$doctor_status" = 0 ] && grep -q "^µPi doctor" <<<"$out" && grep -q "^  compiled code  *used" <<<"$out" &&
 	{ { [ -n "$jit_on" ] && grep -q "run time  *~/agent/extensions/needs-jit/index.ts: JIT, loaded" <<<"$out"; } ||
-		{ [ -z "$jit_on" ] && grep -q "needs-jit needs Pi-Bolt's JIT build" <<<"$out"; }; } &&
+		{ [ -z "$jit_on" ] && grep -q "needs-jit needs µPi's JIT build" <<<"$out"; }; } &&
 	! grep -q "$home\|$real_home" <<<"$out"; then
 	echo "PASS pi-bolt doctor"
 else
@@ -161,6 +161,6 @@ bedrock() {
 bedrock "Bedrock loads (the request is refused)" AWS_ENDPOINT_URL_BEDROCK_RUNTIME=http://127.0.0.1:1
 bedrock "Bedrock loads behind a proxy (the proxy refuses)" AWS_ENDPOINT_URL_BEDROCK_RUNTIME=https://127.0.0.1:1 HTTPS_PROXY=http://127.0.0.1:1 https_proxy=http://127.0.0.1:1
 
-# Pi-Bolt's grep and find tools, in-process: on by default, and not with FFF loaded.
+# µPi's grep and find tools, in-process: on by default, and not with FFF loaded.
 python3 search-tools.py "$PI" || status=1
 exit $status

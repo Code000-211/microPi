@@ -5,7 +5,7 @@ contact_links:
     about: Report it privately, never in a public issue (SECURITY.md).
   - name: A problem in Pi itself (stock Pi on Node or Bun does it too)
     url: https://github.com/earendil-works/pi/issues
-    about: Pi-Bolt runs Pi as released; a bug stock Pi has too belongs upstream.
+    about: µPi runs Pi as released; a bug stock Pi has too belongs upstream.
   - name: A question or an idea to discuss
     url: https://github.com/opensec-git/Pi-Bolt/discussions
     about: Usage questions, setup help and early ideas.

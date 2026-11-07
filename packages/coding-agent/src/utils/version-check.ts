@@ -1,5 +1,6 @@
 import { compare, valid } from "semver";
 import {
+	MICROPI_HAS_RELEASES,
 	PIBOLT,
 	PIBOLT_LATEST_RELEASE_API,
 	PIBOLT_LATEST_RELEASE_URL,
@@ -228,7 +229,7 @@ export async function getLatestPiVersion(
 }
 
 export async function checkForNewPiVersion(currentVersion: string): Promise<LatestPiRelease | undefined> {
-	if (process.env.PI_SKIP_VERSION_CHECK) return undefined;
+	if (!MICROPI_HAS_RELEASES || process.env.PI_SKIP_VERSION_CHECK) return undefined;
 	if (PIBOLT) currentVersion = PIBOLT.version;
 
 	try {

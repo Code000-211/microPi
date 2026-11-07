@@ -7,7 +7,7 @@ the model's provider). When it ends, hidden tests are copied in and run: a task 
 Recorded per run: solved, wall time, turns, tool calls and tool errors, tokens (new, cached, output), cost.
 
   harnessbench.py selftest                       check every task's setup and verifier without a model
-  harnessbench.py run --harness pi=CMD --harness lightspeed=CMD --model melious/glm-5.3-flash --reps 3
+  harnessbench.py run --harness pi=CMD --harness micropi=CMD --model melious/glm-5.3-flash --reps 3
   harnessbench.py report results/<dir>
 
 Runs go round-robin over repetitions, tasks and harnesses, so provider latency drifts hit every harness alike.

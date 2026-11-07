@@ -1,7 +1,7 @@
-# Pi-Lightspeed
+# µPi
 
 **A Pi-Bolt fork whose agent wastes less time.** [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is Pi, the coding agent,
-compiled ahead of time to one native executable. Pi-Lightspeed keeps all of that and works on the agent itself: how fast
+compiled ahead of time to one native executable. µPi keeps all of that and works on the agent itself: how fast
 it finds code, what it learns from each edit, how it runs long commands, and how much context it sends again. Measured
 numbers say how they were measured; anything not measured says so.
 
@@ -16,7 +16,7 @@ its runtime benchmarks are left out. Extensions, `pi-bolt compile` and the relea
 
 ## At a glance
 
-| Area | What Pi-Lightspeed does better | Measured |
+| Area | What µPi does better | Measured |
 |---|---|---|
 | [Search](#finding-code) | `grep`/`find` keep the file tree and contents in memory and match with SIMD | `grep` 1.7–6× faster, `find` 7.5× (p50) |
 | [Search](#project_search) | `project_search`: code and docs search that finds a function's definition first | definition first 55% → **83%**; doc answer in top 3 40% → **83%** |
@@ -48,7 +48,7 @@ its runtime benchmarks are left out. Extensions, `pi-bolt compile` and the relea
 
 ## Install
 
-There are no releases of Pi-Lightspeed yet; it is built from source with Pi-Bolt's own scripts. Needs git, Python 3 and Node.js
+There are no releases of µPi yet; it is built from source with Pi-Bolt's own scripts. Needs git, Python 3 and Node.js
 22.19 or later. Tested on Linux x86-64.
 
 ```bash
@@ -74,7 +74,7 @@ pi-bolt compile --kit .work/kit --runtime .work/runtime/bun
 a native SIMD search (AVX2 on x86-64, NEON on ARM64). They are not on by default (`--tools +grep,+find` or the
 `defaultTools` setting): their schemas cost every request about 400 tokens, and models search with `rg` in bash anyway.
 
-| Measured | Pi-Bolt | Pi-Lightspeed | |
+| Measured | Pi-Bolt | µPi | |
 |---|---:|---:|---:|
 | `grep` a function name (case-sensitive), p50 | 12.8 ms | **7.5 ms** | 1.7× |
 | `grep` a word, ignoring case, p50 | 11.3 ms | **1.9 ms** | 6× |
@@ -278,7 +278,7 @@ caught.
 ### Background jobs instead of sleep
 
 In real sessions, models waited for builds and tests with commands like `sleep 295; tail build.log`: 97 such calls waited
-3.2 hours, either past the moment the job had ended or not long enough, which cost another turn. Pi-Lightspeed gives the agent
+3.2 hours, either past the moment the job had ended or not long enough, which cost another turn. µPi gives the agent
 a way to wait that ends exactly when the job does (as [oh-my-pi](https://github.com/can1357/oh-my-pi) does).
 
 - **Automatic background.** A command still running after 120 s goes on in the background as a job (`bg1`, `bg2`, …);
@@ -380,7 +380,7 @@ Not measured on a real host yet: checked with an ssh stand-in that runs the remo
   request, so the provider reads the conversation from its cache (as deepseek-harness does). Before, all 4 compactions in
   real sessions read nothing from the cache (26k to 508k input tokens, 14 to 95 s each).
 
-| Measured: `melious/deepseek-v4.1-flash`, manual compaction, 4 runs each | Before | Pi-Lightspeed |
+| Measured: `melious/deepseek-v4.1-flash`, manual compaction, 4 runs each | Before | µPi |
 |---|---:|---:|
 | After ten long answers (76k–119k tokens): new input tokens, median | 54k | **8.4k** (+70k–110k from cache) |
 | After reading six large files (82k tokens): new input tokens | 4.2k | 0.4k–0.7k (+82k from cache) |
@@ -420,14 +420,14 @@ run's time was the model's. So:
 
 [harnessbench](bench/harness): 14 small projects (Python, C, Rust, TypeScript), each with hidden tests that decide
 whether the task is solved; every harness runs with no extensions, skills or instruction files, the same provider config,
-and its own agent folder. Pi 1.4.0 from npm (Node 24) against Pi-Lightspeed, 10 runs of each task, 5 November 2026:
+and its own agent folder. Pi 1.4.0 from npm (Node 24) against µPi, 10 runs of each task, 5 November 2026:
 
 | Model | | Solved | Time, sum | Turns, median | Cost |
 |---|---|---:|---:|---:|---:|
 | glm-5.3-flash | Pi 1.4.0 | 140/140 | 2,215 s | 6 | $0.23 |
-| | Pi-Lightspeed | 138/140 | **1,883 s** | 5 | $0.17 |
+| | µPi | 138/140 | **1,883 s** | 5 | $0.17 |
 | deepseek-v4.1-flash | Pi 1.4.0 | 137/140 | 1,745 s | 5 | $0.30 |
-| | Pi-Lightspeed | 137/140 | **1,466 s** | 4 | $0.25 |
+| | µPi | 137/140 | **1,466 s** | 4 | $0.25 |
 
 <sub>Time ratio 0.846 (95% CI 0.709–0.934, bootstrap over task/model pairs and runs); geometric mean of the 28 per-pair
 ratios 0.781 (0.701–0.867); 26 of the 28 pairs faster by median. The run before (an older build) gave 0.855
@@ -474,7 +474,7 @@ Everything above is on by default.
 
 ## Tests
 
-Pi-Lightspeed's own tests, in `packages/coding-agent` unless noted:
+µPi's own tests, in `packages/coding-agent` unless noted:
 
 - `test/claude-harness.test.ts`: read before edit, nested instruction files, compile flags, the search caches, the
   bash fast paths and the edit fallback.

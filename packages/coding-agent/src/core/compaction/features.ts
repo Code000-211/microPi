@@ -1,5 +1,5 @@
 /**
- * Pi-Lightspeed's additions to compaction, each on. Tests of Pi's own compaction (its requests, its thresholds) turn
+ * µPi's additions to compaction, each on. Tests of Pi's own compaction (its requests, its thresholds) turn
  * them off here; nothing else does.
  */
 export const compactionFeatures = {

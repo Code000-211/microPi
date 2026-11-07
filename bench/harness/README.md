@@ -37,10 +37,10 @@ harnesses.
 python3 harnessbench.py selftest   # every task: the untouched project fails, the reference solution passes
 python3 harnessbench.py run --suite quick --model melious/glm-5.3-flash \
     --harness before=/path/to/old/pi-bolt --harness after=/path/to/new/pi-bolt   # before a pull request, ~5 min
-python3 harnessbench.py run --harness pi='node /path/to/pi' --harness lightspeed=/path/to/pi-bolt \
+python3 harnessbench.py run --harness pi='node /path/to/pi' --harness micropi=/path/to/pi-bolt \
     --model melious/glm-5.3-flash --reps 5
 python3 harnessbench.py run --suite hard --model melious/glm-5.3 --model melious/deepseek-v4.1-flash \
-    --harness pi='node /path/to/pi' --harness lightspeed=/path/to/pi-bolt --reps 3 --parallel 4
+    --harness pi='node /path/to/pi' --harness micropi=/path/to/pi-bolt --reps 3 --parallel 4
 python3 harnessbench.py report results/<dir>
 ```
 

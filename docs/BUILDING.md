@@ -1,6 +1,6 @@
-# Building Pi-Bolt
+# Building µPi
 
-Pi-Bolt is built in two stages:
+µPi is built in two stages:
 
 1. **The runtime**: Bun on a patched JavaScriptCore with the ahead-of-time compiler. Build it once, or download it from a release.
 2. **Pi**: compiled with that runtime into a single executable. This takes about a minute, and it is where plugins are added.
@@ -20,7 +20,7 @@ Needs git, Node.js 22.19 or later with npm (to build Pi), Python 3, and rsync (f
 ```bash
 git clone https://github.com/opensec-git/Pi-Bolt.git && cd Pi-Bolt
 scripts/fetch-runtime.sh     # the Pi-Bolt runtime from the latest release -> .work/runtime/bun
-scripts/prepare-pi.sh        # builds the Pi in this repository (Pi-Bolt is a fork of Pi)
+scripts/prepare-pi.sh        # builds the Pi in this repository (µPi is a fork of Pi)
 scripts/build-pi.sh          # -> out/pi-bolt/pi
 out/pi-bolt/pi --version
 ```
@@ -59,7 +59,7 @@ scripts/build-runtime.sh            # release build with LTO -> .work/runtime/bu
 
 - the upstream repositories and commits: WebKit from [oven-sh/WebKit#743](https://github.com/oven-sh/WebKit/pull/743), and Bun
   from `main`;
-- Pi-Bolt's changes to each, one patch apiece: [`patches/webkit.patch`](../patches/webkit.patch) and
+- µPi's changes to each, one patch apiece: [`patches/webkit.patch`](../patches/webkit.patch) and
   [`patches/bun.patch`](../patches/bun.patch), applied with `git am`.
 
 The sysroot is what makes the executables portable. Linked against it, they need only glibc 2.17, and they carry their own
@@ -106,7 +106,7 @@ pages, the largest page size of ARM64 kernels, so one executable runs with 4, 16
 
 ### Working on the engine
 
-The checkouts in `.work/webkit` and `.work/bun` are ordinary git repositories, each with Pi-Bolt's changes as one commit on top
+The checkouts in `.work/webkit` and `.work/bun` are ordinary git repositories, each with µPi's changes as one commit on top
 of the pinned upstream commit. Make a change part of that commit (`git commit --amend`), rebuild with `scripts/build-runtime.sh`,
 then regenerate the patch:
 

@@ -2,7 +2,7 @@ import { closeSync, openSync, readSync } from "node:fs";
 import { basename } from "node:path";
 
 /**
- * Whether `path` is the extension Herdr's Pi integration installs (`herdr integration install pi`). Pi-Bolt's built-in
+ * Whether `path` is the extension Herdr's Pi integration installs (`herdr integration install pi`). µPi's built-in
  * Herdr extension takes its place.
  */
 export function isHerdrPiIntegration(path: string): boolean {

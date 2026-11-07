@@ -4,7 +4,7 @@
  * Updates used to start the installer as `powershell -Command "irm https://.../install.ps1 | iex"`. A program that starts
  * PowerShell to download a script and run it with iex is what a malware "download cradle" does, and behavior-based antivirus
  * stops it as such: Kaspersky's System Watcher reports PDM:Trojan.Win32.Generic for pi-bolt.exe during `pi-bolt update`
- * (#82). So Pi-Bolt updates itself here, doing what install.ps1 does for an update (PIBOLT_YES, PIBOLT_NO_PATH: no questions,
+ * (#82). So µPi updates itself here, doing what install.ps1 does for an update (PIBOLT_YES, PIBOLT_NO_PATH: no questions,
  * no PATH, no extensions): the signed SHA256SUMS, the release's .zip from npm or else GitHub, checked against them, unpacked
  * by Windows' own tar.exe, the build it replaces kept as <folder>.previous for `pi-bolt update --rollback`, and the new files
  * renamed into place the way install.ps1 does it, the executable last.
@@ -141,7 +141,7 @@ function moveFile(from: string, to: string): void {
 }
 
 /**
- * Moves the new build in `from` into place over the one in `to`, as install.ps1's Install-PiBoltFiles: a running Pi-Bolt keeps
+ * Moves the new build in `from` into place over the one in `to`, as install.ps1's Install-PiBoltFiles: a running µPi keeps
  * its executable and DLLs open, and Windows lets those be renamed but not replaced or deleted. Each new file is first moved
  * next to its target, then the old one renamed aside, then the new one renamed into place (if that fails, the old one is put
  * back); pi-bolt.exe last, so that until it is in place the one that runs is the old one. What was renamed aside is deleted
@@ -177,7 +177,7 @@ export function installFiles(from: string, to: string, stamp: number = Date.now(
 		} catch (error) {
 			rmSync(staged, { force: true });
 			throw new Error(
-				`could not put ${target} in place (${(error as Error).message}). Close Pi-Bolt and anything that has its files open, then run \`pi-bolt update\` again.`,
+				`could not put ${target} in place (${(error as Error).message}). Close µPi and anything that has its files open, then run \`pi-bolt update\` again.`,
 			);
 		}
 	}
@@ -185,7 +185,7 @@ export function installFiles(from: string, to: string, stamp: number = Date.now(
 
 /**
  * Keeps the build in `dir` as <dir>.previous for `pi-bolt update --rollback`, unless the incoming build is the same one (the same
- * pi-bolt.txt). Copied, since the running Pi-Bolt keeps its folder from being renamed. A note, not an error, if it cannot be.
+ * pi-bolt.txt). Copied, since the running µPi keeps its folder from being renamed. A note, not an error, if it cannot be.
  */
 export function keepPrevious(dir: string, incoming: string, note: (text: string) => void = () => {}): void {
 	if (!existsSync(join(dir, "pi-bolt.exe"))) return;
@@ -319,6 +319,6 @@ export async function updatePiBoltWindows(version: string, installDir: string, v
 	} finally {
 		rmSync(tmp, { recursive: true, force: true });
 	}
-	// Pi-Bolt keeps the packages only it runs out of Pi's list as it starts: once now, as install.ps1 does after an install.
+	// µPi keeps the packages only it runs out of Pi's list as it starts: once now, as install.ps1 does after an install.
 	spawnSync(join(dir, "pi-bolt.exe"), ["list"], { cwd: dir, stdio: "ignore" });
 }

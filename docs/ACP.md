@@ -1,6 +1,6 @@
 # Editors (Agent Client Protocol)
 
-`pi-bolt --acp` runs Pi-Bolt as an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) agent: editors that speak ACP
+`pi-bolt --acp` runs µPi as an [Agent Client Protocol](https://agentclientprotocol.com) (ACP) agent: editors that speak ACP
 start it and show it in their agent panel. That covers Zed, JetBrains IDEs, VS Code (through an ACP extension), Neovim, Emacs and
 [the other ACP clients](https://agentclientprotocol.com/get-started/clients). It is built in, so there is nothing to install. The
 ACP code loads only when `--acp` is given; the terminal UI, `-p`, and RPC mode do not load it.
@@ -13,7 +13,7 @@ Editors launched from the desktop may not see your shell's `PATH`: give them the
 
 ```json
 "agent_servers": {
-  "Pi-Bolt": { "type": "custom", "command": "/full/path/to/pi-bolt", "args": ["--acp"], "env": {} }
+  "µPi": { "type": "custom", "command": "/full/path/to/pi-bolt", "args": ["--acp"], "env": {} }
 }
 ```
 
@@ -23,12 +23,12 @@ Editors launched from the desktop may not see your shell's `PATH`: give them the
 ```json
 {
   "agent_servers": {
-    "Pi-Bolt": { "command": "/full/path/to/pi-bolt", "args": ["--acp"], "env": {} }
+    "µPi": { "command": "/full/path/to/pi-bolt", "args": ["--acp"], "env": {} }
   }
 }
 ```
 
-With `"use_idea_mcp": true` in its `default_mcp_settings`, the IDE also passes its own MCP server, and Pi-Bolt gets the IDE's
+With `"use_idea_mcp": true` in its `default_mcp_settings`, the IDE also passes its own MCP server, and µPi gets the IDE's
 tools.
 
 **VS Code, Neovim, Emacs and others**: add a custom agent in the ACP client of your choice (for example the

@@ -9,7 +9,7 @@ import { VirtualTerminal } from "./virtual-terminal.ts";
 
 // The editor's long-line fast paths (wrapping a line of standalone characters without segmenting it, and looking up
 // the grapheme at the cursor directly) must give exactly what segmenting the whole text gives. Run this file with bun
-// as well (`bun test test/editor-long-line.test.ts`): JSC's Intl.Segmenter is the one Pi-Bolt runs (see graphemeAt()).
+// as well (`bun test test/editor-long-line.test.ts`): JSC's Intl.Segmenter is the one µPi runs (see graphemeAt()).
 
 const segmenter = getGraphemeSegmenter();
 

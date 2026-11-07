@@ -113,7 +113,7 @@ describe("pi-bolt on PATH", () => {
 });
 
 describe("package lists", () => {
-	it("shows what only Pi or only Pi-Bolt loads", () => {
+	it("shows what only Pi or only µPi loads", () => {
 		const lists = packageListsOf({
 			packages: ["npm:a", { source: "npm:b", extensions: [] }],
 			piBolt: { packages: ["npm:a", "npm:opensec-pi-todo"] },
@@ -121,16 +121,16 @@ describe("package lists", () => {
 		expect(lists).toEqual({ pi: ["npm:a", "npm:b"], piBolt: ["npm:a", "npm:opensec-pi-todo"] });
 		expect(packageListRows(lists)).toEqual([
 			["Pi (packages)", "npm:a\nnpm:b"],
-			["Pi-Bolt (piBolt.packages)", "npm:a\nnpm:opensec-pi-todo"],
+			["µPi (piBolt.packages)", "npm:a\nnpm:opensec-pi-todo"],
 			["only Pi loads", "npm:b"],
-			["only Pi-Bolt loads", "npm:opensec-pi-todo"],
+			["only µPi loads", "npm:opensec-pi-todo"],
 		]);
 	});
 
-	it("says when Pi-Bolt has no list of its own, or both are the same", () => {
+	it("says when µPi has no list of its own, or both are the same", () => {
 		expect(packageListRows(packageListsOf({ packages: ["npm:a"] }))).toEqual([
 			["Pi (packages)", "npm:a"],
-			["Pi-Bolt", "loads Pi's list (there is no piBolt.packages)"],
+			["µPi", "loads Pi's list (there is no piBolt.packages)"],
 		]);
 		expect(packageListRows(packageListsOf({ packages: [], piBolt: { packages: [] } }))).toContainEqual([
 			"difference",
@@ -200,7 +200,7 @@ describe("jitFinding", () => {
 	it("reports one that failed after a bun:ffi call threw the JIT error, though it rethrew another", () => {
 		const finding = jitFinding({ ...failed, ffi: "called while loading", ffiJitRequired: true }, false);
 		expect(finding?.kind).toBe("problem");
-		expect(finding?.text).toContain("needs Pi-Bolt's JIT build");
+		expect(finding?.text).toContain("needs µPi's JIT build");
 		expect(finding?.text).toContain("threw");
 	});
 
@@ -210,7 +210,7 @@ describe("jitFinding", () => {
 });
 
 describe("findBunFfiImport", () => {
-	it("finds a file that imports bun:ffi, but not in the packages Pi-Bolt keeps from extensions", () => {
+	it("finds a file that imports bun:ffi, but not in the packages µPi keeps from extensions", () => {
 		const root = join(tempDir, "pkg");
 		mkdirSync(join(root, "node_modules", "@ff-labs", "fff-bun"), { recursive: true });
 		mkdirSync(join(root, "node_modules", "native"), { recursive: true });
@@ -251,7 +251,7 @@ describe("the report", () => {
 		const report: DoctorReport = {
 			sections: [
 				{
-					title: "Pi-Bolt",
+					title: "µPi",
 					rows: [
 						["build", "darwin-arm64, JIT off"],
 						["on PATH", "/a\n/b"],
@@ -263,9 +263,9 @@ describe("the report", () => {
 		};
 		expect(formatDoctorReport(report)).toBe(
 			[
-				"Pi-Bolt doctor",
+				"µPi doctor",
 				"",
-				"Pi-Bolt",
+				"µPi",
 				"  build           darwin-arm64, JIT off",
 				"  on PATH         /a",
 				"                  /b",
@@ -352,7 +352,7 @@ describe("runDoctor", () => {
 			join(home, ".config", "zed", "settings.json"),
 			'{ "agent_servers": { "Pi-Bolt": { "command": "/no/such/pi-bolt", "args": ["--acp"] } } }',
 		);
-		writeFileSync(join(bin, "pi-bolt"), "#!/bin/sh\necho 1.0.0 (Pi-Bolt 0.1.0, linux-x64, JIT off)\n");
+		writeFileSync(join(bin, "pi-bolt"), "#!/bin/sh\necho 1.0.0 (µPi 0.1.0, linux-x64, JIT off)\n");
 		chmodSync(join(bin, "pi-bolt"), 0o755);
 		vi.stubEnv("HOME", home);
 		vi.stubEnv("USERPROFILE", home);
@@ -368,8 +368,8 @@ describe("runDoctor", () => {
 		const status = await runDoctor(["--offline"], { cwd: project, agentDir, extensionFactories: [] });
 
 		expect(status).toBe(0);
-		expect(output).toMatch(/^Pi-Bolt doctor\n/);
-		expect(output).toMatch(/ {2}Pi-Bolt +0\.8\.8 \(Pi /);
+		expect(output).toMatch(/^µPi doctor\n/);
+		expect(output).toMatch(/ {2}µPi +0\.8\.8 \(Pi /);
 		expect(output).toContain("JIT off");
 		expect(output).toContain("runtime stamp 0f61517d28995399");
 		expect(output).toContain("not checked (offline)");
@@ -377,18 +377,18 @@ describe("runDoctor", () => {
 		expect(output).toMatch(/run time +~\/\.pi\/agent\/extensions\/fine\.ts: interpreted, loaded in \d+ ms/);
 		expect(output).toMatch(/failed +~\/\.pi\/agent\/extensions\/broken\.ts: boom/);
 		expect(output).toMatch(/ffi-ext\/index\.ts: .*uses bun:ffi \(ffi-ext\/index\.ts imports it\)/);
-		expect(output).toContain("needs Pi-Bolt's JIT build (bun:ffi); switch with: ");
+		expect(output).toContain("needs µPi's JIT build (bun:ffi); switch with: ");
 		// #62: one that fails is a problem; one that only imports bun:ffi and loads is a suggestion.
 		const problems = output.slice(output.indexOf("\nProblems\n"), output.indexOf("\nSuggestions\n"));
 		const suggestions = output.slice(output.indexOf("\nSuggestions\n"));
 		expect(problems).toContain("broken.ts");
-		expect(problems).toContain("ffi-ext/index.ts needs Pi-Bolt's JIT build");
+		expect(problems).toContain("ffi-ext/index.ts needs µPi's JIT build");
 		expect(problems).not.toContain("ffi-lazy");
-		expect(suggestions).toMatch(/ffi-lazy\/index\.ts needs Pi-Bolt's JIT build .*did not call it while loading/);
+		expect(suggestions).toMatch(/ffi-lazy\/index\.ts needs µPi's JIT build .*did not call it while loading/);
 		expect(output).toContain("only Pi loads");
 		expect(output).toContain("git:https://***@github.com/me/private-ext");
 		expect(output).toContain('Zed\'s agent server "Pi-Bolt" runs /no/such/pi-bolt, which does not exist');
-		expect(output).toContain("~/bin/pi-bolt (not this Pi-Bolt)");
+		expect(output).toContain("~/bin/pi-bolt (not this µPi)");
 		expect(output).not.toContain(home);
 		expect(output).not.toContain("ghp_");
 	});

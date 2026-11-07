@@ -1,6 +1,6 @@
 name: runtime
 
-# Builds the Pi-Bolt runtime (patched WebKit and Bun: scripts/build-runtime.sh, scripts\build-runtime.ps1) of every platform on
+# Builds the µPi runtime (patched WebKit and Bun: scripts/build-runtime.sh, scripts\build-runtime.ps1) of every platform on
 # GitHub's runners, each on its own: Linux x86-64 and ARM64, macOS on Apple silicon, Windows x64. It is what a release needs when
 # the engine changed (docs/RELEASING.md, "When the engine changed"): run it from pi-bolt with the release's tag, and it attaches
 # pi-bolt-runtime-<platform>.tar.gz (Windows: .zip) to that tag's draft release, which the release workflow then uses once it has
@@ -278,7 +278,7 @@ jobs:
               { echo "::error::$TAG is published: its runtimes are not replaced"; exit 1; }
           else
             # (Its tag, when pushed later, names the commit that was built.)
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "Pi-Bolt ${TAG#bolt-v}" --notes "" --target "${REF:-$GITHUB_SHA}"
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "µPi ${TAG#bolt-v}" --notes "" --target "${REF:-$GITHUB_SHA}"
           fi
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber runtimes/*
           { echo "### Runtimes attached to the draft of $TAG (built from ${REF:-$GITHUB_SHA})"; echo; (cd runtimes && sha256sum -- *) | sed 's/^/    /'; } >>"$GITHUB_STEP_SUMMARY"

@@ -12,7 +12,7 @@ import type { McpTool, McpToolResult } from "../src/extensions/mcp-server/tools.
 const cliPath = resolve(__dirname, "../src/cli.ts");
 // --import takes a module specifier, not a filesystem path.
 const sourceResolverUrl = pathToFileURL(resolve(__dirname, "../src/experimental/source-resolver.ts")).href;
-/** A built executable to test instead of the sources, such as Pi-Bolt's `out/pi-bolt/pi`. */
+/** A built executable to test instead of the sources, such as µPi's `out/pi-bolt/pi`. */
 const executable = process.env.PI_MCP_TEST_EXECUTABLE;
 
 // ============================================================================
@@ -290,7 +290,7 @@ describe("MCP mode", () => {
 		const { client, init } = await startClient();
 		expect(init.protocolVersion).toBe("2025-11-25");
 		expect(init.capabilities).toEqual({ tools: { listChanged: false } });
-		// (Pi-Bolt's executable is named pi-bolt.)
+		// (µPi's executable is named pi-bolt.)
 		expect(["pi", "pi-bolt"]).toContain(init.serverInfo.name);
 		expect(init.instructions).toContain("sessionId");
 		const { tools } = await client.request<{ tools: McpTool[] }>("tools/list", {});

@@ -1,4 +1,4 @@
-"""Pi-Bolt's grep and find tools in a built Pi: on by default and searching in-process (no ripgrep or fd on PATH, nothing
+"""µPi's grep and find tools in a built Pi: on by default and searching in-process (no ripgrep or fd on PATH, nothing
 downloaded: PI_OFFLINE), following .gitignore, in path order; not on by default with FFF's extension loaded; and still there when
 --tools names them.
   python3 tests/pi/search-tools.py PI

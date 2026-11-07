@@ -97,7 +97,7 @@ function deepMergeObjects(base: Record<string, unknown>, overrides: Record<strin
 
 /** Tools enabled at startup when `defaultTools` does not change them. */
 /**
- * Pi's default tools, and in Pi-Bolt wait for background jobs. grep and find (searching in-process:
+ * Pi's default tools, and in µPi wait for background jobs. grep and find (searching in-process:
  * core/tools/native-search.ts) are there to turn on: every request carries their schemas, about 400 tokens, and models
  * search with rg in bash anyway (19 calls in 108 benchmark runs).
  */
@@ -108,7 +108,7 @@ export const DEFAULT_TOOL_NAMES: readonly string[] =
 const FFF_EXTENSION = /(?:^builtin:|[\\/]node_modules[\\/])(?:opensec-pi-fff|@ff-labs[\\/]pi-fff)(?:[\\/]|$)/;
 
 /**
- * The default tools with these extensions loaded: in Pi-Bolt, without its grep and find when FFF is loaded (it registers
+ * The default tools with these extensions loaded: in µPi, without its grep and find when FFF is loaded (it registers
  * its own, under those names or as ffgrep and fffind).
  */
 export function defaultToolNamesFor(extensionPaths: readonly string[]): readonly string[] {
@@ -340,8 +340,8 @@ export class InMemorySettingsStorage implements SettingsStorage {
 }
 
 /**
- * OpenSec's extensions for Pi-Bolt are Bun builds, which Pi on Node cannot load; installers before Pi-Bolt 0.8.4 added them
- * to `packages`, so Pi stopped at them. Move only those entries to Pi-Bolt's additive list.
+ * OpenSec's extensions for µPi are Bun builds, which Pi on Node cannot load; installers before Pi-Bolt 0.8.4 added them
+ * to `packages`, so Pi stopped at them. Move only those entries to µPi's additive list.
  */
 const PIBOLT_ONLY_PACKAGE = /^npm:opensec-pi-(?:subagents|todo|fff)(?:@|$)/;
 
@@ -372,7 +372,7 @@ function packageIdentityOf(entry: unknown, baseDir: string): string | undefined 
 		: getPackageIdentity(source.startsWith("-") ? source.slice(1) : source, baseDir);
 }
 
-/** `settings` with Pi-Bolt's only packages moved out of Pi's list, or undefined when Pi's list has none. */
+/** `settings` with µPi's only packages moved out of Pi's list, or undefined when Pi's list has none. */
 function withPiBoltOnlyPackagesMoved(
 	settings: Record<string, unknown>,
 	baseDir: string,
@@ -409,7 +409,7 @@ function isSamePackageDeclaration(left: unknown, right: unknown, baseDir: string
  * Pi-Bolt before 0.9.1 kept `piBolt.packages` as an independent list: its first install or removal copied `packages` into it
  * and edited the copy. The list is now an overlay on `packages`, so a shared package missing from a copy would be loaded again.
  * Convert a copy once: exclude each shared package it lacks, drop entries identical to their shared entry, and keep the rest
- * (replacements and Pi-Bolt-only additions). `packagesOverlay` marks a list as an overlay; every writer of the list sets it.
+ * (replacements and µPi-only additions). `packagesOverlay` marks a list as an overlay; every writer of the list sets it.
  * Returns undefined when there is nothing to change.
  */
 function withLegacyPiBoltPackagesConverted(
@@ -441,7 +441,7 @@ function withLegacyPiBoltPackagesConverted(
 	return { ...settings, piBolt: { ...piBolt, packages: [...exclusions.values(), ...kept], packagesOverlay: true } };
 }
 
-/** Pi-Bolt's package migrations for one settings file, or undefined when it needs none. */
+/** µPi's package migrations for one settings file, or undefined when it needs none. */
 function withPiBoltPackagesMigrated(
 	settings: Record<string, unknown>,
 	scope: SettingsScope,
@@ -590,7 +590,7 @@ export class SettingsManager {
 						return next ? JSON.stringify(next, null, 2) : undefined;
 					});
 				} catch {
-					// (Not written: Pi-Bolt uses the migrated lists in memory, and migrates the file at a later start.)
+					// (Not written: µPi uses the migrated lists in memory, and migrates the file at a later start.)
 				}
 			}
 		}
@@ -680,7 +680,7 @@ export class SettingsManager {
 		return structuredClone(this.settings);
 	}
 
-	/** Raw global declarations, including separate shared and Pi-Bolt package lists. */
+	/** Raw global declarations, including separate shared and µPi package lists. */
 	getGlobalSettings(): Settings {
 		return structuredClone(this.globalSettings);
 	}
@@ -1368,7 +1368,7 @@ export class SettingsManager {
 		return this.globalSettings.deviceId;
 	}
 
-	/** As in Pi, a project `packages` list replaces the global one. A project Pi-Bolt list alone does not. */
+	/** As in Pi, a project `packages` list replaces the global one. A project µPi list alone does not. */
 	private getPackageSettingsScope(): SettingsScope {
 		return this.projectSettings.packages !== undefined ? "project" : "global";
 	}
@@ -1385,7 +1385,7 @@ export class SettingsManager {
 		if (scope === "project" || PIBOLT === undefined || !Array.isArray(this.projectSettings.piBolt?.packages)) {
 			return packages;
 		}
-		// Project Pi-Bolt entries without project `packages` add to the global packages or replace one of the same
+		// Project µPi entries without project `packages` add to the global packages or replace one of the same
 		// identity, as the package manager loads them; their exclusions apply only to the project's own (empty) list.
 		const project = this.resolvePackages(this.projectSettings, "project");
 		const identity = (entry: PackageSource, entryScope: SettingsScope) =>
@@ -1417,7 +1417,7 @@ export class SettingsManager {
 		// An unreadable declaration file must abort removal, not authorise deletion of shared files.
 		let persisted: Settings = content ? JSON.parse(stripBom(content)) : {};
 		if (PIBOLT !== undefined) {
-			// A file written by an older Pi-Bolt since this manager loaded it still holds a legacy copy.
+			// A file written by an older µPi since this manager loaded it still holds a legacy copy.
 			persisted =
 				(withLegacyPiBoltPackagesConverted(
 					persisted as Record<string, unknown>,
@@ -1443,12 +1443,12 @@ export class SettingsManager {
 	}
 
 	/**
-	 * Write raw shared declarations. The piBolt option explicitly selects the additive Pi-Bolt list, marked as an overlay so
+	 * Write raw shared declarations. The piBolt option explicitly selects the additive µPi list, marked as an overlay so
 	 * it is never taken for a legacy copy (withLegacyPiBoltPackagesConverted).
 	 */
 	setPackages(packages: PackageSource[], options?: { piBolt?: boolean }): void {
 		if (options?.piBolt) {
-			if (PIBOLT === undefined) throw new Error("Pi-Bolt packages require a Pi-Bolt build");
+			if (PIBOLT === undefined) throw new Error("µPi packages require a µPi build");
 			this.globalSettings.piBolt = {
 				...this.globalSettings.piBolt,
 				packages: structuredClone(packages),
@@ -1466,7 +1466,7 @@ export class SettingsManager {
 	/** Write raw project declarations; never pass the resolved overlay here. */
 	setProjectPackages(packages: PackageSource[], options?: { piBolt?: boolean }): void {
 		if (options?.piBolt) {
-			if (PIBOLT === undefined) throw new Error("Pi-Bolt packages require a Pi-Bolt build");
+			if (PIBOLT === undefined) throw new Error("µPi packages require a µPi build");
 			this.assertProjectTrustedForWrite();
 			const settings = this.getProjectSettings();
 			settings.piBolt = { ...settings.piBolt, packages: structuredClone(packages), packagesOverlay: true };
@@ -1730,7 +1730,7 @@ export class SettingsManager {
 	}
 
 	/** The resolved `defaultTools` selection, or undefined when no settings layer sets it. */
-	/** `base`: what a list of only `+name`/`-name` entries changes (Pi-Bolt: `defaultToolNamesFor()`, which knows the extensions). */
+	/** `base`: what a list of only `+name`/`-name` entries changes (µPi: `defaultToolNamesFor()`, which knows the extensions). */
 	getDefaultTools(base: readonly string[] = DEFAULT_TOOL_NAMES): string[] | undefined {
 		const tools = this.settings.defaultTools;
 		if (tools === undefined) return undefined;

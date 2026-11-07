@@ -1,9 +1,9 @@
 # Contributing
 
-Thanks for helping make Pi-Bolt better. Bug reports, benchmarks on other hardware and fixes are all welcome.
+Thanks for helping make µPi better. Bug reports, benchmarks on other hardware and fixes are all welcome.
 
-Pi-Bolt is a fork of [Pi](https://github.com/earendil-works/pi). If something also happens with stock Pi, it belongs upstream.
-This repository takes what Pi-Bolt adds: the engine patches, the installers and updater, `pi-bolt compile`, the tools Pi-Bolt
+µPi is a fork of [Pi](https://github.com/earendil-works/pi). If something also happens with stock Pi, it belongs upstream.
+This repository takes what µPi adds: the engine patches, the installers and updater, `pi-bolt compile`, the tools µPi
 replaces, scripts, benchmarks and docs.
 
 Security problems: never in a public issue. See [SECURITY.md](SECURITY.md). Everyone taking part follows the
@@ -47,7 +47,7 @@ need to rebase unless asked.
 
 | Area | Where | Check with |
 |---|---|---|
-| Pi's code as Pi-Bolt changes it | `packages/` | `npm run check`, `./test.sh` |
+| Pi's code as µPi changes it | `packages/` | `npm run check`, `./test.sh` |
 | Build scripts, tools | `scripts/`, `bench/` | `shellcheck -x scripts/*.sh`, and a build |
 | The engine (JavaScriptCore AOT compiler, runtime) | `.work/webkit`, then regenerate `patches/webkit.patch` | `tests/aot/run.sh` |
 | The executable format | `.work/bun`, then regenerate `patches/bun.patch` | the same |

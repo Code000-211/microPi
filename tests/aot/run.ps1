@@ -3,7 +3,7 @@
 # the generic copies of loops) and must print exactly what a stock Bun prints running its source.
 #
 # Usage: tests\aot\run.ps1 [test.mjs...]      (default: every test)
-# Environment: PIBOLT_BUN (the Pi-Bolt runtime; default .work\runtime\bun.exe), PIBOLT_STABLE_BUN (the reference; default `bun`),
+# Environment: PIBOLT_BUN (the microPi runtime; default .work\runtime\bun.exe), PIBOLT_STABLE_BUN (the reference; default `bun`),
 #              AOT_BUILD_ENV (extra variables for the compile step, e.g. "BUN_JSC_useAOTLoopSplitting=0")
 param([Parameter(ValueFromRemainingArguments)][string[]]$Tests)
 $ErrorActionPreference = 'Continue'
@@ -11,7 +11,7 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Work = if ($env:PIBOLT_WORK) { $env:PIBOLT_WORK } else { Join-Path $Root '.work' }
 $Bun = if ($env:PIBOLT_BUN) { $env:PIBOLT_BUN } else { Join-Path $Work 'runtime\bun.exe' }
 $Stable = if ($env:PIBOLT_STABLE_BUN) { $env:PIBOLT_STABLE_BUN } else { 'bun' }
-if (-not (Test-Path $Bun)) { Write-Host "error: no Pi-Bolt runtime at $Bun" -ForegroundColor Red; exit 1 }
+if (-not (Test-Path $Bun)) { Write-Host "error: no microPi runtime at $Bun" -ForegroundColor Red; exit 1 }
 $Out = Join-Path $Work 'tests\aot'
 New-Item -ItemType Directory -Force $Out | Out-Null
 Set-Location $PSScriptRoot

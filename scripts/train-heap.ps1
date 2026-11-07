@@ -26,7 +26,7 @@ $Profile = [System.IO.Path]::GetFullPath($Profile)
 if (-not (Test-Path (Join-Path $Profile 'bytecode.order'))) { Die "no $Profile\bytecode.order: run scripts/train-profile.sh" }
 $Build = Join-Path $Work 'heap-training'
 $Cells = Join-Path $Work 'heap-training-function-cells.txt'
-Log "a Pi-Bolt build to trace -> $Build"
+Log "a microPi build to trace -> $Build"
 $withPlugins = if ($Plugins) { @{ Plugins = [System.IO.Path]::GetFullPath($Plugins) } } else { @{} }
 & (Join-Path $Root 'scripts\build-pi.ps1') -Out $Build -Profile $Profile -FunctionCellsOut $Cells @withPlugins
 if ($LASTEXITCODE -ne 0) { Die 'the build failed' }

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
 import type * as PiBolt from "../src/pi-bolt.ts";
+import { MICROPI_HAS_RELEASES } from "../src/pi-bolt.ts";
 import {
 	getLatestPiRelease,
 	newestPiBoltVersionInFeed,
@@ -145,7 +146,7 @@ describe("the latest Pi-Bolt release", () => {
 		expect(requested(fetchMock)).toEqual([API_RELEASES, FEED]);
 	});
 
-	it("pi-bolt update works while GitHub's API is limited", async () => {
+	it.skipIf(!MICROPI_HAS_RELEASES)("pi-bolt update works while GitHub's API is limited", async () => {
 		// #149: "Error: Could not determine latest pi-bolt version." on 1.0.2, with the latest release 1.0.2.
 		serve({
 			[LATEST]: () => redirectTo("https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.2"),
@@ -155,20 +156,23 @@ describe("the latest Pi-Bolt release", () => {
 		const error = vi.spyOn(console, "error").mockImplementation(() => {});
 		expect(await handlePackageCommand(["update", "--self"])).toBe(true);
 		expect(error.mock.calls.flat().join("\n")).toBe("");
-		expect(log.mock.calls.flat().join("\n")).toContain("Pi-Bolt is already up to date (v1.0.2)");
+		expect(log.mock.calls.flat().join("\n")).toContain("µPi is already up to date (v1.0.2)");
 		expect(process.exitCode).toBeUndefined();
 	});
 
-	it("pi-bolt update says why, and how to update without it, when the release cannot be found", async () => {
-		serve({ [LATEST]: () => new Response("", { status: 503 }), [API_LATEST]: rateLimited });
-		vi.spyOn(console, "log").mockImplementation(() => {});
-		const error = vi.spyOn(console, "error").mockImplementation(() => {});
-		expect(await handlePackageCommand(["update", "--self"])).toBe(true);
-		const output = error.mock.calls.flat().join("\n");
-		expect(output).toMatch(/Could not determine latest \S+ version: /);
-		expect(output).toContain("HTTP 403 (rate limit exceeded)");
-		expect(output).toContain("You can update without it: ");
-		expect(output).toMatch(/install\.(sh|ps1)/);
-		expect(process.exitCode).toBe(1);
-	});
+	it.skipIf(!MICROPI_HAS_RELEASES)(
+		"pi-bolt update says why, and how to update without it, when the release cannot be found",
+		async () => {
+			serve({ [LATEST]: () => new Response("", { status: 503 }), [API_LATEST]: rateLimited });
+			vi.spyOn(console, "log").mockImplementation(() => {});
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			expect(await handlePackageCommand(["update", "--self"])).toBe(true);
+			const output = error.mock.calls.flat().join("\n");
+			expect(output).toMatch(/Could not determine latest \S+ version: /);
+			expect(output).toContain("HTTP 403 (rate limit exceeded)");
+			expect(output).toContain("You can update without it: ");
+			expect(output).toMatch(/install\.(sh|ps1)/);
+			expect(process.exitCode).toBe(1);
+		},
+	);
 });

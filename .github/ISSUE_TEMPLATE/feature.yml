@@ -1,5 +1,5 @@
 name: Feature request
-description: Something Pi-Bolt could add or do better.
+description: Something µPi could add or do better.
 labels: [enhancement]
 body:
   - type: markdown

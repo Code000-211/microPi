@@ -4,7 +4,7 @@
  *
  * Those rules are Pi's: packages/coding-agent/src/core/extensions/loader.ts, `discoverExtensionsInDir` and
  * `resolveExtensionEntries`. The generator cannot import them, because they are private to Pi and this script belongs to
- * Pi-Bolt. `pi rules` below is therefore a case for every rule in Pi's own list, so that a change in Pi fails this test
+ * µPi. `pi rules` below is therefore a case for every rule in Pi's own list, so that a change in Pi fails this test
  * instead of quietly shortening a manifest. A plugin missing from a manifest still loads at run time, so a short manifest
  * is invisible.
  */

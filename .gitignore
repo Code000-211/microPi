@@ -46,7 +46,7 @@ plans/
 collect.sh
 packages/agent/docs/extensions/pi-server-artifact/index.md
 
-# --- Pi-Bolt ---
+# --- µPi ---
 # Sources, toolchains and builds made by the scripts (see docs/BUILDING.md)
 /.work/
 /.toolchain/

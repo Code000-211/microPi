@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Run the package manager as it runs inside a compiled Bun executable (Pi-Bolt).
+// Run the package manager as it runs inside a compiled Bun executable (µPi).
 vi.mock("../src/config.ts", async (importOriginal) => {
 	const actual = await importOriginal();
 	return {

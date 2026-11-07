@@ -1,7 +1,7 @@
 /**
- * Pi-Bolt: Pi compiled ahead of time (https://github.com/opensec-git/Pi-Bolt).
+ * µPi: Pi compiled ahead of time (https://github.com/opensec-git/Pi-Bolt).
  *
- * scripts/build-pi.sh defines PIBOLT_BUILD when it compiles this tree ("0.3.1 x64 jit-off e0f307e3d3f66944": the Pi-Bolt
+ * scripts/build-pi.sh defines PIBOLT_BUILD when it compiles this tree ("0.3.1 x64 jit-off e0f307e3d3f66944": the µPi
  * version, the CPU variant (x64, x64-baseline, x64-jit, arm64), whether the JIT is on, and the runtime stamp of the engine it
  * was built for, scripts/runtime-stamp.sh, when known). In every other build it is undefined and nothing here changes what Pi
  * does.
@@ -85,6 +85,11 @@ export function piBoltInstallerProcess(installerFile?: string): { command: strin
 		],
 	};
 }
+/**
+ * µPi has no releases of its own. The releases below are Pi-Bolt's: updating to one would replace µPi, so neither the
+ * update notice nor `pi-bolt update` (the program itself) uses them while this is false.
+ */
+export const MICROPI_HAS_RELEASES = false;
 export const PIBOLT_RELEASES_URL = "https://github.com/opensec-git/Pi-Bolt/releases";
 /** The key releases' SHA256SUMS are signed with (keys/release.pub; the installers carry it too). */
 export const PIBOLT_RELEASE_KEY = `-----BEGIN PUBLIC KEY-----
@@ -186,7 +191,7 @@ function isScoopPath(path: string): boolean {
 }
 
 /**
- * The tool a Pi-Bolt that mise installed goes by, from the folder mise put it in, <data>/installs/<folder>/<version>: <data> is
+ * The tool a µPi that mise installed goes by, from the folder mise put it in, <data>/installs/<folder>/<version>: <data> is
  * ~/.local/share/mise (%LOCALAPPDATA%\mise on Windows) or $MISE_DATA_DIR, and <folder> is `pi-bolt` for the registry's
  * shorthand or `github-opensec-git-pi-bolt` for `github:opensec-git/Pi-Bolt`. Undefined if mise did not install it.
  */
@@ -199,7 +204,7 @@ export function piBoltMiseTool(path: string = realPathOf(process.execPath)): str
 }
 
 /**
- * How this Pi-Bolt was installed: with the npm package (whose launcher keeps the executable under $PIBOLT_HOME/npm/<version>;
+ * How this µPi was installed: with the npm package (whose launcher keeps the executable under $PIBOLT_HOME/npm/<version>;
  * on Windows, whose install script puts it in the package's own bin folder, where npm's shims start it directly), with
  * Homebrew (the executable is in its Cellar, <prefix>/Cellar/pi-bolt/<version>/libexec, wherever a link to it is), with Scoop
  * (in <root>\apps\pi-bolt, started by Scoop's shim), with mise (in <data>/installs/<tool>), or with the installer (anything
@@ -217,7 +222,7 @@ export function piBoltInstallMethod(): PiBoltInstallMethod {
 	return "installer";
 }
 
-/** A package manager that installed this Pi-Bolt. It owns the folder: Pi-Bolt neither updates nor changes it itself. */
+/** A package manager that installed this µPi. It owns the folder: µPi neither updates nor changes it itself. */
 export interface PiBoltPackageManager {
 	/** Its name in messages: "Homebrew". */
 	name: string;
@@ -231,7 +236,7 @@ export interface PiBoltPackageManager {
 	switchVersion?: string;
 }
 
-/** The package manager that installed this Pi-Bolt (or one installed as `method`); undefined for npm and the installer. */
+/** The package manager that installed this µPi (or one installed as `method`); undefined for npm and the installer. */
 export function piBoltPackageManager(
 	method: PiBoltInstallMethod = piBoltInstallMethod(),
 ): PiBoltPackageManager | undefined {
@@ -271,7 +276,7 @@ export function piBoltPackageManager(
 	}
 }
 
-/** The command that updates this Pi-Bolt: its package manager's (`brew upgrade pi-bolt`), else `pi-bolt update`. */
+/** The command that updates this µPi: its package manager's (`brew upgrade pi-bolt`), else `pi-bolt update`. */
 export function piBoltUpdateCommand(method: PiBoltInstallMethod = piBoltInstallMethod()): string {
 	return piBoltPackageManager(method)?.update ?? "pi-bolt update";
 }
@@ -289,7 +294,7 @@ export function piBoltInstallDir(): string | undefined {
 /**
  * The installers' variables an update passes on from the user's environment: which releases updates take, where the npm
  * registry is (what comes from it is checked against the signed checksums), how many connections, where `pi-bolt` is linked,
- * the extensions, and Termux's LD_PRELOAD, which Pi-Bolt gives back to the programs it starts.
+ * the extensions, and Termux's LD_PRELOAD, which µPi gives back to the programs it starts.
  */
 const PIBOLT_UPDATE_PASSED_ON = new Set([
 	"PIBOLT_CHANNEL",

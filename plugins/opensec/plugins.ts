@@ -1,5 +1,5 @@
 /**
- * OpenSec's extensions compiled into Pi-Bolt's release executables: opensec-pi-subagents and opensec-pi-todo, at the versions
+ * OpenSec's extensions compiled into µPi's release executables: opensec-pi-subagents and opensec-pi-todo, at the versions
  * extensions.txt pins (package.json, package-lock.json: `npm ci --ignore-scripts`, then `node prepare.mjs`, here before building).
  *
  * Build:  scripts\build-pi.ps1 -Plugins plugins\opensec\plugins.ts -Out out\pi-bolt   (scripts\package-release.ps1 does)

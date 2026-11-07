@@ -1,7 +1,7 @@
 /*
  * Zero-dependency N-API C addon for fff-style fast file search and SIMD grep.
  *
- * Designed specifically for Pi-Bolt (works under BUN_AOT_JIT=0):
+ * Designed specifically for µPi (works under BUN_AOT_JIT=0):
  *  - SIMD-accelerated / 64-bit word-at-a-time literal & case-insensitive byte search
  *  - Multi-pattern OR prefilter & matching (Aho-Corasick / first-byte bitmask)
  *  - Smith-Waterman + Bitmask Prefilter Fuzzy Path Scorer with Frecency & Git boosts

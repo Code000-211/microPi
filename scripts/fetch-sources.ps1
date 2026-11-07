@@ -1,4 +1,4 @@
-# Clones oven-sh/WebKit and oven-sh/bun at the commits in sources.json and applies Pi-Bolt's patches on top: Windows'
+# Clones oven-sh/WebKit and oven-sh/bun at the commits in sources.json and applies microPi's patches on top: Windows'
 # scripts/fetch-sources.sh. Sources go to $env:PIBOLT_WORK (default .work\) as webkit\ and bun\.
 #
 # WebKit is fetched without file contents and checked out sparsely (Source, Tools, WebKitLibraries, JSTests, icu, scripts,

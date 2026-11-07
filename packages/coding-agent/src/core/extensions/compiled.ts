@@ -1,5 +1,5 @@
 /**
- * Pi-Bolt: extensions compiled into the executable by `pi-bolt compile` (src/pi-bolt-compile.ts).
+ * µPi: extensions compiled into the executable by `pi-bolt compile` (src/pi-bolt-compile.ts).
  *
  * Each stands in for an extension installed on this machine for as long as that extension is as it was when it was compiled
  * in. Pi finds, filters and orders its extensions as always; the one at a compiled-in path then gets the compiled factory

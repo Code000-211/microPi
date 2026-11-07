@@ -1,9 +1,9 @@
 /**
- * Pi-Bolt: Pi's modules for the modules a compiled-in extension loads from disk as it runs.
+ * µPi: Pi's modules for the modules a compiled-in extension loads from disk as it runs.
  *
  * Loaded from its files, an extension is loaded by jiti, which gives every module it loads Pi's own modules by the names
  * Pi gives them (VIRTUAL_MODULES): an extension that loads a module of its own with `await import(path)`, whose code
- * imports `typebox` or `@earendil-works/pi-coding-agent`, gets Pi's. Compiled in, the extension's code is Pi-Bolt's own,
+ * imports `typebox` or `@earendil-works/pi-coding-agent`, gets Pi's. Compiled in, the extension's code is µPi's own,
  * and such a module is loaded by the runtime, which finds no package of that name beside it (#6 of the loader-parity
  * review: "Cannot find package 'typebox'"). So, once Pi uses a compiled-in extension, the runtime is given those names too.
  *

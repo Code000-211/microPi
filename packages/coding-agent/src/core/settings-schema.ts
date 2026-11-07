@@ -394,17 +394,17 @@ export const SettingsSchema = Type.Object(
 					packages: Type.Optional(
 						Type.Array(PackageSourceSchema, {
 							description:
-								"Pi-Bolt package additions and same-identity replacements over this file's shared packages. Use -<source> strings to exclude inherited packages. An empty list inherits shared packages.",
+								"µPi package additions and same-identity replacements over this file's shared packages. Use -<source> strings to exclude inherited packages. An empty list inherits shared packages.",
 						}),
 					),
 					packagesOverlay: Type.Optional(
 						Type.Boolean({
 							description:
-								"Set by Pi-Bolt when it writes packages. A list without it and without -<source> entries is taken for an independent copy written before Pi-Bolt 0.9.1 and converted to an overlay once.",
+								"Set by µPi when it writes packages. A list without it and without -<source> entries is taken for an independent copy written before Pi-Bolt 0.9.1 and converted to an overlay once.",
 						}),
 					),
 				},
-				{ description: "Pi-Bolt only settings." },
+				{ description: "µPi only settings." },
 			),
 		),
 		extensions: Type.Optional(

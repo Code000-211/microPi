@@ -1,5 +1,5 @@
 /**
- * Pi-Bolt plugin manifest: the extensions compiled into the executable.
+ * µPi plugin manifest: the extensions compiled into the executable.
  *
  * Build:  scripts/build-pi.sh --plugins examples/plugins/plugins.ts --out out/pi-bolt-plugins
  *

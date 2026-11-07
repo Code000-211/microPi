@@ -30,7 +30,7 @@ afterEach(() => {
 });
 
 // #28: package selector preflight must reuse startup argument consumption, not scan option values.
-describe.each([true, false])("getPiBoltPackageFlagError (Pi-Bolt=%s)", (piBolt) => {
+describe.each([true, false])("getPiBoltPackageFlagError (µPi=%s)", (piBolt) => {
 	beforeEach(() => {
 		build.piBolt = piBolt;
 	});
@@ -119,7 +119,7 @@ describe.each([true, false])("getPiBoltPackageFlagError (Pi-Bolt=%s)", (piBolt) 
 	])("rejects actual unsupported selector tokens: %j", async (...args) => {
 		const expected = piBolt
 			? "--pi-bolt is only supported by install, remove, and uninstall"
-			: "--pi-bolt requires a Pi-Bolt build";
+			: "--pi-bolt requires a µPi build";
 		expect(getPiBoltPackageFlagError(args)).toBe(expected);
 		await main(args);
 		expect(process.exitCode).toBe(1);
@@ -130,7 +130,7 @@ describe.each([true, false])("getPiBoltPackageFlagError (Pi-Bolt=%s)", (piBolt) 
 	// #28: startup value handling must not relax package-command selector validation or help precedence.
 	test.each(["install", "remove", "uninstall"])("preserves %s selector grammar", async (command) => {
 		const args = [command, "npm:fixture", "--pi-bolt", "--help"];
-		expect(getPiBoltPackageFlagError(args)).toBe(piBolt ? undefined : "--pi-bolt requires a Pi-Bolt build");
+		expect(getPiBoltPackageFlagError(args)).toBe(piBolt ? undefined : "--pi-bolt requires a µPi build");
 		expect(await handlePackageCommand(args)).toBe(true);
 		expect(process.exitCode).toBe(piBolt ? undefined : 1);
 		expect(SettingsManager.create).not.toHaveBeenCalled();
@@ -143,7 +143,7 @@ describe.each([true, false])("getPiBoltPackageFlagError (Pi-Bolt=%s)", (piBolt) 
 		["update", "--extension", "--pi-bolt=true"],
 	])("rejects every valued package selector: %j", async (...args) => {
 		expect(getPiBoltPackageFlagError(args)).toBe(
-			piBolt ? "--pi-bolt does not take a value" : "--pi-bolt requires a Pi-Bolt build",
+			piBolt ? "--pi-bolt does not take a value" : "--pi-bolt requires a µPi build",
 		);
 		await handlePackageCommand(args);
 		expect(process.exitCode).toBe(1);
@@ -153,9 +153,7 @@ describe.each([true, false])("getPiBoltPackageFlagError (Pi-Bolt=%s)", (piBolt) 
 	test.each(["list", "update", "config"])("rejects unsupported %s selectors before settings", async (command) => {
 		const args = command === "update" ? [command, "--extension", "--pi-bolt"] : [command, "--pi-bolt"];
 		expect(getPiBoltPackageFlagError(args)).toBe(
-			piBolt
-				? "--pi-bolt is only supported by install, remove, and uninstall"
-				: "--pi-bolt requires a Pi-Bolt build",
+			piBolt ? "--pi-bolt is only supported by install, remove, and uninstall" : "--pi-bolt requires a µPi build",
 		);
 		if (command === "config") await handleConfigCommand(args);
 		else await handlePackageCommand(args);

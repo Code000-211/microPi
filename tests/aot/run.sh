@@ -4,7 +4,7 @@
 # loops) and must print exactly what a stock Bun prints running its source.
 #
 # Usage: tests/aot/run.sh [test.mjs...]      (default: every test)
-# Environment: PIBOLT_BUN (the Pi-Bolt runtime), PIBOLT_STABLE_BUN (the reference; default `bun`),
+# Environment: PIBOLT_BUN (the µPi runtime), PIBOLT_STABLE_BUN (the reference; default `bun`),
 #              AOT_BUILD_ENV (extra variables for the compile step, e.g. "BUN_JSC_useAOTLoopSplitting=0")
 source "$(dirname "$0")/../../scripts/lib/common.sh"
 set +e

@@ -52,7 +52,7 @@ jobs:
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then echo "$tag exists"; exit 0; fi
           gh api "repos/$GITHUB_REPOSITORY/contents/docs/releases/$version.md?ref=$SHA" >/dev/null 2>&1 ||
             { echo "::warning::VERSION is $version but docs/releases/$version.md is missing: not tagged"; exit 0; }
-          object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$tag" -f message="Pi-Bolt $version" -f object="$SHA" -f type=commit \
+          object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$tag" -f message="µPi $version" -f object="$SHA" -f type=commit \
             -f "tagger[name]=OpenSec" -f "tagger[email]=323596076+opensec-intelligence@users.noreply.github.com" --jq .sha)
           gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$object" >/dev/null
           echo "tagged $SHA as $tag"

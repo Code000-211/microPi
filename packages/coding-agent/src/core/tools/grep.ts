@@ -73,7 +73,7 @@ const defaultGrepOperations: GrepOperations = {
 export interface GrepToolOptions {
 	/** Custom operations for grep. Default: local filesystem plus ripgrep */
 	operations?: GrepOperations;
-	/** Search in-process instead of with ripgrep (native-search.ts). Default: in Pi-Bolt builds, without custom operations. */
+	/** Search in-process instead of with ripgrep (native-search.ts). Default: in µPi builds, without custom operations. */
 	native?: boolean;
 }
 

@@ -35,7 +35,7 @@
 #   --kit DIR         also write the compile kit to DIR: the files this build read, its compile command and the training
 #                     profile, for `pi-bolt compile` to build the same executable with extensions (scripts/make-kit.mjs).
 #                     Not with --plugins
-# Environment: PIBOLT_BUN (the Pi-Bolt runtime; default $PIBOLT_WORK/runtime/bun); PIBOLT_BUILD_LOG (a file for everything the
+# Environment: PIBOLT_BUN (the µPi runtime; default $PIBOLT_WORK/runtime/bun); PIBOLT_BUILD_LOG (a file for everything the
 #              compiler prints, e.g. with BUN_JSC_verboseAOTCompilation=1)
 source "$(dirname "$0")/lib/common.sh"
 
@@ -130,7 +130,7 @@ stage_assets() {
 	# Not the documentation's pictures (2.5 MB of PNG, about 4% of the download): the model reads the text, and a terminal
 	# shows none of them (the one the docs show has its alt text).
 	rm -rf "$dir/docs/images"
-	# With Pi-Bolt's own that `pi-bolt doctor` points at (#63).
+	# With µPi's own that `pi-bolt doctor` points at (#63).
 	cp "$PIBOLT_ROOT/docs/PLUGINS.md" "$PIBOLT_ROOT/docs/ACP.md" "$PIBOLT_ROOT/docs/TROUBLESHOOTING.md" "$dir/docs/"
 	mkdir -p "$dir/theme" "$dir/assets" "$dir/export-html/vendor" "$dir/native/$PIBOLT_OS/prebuilds"
 	cp "$AGENT"/src/modes/interactive/theme/*.json "$dir/theme/"

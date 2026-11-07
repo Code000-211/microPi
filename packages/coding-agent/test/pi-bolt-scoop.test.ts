@@ -6,10 +6,15 @@ import { runDoctor } from "../src/cli/doctor.ts";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
 import type * as PiBolt from "../src/pi-bolt.ts";
-import { piBoltInstallMethod, piBoltJitSwitchCommand, piBoltUpdateCommand } from "../src/pi-bolt.ts";
+import {
+	MICROPI_HAS_RELEASES,
+	piBoltInstallMethod,
+	piBoltJitSwitchCommand,
+	piBoltUpdateCommand,
+} from "../src/pi-bolt.ts";
 import type * as VersionCheck from "../src/utils/version-check.ts";
 
-// A Pi-Bolt build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
+// A µPi build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
 vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof PiBolt>()),
 	PIBOLT: { version: "1.0.0", variant: "x64", jit: false },
@@ -42,7 +47,7 @@ function scoopInstall(root: string): string {
 	return join(app, "current");
 }
 
-/** Every file in Scoop's folder for Pi-Bolt, to tell that nothing was changed. */
+/** Every file in Scoop's folder for µPi, to tell that nothing was changed. */
 function filesIn(folder: string): string[] {
 	return readdirSync(folder, { recursive: true, encoding: "utf8" }).sort();
 }
@@ -63,7 +68,7 @@ afterEach(() => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-describe("a Pi-Bolt installed with Scoop", () => {
+describe("a µPi installed with Scoop", () => {
 	it("is told by where the executable is, in Scoop's apps folder", () => {
 		const current = scoopInstall(join(dir, "scoop"));
 		runningFrom(join(current, "pi-bolt.exe"));
@@ -95,16 +100,16 @@ describe("a Pi-Bolt installed with Scoop", () => {
 		expect(piBoltInstallMethod()).toBe("scoop");
 	});
 
-	it("update says to run scoop update, and changes nothing", async () => {
+	it.skipIf(!MICROPI_HAS_RELEASES)("update says to run scoop update, and changes nothing", async () => {
 		runningFrom(join(scoopInstall(join(dir, "scoop")), "pi-bolt.exe"));
 		const before = filesIn(app);
 		const log = vi.spyOn(console, "log").mockImplementation(() => {});
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		expect(await handlePackageCommand(["update", "--self"])).toBe(true);
 		const output = log.mock.calls.flat().join("\n");
-		expect(output).toContain("This Pi-Bolt was installed with Scoop");
+		expect(output).toContain("This µPi was installed with Scoop");
 		expect(output).toContain("scoop update pi-bolt");
-		expect(output).not.toContain("Updating Pi-Bolt");
+		expect(output).not.toContain("Updating µPi");
 		expect(process.exitCode).toBe(1);
 		expect(filesIn(app)).toEqual(before);
 	});

@@ -1,10 +1,10 @@
-# Releasing Pi-Bolt
+# Releasing µPi
 
 Six workflows, all on GitHub's own runners (Ubuntu 24.04 x86-64 and ARM64, Windows Server 2025, macOS 15 on Apple silicon):
 
 | Workflow | When | What |
 |---|---|---|
-| `ci` | every push to `pi-bolt`, every pull request | lint and types (the workflows too, with actionlint), Pi's tests, Pi-Bolt built and tested on Linux x86-64, Linux ARM64, macOS (Apple silicon: its tests and its comparison with stock Pi side by side) and Windows x64, the installer's checks, whether the engine patches apply. A pull request that changes only documentation builds and tests nothing |
+| `ci` | every push to `pi-bolt`, every pull request | lint and types (the workflows too, with actionlint), Pi's tests, µPi built and tested on Linux x86-64, Linux ARM64, macOS (Apple silicon: its tests and its comparison with stock Pi side by side) and Windows x64, the installer's checks, whether the engine patches apply. A pull request that changes only documentation builds and tests nothing |
 | `tag` | `ci` passed on a push to `pi-bolt` | when `VERSION` has no `bolt-vX.Y.Z` tag yet, tags that commit and runs `release` |
 | `release` | a `bolt-vX.Y.Z` tag | checks the runtimes' attestations, builds the 20 archives on Linux (x86-64 and ARM64), macOS and Windows, tests each as unpacked from its archive, attests each, makes a **draft** release with `SHA256SUMS`, `extensions.txt` and `RUNTIME_STAMP`, and runs `publish` |
 | `publish` | after `release`, or by hand | signs `SHA256SUMS`, checks the signature and the checksums, publishes the release, puts `install.sh`, `install.ps1` and the site on `gh-pages`, publishes npm, and updates the Homebrew formula |
@@ -240,7 +240,7 @@ npm answers a publish with "being processed": a new version can take a few minut
 `brew install opensec-git/tap/pi-bolt` installs the formula `Formula/pi-bolt.rb` of
 [opensec-git/homebrew-tap](https://github.com/opensec-git/homebrew-tap): the default build of the latest release for macOS on
 Apple silicon, Linux x86-64 and Linux ARM64 (the `.tar.gz` archives), unpacked into the keg's `libexec` with `pi-bolt` linked to
-`pi`. Intel Macs are refused by the formula's `arm64` requirement. A Pi-Bolt whose executable is in a Homebrew Cellar
+`pi`. Intel Macs are refused by the formula's `arm64` requirement. A µPi whose executable is in a Homebrew Cellar
 (`.../Cellar/pi-bolt/...`) knows it: `pi-bolt update` says to run `brew upgrade pi-bolt`, and `pi-bolt compile` and
 `pi-bolt update --rollback` refuse.
 
@@ -267,11 +267,11 @@ release's `SHA256SUMS`, then `brew style Formula/pi-bolt.rb`, commit and push.
 `scoop install opensec-git/pi-bolt` (after `scoop bucket add opensec-git https://github.com/opensec-git/scoop-bucket`) installs
 the manifest `bucket/pi-bolt.json` of [opensec-git/scoop-bucket](https://github.com/opensec-git/scoop-bucket): the default
 Windows build of the latest release (`pi-bolt-win32-x64.zip`), unpacked into `<scoop>\apps\pi-bolt\<version>` with a shim for
-`pi-bolt.exe`. A Pi-Bolt whose executable is there (`...\scoop\apps\pi-bolt\...`, or under `$SCOOP` or `$SCOOP_GLOBAL`)
+`pi-bolt.exe`. A µPi whose executable is there (`...\scoop\apps\pi-bolt\...`, or under `$SCOOP` or `$SCOOP_GLOBAL`)
 knows it: `pi-bolt update` says to run `scoop update pi-bolt`, and `pi-bolt update --rollback` to run
 `scoop reset pi-bolt@<version>`.
 
-Nothing in Pi-Bolt's workflows touches the bucket. Its Excavator workflow (from Scoop's bucket template) runs every four hours:
+Nothing in µPi's workflows touches the bucket. Its Excavator workflow (from Scoop's bucket template) runs every four hours:
 it reads the latest release's `bolt-vX.Y.Z` tag, takes the archive's checksum from the release's `SHA256SUMS`, and commits the
 new manifest. Its Install workflow installs the manifest with Scoop on a Windows runner and runs `pi-bolt --version` on every
 push, every pull request and once a day. A pre-release is not taken (the tag comes from the latest release). To update it by
@@ -282,7 +282,7 @@ hand, from a clone of the bucket on Windows with Scoop installed: `.\bin\checkve
 mise installs Pi-Bolt from the GitHub release with its `github` backend; nothing is published for it. The options (in
 [docs-site/pages/installation.html](../docs-site/pages/installation.html)) pick the default build's archive per platform,
 strip the `bolt-v` tag prefix, rename `pi` to `pi-bolt` and put only `pi-bolt` on PATH. mise takes a release once it is older
-than its `minimum_release_age` setting. A Pi-Bolt in mise's installs folder (`.../mise/installs/<tool>/...`, or under
+than its `minimum_release_age` setting. A µPi in mise's installs folder (`.../mise/installs/<tool>/...`, or under
 `$MISE_DATA_DIR/installs`) knows it: `pi-bolt update` says to run `mise upgrade --bump github:opensec-git/Pi-Bolt`
 (`mise upgrade --bump pi-bolt` once mise's registry has the shorthand), and `pi-bolt update --rollback` to run
 `mise use -g github:opensec-git/Pi-Bolt@<version>`. If a release renames its archives, update the options in the docs.
@@ -294,7 +294,7 @@ records the profile, opens a pull request and merges it when `ci` passes, after 
 By hand:
 
 1. Merge the tag into `pi-bolt` (`git fetch https://github.com/earendil-works/pi.git tag vX.Y.Z && git merge vX.Y.Z`). Where
-   Pi-Bolt changed the same code, keep both: Pi-Bolt's changes are its commits on top of the previous Pi tag
+   µPi changed the same code, keep both: µPi's changes are its commits on top of the previous Pi tag
    (`git log vX.Y.Z..pi-bolt -- packages/`).
 2. `scripts/bump-version.sh --pi X.Y.Z` (the last number goes up by one, as for any release), `scripts/prepare-pi.sh --refresh-models`
    (the model catalog of the new Pi, `packages/ai/src/providers/data`), then `scripts/train-profile.sh` **on Linux**, and commit
@@ -329,7 +329,7 @@ again, up to three times, so that only a build whose two copies agreed is releas
 release without one. The executables carry no Authenticode signature yet: SmartScreen may warn about one downloaded with a
 browser (the installers do not mark what they download). An Authenticode signature, with the owner's certificate, would go on
 `pi-bolt.exe` before the archive is made, as it changes the file and so its checksum. Never ask users to turn SmartScreen off or
-to exclude Pi-Bolt from Defender.
+to exclude µPi from Defender.
 
 ## Signing
 
@@ -337,7 +337,7 @@ to exclude Pi-Bolt from Defender.
 0.9.9, `SHA256SUMS.sshsig` (the same key in OpenSSH's signature format, namespace `pi-bolt-release`, made by
 `scripts/lib/sshsig.mjs`). The installer carries the public key and refuses a download whose signature is missing or does not
 verify. It checks it with OpenSSL 3 (on `PATH` or Homebrew's), or else with `ssh-keygen -Y verify` against `SHA256SUMS.sshsig`
-(OpenSSH 8.1 or later, which every current Mac has), or else with the Pi-Bolt already installed (which must print the SHA-256 of
+(OpenSSH 8.1 or later, which every current Mac has), or else with the µPi already installed (which must print the SHA-256 of
 the checksums it verified; an exit status alone does not count). Where none of them can check it, and for a release from before
 0.6.0, which has no signature, nothing is installed unless `PIBOLT_UNVERIFIED` is the SHA-256 of that release's `SHA256SUMS`
 (the installer shows it): the value matches one download only, so one left in a profile lets nothing else in, and the npm

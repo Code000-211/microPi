@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 const dependencySections = ["dependencies", "devDependencies", "optionalDependencies"];
 const exactVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
-const ignoredDirectories = new Set([".git", ".work", "dist", "node_modules", "out"]); // (.work, out: Pi-Bolt's engine checkouts and builds)
+const ignoredDirectories = new Set([".git", ".work", "dist", "node_modules", "out"]); // (.work, out: µPi's engine checkouts and builds)
 const packageJsonFiles = [];
 
 function collectPackageJsonFiles(directory) {

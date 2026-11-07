@@ -1,6 +1,6 @@
 # docsearch
 
-Search over a project's code and documentation for Pi-Bolt's agent, in a Rust addon compiled into the executable. It
+Search over a project's code and documentation for µPi's agent, in a Rust addon compiled into the executable. It
 adds the tool `project_search`, adds matching doc sections to a typed prompt (auto-recall), and the command `/docs`.
 
 - **No model at search time.** BM25 over sections, plus a graph of sections and the names they mention, walked with
@@ -23,7 +23,7 @@ descriptions):
 | Docs | 73% | 83% | 88% |
 | Code, function by name | 87% | 97% | 98% |
 | Code, function by description | 15% | 32% | 55% |
-| TypeScript, function or type by name (Pi-Bolt's sources) | 98% | 100% | 100% |
+| TypeScript, function or type by name (µPi's sources) | 98% | 100% | 100% |
 
 TypeScript, JavaScript, Go and shell files were split like plain text until the change that added them: the same 60
 TypeScript names had 53% / 83% / 98% then (search p50 33 → 38 µs, build 93 → 107 ms for 568 files).
@@ -48,7 +48,7 @@ embeddings (docs Hit@10 88% → 97%, but ~22 ms per search on the CPU).
 
 ## Build and install
 
-Needs Rust (stable) and Pi-Bolt's `pi-bolt compile`.
+Needs Rust (stable) and µPi's `pi-bolt compile`.
 
 ```sh
 packages/docsearch/install.sh                 # builds the addon, copies it and the extension to ~/.pi/agent/extensions/docsearch
@@ -91,7 +91,7 @@ less than 100 ms is kept in memory only. Files unused for 30 days are removed.
 ## Measuring a change
 
 The test sets point at frozen snapshots of radiance taken on 2026-11-03: `corpus/` with its tracked Markdown and text
-files, `code/` with its tracked source files. `ts-names.tsv` points at `ts/`, Pi-Bolt's TypeScript at commit `5641c898`
+files, `code/` with its tracked source files. `ts-names.tsv` points at `ts/`, µPi's TypeScript at commit `5641c898`
 of this fork: `git archive 5641c898 packages/{coding-agent,ai,agent,tui}/src | tar -x -C ts`, without
 `models.generated.ts`. Put them in one folder, then:
 

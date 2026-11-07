@@ -6,11 +6,16 @@ import { runDoctor } from "../src/cli/doctor.ts";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
 import type * as PiBolt from "../src/pi-bolt.ts";
-import { piBoltInstallMethod, piBoltJitSwitchCommand, piBoltUpdateCommand } from "../src/pi-bolt.ts";
+import {
+	MICROPI_HAS_RELEASES,
+	piBoltInstallMethod,
+	piBoltJitSwitchCommand,
+	piBoltUpdateCommand,
+} from "../src/pi-bolt.ts";
 import { runPiBoltCompile } from "../src/pi-bolt-compile.ts";
 import type * as VersionCheck from "../src/utils/version-check.ts";
 
-// A Pi-Bolt build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
+// A µPi build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
 vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof PiBolt>()),
 	PIBOLT: { version: "1.0.0", variant: "arm64", jit: false },
@@ -65,7 +70,7 @@ afterEach(() => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-describe.skipIf(process.platform === "win32")("a Pi-Bolt installed with Homebrew", () => {
+describe.skipIf(process.platform === "win32")("a µPi installed with Homebrew", () => {
 	it("is told by where the executable really is, in the Cellar", () => {
 		const libexec = brewInstall(join(dir, "homebrew"));
 		runningFrom(join(libexec, "pi-bin"));
@@ -88,7 +93,7 @@ describe.skipIf(process.platform === "win32")("a Pi-Bolt installed with Homebrew
 		);
 	});
 
-	it("update says to run brew upgrade, and changes nothing", async () => {
+	it.skipIf(!MICROPI_HAS_RELEASES)("update says to run brew upgrade, and changes nothing", async () => {
 		const libexec = brewInstall(join(dir, "homebrew"));
 		runningFrom(join(libexec, "pi-bin"));
 		const before = filesIn(keg);
@@ -96,9 +101,9 @@ describe.skipIf(process.platform === "win32")("a Pi-Bolt installed with Homebrew
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		expect(await handlePackageCommand(["update", "--self"])).toBe(true);
 		const output = log.mock.calls.flat().join("\n");
-		expect(output).toContain("This Pi-Bolt was installed with Homebrew");
+		expect(output).toContain("This µPi was installed with Homebrew");
 		expect(output).toContain("brew upgrade pi-bolt");
-		expect(output).not.toContain("Updating Pi-Bolt");
+		expect(output).not.toContain("Updating µPi");
 		expect(process.exitCode).toBe(1);
 		expect(filesIn(keg)).toEqual(before);
 	});
@@ -123,7 +128,7 @@ describe.skipIf(process.platform === "win32")("a Pi-Bolt installed with Homebrew
 		const installAgain = vi.fn(async () => true);
 		expect(await runPiBoltCompile([], installAgain)).toBe(1);
 		expect(error.mock.calls.flat().join("\n")).toContain(
-			"this Pi-Bolt was installed with Homebrew, whose folder brew owns",
+			"this µPi was installed with Homebrew, whose folder brew owns",
 		);
 		expect(installAgain).not.toHaveBeenCalled();
 		expect(filesIn(keg)).toEqual(before);
@@ -146,6 +151,6 @@ describe.skipIf(process.platform === "win32")("a Pi-Bolt installed with Homebrew
 		});
 		expect(await runDoctor(["--offline"], { cwd: home, agentDir, extensionFactories: [] })).toBe(0);
 		expect(output).toMatch(/installed +Homebrew \(the opensec-git\/tap\/pi-bolt formula\), run from .*libexec/);
-		expect(output).toContain("(this Pi-Bolt)");
+		expect(output).toContain("(this µPi)");
 	});
 });

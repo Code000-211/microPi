@@ -17,7 +17,7 @@ import type * as PiBoltModule from "../src/pi-bolt.ts";
 import { type PiBoltBuild, parsePiBoltBuild, piBoltJitSwitchCommand, piBoltJitVariant } from "../src/pi-bolt.ts";
 import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 
-// The build these tests run as: Pi-Bolt without the JIT, unless a test says otherwise. (In source runs PIBOLT is undefined.)
+// The build these tests run as: µPi without the JIT, unless a test says otherwise. (In source runs PIBOLT is undefined.)
 const build = vi.hoisted(() => ({ value: undefined as PiBoltBuild | undefined }));
 vi.mock("../src/pi-bolt.ts", async (importOriginal) => {
 	const original = await importOriginal<typeof PiBoltModule>();
@@ -90,9 +90,7 @@ describe("the JIT build to switch to", () => {
 describe("withJitHint", () => {
 	it("names the extension and the command after the engine's message", () => {
 		const message = withJitHint(`FFF init failed: ${JIT_REQUIRED_MESSAGE}`, () => "pi-foo");
-		expect(message).toMatch(
-			/^FFF init failed: bun:ffi requires the JIT\. pi-foo needs Pi-Bolt's JIT build \(bun:ffi\);/,
-		);
+		expect(message).toMatch(/^FFF init failed: bun:ffi requires the JIT\. pi-foo needs µPi's JIT build \(bun:ffi\);/);
 		expect(message).toContain("switch with: ");
 		expect(message).toContain("PIBOLT_VARIANT=");
 		// Once: a message that has the hint already keeps it as it is.
@@ -148,7 +146,7 @@ describe("extensionDisplayName and extensionOfStack", () => {
 	});
 });
 
-describe("where Pi-Bolt shows the error", () => {
+describe("where µPi shows the error", () => {
 	it("says which extension that failed to load needs the JIT build", async () => {
 		const root = writePackage("pi-ffi", {
 			"index.ts": `export default function () { throw new TypeError("${JIT_REQUIRED_MESSAGE}"); }\n`,
@@ -156,7 +154,7 @@ describe("where Pi-Bolt shows the error", () => {
 		const result = await loadExtensions([join(root, "index.ts")], tempDir);
 		expect(result.errors).toHaveLength(1);
 		expect(result.errors[0].error).toMatch(
-			/^Failed to load extension: bun:ffi requires the JIT\. pi-ffi needs Pi-Bolt's JIT build \(bun:ffi\); switch with: /,
+			/^Failed to load extension: bun:ffi requires the JIT\. pi-ffi needs µPi's JIT build \(bun:ffi\); switch with: /,
 		);
 	});
 
@@ -204,9 +202,9 @@ describe("where Pi-Bolt shows the error", () => {
 		await runner.emit({ type: "session_start", reason: "startup" });
 
 		expect(notices).toHaveLength(1);
-		expect(notices[0]).toMatch(/^FFF init failed: bun:ffi requires the JIT\. pi-notifier needs Pi-Bolt's JIT build/);
+		expect(notices[0]).toMatch(/^FFF init failed: bun:ffi requires the JIT\. pi-notifier needs µPi's JIT build/);
 		expect(errors).toHaveLength(1);
-		expect(errors[0]).toMatch(/^bun:ffi requires the JIT\. pi-thrower needs Pi-Bolt's JIT build/);
+		expect(errors[0]).toMatch(/^bun:ffi requires the JIT\. pi-thrower needs µPi's JIT build/);
 	});
 
 	it("passes other notices through unchanged", async () => {

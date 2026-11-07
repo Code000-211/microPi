@@ -16,7 +16,7 @@ afterEach(() => {
 	else process.env.PIBOLT_INSTALL = realInstall;
 });
 
-describe("pi-bolt update installs where Pi-Bolt is", () => {
+describe("pi-bolt update installs where µPi is", () => {
 	test("an installation in the home directory", () => {
 		delete process.env.PIBOLT_INSTALL;
 		runningFrom(join(homedir(), ".pi-bolt", "pi-bolt-linux-x64", "pi"));

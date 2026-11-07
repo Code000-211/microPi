@@ -1,4 +1,4 @@
-# A self-test of a Pi-Bolt executable on this Windows machine (Windows 10 1809 or later, or Windows 11; x64), for machines the
+# A self-test of a microPi executable on this Windows machine (Windows 10 1809 or later, or Windows 11; x64), for machines the
 # release was not built or tested on. Self-contained: no Python, no repository, no network (a small fake model on 127.0.0.1
 # answers Pi; no provider is called). Run it with Windows PowerShell:
 #
@@ -119,7 +119,7 @@ function Hex($code) { if ($code -is [int]) { '0x{0:x8}' -f $code } else { $code 
 try {
 	# --- The checks -------------------------------------------------------------------------------------------------------
 	$v = Invoke-Pi @('--version')
-	Result 'starts and says its version' ($v.Code -eq 0 -and $v.Out -match 'Pi-Bolt') "exit $(Hex $v.Code) $($v.Out.Trim()) $($v.Err.Trim())"
+	Result 'starts and says its version' ($v.Code -eq 0 -and $v.Out -match 'Pi-Bolt|Pi [0-9]') "exit $(Hex $v.Code) $($v.Out.Trim()) $($v.Err.Trim())"
 	Say "  version: $($v.Out.Trim())"
 	$aot = if ($v.Err -match 'image of \d+ bytes mapped') { 'yes' } elseif ($v.Err -match 'not used \(([^)]*)\)') { "no ($($Matches[1]))" } else { 'not said' }
 	Say "  compiled code used: $aot"

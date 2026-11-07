@@ -1,5 +1,5 @@
 name: Bug report
-description: Pi-Bolt does something stock Pi does not, or fails to install, update, compile or start.
+description: µPi does something stock Pi does not, or fails to install, update, compile or start.
 labels: [bug]
 body:
   - type: markdown
@@ -44,7 +44,7 @@ body:
     id: version
     attributes:
       label: pi-bolt --version
-      placeholder: "1.4.0 (Pi-Bolt 1.0.4, darwin-arm64, JIT off)"
+      placeholder: "1.4.0 (µPi 1.0.4, darwin-arm64, JIT off)"
     validations:
       required: true
   - type: input
@@ -74,7 +74,7 @@ body:
     id: plain-pi
     attributes:
       label: Does stock Pi (on Node or Bun) do the same?
-      options: ["No, only Pi-Bolt", "Yes, stock Pi too", "Not tried"]
+      options: ["No, only µPi", "Yes, stock Pi too", "Not tried"]
     validations:
       required: true
   - type: textarea

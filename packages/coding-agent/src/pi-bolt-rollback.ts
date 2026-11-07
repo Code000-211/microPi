@@ -77,7 +77,7 @@ export function swapFolderContents(current: string, previous: string): void {
 		try {
 			rmSync(join(current, file), { force: true });
 		} catch {
-			// A file still running (this executable, or another Pi-Bolt's) cannot be deleted: the next install deletes it.
+			// A file still running (this executable, or another µPi's) cannot be deleted: the next install deletes it.
 		}
 	}
 }
@@ -128,27 +128,27 @@ export function rollbackPiBolt(): number {
 	const method = piBoltInstallMethod();
 	if (method === "npm") {
 		console.error(
-			"This Pi-Bolt was installed with the npm package. Install the version you want with the package manager that installed it:",
+			"This µPi was installed with the npm package. Install the version you want with the package manager that installed it:",
 		);
 		console.error("  npm install -g pi-bolt@<version>      (the versions: npm view pi-bolt versions)");
 		return 1;
 	}
 	const manager = piBoltPackageManager(method);
 	if (manager?.switchVersion) {
-		console.error(`This Pi-Bolt was installed with ${manager.name}. Switch to another version with ${manager.name}:`);
+		console.error(`This µPi was installed with ${manager.name}. Switch to another version with ${manager.name}:`);
 		console.error(`  ${manager.switchVersion}`);
 		return 1;
 	}
 	// (Homebrew keeps no build before this one: its formula has the latest release only.)
 	if (manager) {
 		console.error(
-			`This Pi-Bolt was installed with ${manager.name}, which keeps no earlier build to go back to. To run another version, uninstall it and install that version with the installer:`,
+			`This µPi was installed with ${manager.name}, which keeps no earlier build to go back to. To run another version, uninstall it and install that version with the installer:`,
 		);
 		console.error(`  ${manager.uninstall} && curl -fsSL ${PIBOLT_INSTALL_URL} | PIBOLT_VERSION=bolt-v<version> sh`);
 		return 1;
 	}
 	if (!piBoltInstallDir()) {
-		console.error(chalk.red(`error: this Pi-Bolt is not in an installation (${dirname(process.execPath)})`));
+		console.error(chalk.red(`error: this µPi is not in an installation (${dirname(process.execPath)})`));
 		return 1;
 	}
 	try {

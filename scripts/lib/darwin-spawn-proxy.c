@@ -277,7 +277,7 @@ int main(int argc, char** argv)
     struct pibolt_spawn_reply used;
     struct pibolt_spawn_usage usage;
     // `usage` comes right after `exited` from a helper of 0.8.2 or later. A helper of an earlier release (that of a session
-    // started before Pi-Bolt was updated in place, which runs this pi-spawn from the new files) sends nothing more and waits
+    // started before µPi was updated in place, which runs this pi-spawn from the new files) sends nothing more and waits
     // for pi-spawn to exit: so only a short wait for it.
     struct pollfd more = { .fd = stream, .events = POLLIN };
     int ready;

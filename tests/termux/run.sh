@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Pi-Bolt as install.sh installs it in Termux, on Linux ARM64 made to look like Android where it matters (no device needed):
+# µPi as install.sh installs it in Termux, on Linux ARM64 made to look like Android where it matters (no device needed):
 #   - Termux's prefix (/data/data/com.termux/files/usr), TERMUX_VERSION and getprop, with a glibc loader where Termux's glibc has
 #     it ($PREFIX/glibc/lib; here the system's own) and /system/bin/linker64, by which the runtime knows it is on Android;
 #   - Termux's LD_PRELOAD: a library that glibc's loader cannot load (it needs a library that is not there, as Termux's needs
 #     Android's libc), so that a glibc program started with it stops, as in Termux;
 #   - Android's system call filter (android-filter.c): the calls Android 10 refuses to apps, which kill the process (SIGSYS);
 #     glibc's rseq is off, as in Termux's glibc;
-#   - Android's 39-bit address space (512 GB): what Pi-Bolt maps at fixed addresses must be below it. (Only where it is: qemu-user's
+#   - Android's 39-bit address space (512 GB): what µPi maps at fixed addresses must be below it. (Only where it is: qemu-user's
 #     reserved_va, which would make the limit real, stops on stock Bun as well, at mimalloc's address hints above it.)
 # The build is served from a local folder as a release from before releases were signed, which install.sh takes with
 # PIBOLT_UNVERIFIED set to the SHA-256 of its SHA256SUMS. Not covered: Termux's patched glibc itself, Android's SELinux policy and kernel.
@@ -113,7 +113,7 @@ out=$(LD_PRELOAD="$PRELOAD" BUN_STATIC_HEAP_VERBOSE=1 pi-bolt --version 2>&1)
 if grep -q "image registered: true" <<<"$out"; then pass "it runs its compiled code"; else fail "it runs its compiled code" "$out"; fi
 
 # Under Android's filter: a program without the runtime's SIGSYS handling is killed by it (stock Bun's event loop calls
-# epoll_pwait2); Pi-Bolt is not.
+# epoll_pwait2); µPi is not.
 if command -v bun >/dev/null 2>&1; then
 	"$WORK/android-filter" bun -e 'setTimeout(() => console.log("ok"), 1)' >/dev/null 2>&1
 	code=$?

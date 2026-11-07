@@ -277,7 +277,7 @@ function buildSystemPromptSectionsUncached(input: BuildSystemPromptOptions): Sys
 		promptSections.rules = buildRules(declaredTools, toolGuidelines, promptGuidelines);
 		// Short: every request carries it, and it matters only for questions about pi itself.
 		promptSections.docs = `Only for questions about pi itself (extensions, SDK, themes, skills, TUI, models, packages, MCP): read ${getReadmePath()}, the docs in ${getDocsPath()} and the examples in ${getExamplesPath()}, following their links; docs/... and examples/... paths are under those folders, not the working folder.${
-			PIBOLT ? " This is µPi: `pi-bolt`, updated with `pi-bolt update`, not with pi's install commands." : ""
+			PIBOLT ? " This is µPi: `pi-bolt`, built from source (git pull, then scripts/build-pi.sh), not updated with pi's install commands or `pi-bolt update`." : ""
 		}`;
 	}
 

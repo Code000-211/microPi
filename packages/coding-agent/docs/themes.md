@@ -1,6 +1,6 @@
 # Customize Pi with themes
 
-Themes control the colors Pi uses in interactive mode and HTML exports. Pi includes the `system`, `dark`, and `light` themes, plus tokyo-night (also `-storm` and `-day`), catppuccin (`-mocha`, `-macchiato`, `-frappe`, `-latte`), dracula, nord, gruvbox (`-dark`, `-light`), solarized (`-dark`, `-light`), one-dark, rose-pine, and monokai. Switch with `/theme` or `/theme <name>`. You can select one theme, follow your terminal's light or dark appearance, or create your own palette.
+Themes control the colors Pi uses in interactive mode and HTML exports. Pi includes the `system`, `dark`, and `light` themes, plus tokyo-night (also `-storm` and `-day`), catppuccin (`-mocha`, `-macchiato`, `-frappe`, `-latte`), dracula, nord, gruvbox (`-dark`, `-light`), solarized (`-dark`, `-light`), one-dark, rose-pine, monokai, and bolt. Switch with `/theme` or `/theme <name>`. You can select one theme, follow your terminal's light or dark appearance, or create your own palette.
 
 ## Use your terminal's colors
 

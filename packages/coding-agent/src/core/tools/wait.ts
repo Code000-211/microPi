@@ -20,8 +20,13 @@ export interface WaitToolOptions {
  * do: short waits only cost turns.
  */
 export const WAIT_LADDER_MS = [120_000, 300_000, 600_000] as const;
-/** A wait this long after the last empty one starts again at the bottom of the ladder: the agent worked in between. */
+/**
+ * A wait this long after the last empty one starts again at the bottom of the ladder: the agent worked in between, and none
+ * of the jobs it waited for runs any more.
+ */
 const WAIT_LADDER_RESET_MS = 60_000;
+/** A report that came as a message this recently is still named by a wait that finds nothing: it may be on its way. */
+const JOB_REPORT_MSG_MS = 60_000;
 
 export const waitToolSystemPromptContribution = {
 	snippet: "Wait for a background job to end",
@@ -35,8 +40,8 @@ export function createWaitToolDefinition(
 	options?: WaitToolOptions,
 ): ToolDefinition<typeof waitSchema, { jobs: string[] } | undefined> {
 	const jobs = options?.backgroundJobs;
-	// Back-to-back waits with nothing ending: how far up the ladder, and when the last one returned.
-	let idle: { rung: number; endedAt: number; waitedMs: number } | undefined;
+	// Back-to-back waits with nothing ending: how far up the ladder, when the last one returned, and the jobs it waited for.
+	let idle: { rung: number; endedAt: number; waitedMs: number; jobIds: string[] } | undefined;
 	return {
 		name: "wait",
 		label: "wait",
@@ -44,7 +49,14 @@ export function createWaitToolDefinition(
 		promptSnippet: waitToolSystemPromptContribution.snippet,
 		parameters: waitSchema,
 		async execute(_toolCallId, _params, signal) {
-			const streak = idle && Date.now() - idle.endedAt < WAIT_LADDER_RESET_MS ? idle : undefined;
+			const runningIds = () => jobs?.running().map((job) => job.id) ?? [];
+			// The ladder also holds while a job it waited for still runs: what the agent did in between does not end the wait
+			// for it, and the timeout asks it to do exactly that.
+			const streak =
+				idle &&
+				(Date.now() - idle.endedAt < WAIT_LADDER_RESET_MS || idle.jobIds.some((id) => runningIds().includes(id)))
+					? idle
+					: undefined;
 			idle = undefined;
 			const report = () => {
 				const ended = jobs?.takeUnreported() ?? [];
@@ -58,6 +70,23 @@ export function createWaitToolDefinition(
 			const before = report();
 			if (before) return before;
 			if (!jobs || jobs.running().length === 0) {
+				// The reporter takes the same unreported jobs, 1.5 s after they ended, and sends their report as a message of its
+				// own. A wait that comes in while that message is on its way finds nothing to report: it says so, rather than
+				// that no job ran at all.
+				const messaged = (jobs?.list() ?? []).filter(
+					(job) =>
+						job.reportedBy === "message" &&
+						job.endedAt !== undefined &&
+						Date.now() - job.endedAt < JOB_REPORT_MSG_MS,
+				);
+				if (messaged.length > 0) {
+					const named = messaged.map((job) => `${job.id} (\`${job.command}\`)`).join(", ");
+					const text =
+						messaged.length === 1
+							? `Nothing to wait for: no background job is running. The report of ${named} came as its own message just now.`
+							: `Nothing to wait for: no background job is running. The reports of ${named} came as their own messages just now.`;
+					return { content: [{ type: "text", text }], details: { jobs: messaged.map((job) => job.id) } };
+				}
 				return {
 					content: [{ type: "text", text: "Nothing to wait for: no background job is running." }],
 					details: { jobs: [] },
@@ -75,7 +104,7 @@ export function createWaitToolDefinition(
 				};
 			}
 			const waitedMs = (streak?.waitedMs ?? 0) + WAIT_LADDER_MS[rung];
-			idle = { rung, endedAt: Date.now(), waitedMs };
+			idle = { rung, endedAt: Date.now(), waitedMs, jobIds: runningIds() };
 			let text = `No background job ended within ${WAIT_LADDER_MS[rung] / 1000} s. Running: ${describeRunningJobs(jobs.running())}.`;
 			if (rung >= 1) {
 				text += `\n\nNothing ended after ${Math.round(waitedMs / 1000)} s of back-to-back waits. Waiting is not progress: go on with everything that does not need these jobs, and call wait again only when nothing else is left. Their reports come on their own.`;

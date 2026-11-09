@@ -209,7 +209,7 @@ async function sleepUntilJobEnds(
 	const start = performance.now();
 	const outcome = await jobs.waitForEnd(seconds * 1000, signal);
 	if (outcome === "aborted") throw new Error("Command aborted");
-	const ended = jobs.takeUnreported();
+	const ended = jobs.takeUnreported("bash");
 	if (ended.length === 0) return "";
 	const slept = ((performance.now() - start) / 1000).toFixed(1);
 	return `[The sleep of ${seconds} s ended after ${slept} s: a background job ended.]\n${formatJobReport(ended)}\n\n`;

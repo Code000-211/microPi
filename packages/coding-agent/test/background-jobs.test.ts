@@ -2,8 +2,14 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type BackgroundJob, BackgroundJobs, formatJobReport } from "../src/core/background-jobs.ts";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	type BackgroundJob,
+	BackgroundJobs,
+	formatJobReport,
+	JOB_SETTLE_WINDOW_MS,
+	JobReporter,
+} from "../src/core/background-jobs.ts";
 import { createBashTool, fixedSleepSeconds, leadingSleep } from "../src/core/tools/bash.ts";
 import { createWaitTool, WAIT_LADDER_MS } from "../src/core/tools/wait.ts";
 
@@ -202,6 +208,50 @@ describe("wait tool", () => {
 		expect(texts[0]).toMatch(/^No background job ended within 120 s\. Running: bg1 \(`slow`, running [\d.]+ s\)\.$/);
 		expect(texts[1]).toContain("Nothing ended after 420 s of back-to-back waits. Waiting is not progress");
 		expect(texts[2]).toContain("Nothing ended after 1020 s of back-to-back waits.");
+	});
+
+	it("names the report that came as a message, instead of claiming no job ran", async () => {
+		const jobs = new BackgroundJobs();
+		const sent: string[] = [];
+		const reporter = new JobReporter(jobs, async (ended) => {
+			sent.push(formatJobReport(ended));
+		});
+		try {
+			// The reporter's settle timer fires a moment before the agent asks for the report again.
+			vi.useFakeTimers();
+			fakeJob(jobs, "cargo test").end("done", 0, "ok\n");
+			await vi.advanceTimersByTimeAsync(JOB_SETTLE_WINDOW_MS + 100);
+			vi.useRealTimers();
+			const text = getText(await createWaitTool({ backgroundJobs: jobs }).execute("w", {}));
+			expect(sent).toHaveLength(1);
+			expect(text).toBe(
+				"Nothing to wait for: no background job is running. The report of bg1 (`cargo test`) came as its own message just now.",
+			);
+		} finally {
+			vi.useRealTimers();
+			reporter.dispose();
+		}
+	});
+
+	it("goes on where the ladder left off after other work, while the job it waited for still runs", async () => {
+		const jobs = new BackgroundJobs();
+		fakeJob(jobs, "cargo test --workspace");
+		const wait = createWaitTool({ backgroundJobs: jobs });
+		const durations: number[] = [];
+		const realWait = jobs.waitForEnd.bind(jobs);
+		jobs.waitForEnd = async (ms, signal) => {
+			durations.push(ms);
+			return realWait(1, signal);
+		};
+		await wait.execute("w0", {});
+		const realNow = Date.now;
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 90_000);
+		try {
+			await wait.execute("w1", {});
+		} finally {
+			clock.mockRestore();
+		}
+		expect(durations).toEqual([WAIT_LADDER_MS[0], WAIT_LADDER_MS[1]]);
 	});
 });
 

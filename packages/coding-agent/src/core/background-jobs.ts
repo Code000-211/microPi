@@ -24,8 +24,11 @@ export interface BackgroundJob {
 	endedAt: number | undefined;
 	/** The end of its output when it ended, for the report. */
 	tail: string;
-	/** Whether the agent got its report. */
-	reported: boolean;
+	/**
+	 * Whether the agent got its report, and how: a `wait` call, a sleep in a bash call that looked at it, or the message the
+	 * reporter sends.
+	 */
+	reportedBy: "wait" | "bash" | "message" | undefined;
 }
 
 export interface BackgroundJobSpec {
@@ -84,7 +87,7 @@ export class BackgroundJobs {
 			exitCode: undefined,
 			endedAt: undefined,
 			tail: "",
-			reported: false,
+			reportedBy: undefined,
 		};
 		this.jobs.push(job);
 		this.specs.set(job.id, spec);
@@ -134,15 +137,15 @@ export class BackgroundJobs {
 		return true;
 	}
 
-	/** Ended jobs whose report the agent has not had, now marked reported. */
-	takeUnreported(): BackgroundJob[] {
-		const ended = this.jobs.filter((job) => job.status !== "running" && !job.reported);
-		for (const job of ended) job.reported = true;
+	/** Ended jobs whose report the agent has not had, now marked reported by `by`. */
+	takeUnreported(by: NonNullable<BackgroundJob["reportedBy"]> = "wait"): BackgroundJob[] {
+		const ended = this.jobs.filter((job) => job.status !== "running" && job.reportedBy === undefined);
+		for (const job of ended) job.reportedBy = by;
 		return ended;
 	}
 
 	hasUnreported(): boolean {
-		return this.jobs.some((job) => job.status !== "running" && !job.reported);
+		return this.jobs.some((job) => job.status !== "running" && job.reportedBy === undefined);
 	}
 
 	/** Whether a `wait` call is blocked on these jobs: it, not a message, reports the next ends. */
@@ -213,7 +216,7 @@ export class BackgroundJobs {
 		let ended = this.jobs.filter((job) => job.status !== "running").length;
 		for (let i = 0; i < this.jobs.length && ended > MAX_ENDED_JOBS; ) {
 			const job = this.jobs[i]!;
-			if (job.status !== "running" && job.reported) {
+			if (job.status !== "running" && job.reportedBy !== undefined) {
 				this.jobs.splice(i, 1);
 				ended--;
 			} else i++;
@@ -286,7 +289,7 @@ export class JobReporter {
 			this.schedule();
 			return;
 		}
-		const ended = this.jobs.takeUnreported();
+		const ended = this.jobs.takeUnreported("message");
 		if (ended.length > 0) this.sending = this.send(ended).catch(() => {});
 	}
 }

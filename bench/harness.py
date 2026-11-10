@@ -27,8 +27,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 WINDOWS = sys.platform == "win32"
-if not WINDOWS:
-    # wait4(), /proc and pty instead of Job objects, cycle counts and ConPTY on Windows (winproc.py).
+if WINDOWS:
+    # Job objects, cycle counts and ConPTY instead of wait4(), /proc and pty (winproc.py).
+    import winproc
+else:
     import fcntl
     import pty
     import select
@@ -44,8 +46,6 @@ def done(prompt: int) -> str:
     """How the fake model ends its answer to the nth prompt of a session. Wait for this, not for DONE: the answers before it
     are on the screen too, and are written again when the screen is redrawn."""
     return f"{DONE} (prompt {prompt})."
-
-
 MODEL_ARGS = ["--model", "fake/fake-model"]
 # What Pi shows for a prompt submitted while it is still starting (the prompt stays in the editor).
 STARTUP_IN_PROGRESS = b"Startup is still in progress"
@@ -196,7 +196,6 @@ def maxrss_mb(ru) -> float:
 def alive(pid: int) -> bool:
     """Whether a process (not necessarily a child) still exists."""
     if WINDOWS:
-        import winproc
         return winproc.alive(pid)  # (os.kill(pid, 0) would terminate it there)
     try:
         os.kill(pid, 0)
@@ -296,7 +295,6 @@ class WinTty:
     """Tty's counterpart on Windows: Pi in a ConPTY, in a Job object. quit() returns (status, winproc.Usage)."""
 
     def __init__(self, argv, env, cwd, cols=120, rows=40, stderr=None):
-        import winproc
         self.console = winproc.ConPty(argv, env, cwd, cols, rows, stderr=stderr)
         self.pid = self.console.proc.pid
         self.buf = b""
@@ -339,7 +337,6 @@ class WinTty:
             self.console.proc.wait()
         result = self.console.proc.result()
         self.console.close()
-        import winproc
         return status, winproc.Usage(result)
 
 
@@ -449,7 +446,6 @@ def cpu_ms(pid: int) -> float:
     """CPU time of every thread of a live process: from schedstat (nanoseconds), on macOS from proc_pid_rusage, on Windows
     from its cycles."""
     if WINDOWS:
-        import winproc
         return winproc.cpu_ms(pid)
     if MACOS:
         ri = _rusage_macos(pid)
@@ -466,7 +462,6 @@ def memory_mb(pid: int) -> dict:
     macOS "own" is the physical footprint (what Activity Monitor shows: dirty and compressed memory, without clean file pages).
     On Windows: the working set, and "own" is the private bytes (commit charge)."""
     if WINDOWS:
-        import winproc
         return winproc.memory_mb(pid)
     if MACOS:
         ri = _rusage_macos(pid)

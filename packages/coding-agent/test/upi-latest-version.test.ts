@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
-import type * as PiBolt from "../src/pi-bolt.ts";
-import { MICROPI_HAS_RELEASES } from "../src/pi-bolt.ts";
+import type * as PiBolt from "../src/upi.ts";
+import { MICROPI_HAS_RELEASES } from "../src/upi.ts";
 import {
 	getLatestPiRelease,
 	newestPiBoltVersionInFeed,
@@ -14,7 +14,7 @@ import {
 import { allowNetwork } from "./test-network-env.ts";
 
 // A Pi-Bolt build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
-vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
+vi.mock("../src/upi.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof PiBolt>()),
 	PIBOLT: { version: "1.0.2", variant: "x64", jit: false },
 }));
@@ -72,16 +72,16 @@ let dir: string;
 beforeEach(() => {
 	allowNetwork();
 	dir = mkdtempSync(join(tmpdir(), "pibolt-latest-"));
-	vi.stubEnv("PIBOLT_CHANNEL", "");
-	vi.stubEnv("PIBOLT_NPM", "");
+	vi.stubEnv("MICROPI_CHANNEL", "");
+	vi.stubEnv("MICROPI_NPM", "");
 	vi.stubEnv("SCOOP", "");
 	vi.stubEnv("SCOOP_GLOBAL", "");
 	vi.stubEnv("MISE_DATA_DIR", "");
 	vi.stubEnv(ENV_AGENT_DIR, join(dir, "agent"));
-	// An installation of the installer's (~/.pi-bolt/pi-bolt-<platform>-x64), with no channel file: stable.
-	const variantDir = join(dir, ".pi-bolt", `pi-bolt-${process.platform}-x64`);
+	// An installation of the installer's (~/.micropi/upi-<platform>-x64), with no channel file: stable.
+	const variantDir = join(dir, ".micropi", `upi-${process.platform}-x64`);
 	mkdirSync(variantDir, { recursive: true });
-	const exe = join(variantDir, process.platform === "win32" ? "pi-bolt.exe" : "pi");
+	const exe = join(variantDir, process.platform === "win32" ? "upi.exe" : "pi");
 	writeFileSync(exe, "");
 	Object.defineProperty(process, "execPath", { value: exe, configurable: true });
 });
@@ -135,7 +135,7 @@ describe("the latest Pi-Bolt release", () => {
 	});
 
 	it("on the beta channel, is the newest release the feed lists when the API is limited", async () => {
-		vi.stubEnv("PIBOLT_CHANNEL", "beta");
+		vi.stubEnv("MICROPI_CHANNEL", "beta");
 		// (A link in a release's notes, escaped in the feed, is not a release.)
 		expect(newestPiBoltVersionInFeed(feed(["bolt-v1.0.2", "v1.4.0", "bolt-v1.0.10", "bolt-v1.0.9"]))).toBe("1.0.10");
 		const fetchMock = serve({
@@ -146,8 +146,8 @@ describe("the latest Pi-Bolt release", () => {
 		expect(requested(fetchMock)).toEqual([API_RELEASES, FEED]);
 	});
 
-	it.skipIf(!MICROPI_HAS_RELEASES)("pi-bolt update works while GitHub's API is limited", async () => {
-		// #149: "Error: Could not determine latest pi-bolt version." on 1.0.2, with the latest release 1.0.2.
+	it.skipIf(!MICROPI_HAS_RELEASES)("upi update works while GitHub's API is limited", async () => {
+		// #149: "Error: Could not determine latest upi version." on 1.0.2, with the latest release 1.0.2.
 		serve({
 			[LATEST]: () => redirectTo("https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.2"),
 			[API_LATEST]: rateLimited,
@@ -161,7 +161,7 @@ describe("the latest Pi-Bolt release", () => {
 	});
 
 	it.skipIf(!MICROPI_HAS_RELEASES)(
-		"pi-bolt update says why, and how to update without it, when the release cannot be found",
+		"upi update says why, and how to update without it, when the release cannot be found",
 		async () => {
 			serve({ [LATEST]: () => new Response("", { status: 503 }), [API_LATEST]: rateLimited });
 			vi.spyOn(console, "log").mockImplementation(() => {});

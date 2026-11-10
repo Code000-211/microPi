@@ -32,7 +32,7 @@ import type {
 const cliPath = resolve(__dirname, "../src/cli.ts");
 // --import takes a module specifier, not a filesystem path.
 const sourceResolverUrl = pathToFileURL(resolve(__dirname, "../src/experimental/source-resolver.ts")).href;
-/** A built executable to test instead of the sources, such as µPi's `out/pi-bolt/pi`. */
+/** A built executable to test instead of the sources, such as µPi's `out/upi/pi`. */
 const executable = process.env.PI_ACP_TEST_EXECUTABLE;
 
 // ============================================================================

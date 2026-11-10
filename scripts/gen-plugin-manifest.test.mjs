@@ -627,33 +627,33 @@ describe("packages installed with pi install", () => {
 	});
 });
 
-describe("the packages pi-bolt compile gives it (--packages)", () => {
+describe("the packages upi compile gives it (--packages)", () => {
 	it("takes them instead of the packages setting, local folders too, each with the entries given (#108)", () => {
-		// The settings name npm:pi-web-access; piBolt.packages removed it and added these, which pi-bolt compile resolved.
+		// The settings name npm:pi-web-access; piBolt.packages removed it and added these, which upi compile resolved.
 		const agentDir = agent({ packages: ["npm:pi-web-access"] });
 		installPackage(agentDir, "pi-web-access", { pi: { extensions: ["./index.js"] } }, ["index.js"]);
 		const fff = installPackage(agentDir, "opensec-pi-fff", { dependencies: { direct: "1" } }, ["src/index.ts"]);
 		installPackage(agentDir, "direct", {}, ["index.js"]);
-		const bundle = join(agentDir, "pi-bolt-bundles", "pi-bolt-web-access");
-		write(join(bundle, "package.json"), JSON.stringify({ name: "pi-bolt-web-access", dependencies: { own: "1" } }));
+		const bundle = join(agentDir, "upi-bundles", "upi-web-access");
+		write(join(bundle, "package.json"), JSON.stringify({ name: "upi-web-access", dependencies: { own: "1" } }));
 		write(join(bundle, "extensions", "a.ts"));
 		write(join(bundle, "node_modules", "own", "index.js"));
-		const bare = join(agentDir, "pi-bolt-bundles", "no-manifest");
+		const bare = join(agentDir, "upi-bundles", "no-manifest");
 		write(join(bare, "index.ts"));
 
 		const plan = planPlugins({
 			agentDir,
 			packages: [
 				{ source: "npm:opensec-pi-fff@0.11.0", root: fff, entries: [join(fff, "src", "index.ts")] },
-				{ source: "pi-bolt-bundles/pi-bolt-web-access", root: bundle, entries: [join(bundle, "extensions", "a.ts")] },
-				{ source: "pi-bolt-bundles/no-manifest", root: bare, entries: [join(bare, "index.ts")] },
+				{ source: "upi-bundles/upi-web-access", root: bundle, entries: [join(bundle, "extensions", "a.ts")] },
+				{ source: "upi-bundles/no-manifest", root: bare, entries: [join(bare, "index.ts")] },
 			],
 		});
 		assert.deepEqual(
 			plan.plugins.map((plugin) => [plugin.name, plugin.origin, plugin.importPath]),
 			[
 				["opensec-pi-fff", "package", "./package-opensec-pi-fff/src/index.ts"],
-				["pi-bolt-web-access", "package", "./package-pi-bolt-web-access/extensions/a.ts"],
+				["upi-web-access", "package", "./package-upi-web-access/extensions/a.ts"],
 				["no-manifest", "package", "./package-no-manifest/index.ts"],
 			],
 		);
@@ -664,7 +664,7 @@ describe("the packages pi-bolt compile gives it (--packages)", () => {
 		);
 		const out = join(scratch(), "folder");
 		writePluginFolder(plan, out);
-		assert.ok(readFileSync(join(out, "package-pi-bolt-web-access", "node_modules", "own", "index.js"), "utf8"));
+		assert.ok(readFileSync(join(out, "package-upi-web-access", "node_modules", "own", "index.js"), "utf8"));
 	});
 
 	it("finds a workspace package's dependencies hoisted above it, as Node does", () => {
@@ -823,10 +823,10 @@ describe("the packages pi-bolt compile gives it (--packages)", () => {
 
 	it("reads them from a file given to the command", () => {
 		const agentDir = agent();
-		const bundle = join(agentDir, "pi-bolt-bundles", "b");
+		const bundle = join(agentDir, "upi-bundles", "b");
 		write(join(bundle, "index.ts"));
 		const list = join(scratch(), "packages.json");
-		writeFileSync(list, JSON.stringify([{ source: "pi-bolt-bundles/b", root: bundle, entries: [join(bundle, "index.ts")] }]));
+		writeFileSync(list, JSON.stringify([{ source: "upi-bundles/b", root: bundle, entries: [join(bundle, "index.ts")] }]));
 		const out = join(scratch(), "out");
 		const script = fileURLToPath(new URL("./gen-plugin-manifest.mjs", import.meta.url));
 		const run = (file) =>
@@ -1490,7 +1490,7 @@ describe("import.meta in the copies", () => {
 		assert.equal(rewriteCopy("x = import.meta.filename;", odd), `x = ${JSON.stringify(odd)};`);
 	});
 
-	// Loader-parity review #5: the bundler resolves these per module, against the copy, which `pi-bolt compile` deletes, or
+	// Loader-parity review #5: the bundler resolves these per module, against the copy, which `upi compile` deletes, or
 	// leaves them to resolve from the executable's own file system (/$bunfs). Loaded from its files, a module finds them
 	// from where it is installed.
 	it("pins __dirname and __filename, and resolves require.resolve, import.meta.resolve, require(x) and import(x) from the installed file", () => {
@@ -1591,7 +1591,7 @@ describe("import.meta in the copies", () => {
 			encoding: "utf8",
 		});
 		assert.equal(built.status, 0, built.stderr);
-		// (As after `pi-bolt compile`: the copies are gone.)
+		// (As after `upi compile`: the copies are gone.)
 		rmSync(join(out, "src"), { recursive: true, force: true });
 		const ran = spawnSync("bun", [join(out, "dist", "main.js")], { encoding: "utf8" });
 		assert.equal(ran.status, 0, ran.stderr);
@@ -1672,7 +1672,7 @@ describe("import.meta in the copies", () => {
 			encoding: "utf8",
 		});
 		assert.equal(built.status, 0, built.stderr);
-		// (As after `pi-bolt compile`: the copies are gone, and the build's folder has no chunk of the package.)
+		// (As after `upi compile`: the copies are gone, and the build's folder has no chunk of the package.)
 		rmSync(join(out, "src"), { recursive: true, force: true });
 		const ran = spawnSync("bun", [join(out, "dist", "main.js")], { encoding: "utf8" });
 		assert.equal(ran.status, 0, ran.stderr);

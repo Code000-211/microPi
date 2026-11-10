@@ -7,7 +7,7 @@ import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto
 import { readFileSync, writeFileSync } from "node:fs";
 
 // The namespace the installer verifies with (-n): a signature made for something else does not pass as a release's.
-const NAMESPACE = "pi-bolt-release";
+const NAMESPACE = "upi-release";
 
 const string = (value) => {
 	const bytes = Buffer.from(value);

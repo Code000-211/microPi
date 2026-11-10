@@ -1,7 +1,7 @@
 name: upstream
 
 # Once a day, looks for a new Pi release. When there is one µPi does not run yet, opens an issue (once per release) with
-# its changelog and the files where merging its tag into pi-bolt conflicts, worked out without a checkout (git merge-tree).
+# its changelog and the files where merging its tag into upi conflicts, worked out without a checkout (git merge-tree).
 # Merging it: scripts/bump-version.sh --pi X.Y.Z and scripts/train-profile.sh on a branch, and a pull request (docs/RELEASING.md).
 on:
   schedule:
@@ -37,11 +37,11 @@ jobs:
             echo "Pi [$latest](https://github.com/earendil-works/pi/releases/tag/$latest) is released; µPi runs $current."
             echo
             if [ -n "$conflicts" ]; then
-              echo "Merging \`$latest\` into \`pi-bolt\` conflicts in:"
+              echo "Merging \`$latest\` into \`upi\` conflicts in:"
               echo
               printf '%s\n' "$conflicts" | while IFS= read -r file; do printf -- "- \`%s\`\n" "$file"; done
             else
-              echo "\`$latest\` merges into \`pi-bolt\` without conflicts."
+              echo "\`$latest\` merges into \`upi\` without conflicts."
             fi
             echo
             echo "To follow it: merge the tag, \`scripts/bump-version.sh --pi ${latest#v}\`, \`scripts/train-profile.sh\` on Linux, the tests, then tag \`bolt-v<version>\` (docs/RELEASING.md)."

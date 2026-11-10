@@ -1,14 +1,14 @@
 #!/bin/sh
-# pi-bolt launcher (npm and bun packages). The first run installs the Pi-Bolt release that matches this package's version
-# into ~/.pi-bolt/npm with the bundled installer (the same as install.sh: progress, checksum, checks). Every run then
+# upi launcher (npm and bun packages). The first run installs the Pi-Bolt release that matches this package's version
+# into ~/.micropi/npm with the bundled installer (the same as install.sh: progress, checksum, checks). Every run then
 # replaces this script with the native executable (exec), so the launcher costs no startup time.
 set -eu
 
-VERSION=1.0.9
-HOME_DIR="${PIBOLT_HOME:-$HOME/.pi-bolt}"
+VERSION=0.1.0
+HOME_DIR="${MICROPI_HOME:-$HOME/.micropi}"
 
 if [ "$(uname -s)" = Darwin ]; then PLATFORM=darwin; else PLATFORM=linux; fi
-VARIANT="${PIBOLT_VARIANT:-}"
+VARIANT="${MICROPI_VARIANT:-}"
 if [ -z "$VARIANT" ]; then
 	if [ "$PLATFORM" = darwin ]; then VARIANT=arm64
 	else
@@ -18,14 +18,14 @@ if [ -z "$VARIANT" ]; then
 		esac
 	fi
 fi
-DIR="$HOME_DIR/npm/$VERSION/pi-bolt-$PLATFORM-$VARIANT"
+DIR="$HOME_DIR/npm/$VERSION/upi-$PLATFORM-$VARIANT"
 
 if [ ! -x "$DIR/pi" ]; then
 	here=$(dirname "$(readlink -f "$0")")
 	# (The first run installs nothing without a signature check: an opt-in to that, left in the environment, is not passed on.)
-	unset PIBOLT_UNVERIFIED
-	# On stderr, so that what Pi-Bolt prints on stdout (pi-bolt -p ... > file) is all that is there.
-	PIBOLT_LAUNCHER=1 PIBOLT_VERSION="bolt-v$VERSION" PIBOLT_VARIANT="$VARIANT" PIBOLT_INSTALL="$HOME_DIR/npm/$VERSION" \
+	unset MICROPI_UNVERIFIED
+	# On stderr, so that what Pi-Bolt prints on stdout (upi -p ... > file) is all that is there.
+	MICROPI_LAUNCHER=1 MICROPI_VERSION="bolt-v$VERSION" MICROPI_VARIANT="$VARIANT" MICROPI_INSTALL="$HOME_DIR/npm/$VERSION" \
 		sh "$here/../install.sh" 1>&2
 	printf '\n' >&2
 	# The versions installed before this one are not run again, except by sessions still running: those keep their folder (on
@@ -37,6 +37,6 @@ if [ ! -x "$DIR/pi" ]; then
 		done
 	fi
 fi
-# (So that `pi-bolt update` knows to say: update the package. In Termux, through the launcher install.sh wrote beside pi.)
-if [ -x "$DIR/pi-termux" ]; then PIBOLT_NPM=1 exec "$DIR/pi-termux" "$@"; fi
-PIBOLT_NPM=1 exec "$DIR/pi" "$@"
+# (So that `upi update` knows to say: update the package. In Termux, through the launcher install.sh wrote beside pi.)
+if [ -x "$DIR/pi-termux" ]; then MICROPI_NPM=1 exec "$DIR/pi-termux" "$@"; fi
+MICROPI_NPM=1 exec "$DIR/pi" "$@"

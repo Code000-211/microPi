@@ -59,7 +59,7 @@ function Fetch($name, [string[]]$sparse) {
 	git -C $dir checkout -q --detach $s.commit
 	if ($LASTEXITCODE -ne 0) { throw "${name}: checkout failed" }
 	Log "${name}: applying $(Split-Path -Leaf $s.patches)"
-	git -C $dir -c user.name=pi-bolt -c user.email=pi-bolt@localhost am -q (Join-Path $Root $s.patches)
+	git -C $dir -c user.name=upi -c user.email=upi@localhost am -q (Join-Path $Root $s.patches)
 	if ($LASTEXITCODE -ne 0) { throw "${name}: the patch did not apply" }
 }
 

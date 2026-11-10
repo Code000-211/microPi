@@ -26,7 +26,7 @@ import { handlePackageCommand } from "../src/package-manager-cli.ts";
 import { allowNetwork } from "./test-network-env.ts";
 
 const build = vi.hoisted(() => ({ piBolt: true }));
-vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
+vi.mock("../src/upi.ts", async (importOriginal) => ({
 	...(await importOriginal<object>()),
 	get PIBOLT() {
 		return build.piBolt ? { version: "0.8.4", variant: "arm64", jit: false } : undefined;
@@ -905,9 +905,9 @@ describe("µPi additive package inheritance", () => {
 		const conflict = loader
 			.getExtensions()
 			.errors.find((entry) => entry.error.includes('Tool "example_tool" conflicts'));
-		expect(conflict?.error).toContain("pi-bolt remove --pi-bolt <source>");
+		expect(conflict?.error).toContain("upi remove --upi <source>");
 		expect(conflict?.error).not.toContain("a package list of its own");
-		await handlePackageCommand(["remove", "--pi-bolt", sources[1]]);
+		await handlePackageCommand(["remove", "--upi", sources[1]]);
 		expect(process.exitCode).toBeUndefined();
 		expect(readSettings().packages).toEqual(sources);
 		expect(readSettings().piBolt?.packages).toEqual([`-${sources[1]}`]);
@@ -975,22 +975,22 @@ describe("µPi additive package inheritance", () => {
 });
 
 // #28: CLI tests use real handlers and local package fixtures, including rejection before settings migrations.
-describe("package CLI --pi-bolt", () => {
+describe("package CLI --upi", () => {
 	test.each([false, true])("install/remove select µPi list explicitly (local=%s)", async (local) => {
 		const shared = localPackage("shared");
 		const own = localPackage("own");
 		writeSettings({ packages: [shared] }, { packages: [shared] });
 		const scopeFlags = local ? ["--local", "--approve"] : [];
-		await handlePackageCommand(["install", own, "--pi-bolt", ...scopeFlags]);
+		await handlePackageCommand(["install", own, "--upi", ...scopeFlags]);
 		expect(process.exitCode).toBeUndefined();
 		const file = local ? projectFile : globalFile;
 		const baseDir = local ? join(cwd, CONFIG_DIR_NAME) : agentDir;
 		expect(readSettings(file)).toEqual(
 			overlay({ packages: [shared], piBolt: { packages: [relative(baseDir, own)] } }),
 		);
-		await handlePackageCommand(["uninstall", own, "--pi-bolt", ...scopeFlags]);
+		await handlePackageCommand(["uninstall", own, "--upi", ...scopeFlags]);
 		expect(readSettings(file)).toEqual(overlay({ packages: [shared], piBolt: { packages: [] } }));
-		await handlePackageCommand(["remove", shared, "--pi-bolt", ...scopeFlags]);
+		await handlePackageCommand(["remove", shared, "--upi", ...scopeFlags]);
 		expect(readSettings(file).piBolt?.packages).toEqual([`-${shared}`]);
 	});
 
@@ -1017,9 +1017,9 @@ describe("package CLI --pi-bolt", () => {
 		expect(manager().settings.getResolvedPackages("global")).toEqual(["npm:tools@2.0.0", "npm:other"]);
 	});
 
-	test("untrusted --local --pi-bolt is rejected without project writes", async () => {
+	test("untrusted --local --upi is rejected without project writes", async () => {
 		writeSettings({}, { piBolt: { packages: [] } });
-		await handlePackageCommand(["install", localPackage("own"), "--pi-bolt", "--local", "--no-approve"]);
+		await handlePackageCommand(["install", localPackage("own"), "--upi", "--local", "--no-approve"]);
 		expect(process.exitCode).toBe(1);
 		expect(readSettings(projectFile)).toEqual(overlay({ piBolt: { packages: [] } }));
 	});
@@ -1029,19 +1029,19 @@ describe("package CLI --pi-bolt", () => {
 		async (command) => {
 			writeSettings({ packages: ["npm:opensec-pi-todo"] });
 			const before = readFileSync(globalFile, "utf8");
-			await main([command, "--pi-bolt"]);
+			await main([command, "--upi"]);
 			expect(process.exitCode).toBe(1);
 			expect(readFileSync(globalFile, "utf8")).toBe(before);
 			expect(existsSync(join(agentDir, "sessions"))).toBe(false);
 		},
 	);
 
-	test("stock Pi rejects --pi-bolt before installs, settings writes or help dispatch", async () => {
+	test("stock Pi rejects --upi before installs, settings writes or help dispatch", async () => {
 		build.piBolt = false;
 		for (const args of [
-			["install", "npm:tools", "--pi-bolt"],
-			["remove", "npm:tools", "--pi-bolt"],
-			["install", "--help", "--pi-bolt"],
+			["install", "npm:tools", "--upi"],
+			["remove", "npm:tools", "--upi"],
+			["install", "--help", "--upi"],
 		]) {
 			process.exitCode = undefined;
 			await main(args);
@@ -1052,24 +1052,24 @@ describe("package CLI --pi-bolt", () => {
 	});
 
 	// #28: an explicit install re-enables an identity despite duplicate manual modifiers and retains its filters.
-	test("install --pi-bolt removes all same-identity modifiers before enabling the source", async () => {
+	test("install --upi removes all same-identity modifiers before enabling the source", async () => {
 		const shared = localPackage("shared");
 		writeSettings({
 			packages: [shared],
 			piBolt: { packages: [shared, `-${shared}`, { source: shared, skills: [] }, `-${shared}`] },
 		});
-		await handlePackageCommand(["install", shared, "--pi-bolt"]);
+		await handlePackageCommand(["install", shared, "--upi"]);
 		expect(process.exitCode).toBeUndefined();
 		expect(readSettings()).toEqual(
 			overlay({ packages: [shared], piBolt: { packages: [{ source: relative(agentDir, shared), skills: [] }] } }),
 		);
 		expect((await manager().packages.resolve()).extensions).toHaveLength(2);
-		await handlePackageCommand(["remove", shared, "--pi-bolt"]);
+		await handlePackageCommand(["remove", shared, "--upi"]);
 		expect(readSettings().piBolt?.packages).toEqual([`-${shared}`]);
 	});
 
 	// #28: validate every flag occurrence before any migration or installation.
-	test.each([{ flags: ["--pi-bolt", "--pi-bolt=true"] }, { flags: ["--pi-bolt=false", "--pi-bolt"] }])(
+	test.each([{ flags: ["--upi", "--upi=true"] }, { flags: ["--upi=false", "--upi"] }])(
 		"rejects malformed repeated selectors: $flags",
 		async ({ flags }) => {
 			writeSettings({ packages: ["npm:opensec-pi-todo"] });

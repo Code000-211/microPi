@@ -99,7 +99,7 @@ function buildScreen(mode: Mode, terminal: VirtualTerminal, original: string, se
 		transcript.addChild(running);
 	}
 	const document = new Container();
-	document.addChild(new ThemedText(() => theme.fg("accent", "pi-bolt header")));
+	document.addChild(new ThemedText(() => theme.fg("accent", "upi header")));
 	document.addChild(transcript);
 	const editor = new Container();
 	editor.addChild(new DynamicBorder());

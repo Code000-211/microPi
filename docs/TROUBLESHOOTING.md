@@ -11,7 +11,7 @@
 ## Is the compiled code being used?
 
 ```bash
-BUN_STATIC_HEAP_VERBOSE=1 pi-bolt --version
+BUN_STATIC_HEAP_VERBOSE=1 upi --version
 ```
 
 ```
@@ -30,13 +30,13 @@ When the compiled code cannot be used, the executable prints one line on stderr,
 but slower to start, and uses more CPU:
 
 ```
-pi-bolt: the executable's ahead-of-time compiled code is not used (<reason>); running from bytecode
+upi: the executable's ahead-of-time compiled code is not used (<reason>); running from bytecode
 ```
 
 | Reason | Cause | What to do |
 |---|---|---|
 | `the address space for it is not available` | An address-space limit (`ulimit -v`, `RLIMIT_AS`, or `vm.overcommit_memory=2`) leaves no room for the fixed regions the code expects. | The compiled code needs about 10 GB of *virtual* address space. It is reserved, not used, so it costs no memory. Raise or remove the limit. Below it, Pi still works from bytecode, down to about 1.5 GB. |
-| `this CPU lacks an instruction set the code was compiled for` | A `linux-x64` build on a CPU without AVX2. | Use the `linux-x64-baseline` build (`PIBOLT_VARIANT=x64-baseline` with the installer). |
+| `this CPU lacks an instruction set the code was compiled for` | A `linux-x64` build on a CPU without AVX2. | Use the `linux-x64-baseline` build (`MICROPI_VARIANT=x64-baseline` with the installer). |
 | `the image is not one for this engine`, `the image could not be mapped executable`, `the prebuilt heap could not be mapped` | A damaged executable, or a system that forbids executable file mappings. | Re-download the release and check `SHA256SUMS`. Report it if it persists. On macOS, an executable re-signed with the hardened runtime needs `com.apple.security.cs.disable-library-validation` (see [macOS](#macos)). |
 | `the executable could not be loaded where its prebuilt heap expects it` | macOS: the executable could not be started where its prebuilt heap expects it (see [ARCHITECTURE.md](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/ARCHITECTURE.md#the-macos-arm64-port)). | Report it, with `sw_vers` and how µPi was started. |
 
@@ -79,7 +79,7 @@ To rule a compiler optimization in or out of a problem, build with it off (each 
 
 ## Common problems
 
-**`pi-bolt: command not found` after installing.** `~/.local/bin` is not on your `PATH`. Add
+**`upi: command not found` after installing.** `~/.local/bin` is not on your `PATH`. Add
 `export PATH="$HOME/.local/bin:$PATH"` to your shell profile.
 
 **`GLIBC_2.xx not found` or `No such file or directory` when starting.** The system is musl-based (Alpine), or older than
@@ -93,7 +93,7 @@ folder together, and link or alias the executable instead of copying it.
 
 **`bun:ffi requires the JIT`.** The extension calls into a native library through `bun:ffi`, which works only on the JIT build.
 The message names the extension and gives the command that installs the JIT build
-([README](../README.md#jit-build-for-heavy-plugins)); `pi-bolt doctor` lists every extension that uses `bun:ffi`.
+([README](../README.md#jit-build-for-heavy-plugins)); `upi doctor` lists every extension that uses `bun:ffi`.
 
 **A plugin works with stock Pi but not when compiled in.** See the [compatibility checklist](PLUGINS.md#compatibility-checklist):
 usually a dynamic import, or a file read from next to the plugin's source.
@@ -103,49 +103,49 @@ function that is not compiled cannot be relied on to run. The message names the 
 change that function. `BUN_JSC_allowAOTDeclinedFunctions=1` builds anyway: the function then runs from bytecode if it uses no
 variables from outside itself, and stops the program when it is called if it does.
 
-**`pi-bolt compile` says an extension is "not compiled in".** It could not build that extension (a static `import` or
+**`upi compile` says an extension is "not compiled in".** It could not build that extension (a static `import` or
 `require()` that does not resolve: the line names it and the installed file), a function of it is too big for the compiler
 (below), or it fails in the new build as it starts and not from its files (it reads the copy the build was made from, which is
 gone). The others are compiled in, and that one loads from its files as Pi loads it: it works there, or fails with
 Pi's own error. Nothing to do; to compile it in, install what it imports, or fix what it reads.
 
-**`pi-bolt compile` stops with "is bigger than maximumAOTCandidateBytecodeSize".** When `pi-bolt compile` can tell which
+**`upi compile` stops with "is bigger than maximumAOTCandidateBytecodeSize".** When `upi compile` can tell which
 extension the function is of, it leaves that one out (above) and goes on. Otherwise: one function of the program holds more than
 256 KB of bytecode. Each extension, with the modules only it imports, is a file of its own, compiled apart from Pi's code and
-from the other extensions, so the limit is one extension's. Below the compiler's line, `pi-bolt compile` says which it is:
+from the other extensions, so the limit is one extension's. Below the compiler's line, `upi compile` says which it is:
 - `(a function)`: one very large function of an extension, or a CommonJS module (a package's prebuilt, bundled `dist/`). The
   message names the file and the extension.
 - `(the top-level code of a module)`: the top-level code of one extension, usually one large literal (embedded data). The
   message names the extension.
 
-Leave that extension out with `pi-bolt compile --exclude <name>`, by the name `pi-bolt compile` prints for it: it still loads
-from its files at run time, and later compiles and `pi-bolt update` leave it out too (`--include <name>` takes it back). Or compile
-it anyway with `BUN_JSC_maximumAOTCandidateBytecodeSize=<n> pi-bolt compile`, `<n>` being at least the size the message gives.
-compile.json keeps that limit: a later `pi-bolt compile` without the variable, and `pi-bolt update`, build with it too, and
-`BUN_JSC_maximumAOTCandidateBytecodeSize=262144 pi-bolt compile` takes it back. The compiler warns that a big function can take
+Leave that extension out with `upi compile --exclude <name>`, by the name `upi compile` prints for it: it still loads
+from its files at run time, and later compiles and `upi update` leave it out too (`--include <name>` takes it back). Or compile
+it anyway with `BUN_JSC_maximumAOTCandidateBytecodeSize=<n> upi compile`, `<n>` being at least the size the message gives.
+compile.json keeps that limit: a later `upi compile` without the variable, and `upi update`, build with it too, and
+`BUN_JSC_maximumAOTCandidateBytecodeSize=262144 upi compile` takes it back. The compiler warns that a big function can take
 minutes and tens of GB; one of a few hundred KB has taken seconds. The message's third remedy,
-`BUN_JSC_omitBytecodeFromStaticHeap=0`, does not apply to `pi-bolt compile`: the build keeps the release's setting.
+`BUN_JSC_omitBytecodeFromStaticHeap=0`, does not apply to `upi compile`: the build keeps the release's setting.
 
 Pi-Bolt 1.0.1 and earlier added the top-level code of every extension to the program's, about 200 KB of which is Pi's: there a
 few extensions together passed the limit, and leaving out any one of them did not help (#129). Pi-Bolt 1.0.2 compiled each
 module on its own, but stopped at an extension with an `await` at its top level (#142). Pi-Bolt 1.0.3 compiles each
 extension on its own, `await` or not.
 
-**`pi-bolt compile` says an `import()` "does not resolve: left to run time".** The extension loads a package it does not
+**`upi compile` says an `import()` "does not resolve: left to run time".** The extension loads a package it does not
 declare with `import()`, usually for a feature that needs that package (#160). The build goes on, and when that code runs the
 `import()` finds the package from where the extension is installed, or fails as it does without µPi. Nothing to do unless
 you want that feature: then install the package where the extension finds it. An extension with a static `import` of a package
 that is not there is left out of the build (above).
 
-**Every `pi-bolt` command stops with an extension's error (Pi-Bolt 1.0.4 and earlier, after `pi-bolt compile`).** Those builds
-ran every compiled-in extension's top-level code before Pi started, so one that threw stopped every command, `pi-bolt update
---rollback` included. Put the build before back by hand: in the installation folder (`~/.pi-bolt`), replace the build folder
-(`pi-bolt-<platform>`) with `pi-bolt-<platform>.previous`, or run the installer again. Pi-Bolt 1.0.5 runs an extension's code only
+**Every `pi-bolt` command stops with an extension's error (Pi-Bolt 1.0.4 and earlier, after `upi compile`).** Those builds
+ran every compiled-in extension's top-level code before Pi started, so one that threw stopped every command, `upi update
+--rollback` included. Put the build before back by hand: in the installation folder (`~/.micropi`), replace the build folder
+(`upi-<platform>`) with `upi-<platform>.previous`, or run the installer again. Pi-Bolt 1.0.5 runs an extension's code only
 when Pi loads it.
 
-**`pi-bolt compile` stops with `Could not resolve` or another error of the bundler in an extension.** Below the bundler's
-error, `pi-bolt compile` names the extension it is in and gives the `pi-bolt compile --exclude <name>` that leaves it out: it
-then loads from its files, as it does without `pi-bolt compile`. `--exclude` takes the names `pi-bolt compile --list` gives,
+**`upi compile` stops with `Could not resolve` or another error of the bundler in an extension.** Below the bundler's
+error, `upi compile` names the extension it is in and gives the `upi compile --exclude <name>` that leaves it out: it
+then loads from its files, as it does without `upi compile`. `--exclude` takes the names `upi compile --list` gives,
 such as `pi-system-prompt` in `pi-system-prompt (package): compiling`, or the package's name or the extension's file, not a
 package the extension imports: one that names no extension stops the compile and lists the names there are. Pi-Bolt 1.0.4 and earlier also stopped at Pi's older names for its modules, such as
 `@mariozechner/pi-tui` (#174); later releases compile those in ([what it copies](PLUGINS.md#what-it-copies)).
@@ -159,7 +159,7 @@ container and has to read again when the limit pushes it out. µPi works from a 
 with pauses of a second; 256 MB or more leaves it alone. A CPU limit (`--cpus`) lowers the number of threads µPi starts.
 
 **A Herdr restart does not reopen the µPi session.** Herdr runs the restore command with its server's `PATH`, which must
-include `pi-bolt`: start Herdr from a terminal, not with `brew services`. Agents that pi-herdr starts in other panes run stock
+include `upi`: start Herdr from a terminal, not with `brew services`. Agents that pi-herdr starts in other panes run stock
 Pi (`pi`), which must be installed.
 
 **Startup is slower than expected.** Check that the compiled code is used (above). Check `PI_TIMING=1` for slow extension
@@ -170,7 +170,7 @@ factories. A cold page cache (the first start after boot or install) adds the ti
 **"pi" is killed at once (`zsh: killed`), or macOS says it cannot verify the developer.** The executable carries a quarantine
 attribute: it was downloaded with a browser (or unpacked by something that keeps the attribute). µPi's executables are signed
 ad hoc, which Gatekeeper does not accept for quarantined files. Install with the installer or npm, which do not quarantine, or
-remove the attribute from the unpacked folder: `xattr -dr com.apple.quarantine pi-bolt-darwin-arm64`.
+remove the attribute from the unpacked folder: `xattr -dr com.apple.quarantine upi-darwin-arm64`.
 
 **"µPi runs on Macs with Apple silicon only".** µPi has no build for Intel Macs. From a terminal that runs under Rosetta on
 an Apple silicon Mac, the installer installs the ARM64 build, which runs natively.
@@ -185,9 +185,9 @@ starts the `pi-bin` beside its real path. `BUN_STATIC_HEAP_VERBOSE=1 pi --versio
 
 ## Windows
 
-**`pi-bolt` is not found after installing.** The installer adds `%USERPROFILE%\.pi-bolt\pi-bolt-win32-x64` to your user PATH,
-which terminals opened afterwards have: open a new one. With `npm install -g pi-bolt`, npm's global folder (`npm prefix -g`) must
-be on PATH, and npm must run the package's install script (`npm install -g pi-bolt --allow-scripts=pi-bolt` on npm 11.19 and
+**`upi` is not found after installing.** The installer adds `%USERPROFILE%\.micropi\upi-win32-x64` to your user PATH,
+which terminals opened afterwards have: open a new one. With `npm install -g upi`, npm's global folder (`npm prefix -g`) must
+be on PATH, and npm must run the package's install script (`npm install -g upi --allow-scripts=upi` on npm 11.19 and
 later).
 
 **The bash tool says "No bash shell found", or answers "Windows Subsystem for Linux has no installed distributions".** Pi's
@@ -210,7 +210,7 @@ of the project's folder by name fails inside Pi; have the script name it by its 
 
 **A program keeps running after Escape or the bash tool's timeout.** Stopping a command ends the processes it started. On the
 default build, though, a native program whose own parent has already exited (a dev server a launcher started and left) is not
-found, and keeps running: end it in Task Manager, or use the `-jit` build (`$env:PIBOLT_VARIANT = "x64-jit"` before installing),
+found, and keeps running: end it in Task Manager, or use the `-jit` build (`$env:MICROPI_VARIANT = "x64-jit"` before installing),
 which ends those too.
 
 **The first start after installing or updating an extension takes seconds.** Microsoft Defender checks each file of a newly
@@ -222,7 +222,7 @@ from it.
 **The bash tool says `shellPath` "is not a bash".** `shellPath` names the bash the bash tool runs (Git Bash's `bash.exe`, say).
 `cmd.exe` and PowerShell are not one; PowerShell commands go through the PowerShell tool.
 
-**SmartScreen warns about `pi-bolt.exe` downloaded with a browser.** The executable has no Authenticode signature yet. The
+**SmartScreen warns about `upi.exe` downloaded with a browser.** The executable has no Authenticode signature yet. The
 installers check the release's own signature and do not mark what they download; install with them rather than from the browser.
 
 **A crash on Windows.** The text µPi prints includes an `Args:` line with the whole command line, `-p` prompt included:
@@ -232,10 +232,10 @@ remove anything private from it before you post it.
 
 Please [open an issue](https://github.com/opensec-git/Pi-Bolt/issues/new) with:
 
-- the output of `pi-bolt doctor` (the build, installation, extensions and packages, and the problems it finds; no keys or
+- the output of `upi doctor` (the build, installation, extensions and packages, and the problems it finds; no keys or
   tokens, and your home folder shown as `~`);
 - on Linux, `ldd --version | head -1`; on Windows, the terminal (Windows Terminal, the console window, VS Code);
-- whether the problem also happens with `BUN_AOT=0 pi-bolt`, and with stock Pi.
+- whether the problem also happens with `BUN_AOT=0 upi`, and with stock Pi.
 
 If it only happens with the compiled code, it is a µPi bug. If it also happens with stock Pi, report it to
 [Pi](https://github.com/earendil-works/pi/issues).
@@ -243,7 +243,7 @@ If it only happens with the compiled code, it is a µPi bug. If it also happens 
 ### A crash
 
 When µPi crashes it prints "µPi has crashed", some lines about the system, and a link that starts with
-`https://pi-bolt.opensec.in/crash/`. The link holds an encoded stack trace and nothing else: no file names, paths or data of
+`https://upi.opensec.in/crash/`. The link holds an encoded stack trace and nothing else: no file names, paths or data of
 yours. Please include it in the issue, with what you were doing. µPi's maintainers decode it against the symbols of that
 release. (In Pi-Bolt 0.3.0 and earlier the message named Bun and the link went to bun.report, which cannot decode Pi-Bolt
 traces: report those here too.)

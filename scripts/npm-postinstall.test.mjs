@@ -1,4 +1,4 @@
-// Tests of the pi-bolt npm package's install script (npm/install.cjs), with a fake release signed with a key made here:
+// Tests of the upi npm package's install script (npm/install.cjs), with a fake release signed with a key made here:
 // no network, no real release key.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -16,7 +16,7 @@ const npmDir = fileURLToPath(new URL("../npm/", import.meta.url));
 const root = fileURLToPath(new URL("../", import.meta.url));
 const install = require(join(npmDir, "install.cjs"));
 const VERSION = JSON.parse(readFileSync(join(npmDir, "package.json"), "utf8")).version;
-const PLACEHOLDER = readFileSync(join(npmDir, "bin", "pi-bolt.exe"));
+const PLACEHOLDER = readFileSync(join(npmDir, "bin", "upi.exe"));
 const WINDOWS_10_1809 = "10.0.17763";
 
 // --- Archives, made as the release makes them -------------------------------------------------------------------------
@@ -120,13 +120,13 @@ function newKey() {
 }
 
 const sha256 = (data) => crypto.createHash("sha256").update(data).digest("hex");
-const EXE = Buffer.from("MZ the new pi-bolt.exe");
+const EXE = Buffer.from("MZ the new upi.exe");
 
 function buildZip(variant = "x64", extra = []) {
-	const top = `pi-bolt-win32-${variant}`;
+	const top = `upi-win32-${variant}`;
 	return makeZip([
-		{ name: `${top}/pi-bolt.exe`, data: EXE },
-		{ name: `${top}/pi-bolt.txt`, data: Buffer.from(`Pi-Bolt ${VERSION} (Pi 1.1.0), win32-${variant}, JIT off\n`) },
+		{ name: `${top}/upi.exe`, data: EXE },
+		{ name: `${top}/upi.txt`, data: Buffer.from(`µPi ${VERSION} (Pi 1.1.0), win32-${variant}, JIT off\n`) },
 		{ name: `${top}/package.json`, data: Buffer.from('{"name":"pi"}\n') },
 		{ name: `${top}/theme/` },
 		{ name: `${top}/theme/dark.json`, data: Buffer.from("{}\n") },
@@ -140,11 +140,11 @@ function buildZip(variant = "x64", extra = []) {
  * `sumsVersion` is the version the checksums say.
  */
 function makeRelease({ signer, sumsVersion = VERSION, zips = { x64: buildZip() }, firstLine } = {}) {
-	const lines = [firstLine ?? `# pi-bolt ${sumsVersion}`];
+	const lines = [firstLine ?? `# upi ${sumsVersion}`];
 	const files = {};
 	for (const [variant, zip] of Object.entries(zips)) {
-		files[`pi-bolt-win32-${variant}.zip`] = zip;
-		lines.push(`${sha256(zip)}  pi-bolt-win32-${variant}.zip`);
+		files[`upi-win32-${variant}.zip`] = zip;
+		lines.push(`${sha256(zip)}  upi-win32-${variant}.zip`);
 	}
 	files.SHA256SUMS = Buffer.from(`${lines.join("\n")}\n`);
 	if (signer) files["SHA256SUMS.sig"] = crypto.sign(null, files.SHA256SUMS, signer.privateKey);
@@ -153,7 +153,7 @@ function makeRelease({ signer, sumsVersion = VERSION, zips = { x64: buildZip() }
 
 const GITHUB = `https://github.com/opensec-git/Pi-Bolt/releases/download/bolt-v${VERSION}`;
 const REGISTRY = "https://registry.npmjs.org";
-const npmUrl = (variant = "x64") => `${REGISTRY}/@kushalkhemka/pi-bolt-win32-${variant}/-/pi-bolt-win32-${variant}-${VERSION}.tgz`;
+const npmUrl = (variant = "x64") => `${REGISTRY}/@kushalkhemka/upi-win32-${variant}/-/upi-win32-${variant}-${VERSION}.tgz`;
 
 /** A fetch that serves `routes` (URL -> bytes) and records what was asked for. */
 function fakeFetch(routes) {
@@ -172,18 +172,18 @@ function githubRoutes(release, base = GITHUB) {
 
 function npmPackage(zip, variant = "x64") {
 	return makeTgz([
-		{ name: "package/package.json", data: Buffer.from(`{"name":"@kushalkhemka/pi-bolt-win32-${variant}","version":"${VERSION}"}`) },
-		{ name: `package/pi-bolt-win32-${variant}.zip`, data: zip },
+		{ name: "package/package.json", data: Buffer.from(`{"name":"@kushalkhemka/upi-win32-${variant}","version":"${VERSION}"}`) },
+		{ name: `package/upi-win32-${variant}.zip`, data: zip },
 	]);
 }
 
 /** A package folder as npm leaves it before the install script runs. */
 function makePackage(t) {
-	const dir = mkdtempSync(join(tmpdir(), "pi-bolt-npm-test-"));
+	const dir = mkdtempSync(join(tmpdir(), "upi-npm-test-"));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	mkdirSync(join(dir, "bin"));
-	writeFileSync(join(dir, "bin", "pi-bolt.exe"), PLACEHOLDER);
-	writeFileSync(join(dir, "bin", "pi-bolt"), readFileSync(join(npmDir, "bin", "pi-bolt")));
+	writeFileSync(join(dir, "bin", "upi.exe"), PLACEHOLDER);
+	writeFileSync(join(dir, "bin", "upi"), readFileSync(join(npmDir, "bin", "upi")));
 	writeFileSync(join(dir, "package.json"), readFileSync(join(npmDir, "package.json")));
 	return dir;
 }
@@ -206,21 +206,21 @@ function run(pkgDir, { fetch, key, env = {}, runsVersion = () => true, hasAvx2 =
 }
 
 function assertPlaceholder(pkgDir) {
-	assert.deepEqual(readFileSync(join(pkgDir, "bin", "pi-bolt.exe")), PLACEHOLDER);
+	assert.deepEqual(readFileSync(join(pkgDir, "bin", "upi.exe")), PLACEHOLDER);
 	assert.deepEqual(readdirSync(pkgDir).sort(), ["bin", "package.json"], "nothing is left behind");
 }
 
 // --- The package --------------------------------------------------------------------------------------------------------
 
-test("the package: bin/pi-bolt.exe on every platform, a placeholder with no #! line, and the install script", () => {
+test("the package: bin/upi.exe on every platform, a placeholder with no #! line, and the install script", () => {
 	const pkg = JSON.parse(readFileSync(join(npmDir, "package.json"), "utf8"));
-	assert.deepEqual(pkg.bin, { "pi-bolt": "bin/pi-bolt.exe" });
+	assert.deepEqual(pkg.bin, { "upi": "bin/upi.exe" });
 	assert.equal(pkg.scripts.postinstall, "node install.cjs");
-	for (const file of ["bin/pi-bolt", "bin/pi-bolt.exe", "install.cjs", "install.sh"]) assert.ok(pkg.files.includes(file), file);
+	for (const file of ["bin/upi", "bin/upi.exe", "install.cjs", "install.sh"]) assert.ok(pkg.files.includes(file), file);
 	assert.ok(pkg.os.includes("win32"));
 	assert.notEqual(PLACEHOLDER.toString("latin1", 0, 2), "#!", "a #! line would make npm's Windows commands start it with sh");
 	assert.ok(!PLACEHOLDER.includes("\r"), "LF line ends");
-	assert.ok(readFileSync(join(npmDir, "bin", "pi-bolt"), "latin1").startsWith("#!/bin/sh\n"));
+	assert.ok(readFileSync(join(npmDir, "bin", "upi"), "latin1").startsWith("#!/bin/sh\n"));
 	assert.equal(pkg.dependencies, undefined);
 });
 
@@ -231,9 +231,9 @@ test("the release key is keys/release.pub, the one install.sh and install.ps1 ha
 	assert.ok(readFileSync(join(root, "install.sh"), "utf8").includes(install.RELEASE_KEY));
 });
 
-test("in Pi-Bolt's repository the install script leaves the placeholder alone", () => {
+test("in µPi's repository the install script leaves the placeholder alone", () => {
 	assert.equal(install.isSourceTree(npmDir.replace(/[\\/]$/, "")), true);
-	assert.equal(install.isSourceTree(join(tmpdir(), "node_modules", "pi-bolt")), false);
+	assert.equal(install.isSourceTree(join(tmpdir(), "node_modules", "upi")), false);
 });
 
 // --- Windows ------------------------------------------------------------------------------------------------------------
@@ -241,25 +241,25 @@ test("in Pi-Bolt's repository the install script leaves the placeholder alone", 
 test("Windows: installs the build from npm, signature and checksum verified, over the placeholder", async (t) => {
 	const signer = newKey();
 	const release = makeRelease({ signer });
-	const { fetch, asked } = fakeFetch({ ...githubRoutes(release), [npmUrl()]: npmPackage(release["pi-bolt-win32-x64.zip"]) });
+	const { fetch, asked } = fakeFetch({ ...githubRoutes(release), [npmUrl()]: npmPackage(release["upi-win32-x64.zip"]) });
 	const pkgDir = makePackage(t);
 	let ran;
 	const { promise, log } = run(pkgDir, { fetch, key: signer.key, runsVersion: (exe) => ((ran = readFileSync(exe)), true) });
 	assert.deepEqual(await promise, { variant: "x64", from: "npm", signed: true });
 	assert.deepEqual(ran, EXE, "the new executable ran (--version) before it was installed");
-	assert.deepEqual(readFileSync(join(pkgDir, "bin", "pi-bolt.exe")), EXE);
+	assert.deepEqual(readFileSync(join(pkgDir, "bin", "upi.exe")), EXE);
 	assert.equal(readFileSync(join(pkgDir, "bin", "theme", "dark.json"), "utf8"), "{}\n");
 	assert.ok(existsSync(join(pkgDir, "bin", "native", "win32", "prebuilds", "win32-x64", "win32-platform.node")));
-	assert.ok(existsSync(join(pkgDir, "bin", "pi-bolt.txt")));
+	assert.ok(existsSync(join(pkgDir, "bin", "upi.txt")));
 	assert.deepEqual(readdirSync(pkgDir).sort(), ["bin", "package.json"], "the staging folder is gone");
-	assert.ok(!asked.includes(`${GITHUB}/pi-bolt-win32-x64.zip`), "nothing from GitHub but the checksums and their signature");
-	assert.match(log.join("\n"), /installed Pi-Bolt .* from npm, signature verified/);
+	assert.ok(!asked.includes(`${GITHUB}/upi-win32-x64.zip`), "nothing from GitHub but the checksums and their signature");
+	assert.match(log.join("\n"), /installed µPi .* from npm, signature verified/);
 });
 
 test("Windows: a build from npm that does not match the checksum is not used: GitHub's is, checked the same way", async (t) => {
 	const signer = newKey();
 	const release = makeRelease({ signer });
-	const { fetch } = fakeFetch({ ...githubRoutes(release), [npmUrl()]: npmPackage(buildZip("x64", [{ name: "pi-bolt-win32-x64/evil.dll", data: Buffer.from("x") }])) });
+	const { fetch } = fakeFetch({ ...githubRoutes(release), [npmUrl()]: npmPackage(buildZip("x64", [{ name: "upi-win32-x64/evil.dll", data: Buffer.from("x") }])) });
 	const pkgDir = makePackage(t);
 	const { promise, log } = run(pkgDir, { fetch, key: signer.key });
 	assert.deepEqual(await promise, { variant: "x64", from: "GitHub", signed: true });
@@ -267,27 +267,27 @@ test("Windows: a build from npm that does not match the checksum is not used: Gi
 	assert.match(log.join("\n"), /not available from npm; downloading from GitHub instead/);
 });
 
-test("Windows: PIBOLT_SOURCE=npm refuses when npm does not have the build", async (t) => {
+test("Windows: MICROPI_SOURCE=npm refuses when npm does not have the build", async (t) => {
 	const signer = newKey();
 	const { fetch } = fakeFetch(githubRoutes(makeRelease({ signer })));
 	const pkgDir = makePackage(t);
-	await assert.rejects(run(pkgDir, { fetch, key: signer.key, env: { PIBOLT_SOURCE: "npm" } }).promise, /npm does not have Pi-Bolt/);
+	await assert.rejects(run(pkgDir, { fetch, key: signer.key, env: { MICROPI_SOURCE: "npm" } }).promise, /npm does not have µPi/);
 	assertPlaceholder(pkgDir);
 });
 
-test("Windows: PIBOLT_SOURCE=github downloads from GitHub only", async (t) => {
+test("Windows: MICROPI_SOURCE=github downloads from GitHub only", async (t) => {
 	const signer = newKey();
 	const release = makeRelease({ signer });
-	const { fetch, asked } = fakeFetch({ ...githubRoutes(release), [npmUrl()]: npmPackage(release["pi-bolt-win32-x64.zip"]) });
+	const { fetch, asked } = fakeFetch({ ...githubRoutes(release), [npmUrl()]: npmPackage(release["upi-win32-x64.zip"]) });
 	const pkgDir = makePackage(t);
-	assert.equal((await run(pkgDir, { fetch, key: signer.key, env: { PIBOLT_SOURCE: "github" } }).promise).from, "GitHub");
+	assert.equal((await run(pkgDir, { fetch, key: signer.key, env: { MICROPI_SOURCE: "github" } }).promise).from, "GitHub");
 	assert.ok(!asked.includes(npmUrl()));
 });
 
 test("Windows: a build from GitHub that does not match the checksum is refused", async (t) => {
 	const signer = newKey();
 	const release = makeRelease({ signer });
-	release["pi-bolt-win32-x64.zip"] = buildZip("x64", [{ name: "pi-bolt-win32-x64/extra", data: Buffer.from("x") }]);
+	release["upi-win32-x64.zip"] = buildZip("x64", [{ name: "upi-win32-x64/extra", data: Buffer.from("x") }]);
 	const { fetch } = fakeFetch(githubRoutes(release));
 	const pkgDir = makePackage(t);
 	await assert.rejects(run(pkgDir, { fetch, key: signer.key }).promise, /checksum mismatch/);
@@ -296,9 +296,9 @@ test("Windows: a build from GitHub that does not match the checksum is refused",
 
 test("Windows: checksums signed with another key are refused before anything else is downloaded", async (t) => {
 	const release = makeRelease({ signer: newKey() });
-	const { fetch, asked } = fakeFetch({ ...githubRoutes(release), [npmUrl()]: npmPackage(release["pi-bolt-win32-x64.zip"]) });
+	const { fetch, asked } = fakeFetch({ ...githubRoutes(release), [npmUrl()]: npmPackage(release["upi-win32-x64.zip"]) });
 	const pkgDir = makePackage(t);
-	await assert.rejects(run(pkgDir, { fetch, key: newKey().key }).promise, /signature does not verify: the download is not Pi-Bolt's/);
+	await assert.rejects(run(pkgDir, { fetch, key: newKey().key }).promise, /signature does not verify: the download is not µPi's/);
 	assert.deepEqual(asked, [`${GITHUB}/SHA256SUMS`, `${GITHUB}/SHA256SUMS.sig`]);
 	assertPlaceholder(pkgDir);
 });
@@ -329,52 +329,52 @@ test("Windows: a release without a signature is refused from GitHub", async (t) 
 	assertPlaceholder(pkgDir);
 });
 
-test("Windows: a mirror (PIBOLT_DOWNLOAD_BASE) without a signature is refused", async (t) => {
+test("Windows: a mirror (MICROPI_DOWNLOAD_BASE) without a signature is refused", async (t) => {
 	const release = makeRelease();
-	const { fetch } = fakeFetch(githubRoutes(release, "http://mirror.test/pi-bolt"));
+	const { fetch } = fakeFetch(githubRoutes(release, "http://mirror.test/upi"));
 	const pkgDir = makePackage(t);
 	await assert.rejects(
-		run(pkgDir, { fetch, key: install.RELEASE_KEY, env: { PIBOLT_DOWNLOAD_BASE: "http://mirror.test/pi-bolt/" } }).promise,
+		run(pkgDir, { fetch, key: install.RELEASE_KEY, env: { MICROPI_DOWNLOAD_BASE: "http://mirror.test/upi/" } }).promise,
 		/has no signature/,
 	);
 	assertPlaceholder(pkgDir);
 });
 
 // An opt-in left in the environment (a profile, setx, a CI image) would otherwise let any later download in without its signature.
-test("Windows: PIBOLT_ALLOW_UNSIGNED=1, or the SHA-256 of other checksums, does not let an unsigned release in", async (t) => {
+test("Windows: MICROPI_ALLOW_UNSIGNED=1, or the SHA-256 of other checksums, does not let an unsigned release in", async (t) => {
 	const release = makeRelease();
 	const other = sha256(makeRelease({ sumsVersion: "0.0.1" }).SHA256SUMS);
 	for (const value of ["1", "yes", other]) {
-		const { fetch } = fakeFetch(githubRoutes(release, "http://mirror.test/pi-bolt"));
+		const { fetch } = fakeFetch(githubRoutes(release, "http://mirror.test/upi"));
 		const pkgDir = makePackage(t);
-		const env = { PIBOLT_DOWNLOAD_BASE: "http://mirror.test/pi-bolt", PIBOLT_ALLOW_UNSIGNED: value };
+		const env = { MICROPI_DOWNLOAD_BASE: "http://mirror.test/upi", MICROPI_ALLOW_UNSIGNED: value };
 		await assert.rejects(run(pkgDir, { fetch, key: install.RELEASE_KEY, env }).promise, (error) => {
 			assert.match(error.message, /has no signature/);
 			assert.match(error.message, /not to this download's SHA-256/);
-			assert.ok(error.message.includes(`PIBOLT_ALLOW_UNSIGNED=${sha256(release.SHA256SUMS)}`), "it says the value for this download");
+			assert.ok(error.message.includes(`MICROPI_ALLOW_UNSIGNED=${sha256(release.SHA256SUMS)}`), "it says the value for this download");
 			return true;
 		});
 		assertPlaceholder(pkgDir);
 	}
 });
 
-test("Windows: an unsigned release only with PIBOLT_ALLOW_UNSIGNED set to the SHA-256 of its SHA256SUMS, with a warning", async (t) => {
-	const mirror = "http://mirror.test/pi-bolt/";
+test("Windows: an unsigned release only with MICROPI_ALLOW_UNSIGNED set to the SHA-256 of its SHA256SUMS, with a warning", async (t) => {
+	const mirror = "http://mirror.test/upi/";
 	const release = makeRelease();
-	const { fetch, asked } = fakeFetch(githubRoutes(release, "http://mirror.test/pi-bolt"));
+	const { fetch, asked } = fakeFetch(githubRoutes(release, "http://mirror.test/upi"));
 	const pkgDir = makePackage(t);
-	const env = { PIBOLT_DOWNLOAD_BASE: mirror, PIBOLT_ALLOW_UNSIGNED: sha256(release.SHA256SUMS).toUpperCase() };
+	const env = { MICROPI_DOWNLOAD_BASE: mirror, MICROPI_ALLOW_UNSIGNED: sha256(release.SHA256SUMS).toUpperCase() };
 	const { promise, log } = run(pkgDir, { fetch, key: install.RELEASE_KEY, env });
-	assert.deepEqual(await promise, { variant: "x64", from: "http://mirror.test/pi-bolt", signed: false });
-	assert.ok(asked.every((url) => url.startsWith("http://mirror.test/pi-bolt/")));
-	assert.match(log.join("\n"), /WARNING: http:\/\/mirror\.test\/pi-bolt has no signature for this release \(SHA256SUMS\.sig\)/);
+	assert.deepEqual(await promise, { variant: "x64", from: "http://mirror.test/upi", signed: false });
+	assert.ok(asked.every((url) => url.startsWith("http://mirror.test/upi/")));
+	assert.match(log.join("\n"), /WARNING: http:\/\/mirror\.test\/upi has no signature for this release \(SHA256SUMS\.sig\)/);
 });
 
-test("Windows: a signature that does not verify is refused, PIBOLT_ALLOW_UNSIGNED or not", async (t) => {
+test("Windows: a signature that does not verify is refused, MICROPI_ALLOW_UNSIGNED or not", async (t) => {
 	const release = makeRelease({ signer: newKey() });
 	const { fetch } = fakeFetch(githubRoutes(release, "http://mirror.test"));
 	const pkgDir = makePackage(t);
-	const env = { PIBOLT_DOWNLOAD_BASE: "http://mirror.test", PIBOLT_ALLOW_UNSIGNED: sha256(release.SHA256SUMS) };
+	const env = { MICROPI_DOWNLOAD_BASE: "http://mirror.test", MICROPI_ALLOW_UNSIGNED: sha256(release.SHA256SUMS) };
 	await assert.rejects(run(pkgDir, { fetch, key: install.RELEASE_KEY, env }).promise, /signature does not verify/);
 	assertPlaceholder(pkgDir);
 });
@@ -383,14 +383,14 @@ test("Windows: a mirror's signature is checked all the same", async (t) => {
 	const release = makeRelease({ signer: newKey() });
 	const { fetch } = fakeFetch(githubRoutes(release, "http://mirror.test"));
 	const pkgDir = makePackage(t);
-	await assert.rejects(run(pkgDir, { fetch, key: install.RELEASE_KEY, env: { PIBOLT_DOWNLOAD_BASE: "http://mirror.test" } }).promise, /signature does not verify/);
+	await assert.rejects(run(pkgDir, { fetch, key: install.RELEASE_KEY, env: { MICROPI_DOWNLOAD_BASE: "http://mirror.test" } }).promise, /signature does not verify/);
 	assertPlaceholder(pkgDir);
 });
 
 test("Windows: checksums of another version, or that do not say their version, are refused", async (t) => {
 	const signer = newKey();
 	for (const [release, error] of [
-		[makeRelease({ signer, sumsVersion: "0.1.0" }), /the download is Pi-Bolt 0\.1\.0, not .* \(an older release served as a newer one\?\)/],
+		[makeRelease({ signer, sumsVersion: "0.2.9" }), /the download is µPi 0\.2\.9, not .* \(an older release served as a newer one\?\)/],
 		[makeRelease({ signer, firstLine: "# checksums" }), /does not say which version it is/],
 	]) {
 		const { fetch } = fakeFetch(githubRoutes(release));
@@ -403,11 +403,11 @@ test("Windows: checksums of another version, or that do not say their version, a
 test("Windows: a release without a Windows build, or without the variant asked for, is refused", async (t) => {
 	const signer = newKey();
 	const { fetch } = fakeFetch(githubRoutes(makeRelease({ signer, zips: {} })));
-	await assert.rejects(run(makePackage(t), { fetch, key: signer.key }).promise, /has no Windows build x64 \(pi-bolt-win32-x64\.zip is not in its SHA256SUMS\)/);
+	await assert.rejects(run(makePackage(t), { fetch, key: signer.key }).promise, /has no Windows build x64 \(upi-win32-x64\.zip is not in its SHA256SUMS\)/);
 	const other = fakeFetch(githubRoutes(makeRelease({ signer })));
-	await assert.rejects(run(makePackage(t), { fetch: other.fetch, key: signer.key, env: { PIBOLT_VARIANT: "x64-jit" } }).promise, /pi-bolt-win32-x64-jit\.zip is not in its SHA256SUMS/);
-	await assert.rejects(run(makePackage(t), { fetch: other.fetch, key: signer.key, env: { PIBOLT_VARIANT: "arm64" } }).promise, /PIBOLT_VARIANT must be x64, x64-baseline or x64-jit/);
-	await assert.rejects(run(makePackage(t), { fetch: other.fetch, key: signer.key, env: { PIBOLT_SOURCE: "ftp" } }).promise, /PIBOLT_SOURCE must be auto, npm or github/);
+	await assert.rejects(run(makePackage(t), { fetch: other.fetch, key: signer.key, env: { MICROPI_VARIANT: "x64-jit" } }).promise, /upi-win32-x64-jit\.zip is not in its SHA256SUMS/);
+	await assert.rejects(run(makePackage(t), { fetch: other.fetch, key: signer.key, env: { MICROPI_VARIANT: "arm64" } }).promise, /MICROPI_VARIANT must be x64, x64-baseline or x64-jit/);
+	await assert.rejects(run(makePackage(t), { fetch: other.fetch, key: signer.key, env: { MICROPI_SOURCE: "ftp" } }).promise, /MICROPI_SOURCE must be auto, npm or github/);
 });
 
 test("Windows: the baseline build on a CPU without AVX2, when the release has one", async (t) => {
@@ -433,7 +433,7 @@ test("Windows: an executable that does not run is not installed", async (t) => {
 
 test("Windows: a .zip with an entry outside its folder is refused, signed or not", async (t) => {
 	const signer = newKey();
-	for (const name of ["pi-bolt-win32-x64/../../evil.exe", "../evil.exe", "/evil.exe", "C:/evil.exe", "pi-bolt-win32-x64\\..\\evil.exe"]) {
+	for (const name of ["upi-win32-x64/../../evil.exe", "../evil.exe", "/evil.exe", "C:/evil.exe", "upi-win32-x64\\..\\evil.exe"]) {
 		const release = makeRelease({ signer, zips: { x64: buildZip("x64", [{ name, data: Buffer.from("x") }]) } });
 		const { fetch } = fakeFetch(githubRoutes(release));
 		const pkgDir = makePackage(t);
@@ -452,7 +452,7 @@ test("Windows: an older Windows is refused before anything is downloaded", async
 	assert.deepEqual(install.windowsProblems({ PROCESSOR_ARCHITECTURE: "x86", PROCESSOR_ARCHITEW6432: "AMD64" }, WINDOWS_10_1809), []);
 	assert.deepEqual(install.windowsProblems({ PROCESSOR_ARCHITECTURE: "ARM64" }, "10.0.26100"), []);
 	// Windows 10 on ARM has no x64 emulation.
-	assert.match(install.windowsProblems({ PROCESSOR_ARCHITECTURE: "ARM64" }, "10.0.19045").join(), /On ARM, Pi-Bolt needs Windows 11/);
+	assert.match(install.windowsProblems({ PROCESSOR_ARCHITECTURE: "ARM64" }, "10.0.19045").join(), /On ARM, µPi needs Windows 11/);
 });
 
 test("Windows: installing again replaces the files that are there", async (t) => {
@@ -463,13 +463,13 @@ test("Windows: installing again replaces the files that are there", async (t) =>
 	writeFileSync(join(pkgDir, "bin", "theme", "dark.json"), "changed");
 	await run(pkgDir, { fetch, key: signer.key }).promise;
 	assert.equal(readFileSync(join(pkgDir, "bin", "theme", "dark.json"), "utf8"), "{}\n");
-	assert.deepEqual(readFileSync(join(pkgDir, "bin", "pi-bolt.exe")), EXE);
+	assert.deepEqual(readFileSync(join(pkgDir, "bin", "upi.exe")), EXE);
 	const leftovers = readdirSync(join(pkgDir, "bin"), { recursive: true }).filter((name) => String(name).endsWith(".pibolt-old"));
 	assert.deepEqual(leftovers, []);
 });
 
 test("the npm package's tar: the file asked for, also under a pax name; false when it is not there", async (t) => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-bolt-npm-test-"));
+	const dir = mkdtempSync(join(tmpdir(), "upi-npm-test-"));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	const data = crypto.randomBytes(700000);
 	const tgz = join(dir, "a.tgz");
@@ -485,11 +485,11 @@ test("the npm package's tar: the file asked for, also under a pax name; false wh
 });
 
 test("the checksums' lines, as sha256sum writes them", () => {
-	const sums = `# pi-bolt ${VERSION}\n${"a".repeat(64)}  pi-bolt-win32-x64.zip\n${"B".repeat(64)} *other.zip\n`;
-	assert.equal(install.checksumOf(sums, "pi-bolt-win32-x64.zip"), "a".repeat(64));
+	const sums = `# upi ${VERSION}\n${"a".repeat(64)}  upi-win32-x64.zip\n${"B".repeat(64)} *other.zip\n`;
+	assert.equal(install.checksumOf(sums, "upi-win32-x64.zip"), "a".repeat(64));
 	assert.equal(install.checksumOf(sums, "other.zip"), "b".repeat(64));
 	assert.equal(install.checksumOf(sums, "win32-x64.zip"), undefined);
-	assert.equal(install.checksumOf(sums, "pi-bolt-win32-x64"), undefined);
+	assert.equal(install.checksumOf(sums, "upi-win32-x64"), undefined);
 });
 
 // --- Linux and macOS ----------------------------------------------------------------------------------------------------
@@ -497,12 +497,12 @@ test("the checksums' lines, as sha256sum writes them", () => {
 test("Linux and macOS: the install script puts the launcher, with its #!/bin/sh, over the placeholder", (t) => {
 	const pkgDir = makePackage(t);
 	install.installPosix({ pkgDir });
-	const launcher = readFileSync(join(npmDir, "bin", "pi-bolt"));
-	assert.deepEqual(readFileSync(join(pkgDir, "bin", "pi-bolt.exe")), launcher);
-	if (process.platform !== "win32") assert.equal(statSync(join(pkgDir, "bin", "pi-bolt.exe")).mode & 0o777, 0o755);
+	const launcher = readFileSync(join(npmDir, "bin", "upi"));
+	assert.deepEqual(readFileSync(join(pkgDir, "bin", "upi.exe")), launcher);
+	if (process.platform !== "win32") assert.equal(statSync(join(pkgDir, "bin", "upi.exe")).mode & 0o777, 0o755);
 	install.installPosix({ pkgDir });
-	assert.deepEqual(readFileSync(join(pkgDir, "bin", "pi-bolt.exe")), launcher);
-	assert.deepEqual(readdirSync(join(pkgDir, "bin")).sort(), ["pi-bolt", "pi-bolt.exe"]);
+	assert.deepEqual(readFileSync(join(pkgDir, "bin", "upi.exe")), launcher);
+	assert.deepEqual(readdirSync(join(pkgDir, "bin")).sort(), ["upi", "upi.exe"]);
 });
 
 /** sh, if there is one (Git's on Windows). */
@@ -523,22 +523,22 @@ test("the placeholder, run without the install script: on Linux it starts the la
 	const pkgDir = makePackage(t);
 	const separator = process.platform === "win32" ? ";" : ":";
 	// Elsewhere (Git Bash on Windows): how to run the install script, and a failure.
-	const windows = spawnSync("sh", [join(pkgDir, "bin", "pi-bolt.exe"), "--version"], {
+	const windows = spawnSync("sh", [join(pkgDir, "bin", "upi.exe"), "--version"], {
 		encoding: "utf8",
 		env: { ...process.env, PATH: `${fakeUname(pkgDir, "MINGW64_NT-10.0-26200")}${separator}${process.env.PATH}` },
 	});
 	assert.equal(windows.status, 1);
 	assert.match(windows.stderr, /the package's install script did not run/);
 	assert.match(windows.stderr, /node ".*\/install\.cjs"/);
-	// Linux: the launcher, which works without the install script (here, with PIBOLT_HOME set to where a "build" is).
+	// Linux: the launcher, which works without the install script (here, with MICROPI_HOME set to where a "build" is).
 	const home = join(pkgDir, "home");
-	const dir = join(home, "npm", VERSION, "pi-bolt-linux-x64");
+	const dir = join(home, "npm", VERSION, "upi-linux-x64");
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "pi"), '#!/bin/sh\necho "the build: $*"\n');
 	chmodSync(join(dir, "pi"), 0o755);
-	const linux = spawnSync("sh", [join(pkgDir, "bin", "pi-bolt.exe"), "--version"], {
+	const linux = spawnSync("sh", [join(pkgDir, "bin", "upi.exe"), "--version"], {
 		encoding: "utf8",
-		env: { ...process.env, PIBOLT_HOME: home, PIBOLT_VARIANT: "x64", PATH: `${fakeUname(pkgDir, "Linux")}${separator}${process.env.PATH}` },
+		env: { ...process.env, MICROPI_HOME: home, MICROPI_VARIANT: "x64", PATH: `${fakeUname(pkgDir, "Linux")}${separator}${process.env.PATH}` },
 	});
 	assert.equal(linux.stdout, "the build: --version\n", linux.stderr);
 	assert.equal(linux.status, 0);
@@ -547,55 +547,55 @@ test("the placeholder, run without the install script: on Linux it starts the la
 test("the launcher's first run of a version removes the versions installed before it", { skip: (!findSh() || process.platform === "win32") && "no sh" }, (t) => {
 	const pkgDir = makePackage(t);
 	const home = join(pkgDir, "home");
-	// The installer, as far as the launcher sees it: it puts the build where PIBOLT_INSTALL says.
+	// The installer, as far as the launcher sees it: it puts the build where MICROPI_INSTALL says.
 	writeFileSync(
 		join(pkgDir, "install.sh"),
-		'mkdir -p "$PIBOLT_INSTALL/pi-bolt-linux-x64" && printf \'#!/bin/sh\\necho "the build: $*"\\n\' > "$PIBOLT_INSTALL/pi-bolt-linux-x64/pi" && chmod 755 "$PIBOLT_INSTALL/pi-bolt-linux-x64/pi"\n',
+		'mkdir -p "$MICROPI_INSTALL/upi-linux-x64" && printf \'#!/bin/sh\\necho "the build: $*"\\n\' > "$MICROPI_INSTALL/upi-linux-x64/pi" && chmod 755 "$MICROPI_INSTALL/upi-linux-x64/pi"\n',
 	);
-	mkdirSync(join(home, "npm", "0.7.4", "pi-bolt-linux-x64"), { recursive: true });
+	mkdirSync(join(home, "npm", "0.7.4", "upi-linux-x64"), { recursive: true });
 	mkdirSync(join(home, "npm", "notes"), { recursive: true });
 	// A session of 0.7.3 that is still running keeps its folder.
-	const running = join(home, "npm", "0.7.3", "pi-bolt-linux-x64");
+	const running = join(home, "npm", "0.7.3", "upi-linux-x64");
 	mkdirSync(running, { recursive: true });
 	writeFileSync(join(running, "pi"), "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
 	const session = spawn(join(running, "pi"), [], { stdio: "ignore" });
 	t.after(() => session.kill());
-	const result = spawnSync("sh", [join(pkgDir, "bin", "pi-bolt"), "--version"], {
+	const result = spawnSync("sh", [join(pkgDir, "bin", "upi"), "--version"], {
 		encoding: "utf8",
-		env: { ...process.env, PIBOLT_HOME: home, PIBOLT_VARIANT: "x64", PATH: `${fakeUname(pkgDir, "Linux")}:${process.env.PATH}` },
+		env: { ...process.env, MICROPI_HOME: home, MICROPI_VARIANT: "x64", PATH: `${fakeUname(pkgDir, "Linux")}:${process.env.PATH}` },
 	});
 	assert.equal(result.stdout, "the build: --version\n", result.stderr);
 	assert.equal(result.status, 0);
-	assert.deepEqual(readdirSync(join(home, "npm")).sort(), ["0.7.3", VERSION, "notes"]);
+	assert.deepEqual(readdirSync(join(home, "npm")).sort(), [VERSION, "0.7.3", "notes"]);
 });
 
 // The first run is not asked for by the user: an opt-in to installing without a signature check, left in their environment, is
 // not passed on to the installer (which ignores it in the first run as well).
-test("the launcher's first run does not pass PIBOLT_UNVERIFIED on to the installer", { skip: (!findSh() || process.platform === "win32") && "no sh" }, (t) => {
+test("the launcher's first run does not pass MICROPI_UNVERIFIED on to the installer", { skip: (!findSh() || process.platform === "win32") && "no sh" }, (t) => {
 	const pkgDir = makePackage(t);
 	const home = join(pkgDir, "home");
 	writeFileSync(
 		join(pkgDir, "install.sh"),
-		'mkdir -p "$PIBOLT_INSTALL/pi-bolt-linux-x64" && printf \'#!/bin/sh\\necho "the build"\\n\' > "$PIBOLT_INSTALL/pi-bolt-linux-x64/pi" && chmod 755 "$PIBOLT_INSTALL/pi-bolt-linux-x64/pi"\necho "installer: PIBOLT_UNVERIFIED=${PIBOLT_UNVERIFIED-unset} PIBOLT_LAUNCHER=$PIBOLT_LAUNCHER" >&2\n',
+		'mkdir -p "$MICROPI_INSTALL/upi-linux-x64" && printf \'#!/bin/sh\\necho "the build"\\n\' > "$MICROPI_INSTALL/upi-linux-x64/pi" && chmod 755 "$MICROPI_INSTALL/upi-linux-x64/pi"\necho "installer: MICROPI_UNVERIFIED=${MICROPI_UNVERIFIED-unset} MICROPI_LAUNCHER=$MICROPI_LAUNCHER" >&2\n',
 	);
-	const result = spawnSync("sh", [join(pkgDir, "bin", "pi-bolt")], {
+	const result = spawnSync("sh", [join(pkgDir, "bin", "upi")], {
 		encoding: "utf8",
 		env: {
 			...process.env,
-			PIBOLT_HOME: home,
-			PIBOLT_VARIANT: "x64",
-			PIBOLT_UNVERIFIED: "1",
+			MICROPI_HOME: home,
+			MICROPI_VARIANT: "x64",
+			MICROPI_UNVERIFIED: "1",
 			PATH: `${fakeUname(pkgDir, "Linux")}:${process.env.PATH}`,
 		},
 	});
 	assert.equal(result.status, 0, result.stderr);
-	assert.match(result.stderr, /installer: PIBOLT_UNVERIFIED=unset PIBOLT_LAUNCHER=1/);
+	assert.match(result.stderr, /installer: MICROPI_UNVERIFIED=unset MICROPI_LAUNCHER=1/);
 	assert.equal(result.stdout, "the build\n");
 });
 
 test("an archive entry's name: inside its folder, with / between its parts and no \\, :, .. or empty part", () => {
-	for (const name of ["pi-bolt-win32-x64/pi-bolt.exe", "pi-bolt-win32-x64/", "a/b/c.txt"]) assert.equal(install.isSafeEntryName(name), true, name);
-	for (const name of ["", "/x", "C:/x", "a/../x", "a//x", "./x", "a\\x", "pi-bolt-win32-x64/..\\..\\x", "a\0x"]) {
+	for (const name of ["upi-win32-x64/upi.exe", "upi-win32-x64/", "a/b/c.txt"]) assert.equal(install.isSafeEntryName(name), true, name);
+	for (const name of ["", "/x", "C:/x", "a/../x", "a//x", "./x", "a\\x", "upi-win32-x64/..\\..\\x", "a\0x"]) {
 		assert.equal(install.isSafeEntryName(name), false, JSON.stringify(name));
 	}
 });
@@ -614,7 +614,7 @@ test("a mirror's or registry's address without the slashes it ends with: as .rep
 		last = last.flatMap((prefix) => ["/", "a", ":"].map((c) => prefix + c));
 		inputs.push(...last);
 	}
-	inputs.push("https://registry.npmjs.org", "http://mirror.test/pi-bolt/", "http://mirror.test//pi//bolt///", "/".repeat(1000));
+	inputs.push("https://registry.npmjs.org", "http://mirror.test/upi/", "http://mirror.test//pi//bolt///", "/".repeat(1000));
 	for (const input of inputs) assert.equal(install.withoutTrailingSlashes(input), input.replace(/\/+$/, ""), JSON.stringify(input));
 	// Linear in the length: a long run of slashes not at the end takes no time.
 	const long = `${"/".repeat(200_000)}a`;

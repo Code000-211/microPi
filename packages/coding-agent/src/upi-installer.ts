@@ -1,7 +1,7 @@
 /**
- * The installer `pi-bolt update` runs (install.sh; on Windows, install.ps1 for an installation outside the user's profile), taken
+ * The installer `upi update` runs (install.sh; on Windows, install.ps1 for an installation outside the user's profile), taken
  * from the release it updates to and checked before it runs: the release's SHA256SUMS must verify with the release key built
- * into this executable (pi-bolt-update-windows.ts, as for the Windows update), and the installer's SHA-256 must be the one it
+ * into this executable (upi-update-windows.ts, as for the Windows update), and the installer's SHA-256 must be the one it
  * lists. The bytes checked are the bytes run: they are saved to a private temporary folder and the installer is started from
  * there, not downloaded again.
  *
@@ -11,8 +11,8 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { MICROPI_RELEASE_KEY, piBoltInstallerProcess } from "./pi-bolt.ts";
-import { download, fetchSignedSums, releaseDownloadBase, sha256, sumsEntry } from "./pi-bolt-update-windows.ts";
+import { MICROPI_RELEASE_KEY, piBoltInstallerProcess } from "./upi.ts";
+import { download, fetchSignedSums, releaseDownloadBase, sha256, sumsEntry } from "./upi-update-windows.ts";
 import { spawnProcess, waitForChildProcess } from "./utils/child-process.ts";
 
 /** The installer of this platform, by its name in a release. */
@@ -54,7 +54,7 @@ export async function runReleaseInstaller(installer: ReleaseInstaller, env: Node
 	try {
 		let file: string | undefined;
 		if (installer.script) {
-			folder = mkdtempSync(join(tmpdir(), "pi-bolt-installer-"));
+			folder = mkdtempSync(join(tmpdir(), "upi-installer-"));
 			file = join(folder, installer.name);
 			writeFileSync(file, installer.script, { mode: 0o600 });
 		}

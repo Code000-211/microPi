@@ -4,7 +4,7 @@
 
 import { getSystemMessageText } from "@earendil-works/pi-ai";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
-import { PIBOLT } from "../pi-bolt.ts";
+import { PIBOLT } from "../upi.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
 export interface BuildSystemPromptOptions {
@@ -278,7 +278,7 @@ function buildSystemPromptSectionsUncached(input: BuildSystemPromptOptions): Sys
 		// Short: every request carries it, and it matters only for questions about pi itself.
 		promptSections.docs = `Only for questions about pi itself (extensions, SDK, themes, skills, TUI, models, packages, MCP): read ${getReadmePath()}, the docs in ${getDocsPath()} and the examples in ${getExamplesPath()}, following their links; docs/... and examples/... paths are under those folders, not the working folder.${
 			PIBOLT
-				? " This is µPi: `pi-bolt`, built from source (git pull, then scripts/build-pi.sh), not updated with pi's install commands or `pi-bolt update`."
+				? " This is µPi: `upi`, built from source (git pull, then scripts/build-pi.sh), not updated with pi's install commands or `upi update`."
 				: ""
 		}`;
 	}

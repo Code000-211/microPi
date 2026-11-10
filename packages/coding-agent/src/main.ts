@@ -79,7 +79,7 @@ import {
 	handleConfigCommand,
 	handlePackageCommand,
 } from "./package-manager-cli.ts";
-import { PIBOLT } from "./pi-bolt.ts";
+import { MICROPI_PI, PIBOLT } from "./upi.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { createInterface } from "./utils/readline.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
@@ -583,7 +583,7 @@ async function promptForMissingSessionCwd(
 
 export interface MainOptions {
 	extensionFactories?: InlineExtension[];
-	/** µPi: the extensions `pi-bolt compile` built into this executable (core/extensions/compiled.ts). */
+	/** µPi: the extensions `upi compile` built into this executable (core/extensions/compiled.ts). */
 	compiledExtensions?: CompiledExtension[];
 }
 
@@ -640,7 +640,7 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	// `pi-bolt doctor` (µPi only): a report for an issue. It exits: the extensions it loaded may keep timers running.
+	// `upi doctor` (µPi only): a report for an issue. It exits: the extensions it loaded may keep timers running.
 	if (PIBOLT && args[0] === "doctor") {
 		const { runDoctor } = await loadDoctor();
 		process.exit(await runDoctor(args.slice(1), { cwd, agentDir, extensionFactories }));
@@ -683,7 +683,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		console.log(
 			PIBOLT
-				? `${VERSION} (Pi-Bolt ${PIBOLT.version}, ${process.platform}-${PIBOLT.variant}, JIT ${PIBOLT.jit ? "on" : "off"})`
+				? `µPi ${VERSION} (Pi ${MICROPI_PI ?? PIBOLT.version}, ${process.platform}-${PIBOLT.variant}, JIT ${PIBOLT.jit ? "on" : "off"})`
 				: VERSION,
 		);
 		process.exit(0);

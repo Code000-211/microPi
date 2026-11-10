@@ -73,7 +73,7 @@ function resolveWindowsCommand(command: string, env: NodeJS.ProcessEnv | undefin
 		}
 	}
 	// (In a folder that cannot exist: not one of Windows's own programs of that name, were PATH empty.)
-	return join(process.env.SystemRoot ?? "C:\\Windows", "pi-bolt-no-such-command", `${command}.exe`);
+	return join(process.env.SystemRoot ?? "C:\\Windows", "upi-no-such-command", `${command}.exe`);
 }
 
 /** The first executable file named `command` in the PATH directories, or undefined. Does not run it. */

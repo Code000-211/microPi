@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MICROPI_HAS_RELEASES } from "../src/pi-bolt.ts";
+import { MICROPI_HAS_RELEASES } from "../src/upi.ts";
 import {
 	checkForNewPiVersion,
 	comparePackageVersions,

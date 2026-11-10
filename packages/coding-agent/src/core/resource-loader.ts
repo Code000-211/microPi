@@ -8,7 +8,7 @@ import type { ResourceDiagnostic } from "./diagnostics.ts";
 
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 
-import { PIBOLT } from "../pi-bolt.ts";
+import { PIBOLT } from "../upi.ts";
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
@@ -48,8 +48,8 @@ import { resetTimings } from "./timings.ts";
 
 // µPi shares Pi's agent directory, so a package installed for one runtime is loaded by the other too.
 const TOOL_CONFLICT_HINT =
-	". Two packages provide this tool: exclude one with pi-bolt remove --pi-bolt <source>" +
-	" (add --local for a project package; https://github.com/opensec-git/Pi-Bolt#pi-and-pi-bolt-side-by-side)";
+	". Two packages provide this tool: exclude one with upi remove --upi <source>" +
+	" (add --local for a project package; https://github.com/opensec-git/Pi-Bolt#pi-and-upi-side-by-side)";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;

@@ -13,13 +13,13 @@ import {
 import { loadExtensions } from "../src/core/extensions/loader.ts";
 import { ExtensionRunner } from "../src/core/extensions/runner.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-import type * as PiBoltModule from "../src/pi-bolt.ts";
-import { type PiBoltBuild, parsePiBoltBuild, piBoltJitSwitchCommand, piBoltJitVariant } from "../src/pi-bolt.ts";
+import type * as PiBoltModule from "../src/upi.ts";
+import { type PiBoltBuild, parsePiBoltBuild, piBoltJitSwitchCommand, piBoltJitVariant } from "../src/upi.ts";
 import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 
 // The build these tests run as: µPi without the JIT, unless a test says otherwise. (In source runs PIBOLT is undefined.)
 const build = vi.hoisted(() => ({ value: undefined as PiBoltBuild | undefined }));
-vi.mock("../src/pi-bolt.ts", async (importOriginal) => {
+vi.mock("../src/upi.ts", async (importOriginal) => {
 	const original = await importOriginal<typeof PiBoltModule>();
 	return {
 		...original,
@@ -33,7 +33,7 @@ let tempDir: string;
 
 beforeEach(() => {
 	build.value = { version: "0.8.8", variant: "arm64", jit: false };
-	tempDir = mkdtempSync(join(tmpdir(), "pi-bolt-jit-hint-"));
+	tempDir = mkdtempSync(join(tmpdir(), "upi-jit-hint-"));
 });
 
 afterEach(() => {
@@ -72,17 +72,17 @@ describe("the JIT build to switch to", () => {
 
 	it("is installed as this one was installed", () => {
 		expect(piBoltJitSwitchCommand("installer", "linux", "x64-jit")).toBe(
-			"curl -fsSL https://pi-bolt.opensec.in/install.sh | PIBOLT_VARIANT=x64-jit sh",
+			"curl -fsSL https://upi.opensec.in/install.sh | MICROPI_VARIANT=x64-jit sh",
 		);
 		expect(piBoltJitSwitchCommand("installer", "win32", "x64-jit")).toBe(
-			'$env:PIBOLT_VARIANT = "x64-jit"; irm https://pi-bolt.opensec.in/install.ps1 | iex',
+			'$env:MICROPI_VARIANT = "x64-jit"; irm https://upi.opensec.in/install.ps1 | iex',
 		);
-		// The npm package reads PIBOLT_VARIANT at every run on macOS and Linux, and when it is installed on Windows.
+		// The npm package reads MICROPI_VARIANT at every run on macOS and Linux, and when it is installed on Windows.
 		expect(piBoltJitSwitchCommand("npm", "darwin", "arm64-jit")).toBe(
-			"export PIBOLT_VARIANT=arm64-jit (in your shell profile)",
+			"export MICROPI_VARIANT=arm64-jit (in your shell profile)",
 		);
 		expect(piBoltJitSwitchCommand("npm", "win32", "x64-jit")).toBe(
-			'$env:PIBOLT_VARIANT = "x64-jit"; npm install -g --allow-scripts=pi-bolt pi-bolt',
+			'$env:MICROPI_VARIANT = "x64-jit"; npm install -g --allow-scripts=upi upi',
 		);
 	});
 });
@@ -92,7 +92,7 @@ describe("withJitHint", () => {
 		const message = withJitHint(`FFF init failed: ${JIT_REQUIRED_MESSAGE}`, () => "pi-foo");
 		expect(message).toMatch(/^FFF init failed: bun:ffi requires the JIT\. pi-foo needs µPi's JIT build \(bun:ffi\);/);
 		expect(message).toContain("switch with: ");
-		expect(message).toContain("PIBOLT_VARIANT=");
+		expect(message).toContain("MICROPI_VARIANT=");
 		// Once: a message that has the hint already keeps it as it is.
 		expect(withJitHint(message, () => "pi-foo")).toBe(message);
 	});

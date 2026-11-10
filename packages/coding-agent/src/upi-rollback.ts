@@ -1,5 +1,5 @@
 /**
- * `pi-bolt update --rollback`: puts back the build that the last update (or `pi-bolt compile`) replaced.
+ * `upi update --rollback`: puts back the build that the last update (or `upi compile`) replaced.
  *
  * The installers keep the build an update replaces beside the new one, as <folder>.previous (install.sh renames it there;
  * install.ps1 copies it there first, since Windows does not let a running executable's folder be renamed). A rollback swaps
@@ -9,13 +9,13 @@ import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import chalk from "chalk";
-import { PIBOLT, PIBOLT_INSTALL_URL, piBoltInstallDir, piBoltInstallMethod, piBoltPackageManager } from "./pi-bolt.ts";
+import { MICROPI_INSTALL_URL, PIBOLT, piBoltInstallDir, piBoltInstallMethod, piBoltPackageManager } from "./upi.ts";
 
-/** "Pi-Bolt 0.9.0 (Pi 1.2.0), linux-x64, JIT off, built ..." and what is compiled in, from a build's pi-bolt.txt. */
+/** "µPi 0.9.0 (Pi 1.2.0), linux-x64, JIT off, built ..." and what is compiled in, from a build's upi.txt. */
 function describe(folder: string): string {
 	try {
-		const [about, compiled] = readFileSync(join(folder, "pi-bolt.txt"), "utf8").split("\n");
-		const name = /^(Pi-Bolt \S+)/.exec(about)?.[1] ?? about;
+		const [about, compiled] = readFileSync(join(folder, "upi.txt"), "utf8").split("\n");
+		const name = /^(µPi \S+)/.exec(about)?.[1] ?? about;
 		const extensions = compiled?.match(/: (.+)$/)?.[1];
 		return extensions ? `${name} with ${extensions} compiled in` : name;
 	} catch {
@@ -50,9 +50,7 @@ export function swapFolderContents(current: string, previous: string): void {
 	const keep = `${current}.rollback-${stamp}`;
 	cpSync(current, keep, { recursive: true, filter: (source) => !ASIDE.test(source) });
 	try {
-		const incoming = filesIn(previous).sort(
-			(a, b) => Number(/pi-bolt\.exe$/i.test(a)) - Number(/pi-bolt\.exe$/i.test(b)),
-		);
+		const incoming = filesIn(previous).sort((a, b) => Number(/upi\.exe$/i.test(a)) - Number(/upi\.exe$/i.test(b)));
 		const wanted = new Set(incoming);
 		const aside = (file: string): void => {
 			const target = join(current, file);
@@ -97,9 +95,9 @@ export function rollBackInstallation(
 		);
 	}
 	// The build to go back to has to run here before it takes this one's place.
-	const executable = join(previous, platform === "win32" ? "pi-bolt.exe" : "pi");
+	const executable = join(previous, platform === "win32" ? "upi.exe" : "pi");
 	const check = spawnSync(executable, ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-	if (check.status !== 0 || !check.stdout.includes("Pi-Bolt ")) {
+	if (check.status !== 0 || !check.stdout.includes("µPi ")) {
 		throw new Error(
 			`the build in ${previous} does not run: ${`${check.stdout ?? ""}${check.stderr ?? ""}`.trim() || check.error?.message}`,
 		);
@@ -122,7 +120,7 @@ export function rollBackInstallation(
 	return { from, to };
 }
 
-/** `pi-bolt update --rollback`. Returns the exit status. */
+/** `upi update --rollback`. Returns the exit status. */
 export function rollbackPiBolt(): number {
 	if (!PIBOLT) return 1;
 	const method = piBoltInstallMethod();
@@ -130,7 +128,7 @@ export function rollbackPiBolt(): number {
 		console.error(
 			"This µPi was installed with the npm package. Install the version you want with the package manager that installed it:",
 		);
-		console.error("  npm install -g pi-bolt@<version>      (the versions: npm view pi-bolt versions)");
+		console.error("  npm install -g upi@<version>      (the versions: npm view upi versions)");
 		return 1;
 	}
 	const manager = piBoltPackageManager(method);
@@ -144,7 +142,7 @@ export function rollbackPiBolt(): number {
 		console.error(
 			`This µPi was installed with ${manager.name}, which keeps no earlier build to go back to. To run another version, uninstall it and install that version with the installer:`,
 		);
-		console.error(`  ${manager.uninstall} && curl -fsSL ${PIBOLT_INSTALL_URL} | PIBOLT_VERSION=bolt-v<version> sh`);
+		console.error(`  ${manager.uninstall} && curl -fsSL ${MICROPI_INSTALL_URL} | MICROPI_VERSION=bolt-v<version> sh`);
 		return 1;
 	}
 	if (!piBoltInstallDir()) {
@@ -154,7 +152,7 @@ export function rollbackPiBolt(): number {
 	try {
 		const { from, to } = rollBackInstallation(dirname(process.execPath));
 		console.log(chalk.green(`Rolled back from ${from} to ${to}.`));
-		console.log(chalk.dim(`pi-bolt update --rollback again goes back to ${from}.`));
+		console.log(chalk.dim(`upi update --rollback again goes back to ${from}.`));
 		return 0;
 	} catch (error) {
 		console.error(chalk.red(`error: ${error instanceof Error ? error.message : String(error)}`));

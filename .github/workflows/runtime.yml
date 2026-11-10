@@ -2,9 +2,9 @@ name: runtime
 
 # Builds the µPi runtime (patched WebKit and Bun: scripts/build-runtime.sh, scripts\build-runtime.ps1) of every platform on
 # GitHub's runners, each on its own: Linux x86-64 and ARM64, macOS on Apple silicon, Windows x64. It is what a release needs when
-# the engine changed (docs/RELEASING.md, "When the engine changed"): run it from pi-bolt with the release's tag, and it attaches
-# pi-bolt-runtime-<platform>.tar.gz (Windows: .zip) to that tag's draft release, which the release workflow then uses once it has
-# checked their attestations (the attest job below: only a run from pi-bolt counts for a release). A push to
+# the engine changed (docs/RELEASING.md, "When the engine changed"): run it from upi with the release's tag, and it attaches
+# upi-runtime-<platform>.tar.gz (Windows: .zip) to that tag's draft release, which the release workflow then uses once it has
+# checked their attestations (the attest job below: only a run from upi counts for a release). A push to
 # a branch runtime/<name> builds its commit's runtimes as workflow artifacts only: all four, or the one the name is
 # (runtime/win32-x64).
 #
@@ -121,7 +121,7 @@ jobs:
         if: steps.wanted.outputs.yes
         run: |
           scripts/package-release.sh --runtime-only
-          mkdir -p .work/out && mv dist/*/pi-bolt-runtime-*.tar.gz .work/out/
+          mkdir -p .work/out && mv dist/*/upi-runtime-*.tar.gz .work/out/
           shasum -a 256 .work/out/* | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.wanted.outputs.yes
@@ -212,7 +212,7 @@ jobs:
           & scripts\package-release.ps1 -RuntimeOnly
           if ($LASTEXITCODE -ne 0) { exit 1 }
           New-Item -ItemType Directory -Force .work\out | Out-Null
-          Move-Item dist\*\pi-bolt-runtime-win32-x64.zip .work\out\
+          Move-Item dist\*\upi-runtime-win32-x64.zip .work\out\
           Get-FileHash .work\out\* -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLowerInvariant())  $(Split-Path -Leaf $_.Path)" } | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.wanted.outputs.yes
@@ -250,12 +250,12 @@ jobs:
           merge-multiple: true
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: runtimes/pi-bolt-runtime-*
+          subject-path: runtimes/upi-runtime-*
 
   draft:
     name: Attach to the draft of ${{ github.event.inputs.tag }}
     needs: [unix, windows, attest]
-    if: ${{ github.event.inputs.tag != '' && github.ref == 'refs/heads/pi-bolt' }}
+    if: ${{ github.event.inputs.tag != '' && github.ref == 'refs/heads/upi' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

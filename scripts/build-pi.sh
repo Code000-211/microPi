@@ -3,7 +3,7 @@
 #
 # Usage: scripts/build-pi.sh [options]
 #   --pi DIR          a built Pi tree (scripts/prepare-pi.sh). Default: this repository, which is a fork of Pi
-#   --out DIR         where to put the executable and its assets. Default: out/pi-bolt
+#   --out DIR         where to put the executable and its assets. Default: out/upi
 #   --jit on|off      run with the JIT on (code that is not compiled ahead of time, such as extensions loaded at run time, gets
 #                     JIT-compiled) or off (least memory; the default)
 #   --cpu native|baseline
@@ -33,7 +33,7 @@
 #                     Pi's own functions, and saves memory)
 #   --stable          build with a stock Bun instead (PIBOLT_STABLE_BUN, default `bun`): the comparison build, no AOT
 #   --kit DIR         also write the compile kit to DIR: the files this build read, its compile command and the training
-#                     profile, for `pi-bolt compile` to build the same executable with extensions (scripts/make-kit.mjs).
+#                     profile, for `upi compile` to build the same executable with extensions (scripts/make-kit.mjs).
 #                     Not with --plugins
 # Environment: PIBOLT_BUN (the µPi runtime; default $PIBOLT_WORK/runtime/bun); PIBOLT_BUILD_LOG (a file for everything the
 #              compiler prints, e.g. with BUN_JSC_verboseAOTCompilation=1)
@@ -91,7 +91,7 @@ done
 PIBOLT_VERSION="$(cat "$PIBOLT_ROOT/VERSION")"
 # (Named as the archives are: on ARM64, baseline is the build.)
 CPU_VARIANT=$PIBOLT_ARCH; [ "$CPU" = baseline ] && [ "$PIBOLT_ARCH" = x64 ] && CPU_VARIANT=$PIBOLT_ARCH-baseline; [ "$JIT" = on ] && CPU_VARIANT=$PIBOLT_ARCH-jit
-OUT="$(abspath "${OUT:-$PIBOLT_ROOT/out/pi-bolt}")"
+OUT="$(abspath "${OUT:-$PIBOLT_ROOT/out/upi}")"
 PROFILE="$(abspath "${PROFILE:-$PIBOLT_ROOT/profiles/pi-$VERSION}")"
 
 # The manifest for this machine's extensions, generated before anything is built.
@@ -130,7 +130,7 @@ stage_assets() {
 	# Not the documentation's pictures (2.5 MB of PNG, about 4% of the download): the model reads the text, and a terminal
 	# shows none of them (the one the docs show has its alt text).
 	rm -rf "$dir/docs/images"
-	# With µPi's own that `pi-bolt doctor` points at (#63).
+	# With µPi's own that `upi doctor` points at (#63).
 	cp "$PIBOLT_ROOT/docs/PLUGINS.md" "$PIBOLT_ROOT/docs/ACP.md" "$PIBOLT_ROOT/docs/TROUBLESHOOTING.md" "$dir/docs/"
 	mkdir -p "$dir/theme" "$dir/assets" "$dir/export-html/vendor" "$dir/native/$PIBOLT_OS/prebuilds"
 	cp "$AGENT"/src/modes/interactive/theme/*.json "$dir/theme/"
@@ -161,9 +161,9 @@ if [ -n "$STABLE" ]; then
 	BUN="${PIBOLT_STABLE_BUN:-bun}"
 	need "$BUN"
 	log "Pi $VERSION with stock Bun $("$BUN" --version) (bytecode, no AOT) -> $OUT"
-	# Named Pi-Bolt as the builds it is compared with are (PRODUCT_NAME, in messages and the window title), on stock Bun.
+	# Named µPi: PRODUCT_NAME, in messages and the window title, on stock Bun.
 	(cd "$AGENT" && "$BUN" build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --target="bun-$PIBOLT_PLATFORM" --bytecode --format=esm \
-		--define "PIBOLT_BUILD=\"$PIBOLT_VERSION $PIBOLT_ARCH-stable jit-on\"" "${ENTRIES[@]}" --outfile "$OUT/pi" >/dev/null)
+		--define "PIBOLT_BUILD=\"$PIBOLT_VERSION $PIBOLT_ARCH-stable jit-on\"" --define "MICROPI_PI_VERSION=\"$VERSION\"" "${ENTRIES[@]}" --outfile "$OUT/pi" >/dev/null)
 	stage_assets "$OUT"
 	log "done: $OUT/pi"
 	exit 0
@@ -178,7 +178,7 @@ else
 	warn "no training profile at $PROFILE: building without one (run scripts/train-profile.sh for the fastest startup)"
 fi
 
-# Which engine the runtime is (scripts/runtime-stamp.sh), for `pi-bolt doctor`: PIBOLT_RUNTIME_STAMP (the release workflow's),
+# Which engine the runtime is (scripts/runtime-stamp.sh), for `upi doctor`: PIBOLT_RUNTIME_STAMP (the release workflow's),
 # else the RUNTIME_STAMP that build-runtime.sh or fetch-runtime.sh put beside the runtime; unknown otherwise.
 RUNTIME_STAMP="${PIBOLT_RUNTIME_STAMP:-$(cat "$(dirname "$BUN")/RUNTIME_STAMP" 2>/dev/null || true)}"
 [[ "$RUNTIME_STAMP" =~ ^[0-9a-f]{16}$ ]] || RUNTIME_STAMP=""
@@ -215,9 +215,9 @@ BUILD_ARGS=(build --compile --no-compile-autoload-bunfig --no-compile-autoload-d
 	--target="bun-$PIBOLT_PLATFORM" --bytecode --format=esm --splitting "${ORDER_ARGS[@]}" --compile-exec-argv=--smol)
 if ! (
 	cd "$AGENT" || exit 1
-	# What `pi --version` and `pi update` know themselves by (packages/coding-agent/src/pi-bolt.ts).
+	# What `pi --version` and `pi update` know themselves by (packages/coding-agent/src/upi.ts).
 	env "${BUILD_ENV[@]}" "$BUN" "${BUILD_ARGS[@]}" \
-		--define "PIBOLT_BUILD=\"$PIBOLT_VERSION $CPU_VARIANT jit-$JIT${RUNTIME_STAMP:+ $RUNTIME_STAMP}\"" \
+		--define "PIBOLT_BUILD=\"$PIBOLT_VERSION $CPU_VARIANT jit-$JIT${RUNTIME_STAMP:+ $RUNTIME_STAMP}\"" --define "MICROPI_PI_VERSION=\"$VERSION\"" \
 		"${ENTRIES[@]}" --outfile "$OUT/pi" 2>&1 | tee "$BUILD_LOG" | grep -v "^AOT: " | tail -3
 ); then
 	tail -n 12 "$BUILD_LOG" >&2
@@ -237,7 +237,7 @@ if [ "$PIBOLT_OS" = darwin ]; then
 	python3 "$PIBOLT_ROOT/scripts/lib/darwin_libsystem.py" "$OUT"
 fi
 stage_assets "$OUT"
-printf 'Pi-Bolt %s (Pi %s), %s-%s, JIT %s, built %s\n' "$PIBOLT_VERSION" "$VERSION" "$PIBOLT_OS" "$CPU_VARIANT" "$JIT" "$(date -u +%Y-%m-%d)" >"$OUT/pi-bolt.txt"
+printf 'µPi %s (Pi %s), %s-%s, JIT %s, built %s\n' "$PIBOLT_VERSION" "$VERSION" "$PIBOLT_OS" "$CPU_VARIANT" "$JIT" "$(date -u +%Y-%m-%d)" >"$OUT/upi.txt"
 
 check=$(BUN_STATIC_HEAP_VERBOSE=1 "$OUT/pi" --version 2>&1)
 grep -q "image registered: true" <<<"$check" || die "the executable does not use its compiled code:"$'\n'"$check"
@@ -249,7 +249,7 @@ if [ "$PIBOLT_OS" = darwin ]; then
 fi
 log "done: $OUT/pi ($(du -h "$executable" | cut -f1), Pi $(tail -1 <<<"$check"))"
 
-# The compile kit: what this build read and how it was compiled, for `pi-bolt compile` (packages/coding-agent/src/pi-bolt-compile.ts).
+# The compile kit: what this build read and how it was compiled, for `upi compile` (packages/coding-agent/src/upi-compile.ts).
 if [ -n "$KIT" ]; then
 	record="$(mktemp "${TEMP_DIR%/}/pibolt-kit.XXXXXX")"
 	python3 -c 'import json, sys

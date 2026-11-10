@@ -1,5 +1,5 @@
-// `pi-bolt compile` offline from its cache, what it says while it works, what it cleans up, and what an extension compiled in
-// is fingerprinted by (pi-bolt-compile.ts, core/extensions/compiled.ts).
+// `upi compile` offline from its cache, what it says while it works, what it cleans up, and what an extension compiled in
+// is fingerprinted by (upi-compile.ts, core/extensions/compiled.ts).
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import {
@@ -26,7 +26,7 @@ import {
 	removeOldLog,
 	removeStaleWorkFolders,
 	runBuild,
-} from "../src/pi-bolt-compile.ts";
+} from "../src/upi-compile.ts";
 
 let dir: string;
 
@@ -43,13 +43,13 @@ afterEach(() => {
 
 const sha256 = (data: Buffer) => createHash("sha256").update(data).digest("hex");
 
-describe("pi-bolt compile works offline once the release's files are cached (#6, #8)", () => {
+describe("upi compile works offline once the release's files are cached (#6, #8)", () => {
 	const { publicKey, privateKey } = generateKeyPairSync("ed25519");
 	const key = publicKey.export({ type: "spki", format: "pem" }).toString();
 	const runtime = Buffer.from("the runtime");
 	const kit = Buffer.from("the kit");
 	const sums = Buffer.from(
-		`# pi-bolt 0.9.0\n${sha256(runtime)}  pi-bolt-runtime-linux-x64.tar.gz\n${sha256(kit)}  pi-bolt-kit-linux-x64.tar.gz\n`,
+		`# upi 0.9.0\n${sha256(runtime)}  upi-runtime-linux-x64.tar.gz\n${sha256(kit)}  upi-kit-linux-x64.tar.gz\n`,
 	);
 	const base = "https://example.invalid/download/bolt-v0.9.0";
 
@@ -59,8 +59,8 @@ describe("pi-bolt compile works offline once the release's files are cached (#6,
 		served = new Map([
 			[`${base}/SHA256SUMS`, sums],
 			[`${base}/SHA256SUMS.sig`, sign(null, sums, privateKey)],
-			[`${base}/pi-bolt-runtime-linux-x64.tar.gz`, runtime],
-			[`${base}/pi-bolt-kit-linux-x64.tar.gz`, kit],
+			[`${base}/upi-runtime-linux-x64.tar.gz`, runtime],
+			[`${base}/upi-kit-linux-x64.tar.gz`, kit],
 		]);
 		requested = [];
 		vi.stubGlobal("fetch", async (input: string | URL) => {
@@ -78,8 +78,8 @@ describe("pi-bolt compile works offline once the release's files are cached (#6,
 		expect(readFileSync(first.kit)).toEqual(kit);
 		expect(readdirSync(cache).sort()).toEqual(
 			[
-				`${sha256(kit).slice(0, 16)}-pi-bolt-kit-linux-x64.tar.gz`,
-				`${sha256(runtime).slice(0, 16)}-pi-bolt-runtime-linux-x64.tar.gz`,
+				`${sha256(kit).slice(0, 16)}-upi-kit-linux-x64.tar.gz`,
+				`${sha256(runtime).slice(0, 16)}-upi-runtime-linux-x64.tar.gz`,
 				"SHA256SUMS",
 				"SHA256SUMS.sig",
 			].sort(),
@@ -97,7 +97,7 @@ describe("pi-bolt compile works offline once the release's files are cached (#6,
 		writeFileSync(first.kit, "tampered");
 		requested = [];
 		await releaseArchives(base, "0.9.0", "linux-x64", cache, key);
-		expect(requested).toEqual([`${base}/pi-bolt-kit-linux-x64.tar.gz`]);
+		expect(requested).toEqual([`${base}/upi-kit-linux-x64.tar.gz`]);
 		expect(readFileSync(first.kit)).toEqual(kit);
 
 		// Checksums changed in the cache no longer verify: they are fetched again, and the release's own are what count.
@@ -120,7 +120,7 @@ describe("pi-bolt compile works offline once the release's files are cached (#6,
 	});
 
 	test("a download that does not match the signed checksum is refused", async () => {
-		served.set(`${base}/pi-bolt-kit-linux-x64.tar.gz`, Buffer.from("something else"));
+		served.set(`${base}/upi-kit-linux-x64.tar.gz`, Buffer.from("something else"));
 		await expect(releaseArchives(base, "0.9.0", "linux-x64", join(dir, "cache"), key)).rejects.toThrow(
 			"checksum mismatch",
 		);
@@ -188,7 +188,7 @@ describe("the build: its lines as they come, and a stop signal (#7, #12)", () =>
 	});
 });
 
-describe("pi-bolt compile cleans up after itself (#11)", () => {
+describe("upi compile cleans up after itself (#11)", () => {
 	test("work folders of a process that no longer runs go; one in use, and other folders, stay", async () => {
 		const gone = spawn("true");
 		await new Promise((done) => gone.on("close", done));
@@ -217,7 +217,7 @@ describe("pi-bolt compile cleans up after itself (#11)", () => {
 		expect(existsSync(log)).toBe(true);
 		removeOldLog(log, true);
 		expect(existsSync(log)).toBe(false);
-		writeFileSync(log, "# pi-bolt compile: all of what the compiler printed, 2026-10-27T00:00:00.000Z\nerror\n");
+		writeFileSync(log, "# upi compile: all of what the compiler printed, 2026-10-27T00:00:00.000Z\nerror\n");
 		removeOldLog(log, false);
 		expect(existsSync(log)).toBe(false);
 		removeOldLog(log, true);
@@ -231,7 +231,7 @@ describe("pi-bolt compile cleans up after itself (#11)", () => {
 
 	test("the installer's uninstall removes compile.log and the work folders too", () => {
 		const install = join(dir, "install");
-		mkdirSync(join(install, "pi-bolt-linux-x64"), { recursive: true });
+		mkdirSync(join(install, "upi-linux-x64"), { recursive: true });
 		mkdirSync(join(install, ".compile-Ab12Cd", "kit"), { recursive: true });
 		mkdirSync(join(install, "cache"));
 		for (const file of ["compile.json", "compile.log", "channel"]) writeFileSync(join(install, file), "");
@@ -247,7 +247,7 @@ describe("pi-bolt compile cleans up after itself (#11)", () => {
 	});
 });
 
-describe("pi-bolt compile names the project's extensions it leaves out (#9)", () => {
+describe("upi compile names the project's extensions it leaves out (#9)", () => {
 	test("its .pi/extensions and those its settings name, each with why", () => {
 		const project = join(dir, "project");
 		mkdirSync(join(project, ".pi", "extensions", "folder-ext"), { recursive: true });
@@ -260,7 +260,7 @@ describe("pi-bolt compile names the project's extensions it leaves out (#9)", ()
 				extensions: ["-x.ts", "./y.ts"],
 			}),
 		);
-		const why = "not compiled in: a project's extensions load from their files (docs/PLUGINS.md#pi-bolt-compile)";
+		const why = "not compiled in: a project's extensions load from their files (docs/PLUGINS.md#upi-compile)";
 		expect(projectExtensionLines(project, join(dir, "agent")).sort()).toEqual(
 			[
 				`.pi/extensions/file-ext.ts (project): ${why}`,

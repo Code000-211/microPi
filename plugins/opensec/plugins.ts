@@ -2,12 +2,12 @@
  * OpenSec's extensions compiled into µPi's release executables: opensec-pi-subagents and opensec-pi-todo, at the versions
  * extensions.txt pins (package.json, package-lock.json: `npm ci --ignore-scripts`, then `node prepare.mjs`, here before building).
  *
- * Build:  scripts\build-pi.ps1 -Plugins plugins\opensec\plugins.ts -Out out\pi-bolt   (scripts\package-release.ps1 does)
+ * Build:  scripts\build-pi.ps1 -Plugins plugins\opensec\plugins.ts -Out out\upi   (scripts\package-release.ps1 does)
  *
  * Each package's own entry (dist-bun/index.js) hands Pi's modules to its core (dist-bun/core.cjs) on a global and loads the core
  * by a path it works out at run time, which a compiled executable has no file for. This does the same with the core imported,
  * so that it is compiled ahead of time with Pi. Being named and built-in, each can be turned off (`-builtin:<name>` in the
- * `extensions` setting, or `pi-bolt config`), and a copy installed from npm replaces it (replaceable) rather than conflicting.
+ * `extensions` setting, or `upi config`), and a copy installed from npm replaces it (replaceable) rather than conflicting.
  */
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -66,7 +66,7 @@ const subagents: InlineExtension = {
 	name: "opensec-pi-subagents",
 	builtin: true,
 	replaceable: true,
-	// (Pi's modules imported when the extension loads, not when the executable starts: pi-bolt --version loads no extension.)
+	// (Pi's modules imported when the extension loads, not when the executable starts: upi --version loads no extension.)
 	factory: async (pi) => {
 		const [piCodingAgent, piTui, typebox, typeboxValue] = await Promise.all([
 			import("@earendil-works/pi-coding-agent"),

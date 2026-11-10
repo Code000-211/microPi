@@ -3,20 +3,20 @@
 #
 # Usage: scripts\package-release.ps1 [-Pi DIR] [-NoBuild] [-RuntimeOnly] [-WithOpenSec]
 #   -Pi DIR     the built Pi tree (default: this repository)
-#   -NoBuild    package the builds already in out\pi-bolt and out\pi-bolt-jit instead of building them
+#   -NoBuild    package the builds already in out\upi and out\upi-jit instead of building them
 #   -RuntimeOnly  only the runtime's archive (.github/workflows/runtime.yml), no Pi and no SHA256SUMS
 #   -WithOpenSec  compile in OpenSec's extensions (plugins\opensec; `-builtin:<name>` in the extensions setting turns one off).
 #               Releases are built without: the installers offer them, and compiled in they cost every `-p` +66 ms
 #               (bench/results/2026-10-10-opensec-compiled). With it, retrain the profile with them first
 #               (scripts\train-heap.ps1 -Plugins plugins\opensec\plugins.ts).
 # Archives (the names stay the same from release to release, so that releases/latest/download/<name> always works):
-#   pi-bolt-win32-x64.zip           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
-#   pi-bolt-win32-x64-jit.zip       JIT on, for extensions that do heavy JavaScript work at run time (docs/PLUGINS.md)
-#   pi-bolt-runtime-win32-x64.zip   the microPi Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
-# .zip, which install.ps1 unpacks with what Windows has. In the archive the executable is pi-bolt.exe: the installer puts its
-# folder on PATH, and the command is then `pi-bolt` in cmd, PowerShell and any terminal, with no launcher in between.
+#   upi-win32-x64.zip           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
+#   upi-win32-x64-jit.zip       JIT on, for extensions that do heavy JavaScript work at run time (docs/PLUGINS.md)
+#   upi-runtime-win32-x64.zip   the microPi Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
+# .zip, which install.ps1 unpacks with what Windows has. In the archive the executable is upi.exe: the installer puts its
+# folder on PATH, and the command is then `upi` in cmd, PowerShell and any terminal, with no launcher in between.
 # A release puts the archives of every platform together with one SHA256SUMS (docs/RELEASING.md). An Authenticode signature,
-# with the owner's certificate, goes on pi-bolt.exe before the archive is made (it changes the file, and so its checksum).
+# with the owner's certificate, goes on upi.exe before the archive is made (it changes the file, and so its checksum).
 param(
 	[string]$Pi = '',
 	[switch]$NoBuild,
@@ -34,8 +34,8 @@ $NpmVersion = (Get-Content (Join-Path $Root 'npm\package.json') -Raw | ConvertFr
 if ($NpmVersion -ne $Version) { Die "npm/package.json is $NpmVersion, VERSION is $Version" }
 if (-not $Pi) { $Pi = if ($env:PIBOLT_PI) { $env:PIBOLT_PI } else { $Root } }
 $Pi = (Resolve-Path $Pi).Path
-$Out = Join-Path $Root 'out\pi-bolt'
-$OutJit = Join-Path $Root 'out\pi-bolt-jit'
+$Out = Join-Path $Root 'out\upi'
+$OutJit = Join-Path $Root 'out\upi-jit'
 if (-not $NoBuild -and -not $RuntimeOnly) {
 	# With -WithOpenSec, OpenSec's extensions compiled in (plugins\opensec: the versions extensions.txt pins, by their lockfile's
 	# integrity).
@@ -61,8 +61,8 @@ if (-not $NoBuild -and -not $RuntimeOnly) {
 }
 foreach ($dir in $(if ($RuntimeOnly) { @() } else { @($Out, $OutJit) })) {
 	if (-not (Test-Path (Join-Path $dir 'pi.exe'))) { Die "$dir\pi.exe not found: build it, or run without -NoBuild" }
-	# A build with plugins compiled in (its pi-bolt.txt says which) is packaged only when that was asked for.
-	$compiledIn = Select-String -LiteralPath (Join-Path $dir 'pi-bolt.txt') -Pattern '^plugins: ' -ErrorAction SilentlyContinue
+	# A build with plugins compiled in (its upi.txt says which) is packaged only when that was asked for.
+	$compiledIn = Select-String -LiteralPath (Join-Path $dir 'upi.txt') -Pattern '^plugins: ' -ErrorAction SilentlyContinue
 	if ($compiledIn -and -not $WithOpenSec) { Die "$dir has $($compiledIn.Line): rebuild it without, or pass -WithOpenSec" }
 	if ($WithOpenSec -and -not $compiledIn) { Die "$dir has no plugins compiled in: rebuild it, or run without -WithOpenSec" }
 }
@@ -85,7 +85,7 @@ if (Test-Path $Dist) {
 	Log "the previous packages are in $old"
 }
 New-Item -ItemType Directory -Force $Dist | Out-Null
-$Stage = Join-Path ([IO.Path]::GetTempPath()) "pi-bolt-package-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$Stage = Join-Path ([IO.Path]::GetTempPath()) "upi-package-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 New-Item -ItemType Directory -Force $Stage | Out-Null
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 function Add-Notices($dir) {
@@ -94,7 +94,7 @@ function Add-Notices($dir) {
 	if (Test-Path (Join-Path $Pi 'LICENSE')) { Copy-Item (Join-Path $Pi 'LICENSE') (Join-Path $dir 'LICENSE.pi') }
 }
 # With 7-Zip where it is installed (GitHub's Windows runners have it): its deflate makes the same kind of .zip, which every reader
-# of it unpacks (install.ps1, npm/install.cjs, Expand-Archive), 3.4% smaller than .NET's (-mx=7: pi-bolt.exe 93.9 -> 90.7 MB,
+# of it unpacks (install.ps1, npm/install.cjs, Expand-Archive), 3.4% smaller than .NET's (-mx=7: upi.exe 93.9 -> 90.7 MB,
 # about a minute more per archive). Without it, .NET's.
 $SevenZip = @((Get-Command 7z.exe -ErrorAction SilentlyContinue).Source, (Join-Path $env:ProgramFiles '7-Zip\7z.exe')) |
 	Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
@@ -109,23 +109,23 @@ function New-Zip($dir, $zip) {
 	[IO.Compression.ZipFile]::CreateFromDirectory($dir, $zip, [IO.Compression.CompressionLevel]::Optimal, $true)
 }
 try {
-	foreach ($build in $(if ($RuntimeOnly) { @() } else { @(@{ Name = 'pi-bolt-win32-x64'; Dir = $Out }, @{ Name = 'pi-bolt-win32-x64-jit'; Dir = $OutJit }) })) {
+	foreach ($build in $(if ($RuntimeOnly) { @() } else { @(@{ Name = 'upi-win32-x64'; Dir = $Out }, @{ Name = 'upi-win32-x64-jit'; Dir = $OutJit }) })) {
 		$name = $build.Name
 		$dir = Join-Path $Stage $name
 		Copy-Item -Recurse $build.Dir $dir
-		Move-Item (Join-Path $dir 'pi.exe') (Join-Path $dir 'pi-bolt.exe')
+		Move-Item (Join-Path $dir 'pi.exe') (Join-Path $dir 'upi.exe')
 		Add-Notices $dir
-		Log "$name.zip (Pi $(& (Join-Path $dir 'pi-bolt.exe') --version))"
+		Log "$name.zip (Pi $(& (Join-Path $dir 'upi.exe') --version))"
 		New-Zip $dir (Join-Path $Dist "$name.zip")
 	}
 
 	$runtime = if ($env:PIBOLT_BUN) { $env:PIBOLT_BUN } else { Join-Path $Root '.work\runtime\bun.exe' }
-	$dir = Join-Path $Stage 'pi-bolt-runtime-win32-x64'
+	$dir = Join-Path $Stage 'upi-runtime-win32-x64'
 	New-Item -ItemType Directory -Force $dir | Out-Null
 	Copy-Item $runtime (Join-Path $dir 'bun.exe')
 	Add-Notices $dir
-	Log "pi-bolt-runtime-win32-x64.zip (Bun $(& $runtime --version))"
-	New-Zip $dir (Join-Path $Dist 'pi-bolt-runtime-win32-x64.zip')
+	Log "upi-runtime-win32-x64.zip (Bun $(& $runtime --version))"
+	New-Zip $dir (Join-Path $Dist 'upi-runtime-win32-x64.zip')
 } finally {
 	Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 }
@@ -137,7 +137,7 @@ if ($RuntimeOnly) { exit 0 }
 # sha256sum's format (two spaces, then the name), with LF line ends, after a first line that says which release it is (the
 # installers refuse checksums of another version: an older release, signed all the same, served as a newer one). The release's
 # SHA256SUMS is made over every platform's archives together, and signed on the owner's machine (docs/RELEASING.md).
-$lines = @("# pi-bolt $Version") + (Get-ChildItem $Dist -File | Where-Object { $_.Name -like '*.zip' -or $_.Name -eq 'extensions.txt' } | Sort-Object Name | ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant())  $($_.Name)" })
+$lines = @("# upi $Version") + (Get-ChildItem $Dist -File | Where-Object { $_.Name -like '*.zip' -or $_.Name -eq 'extensions.txt' } | Sort-Object Name | ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant())  $($_.Name)" })
 [IO.File]::WriteAllText((Join-Path $Dist 'SHA256SUMS'), (($lines -join "`n") + "`n"))
 Log "release $Version (Windows) in ${Dist}:"
 Get-ChildItem $Dist | ForEach-Object { '    {0,8:N1} MB  {1}' -f ($_.Length / 1MB), $_.Name }

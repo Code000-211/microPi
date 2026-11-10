@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Writes the compile kit: what `pi-bolt compile` needs, besides the runtime, to build the executable a release has with
+ * Writes the compile kit: what `upi compile` needs, besides the runtime, to build the executable a release has with
  * extensions compiled in, on a machine with no copy of this repository. scripts/build-pi.sh --kit runs it after a build.
  *
  * The kit is a folder:
@@ -252,7 +252,7 @@ mkdirSync(profileDir, { recursive: true });
 if (existsSync(profile)) cpSync(profile, profileDir, { recursive: true });
 cpSync(join(HERE, "..", "packages", "coding-agent", "src", "gen-plugin-manifest.mjs"), join(out, "gen-plugin-manifest.mjs"));
 
-// The compile command, with the profile's paths as @KIT@/profile/... (where `pi-bolt compile` unpacks the kit).
+// The compile command, with the profile's paths as @KIT@/profile/... (where `upi compile` unpacks the kit).
 const kitPath = (value) => value.split(profile).join("@KIT@/profile");
 const piVersion = JSON.parse(readFileSync(join(agent, "package.json"), "utf8")).version;
 const kit = {

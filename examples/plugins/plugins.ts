@@ -1,7 +1,7 @@
 /**
  * µPi plugin manifest: the extensions compiled into the executable.
  *
- * Build:  scripts/build-pi.sh --plugins examples/plugins/plugins.ts --out out/pi-bolt-plugins
+ * Build:  scripts/build-pi.sh --plugins examples/plugins/plugins.ts --out out/upi-plugins
  *
  * Each entry is an extension factory, `(pi: ExtensionAPI) => void | Promise<void>`, the default export of a Pi extension, or
  * `{ name, factory }` to give it a name in Pi's startup list and in errors. Everything this file imports is compiled ahead of

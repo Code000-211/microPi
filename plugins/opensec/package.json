@@ -1,5 +1,5 @@
 {
-	"name": "pi-bolt-opensec-plugins",
+	"name": "upi-opensec-plugins",
 	"private": true,
 	"description": "OpenSec's extensions compiled into µPi's release executables (scripts/package-release.ps1 builds with plugins.ts). The versions are extensions.txt's.",
 	"type": "module",

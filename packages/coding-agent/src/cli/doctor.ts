@@ -1,11 +1,11 @@
 /**
- * `pi-bolt doctor`: a report of this µPi and what it loads, in plain text to paste into an issue. It says which build this
+ * `upi doctor`: a report of this µPi and what it loads, in plain text to paste into an issue. It says which build this
  * is and how it was installed, whether its release's signature verifies, which extensions are compiled in, run at run time or
  * fail, how Pi's and µPi's package lists differ, the Herdr and editor (ACP) setup, and what is known to be wrong.
  *
  * It installs nothing and changes no setting. It loads the extensions that a start would load from their files (their factories
  * run, as at any start; no session starts), and it goes online for the release's signature and the latest version unless asked
- * not to. Those `pi-bolt compile` compiled in are listed, not loaded: doctor starts without them (core/extensions/compiled.ts,
+ * not to. Those `upi compile` compiled in are listed, not loaded: doctor starts without them (core/extensions/compiled.ts,
  * startsWithoutCompiledExtensions), so that it reports whatever one of them does as it loads.
  * Nothing secret is printed: settings' values are not, environment variables only from a list of µPi's own, credentials in
  * URLs and anything shaped like a key are masked, and the home folder is shown as ~.
@@ -33,15 +33,15 @@ import { isHerdrPiIntegration } from "../extensions/herdr/integration-file.ts";
 import { herdrFromEnvironment } from "../extensions/herdr/transport.ts";
 import {
 	MICROPI_RELEASE_KEY,
+	MICROPI_RELEASES_URL,
 	PIBOLT,
-	PIBOLT_RELEASES_URL,
 	type PiBoltPackageManagerId,
 	piBoltInstallDir,
 	piBoltInstallMethod,
 	piBoltJitSwitchCommand,
 	piBoltPackageManager,
 	piBoltUpdateCommand,
-} from "../pi-bolt.ts";
+} from "../upi.ts";
 import { findExecutableOnPath, spawnProcessSync } from "../utils/child-process.ts";
 import { getLatestPiRelease, isNewerPackageVersion } from "../utils/version-check.ts";
 
@@ -63,7 +63,7 @@ export interface DoctorOptions {
 	extensionFactories: readonly InlineExtension[];
 }
 
-const USAGE = "pi-bolt doctor [--offline]";
+const USAGE = "upi doctor [--offline]";
 /** An extension loaded at run time that takes this much CPU to load does heavy JavaScript work: the JIT build runs it faster. */
 const HEAVY_EXTENSION_CPU_MS = 250;
 const EXTENSION_LOAD_TIMEOUT_MS = 15_000;
@@ -131,11 +131,11 @@ function selfInfo(): SelfInfo {
 }
 
 /**
- * Whether the installer put this installation where it is: its own folder (~/.pi-bolt, or PIBOLT_INSTALL), or a `pi-bolt`
+ * Whether the installer put this installation where it is: its own folder (~/.micropi, or MICROPI_INSTALL), or a `upi`
  * on PATH that leads to it. Anything else is an archive unpacked by hand.
  */
 function installedByInstaller(installDir: string, folder: string): boolean {
-	const defaults = [join(homedir(), ".pi-bolt"), process.env.PIBOLT_INSTALL].filter((dir): dir is string => !!dir);
+	const defaults = [join(homedir(), ".micropi"), process.env.MICROPI_INSTALL].filter((dir): dir is string => !!dir);
 	if (defaults.some((dir) => realpathOr(dir) === realpathOr(installDir))) return true;
 	return piBoltOnPath().some((entry) => dirname(entry.real) === folder);
 }
@@ -176,7 +176,7 @@ function buildSection(self: SelfInfo, report: DoctorReport): DoctorSection {
 		"engine",
 		`Bun ${process.versions.bun ?? "-"}${revision ? ` (${revision.slice(0, 12)})` : ""}, runtime stamp ${build?.runtimeStamp ?? "not recorded"}`,
 	]);
-	// `BUN_STATIC_HEAP_VERBOSE=1 pi-bolt --version` (docs/TROUBLESHOOTING.md): the executable says whether its compiled code
+	// `BUN_STATIC_HEAP_VERBOSE=1 upi --version` (docs/TROUBLESHOOTING.md): the executable says whether its compiled code
 	// is used.
 	const check = run(self.command, ["--version"], { ...process.env, BUN_STATIC_HEAP_VERBOSE: "1" });
 	const notUsed = /ahead-of-time compiled code is not used \(([^)]*)\)/.exec(check.output);
@@ -202,9 +202,9 @@ interface PathEntry {
 	real: string;
 }
 
-/** Every `pi-bolt` on PATH, in PATH's order, with where each leads. */
+/** Every `upi` on PATH, in PATH's order, with where each leads. */
 function piBoltOnPath(env: NodeJS.ProcessEnv = process.env): PathEntry[] {
-	const names = process.platform === "win32" ? ["pi-bolt.exe", "pi-bolt.cmd", "pi-bolt.ps1", "pi-bolt"] : ["pi-bolt"];
+	const names = process.platform === "win32" ? ["upi.exe", "upi.cmd", "upi.ps1", "upi"] : ["upi"];
 	const seen = new Set<string>();
 	const entries: PathEntry[] = [];
 	for (const dir of (env.PATH ?? env.Path ?? "").split(delimiter)) {
@@ -226,29 +226,29 @@ function piBoltOnPath(env: NodeJS.ProcessEnv = process.env): PathEntry[] {
 }
 
 /**
- * What a shim npm made on Windows starts: pi-bolt.cmd, pi-bolt.ps1 and pi-bolt (for Git Bash) in npm's global folder are
- * scripts that run node_modules\pi-bolt\bin\pi-bolt.exe beside them, which no link leads to.
+ * What a shim npm made on Windows starts: upi.cmd, upi.ps1 and upi (for Git Bash) in npm's global folder are
+ * scripts that run node_modules\upi\bin\upi.exe beside them, which no link leads to.
  */
 function npmShimTarget(path: string): string | undefined {
 	if (process.platform !== "win32" || /\.exe$/i.test(path)) return undefined;
-	const target = join(dirname(path), "node_modules", "pi-bolt", "bin", "pi-bolt.exe");
+	const target = join(dirname(path), "node_modules", "upi", "bin", "upi.exe");
 	return existsSync(target) ? realpathOr(target) : undefined;
 }
 
-/** The npm package's launcher (npm/bin/pi-bolt): it starts the executable of its version from ~/.pi-bolt/npm. */
+/** The npm package's launcher (npm/bin/upi): it starts the executable of its version from ~/.micropi/npm. */
 function isNpmLauncher(real: string): boolean {
-	return /[\\/]node_modules[\\/]pi-bolt[\\/]bin[\\/]pi-bolt(\.exe)?$/i.test(real);
+	return /[\\/]node_modules[\\/]upi[\\/]bin[\\/]upi(\.exe)?$/i.test(real);
 }
 
 export interface PathAnalysis {
-	/** The `pi-bolt` a shell runs, if any. */
+	/** The `upi` a shell runs, if any. */
 	first: PathEntry | undefined;
 	firstIsThis: boolean;
-	/** Other `pi-bolt`s on PATH after the first. */
+	/** Other `upi`s on PATH after the first. */
 	others: PathEntry[];
 }
 
-/** Which `pi-bolt` on PATH a shell runs, and whether that is this one (`folder` is this executable's). */
+/** Which `upi` on PATH a shell runs, and whether that is this one (`folder` is this executable's). */
 export function analyzePiBoltOnPath(
 	entries: readonly PathEntry[],
 	folder: string,
@@ -260,13 +260,13 @@ export function analyzePiBoltOnPath(
 	return { first, firstIsThis: first !== undefined && isThis(first), others };
 }
 
-/** What a `pi-bolt` that is not this one is: its --version, or the version an npm launcher starts (without starting it). */
+/** What a `upi` that is not this one is: its --version, or the version an npm launcher starts (without starting it). */
 function versionOf(entry: PathEntry): string {
 	if (isNpmLauncher(entry.real)) {
 		try {
 			if (statSync(entry.real).size > 64 * 1024) throw new Error("not the launcher script");
 			const version = /^VERSION=(\S+)$/m.exec(readFileSync(entry.real, "utf8"))?.[1];
-			if (version) return `the npm package's launcher of Pi-Bolt ${version}`;
+			if (version) return `the npm package's launcher of µPi ${version}`;
 		} catch {
 			// (A binary launcher, on Windows: it is run below.)
 		}
@@ -283,13 +283,13 @@ function otherVariants(installDir: string, folder: string): string[] {
 		return [];
 	}
 	return names
-		.filter((name) => /^pi-bolt-(linux|darwin|win32)-[a-z0-9-]+$/.test(name) && join(installDir, name) !== folder)
+		.filter((name) => /^upi-(linux|darwin|win32)-[a-z0-9-]+$/.test(name) && join(installDir, name) !== folder)
 		.map((name) => {
 			let about = "";
 			try {
-				about = firstLine(readFileSync(join(installDir, name, "pi-bolt.txt"), "utf8"));
+				about = firstLine(readFileSync(join(installDir, name, "upi.txt"), "utf8"));
 			} catch {
-				// (No pi-bolt.txt: an old or partial folder.)
+				// (No upi.txt: an old or partial folder.)
 			}
 			return `${name}${about ? `: ${about}` : ""}`;
 		});
@@ -302,7 +302,7 @@ interface SignatureResult {
 
 /** The names a release's archive of this build has (one of them is in SHA256SUMS). */
 function archiveNames(): string[] {
-	const name = `pi-bolt-${process.platform}-${PIBOLT?.variant ?? "x64"}`;
+	const name = `upi-${process.platform}-${PIBOLT?.variant ?? "x64"}`;
 	return process.platform === "win32" ? [`${name}.zip`] : [`${name}.tar.xz`, `${name}.tar.gz`];
 }
 
@@ -325,7 +325,7 @@ export function verifyReleaseSums(
 	}
 	if (!valid) return { status: "bad", detail: "the signature of SHA256SUMS does not verify" };
 	const text = sums.toString("utf8");
-	if (firstLine(text) !== `# pi-bolt ${version}`) {
+	if (firstLine(text) !== `# upi ${version}`) {
 		return { status: "bad", detail: `the signed SHA256SUMS is not release ${version}'s` };
 	}
 	const files = new Set(text.split(/\r?\n/).map((line) => line.split(/\s+[ *]?/)[1]));
@@ -342,7 +342,7 @@ async function fetchBytes(url: string): Promise<{ status: number; body?: Buffer 
 
 async function checkReleaseSignature(): Promise<SignatureResult | undefined> {
 	if (!PIBOLT) return undefined;
-	const base = `${PIBOLT_RELEASES_URL}/download/bolt-v${PIBOLT.version}`;
+	const base = `${MICROPI_RELEASES_URL}/download/bolt-v${PIBOLT.version}`;
 	try {
 		const [sums, signature] = await Promise.all([
 			fetchBytes(`${base}/SHA256SUMS`),
@@ -377,7 +377,7 @@ async function installSection(
 	const how = (method: SelfInfo["method"]): string => {
 		switch (method) {
 			case "npm":
-				return "npm (the pi-bolt package)";
+				return "npm (the upi package)";
 			case "installer":
 				return "the installer";
 			case "manual":
@@ -399,15 +399,13 @@ async function installSection(
 	const onPath = piBoltOnPath();
 	const path = analyzePiBoltOnPath(onPath, self.folder, self.method);
 	if (!path.first) {
-		rows.push(["pi-bolt on PATH", "none"]);
+		rows.push(["upi on PATH", "none"]);
 		if (self.method !== "not installed") {
-			report.problems.push(
-				"There is no `pi-bolt` on PATH (see docs/TROUBLESHOOTING.md, pi-bolt: command not found).",
-			);
+			report.problems.push("There is no `upi` on PATH (see docs/TROUBLESHOOTING.md, upi: command not found).");
 		}
 	} else {
 		rows.push([
-			"pi-bolt on PATH",
+			"upi on PATH",
 			onPath
 				.map((entry) => `${entry.path}${entry.real !== entry.path ? ` -> ${entry.real}` : ""}`)
 				.map((line, index) =>
@@ -419,7 +417,7 @@ async function installSection(
 		]);
 		if (!path.firstIsThis && self.method !== "not installed") {
 			report.problems.push(
-				`\`pi-bolt\` on PATH is ${path.first.path} (${versionOf(path.first)}), not this µPi (${self.executable}). Remove it or put this one's folder earlier on PATH.`,
+				`\`upi\` on PATH is ${path.first.path} (${versionOf(path.first)}), not this µPi (${self.executable}). Remove it or put this one's folder earlier on PATH.`,
 			);
 		}
 	}
@@ -432,7 +430,7 @@ async function installSection(
 		rows.push(["release", `bolt-v${PIBOLT.version}: ${result.detail}`]);
 		if (result.status === "bad") {
 			report.problems.push(
-				`Release bolt-v${PIBOLT.version}: ${result.detail}. Reinstall from ${PIBOLT_RELEASES_URL} and report it.`,
+				`Release bolt-v${PIBOLT.version}: ${result.detail}. Reinstall from ${MICROPI_RELEASES_URL} and report it.`,
 			);
 		}
 	}
@@ -450,10 +448,10 @@ async function installSection(
 
 /** The variables that change what µPi does, whose values say nothing private. */
 const REPORTED_VARIABLES = [
-	"PIBOLT_VARIANT",
-	"PIBOLT_HOME",
-	"PIBOLT_INSTALL",
-	"PIBOLT_NPM",
+	"MICROPI_VARIANT",
+	"MICROPI_HOME",
+	"MICROPI_INSTALL",
+	"MICROPI_NPM",
 	"BUN_AOT",
 	"PI_CODING_AGENT_DIR",
 	"PI_OFFLINE",
@@ -792,7 +790,7 @@ async function extensionSections(
 		entriesOfPackage.set(root, (entriesOfPackage.get(root) ?? 0) + 1);
 	}
 
-	// (Those `pi-bolt compile` compiled in, by their entry's real path: listed while unchanged, not loaded.)
+	// (Those `upi compile` compiled in, by their entry's real path: listed while unchanged, not loaded.)
 	const compiledIn = PIBOLT ? compiledExtensionList() : [];
 	const compiledAt = (path: string) => {
 		if (compiledIn.length === 0) return undefined;
@@ -838,7 +836,7 @@ async function extensionSections(
 			const changed = compiled !== undefined && extensionFingerprint(compiled) !== compiled.fingerprint;
 			if (compiled && !changed) {
 				entry.state = "compiled";
-				entry.detail = "by pi-bolt compile (doctor does not load it)";
+				entry.detail = "by upi compile (doctor does not load it)";
 				continue;
 			}
 			const scanRoot =
@@ -989,7 +987,7 @@ export interface AgentServer {
 	args: string[];
 }
 
-/** The agent servers of an editor's settings that run µPi (`pi-bolt`, or `pi ... --acp`). */
+/** The agent servers of an editor's settings that run µPi (`upi`, or `pi ... --acp`). */
 export function piBoltAgentServers(settings: unknown): AgentServer[] {
 	const servers = (settings as { agent_servers?: unknown } | undefined)?.agent_servers;
 	if (typeof servers !== "object" || servers === null) return [];
@@ -1001,7 +999,7 @@ export function piBoltAgentServers(settings: unknown): AgentServer[] {
 			? server.args.filter((arg): arg is string => typeof arg === "string")
 			: [];
 		const program = basename(server.command.replace(/\\/g, "/"));
-		if (/pi-bolt/i.test(program) || (/^pi(\.exe)?$/i.test(program) && args.includes("--acp"))) {
+		if (/upi/i.test(program) || (/^pi(\.exe)?$/i.test(program) && args.includes("--acp"))) {
 			found.push({ name, command: server.command, args });
 		}
 	}
@@ -1009,7 +1007,7 @@ export function piBoltAgentServers(settings: unknown): AgentServer[] {
 }
 
 function acpSection(self: SelfInfo, report: DoctorReport): DoctorSection {
-	const rows: DoctorSection["rows"] = [["--acp", "built in (`pi-bolt --acp`, docs/ACP.md)"]];
+	const rows: DoctorSection["rows"] = [["--acp", "built in (`upi --acp`, docs/ACP.md)"]];
 	const home = homedir();
 	const editors = [
 		{
@@ -1034,13 +1032,13 @@ function acpSection(self: SelfInfo, report: DoctorReport): DoctorSection {
 			if (!program || !existsSync(program)) {
 				state = isAbsolute(server.command) ? "does not exist" : "not on PATH";
 				report.problems.push(
-					`${editor.name}'s agent server "${server.name}" runs ${server.command}, which ${state}: give it the full path of pi-bolt.`,
+					`${editor.name}'s agent server "${server.name}" runs ${server.command}, which ${state}: give it the full path of upi.`,
 				);
 			} else {
 				state = dirname(realpathOr(program)) === self.folder ? "this µPi" : `another µPi: ${realpathOr(program)}`;
 			}
 			if (!server.args.includes("--acp")) {
-				report.problems.push(`${editor.name}'s agent server "${server.name}" runs pi-bolt without --acp.`);
+				report.problems.push(`${editor.name}'s agent server "${server.name}" runs upi without --acp.`);
 			}
 			rows.push([editor.name, `"${server.name}": ${[server.command, ...server.args].join(" ")} (${state})`]);
 		}

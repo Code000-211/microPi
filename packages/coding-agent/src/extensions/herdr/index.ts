@@ -1,6 +1,6 @@
 /**
  * Herdr (https://herdr.dev) support for µPi: in a Herdr pane, report the agent's state (idle, working, blocked) and the
- * command that reopens its session, so Herdr shows `pi-bolt` in its sidebar, notifies when it finishes or needs the user, and
+ * command that reopens its session, so Herdr shows `upi` in its sidebar, notifies when it finishes or needs the user, and
  * brings the same session back in the same pane after a Herdr server restart.
  *
  * Herdr's own Pi integration (`herdr integration install pi`, ~/.pi/agent/extensions/herdr-agent-state.ts) reports as `pi` and
@@ -19,8 +19,8 @@ import { COMMAND_NAME } from "../../config.ts";
 import type { ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
 import { type HerdrRequest, type HerdrTransport, herdrFromEnvironment } from "./transport.ts";
 
-const SOURCE = "pi-bolt";
-const AGENT = "pi-bolt";
+const SOURCE = "upi";
+const AGENT = "upi";
 
 type AgentState = "working" | "blocked" | "idle";
 
@@ -47,7 +47,7 @@ async function send(transport: HerdrTransport, request: () => HerdrRequest | und
 }
 
 /**
- * The command Herdr runs to reopen this session after a server restart: `pi-bolt --session <file>`. Herdr refuses a
+ * The command Herdr runs to reopen this session after a server restart: `upi --session <file>`. Herdr refuses a
  * report whose command has an apostrophe or a control character in it or is over 8 KiB, so such a session gets no command
  * (its state still reaches Herdr).
  */

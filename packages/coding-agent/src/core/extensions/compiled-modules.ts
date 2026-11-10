@@ -66,7 +66,7 @@ export function provideModulesToFiles(names: readonly string[], load: () => Prom
 		loader: "object",
 	});
 	bun.plugin({
-		name: "pi-bolt: Pi's modules",
+		name: "upi: Pi's modules",
 		setup(build) {
 			for (const name of names) {
 				build.module(name, () =>

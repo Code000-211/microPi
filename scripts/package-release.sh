@@ -18,7 +18,8 @@
 #   upi-darwin-arm64-jit.tar.gz    on macOS: JIT on
 #   upi-runtime-darwin-arm64.tar.gz
 #   upi-kit-<platform>.tar.gz      the compile kit of this platform's builds, for `upi compile` (scripts/make-kit.mjs)
-# The Pi archives also come as .tar.xz, about 40% smaller, which install.sh prefers where xz is installed.
+# The Pi archives also come as .tar.xz, about 40% smaller, which install.sh prefers where xz is installed. The release also
+# holds RUNTIME_STAMP, install.sh and install.ps1 (scripts/release-files.txt), all together in one SHA256SUMS.
 source "$(dirname "$0")/lib/common.sh"
 
 PI_DIR="$PIBOLT_PI"; BUILD=1; RUNTIME_ONLY=""
@@ -102,9 +103,14 @@ log "upi-runtime-$PIBOLT_PLATFORM.tar.gz (Bun $("$runtime" --version))"
 "${TAR[@]}" -C "$STAGE" -czf "$DIST/upi-runtime-$PIBOLT_PLATFORM.tar.gz" "upi-runtime-$PIBOLT_PLATFORM"
 [ -z "$RUNTIME_ONLY" ] || exit 0
 
-# The extensions the installers offer, pinned; and checksums whose first line says which release they are (install.ps1 refuses
-# another version's: an older release, signed all the same, served as a newer one).
-cp "$PIBOLT_ROOT/extensions.txt" "$DIST/extensions.txt"
-(cd "$DIST" && { echo "# upi $VERSION"; sha256 -- *.tar.gz *.tar.xz extensions.txt; } >SHA256SUMS)
+# The installers of this checkout (the release runs the same one `upi update` runs, checked against the signed SHA256SUMS), the
+# runtime's stamp (so a later release reuses its runtimes only if the engine is the same), and checksums whose first line says
+# which release they are (install.ps1 refuses another version's: an older release, signed all the same, served as a newer one).
+cp "$PIBOLT_ROOT/install.sh" "$PIBOLT_ROOT/install.ps1" "$DIST/"
+stamp="${PIBOLT_RUNTIME_STAMP:-}"
+[ -n "$stamp" ] || stamp="$(cat "$(dirname "$(runtime_bun)")/RUNTIME_STAMP" 2>/dev/null || true)"
+[ -n "$stamp" ] || stamp="$("$PIBOLT_ROOT/scripts/runtime-stamp.sh")"
+printf '%s\n' "$stamp" >"$DIST/RUNTIME_STAMP"
+(cd "$DIST" && { echo "# upi $VERSION"; sha256 -- *.tar.gz *.tar.xz install.sh install.ps1 RUNTIME_STAMP; } >SHA256SUMS)
 log "release $VERSION in $DIST:"
 (cd "$DIST" && ls -lh -- * | awk '{print "    " $5 "  " $9}')

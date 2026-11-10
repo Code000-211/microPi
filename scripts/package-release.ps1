@@ -6,7 +6,7 @@
 #   -NoBuild    package the builds already in out\upi and out\upi-jit instead of building them
 #   -RuntimeOnly  only the runtime's archive (.github/workflows/runtime.yml), no Pi and no SHA256SUMS
 #   -WithOpenSec  compile in OpenSec's extensions (plugins\opensec; `-builtin:<name>` in the extensions setting turns one off).
-#               Releases are built without: the installers offer them, and compiled in they cost every `-p` +66 ms
+#               Releases are built without: compiled in they cost every `-p` +66 ms
 #               (bench/results/2026-10-10-opensec-compiled). With it, retrain the profile with them first
 #               (scripts\train-heap.ps1 -Plugins plugins\opensec\plugins.ts).
 # Archives (the names stay the same from release to release, so that releases/latest/download/<name> always works):
@@ -131,13 +131,19 @@ try {
 }
 if ($RuntimeOnly) { exit 0 }
 
-# The extensions the installers offer, pinned (extensions.txt), with LF line ends as everywhere else.
-[IO.File]::WriteAllText((Join-Path $Dist 'extensions.txt'), ((Get-Content (Join-Path $Root 'extensions.txt')) -join "`n") + "`n")
+# The installers of this checkout (the release runs the same one `upi update` runs, checked against the signed SHA256SUMS),
+# and the runtime's stamp (a later release reuses its runtimes only if the engine is the same), with LF line ends as everywhere else.
+Copy-Item (Join-Path $Root 'install.sh') $Dist
+Copy-Item (Join-Path $Root 'install.ps1') $Dist
+$stamp = $env:PIBOLT_RUNTIME_STAMP
+if (-not $stamp) { $stamp = Get-Content -LiteralPath (Join-Path (Split-Path $runtime) 'RUNTIME_STAMP') -ErrorAction SilentlyContinue | Select-Object -First 1 }
+if (-not $stamp) { Die "the runtime's stamp is unknown: set PIBOLT_RUNTIME_STAMP (the release workflow's; scripts\runtime-stamp.sh computes it)" }
+[IO.File]::WriteAllText((Join-Path $Dist 'RUNTIME_STAMP'), "$stamp`n")
 
 # sha256sum's format (two spaces, then the name), with LF line ends, after a first line that says which release it is (the
 # installers refuse checksums of another version: an older release, signed all the same, served as a newer one). The release's
 # SHA256SUMS is made over every platform's archives together, and signed on the owner's machine (docs/RELEASING.md).
-$lines = @("# upi $Version") + (Get-ChildItem $Dist -File | Where-Object { $_.Name -like '*.zip' -or $_.Name -eq 'extensions.txt' } | Sort-Object Name | ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant())  $($_.Name)" })
+$lines = @("# upi $Version") + (Get-ChildItem $Dist -File | Where-Object { $_.Name -like '*.zip' -or $_.Name -in 'RUNTIME_STAMP', 'install.sh', 'install.ps1' } | Sort-Object Name | ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant())  $($_.Name)" })
 [IO.File]::WriteAllText((Join-Path $Dist 'SHA256SUMS'), (($lines -join "`n") + "`n"))
 Log "release $Version (Windows) in ${Dist}:"
 Get-ChildItem $Dist | ForEach-Object { '    {0,8:N1} MB  {1}' -f ($_.Length / 1MB), $_.Name }

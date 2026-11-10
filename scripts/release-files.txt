@@ -1,7 +1,6 @@
 # The files a release holds besides SHA256SUMS and SHA256SUMS.sig, each listed in SHA256SUMS (scripts/check-release-files.sh):
 # exactly these. A new platform or variant is added here.
 RUNTIME_STAMP
-extensions.txt
 install.ps1
 install.sh
 upi-darwin-arm64-jit.tar.gz

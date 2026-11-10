@@ -44,7 +44,7 @@ jobs:
               echo "\`$latest\` merges into \`upi\` without conflicts."
             fi
             echo
-            echo "To follow it: merge the tag, \`scripts/bump-version.sh --pi ${latest#v}\`, \`scripts/train-profile.sh\` on Linux, the tests, then tag \`bolt-v<version>\` (docs/RELEASING.md)."
+            echo "To follow it: merge the tag, \`scripts/bump-version.sh --pi ${latest#v}\`, \`scripts/train-profile.sh\` on Linux, the tests, then tag \`upi-v<version>\` (docs/RELEASING.md)."
           } > issue.md
           gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file issue.md
         env:

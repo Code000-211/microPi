@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads the released µPi runtime (instead of building it with build-runtime.sh) to $PIBOLT_WORK/runtime/bun.
 #
-# Usage: scripts/fetch-runtime.sh [--version bolt-vX.Y.Z]     (default: the latest release)
+# Usage: scripts/fetch-runtime.sh [--version upi-vX.Y.Z]     (default: the latest release)
 # Environment: MICROPI_DOWNLOAD_BASE (a mirror of the release files)
 # The checksums must carry the release key's signature (keys/release.pub), checked with OpenSSL 3 or else with Bun.
 source "$(dirname "$0")/lib/common.sh"

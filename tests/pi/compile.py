@@ -10,8 +10,10 @@ lists without building; --exclude takes a file too and adds to compile.json's, a
 tsconfig.json beside an extension does not give it second copies of Pi's modules. An extension with a static import that does
 not resolve, one that fails compiled in only, or one with a function too big for the compiler is left out of the build with a
 line naming it as --exclude does, and loads from its files; one whose top-level code throws at a start fails alone, with Pi's
-error, and doctor, `compile --status` and `update --rollback` still work.
-It says what it does as it goes, lists a project's extensions as not compiled in, removes the work folder of a compile that
+error, and doctor, `compile --status` and `update --rollback` still work. The kit carries the release's built-in plugins
+(build-pi.sh --builtins: docsearch): upi.txt and `compile --status` name them after the compile, and project_search is
+offered and works in the build under test and in the one compiled in (the checks of tests/pi/docsearch.py). It says what it
+does as it goes, lists a project's extensions as not compiled in, removes the work folder of a compile that
 was killed and an old compile.log, and an extension that writes into its own folder is not "changed" by that. Uses the bench
 fake model.
   python3 tests/pi/compile.py PI KIT RUNTIME     (KIT: upi-kit-<platform>.tar.gz or its folder; RUNTIME: the runtime's bun)
@@ -28,7 +30,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "bench"))
+sys.path.insert(0, str(ROOT / "tests" / "pi"))
 import harness  # noqa: E402
+import docsearch  # noqa: E402
 
 pi, kit, runtime = (str(Path(arg).resolve()) for arg in sys.argv[1:4])
 failures = 0
@@ -136,6 +140,25 @@ export default async function () {
 
 version = subprocess.run([pi, "--version"], capture_output=True, text=True, check=True).stdout
 platform, variant = re.search(r"µPi [^,]+, (\w+)-(\S+), JIT", version).groups()
+
+# The kit carries the release's built-in plugins (build-pi.sh --builtins): `upi compile` adds them to the build it makes
+# besides the extensions, so a build with extensions still has them.
+def kit_builtins():
+    """The kit's builtins, from kit.json — in the kit folder, or in a copy of the kit archive."""
+    if kit.endswith(".tar.gz"):
+        with tempfile.TemporaryDirectory(prefix="pibolt-compile-kit-") as unpacked:
+            subprocess.run(["tar", "-xzf", kit, "-C", unpacked], check=True)
+            match = next(Path(unpacked).rglob("kit.json"), None)
+            return json.loads(match.read_text()).get("builtins", []) if match else []
+    return json.loads((Path(kit) / "kit.json").read_text()).get("builtins", [])
+
+
+builtins = kit_builtins()
+checks = len(builtins) == 1 and "docsearch (project_search)" in builtins[0].get("names", []) \
+    and ".pibolt-plugins/builtins" in builtins[0].get("manifest", "")
+check("the kit carries the release's built-in plugins (docsearch)", checks, str(builtins))
+BUILTIN = "built-in: docsearch (project_search)"
+
 with tempfile.TemporaryDirectory(prefix="pibolt-compile-") as tmp:
     tmp = Path(tmp)
     install = tmp / "install"
@@ -246,6 +269,7 @@ with tempfile.TemporaryDirectory(prefix="pibolt-compile-") as tmp:
         check("the build it replaced is kept as .previous", (install / f"{build.name}.previous" / "pi").exists())
         about = (build / "upi.txt").read_text()
         check("upi.txt says what is compiled in", "Extensions compiled in" in about and "file-ext" in about, about)
+        check("upi.txt names the built-in the kit carried", BUILTIN in about, about)
         out = subprocess.run([str(build / "pi"), "--version"], capture_output=True, text=True).stdout
         check("--version is the same version", out == version, f"{out!r} vs {version!r}")
 
@@ -292,6 +316,8 @@ with tempfile.TemporaryDirectory(prefix="pibolt-compile-") as tmp:
 
         status = subprocess.run([str(build / "pi"), "compile", "--status"], env=env, capture_output=True, text=True)
         check("--status says what is compiled in", "file-ext" in status.stdout, status.stdout + status.stderr)
+        check("--status says the built-in, with the extensions", BUILTIN in status.stdout
+              and status.stdout.index(BUILTIN) < status.stdout.index("file-ext"), status.stdout + status.stderr)
 
         def pi_bolt(*args):
             return subprocess.run([str(build / "pi"), *args], env=env, capture_output=True, text=True,
@@ -440,6 +466,11 @@ with tempfile.TemporaryDirectory(prefix="pibolt-compile-") as tmp:
               and "old-names-ext (global): excluded (--exclude)" in r.stderr, r.stderr[-800:])
         r = compile_("--include", "optional-ext", "--list")
         check("--include compiles one of them in again", "optional-ext (global): compiling" in r.stderr, r.stderr[-800:])
+
+        # The built-in docsearch (the checks of tests/pi/docsearch.py): in the build under test, and in the one compiled
+        # in (the kit's builtins kept it over the extensions compiled in).
+        docsearch.run_checks(pi, "the build under test: ", check)
+        docsearch.run_checks(str(build / "pi"), "compiled in by `upi compile`: ", check)
 
 print("compile:", "all passed" if failures == 0 else f"{failures} failed")
 sys.exit(1 if failures else 0)

@@ -1,15 +1,15 @@
 #!/bin/sh
 # µPi installer.
 #
-#   curl -fsSL https://upi.opensec.in/install.sh | sh
+#   curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | sh
 #
 # Downloads a release, verifies its SHA-256 checksum, installs it to ~/.micropi and links `upi` into ~/.local/bin. Run
 # it again to reinstall, update or uninstall. In Termux (Android) it also installs Termux's glibc, which runs µPi, and links
-# `upi` into $PREFIX/bin. The executable comes from the npm registry (a CDN, fast in most places) and
-# falls back to GitHub; the checksums always come from the GitHub release, so a download from npm is checked against them.
+# `upi` into $PREFIX/bin. The executable comes from GitHub (or, with MICROPI_SOURCE=npm, from the npm registry when one
+# exists there); the checksums always come from the GitHub release, so a download from npm is checked against them.
 #
 # Environment:
-#   MICROPI_VERSION   a release tag such as bolt-v0.2.0 (default: the latest release)
+#   MICROPI_VERSION   a release tag such as upi-v0.2.0 (default: the latest release)
 #   MICROPI_CHANNEL   stable (the latest release; the default) or beta (the newest release, pre-releases included), for this
 #                    installation and its updates (`upi update --channel` changes it)
 #   MICROPI_VARIANT   on Linux x86-64, x64, x64-baseline or x64-jit (default: x64 on CPUs with AVX2, x64-baseline otherwise);
@@ -20,7 +20,8 @@
 #   MICROPI_YES=1     do not ask: take the default action and do not offer to start µPi
 #   MICROPI_LAUNCHER=1  used by the npm package's first run: download only, no menu, link or prompts
 #   MICROPI_CONNECTIONS  connections to download over at once (default: 4; 1 for a single connection)
-#   MICROPI_SOURCE    where to download the executable from: auto (npm, then GitHub; the default), npm or github
+#   MICROPI_SOURCE    where to download the executable from: github (the default) or npm. There are no µPi packages on npm; npm
+#                    is only for a mirror that serves one
 #   MICROPI_NPM_REGISTRY  the npm registry or mirror to use (default: https://registry.npmjs.org)
 #   MICROPI_UNVERIFIED  the SHA-256 of a release's SHA256SUMS (the installer shows it), to install that download without a
 #                    check of its signature: where nothing here can check it (no OpenSSL 3, OpenSSH 8.1 or µPi installed
@@ -29,10 +30,6 @@
 #                    checksum is still checked, and a signature that does not verify always stops the install.
 #   MICROPI_DOWNLOAD_BASE  a mirror of a release to download everything from (its signatures too); needs MICROPI_VERSION when
 #                    which release is the latest cannot be found out
-#   MICROPI_EXTENSIONS  yes or no: whether to install OpenSec's optional extensions (opensec-pi-subagents, opensec-pi-todo, opensec-pi-fff)
-#                    without asking. Without it the installer asks when it can; a run that cannot ask, or MICROPI_YES=1,
-#                    installs none. They are installed at the versions the release pins (its extensions.txt, covered by the
-#                    signed checksums), and only if the registry's tarball has the pinned integrity.
 
 # The public key that releases are signed with (keys/release.pub in the repository; scripts/sign-release.sh), from 0.6.0. A
 # release from before has no signature: it is installed only with MICROPI_UNVERIFIED.
@@ -61,8 +58,8 @@ main() {
 	[ "$LAUNCHER" != 1 ] || unset MICROPI_UNVERIFIED
 	case "$VERSION" in
 	latest) ;;
-	bolt-v[0-9]*.[0-9]*.[0-9]*) case "${VERSION#bolt-v}" in *[!0-9.]*) fail "MICROPI_VERSION must be a release tag such as bolt-v1.0.3" ;; esac ;;
-	*) fail "MICROPI_VERSION must be a release tag such as bolt-v1.0.3" ;;
+	upi-v[0-9]*.[0-9]*.[0-9]*) case "${VERSION#upi-v}" in *[!0-9.]*) fail "MICROPI_VERSION must be a release tag such as upi-v1.0.3" ;; esac ;;
+	*) fail "MICROPI_VERSION must be a release tag such as upi-v1.0.3" ;;
 	esac
 	case "${MICROPI_CHANNEL:-}" in
 	"" | stable) ;;
@@ -70,7 +67,7 @@ main() {
 		# (The newest release is looked up once, and everything is downloaded from that tag.)
 		if [ "$VERSION" = latest ] && [ -z "${MICROPI_DOWNLOAD_BASE:-}" ]; then
 			tag=$(newest_release) && [ -n "$tag" ] || fail "could not find the newest release ($API/releases): try again, or set MICROPI_VERSION"
-			VERSION="bolt-v$tag"
+			VERSION="upi-v$tag"
 		fi
 		;;
 	*) fail "MICROPI_CHANNEL must be stable or beta" ;;
@@ -88,7 +85,7 @@ main() {
 	if [ "$LAUNCHER" = 1 ]; then
 		printf '%s  µPi%s\n%s  First run: getting the native executable%s\n\n' "$bold" "$reset" "$dim" "$reset"
 	else
-		printf '%s  µPi Installer%s\n%s  Pi, compiled ahead of time. Native speed, no JIT.%s\n\n' "$bold" "$reset" "$dim" "$reset"
+		printf '%s  µPi Installer%s\n%s  Native speed, no JIT.%s\n\n' "$bold" "$reset" "$dim" "$reset"
 	fi
 	cat "$check_file"
 	rm -f "$check_file"
@@ -102,7 +99,7 @@ main() {
 	if [ -n "${MICROPI_DOWNLOAD_BASE:-}" ]; then
 		case "$SHOWN_VERSION" in
 		[0-9]*.[0-9]*.[0-9]*) ;;
-		*) fail "which release is the latest could not be found out ($REPO/releases/latest), and a mirror (MICROPI_DOWNLOAD_BASE) is taken for the release asked for only: set MICROPI_VERSION to the release it serves, such as bolt-v1.0.3" ;;
+		*) fail "which release is the latest could not be found out ($REPO/releases/latest), and a mirror (MICROPI_DOWNLOAD_BASE) is taken for the release asked for only: set MICROPI_VERSION to the release it serves, such as upi-v1.0.3" ;;
 		esac
 	fi
 
@@ -119,9 +116,9 @@ main() {
 	*) if is_arm64; then fail "MICROPI_VARIANT must be arm64 or arm64-jit on ARM64"; else fail "MICROPI_VARIANT must be x64, x64-baseline or x64-jit"; fi ;;
 	esac
 	[ -z "$TERMUX" ] || setup_termux
-	case "${MICROPI_SOURCE:-auto}" in
-	auto | npm | github) ;;
-	*) fail "MICROPI_SOURCE must be auto, npm or github" ;;
+	case "${MICROPI_SOURCE:-github}" in
+	github | npm) ;;
+	*) fail "MICROPI_SOURCE must be github or npm" ;;
 	esac
 	NAME="upi-$PLATFORM-$VARIANT"
 	if [ "$VERSION" = latest ]; then BASE="$REPO/releases/latest/download"; else BASE="$REPO/releases/download/$VERSION"; fi
@@ -152,9 +149,6 @@ main() {
 	esac
 	mkdir -p "$BIN_DIR"
 	ln -sfn "$INSTALL/$NAME/$(command_of_build)" "$BIN_DIR/upi"
-	# µPi keeps the packages only it runs (OpenSec's extensions) out of Pi's list, which it does as it starts: once now, so
-	# that Pi, if it is started before µPi, does not find them (an earlier installer put them there).
-	(cd "$INSTALL" && "$INSTALL/$NAME/pi" list >/dev/null 2>&1) || true
 	if [ "$ACTION" = reinstall ] && [ -n "${installed:-}" ] && [ "${installed:-}" != "$SHOWN_VERSION" ]; then word=updated
 	elif [ "$ACTION" = reinstall ]; then word=reinstalled
 	else word=installed; fi
@@ -163,7 +157,6 @@ main() {
 	if [ -f "$INSTALL/compile.json" ]; then
 		printf 'Extensions were compiled into the build this replaced: run %supi compile%s to compile them into this one.\n' "$bold" "$reset"
 	fi
-	offer_extensions
 	if [ "$(command -v upi 2>/dev/null || true)" = "$BIN_DIR/upi" ]; then
 		printf '\nRun it with: %supi%s\n' "$bold" "$reset"
 	else
@@ -319,18 +312,18 @@ finish_progress() { printf '\r%s[K' "$ESC"; [ -t 1 ] && printf '%s[?25h' "$ESC";
 # shellcheck disable=SC2088 # a literal ~ for display
 tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
 
-# The release tag the latest download points to, as a version: bolt-v0.2.0 -> 0.2.0.
+# The release tag the latest download points to, as a version: upi-v0.2.0 -> 0.2.0.
 resolve_version() {
-	if [ "$VERSION" != latest ]; then printf '%s' "${VERSION#bolt-v}"; return; fi
+	if [ "$VERSION" != latest ]; then printf '%s' "${VERSION#upi-v}"; return; fi
 	command -v curl >/dev/null 2>&1 || return 0
-	net_curl -fsSIL -o /dev/null -w '%{url_effective}' "$REPO/releases/latest" | sed -n 's#.*/tag/bolt-v##p'
+	net_curl -fsSIL -o /dev/null -w '%{url_effective}' "$REPO/releases/latest" | sed -n 's#.*/tag/upi-v##p'
 }
 
-# The newest release, pre-releases included (the beta channel), as a version: the highest bolt-vX.Y.Z tag GitHub lists (it
+# The newest release, pre-releases included (the beta channel), as a version: the highest upi-vX.Y.Z tag GitHub lists (it
 # lists no drafts to anyone without write access).
 newest_release() {
 	net_curl -fsSL -H 'Accept: application/vnd.github+json' "$API/releases?per_page=30" |
-		sed -n 's/^ *"tag_name": *"bolt-v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' |
+		sed -n 's/^ *"tag_name": *"upi-v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' |
 		sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
 }
 
@@ -462,12 +455,12 @@ plan_download() {
 	ext=tar.gz
 	if can_unxz && grep -q " $NAME.tar.xz\$" "$TMP/SHA256SUMS"; then ext=tar.xz; fi
 	where=""
-	if [ "$ext" = tar.xz ] && [ "${MICROPI_SOURCE:-auto}" != github ] && [ -z "${MICROPI_DOWNLOAD_BASE:-}" ]; then
+	if [ "$ext" = tar.xz ] && [ "${MICROPI_SOURCE:-github}" = npm ] && [ -z "${MICROPI_DOWNLOAD_BASE:-}" ]; then
 		case "$SHOWN_VERSION" in
 		[0-9]*.[0-9]*.[0-9]*) where=$(npm_probe "$(npm_url)") && where="npm $where" || where="" ;;
 		esac
 	fi
-	if [ -z "$where" ] && [ "${MICROPI_SOURCE:-auto}" = npm ]; then
+	if [ -z "$where" ] && [ "${MICROPI_SOURCE:-github}" = npm ]; then
 		echo fail-npm >"$TMP/plan"
 		return
 	fi
@@ -543,7 +536,7 @@ rate_and_eta() {
 # signature in OpenSSH's format (published for releases after 0.9.9; macOS has OpenSSH), or else with the µPi installed
 # here before. Where none of them can, or for a release from before 0.6.0 (which has no signature), nothing is installed
 # unless MICROPI_UNVERIFIED is the SHA-256 of these checksums (unverified_allowed): the checksums come from the same place as
-# the files, so they alone do not show that a release is Pi-Bolt's. Both signatures are fetched in the background while the
+# the files, so they alone do not show that a release is µPi's. Both signatures are fetched in the background while the
 # release downloads.
 fetch_signature() {
 	if fetch "$TMP/SHA256SUMS.sig.part" "$BASE/SHA256SUMS.sig" 2>/dev/null; then mv "$TMP/SHA256SUMS.sig.part" "$TMP/SHA256SUMS.sig"; fi
@@ -552,7 +545,7 @@ fetch_signature() {
 }
 
 # The release key in OpenSSH's form, for SHA256SUMS.sshsig (node scripts/lib/sshsig.mjs pubkey keys/release.pub).
-RELEASE_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKC26CarSmqCEj6n35NN7x2a/tbEQRt7iESFnijnsPmm"
+RELEASE_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO71pQ9OWueQ/BuY8484EOSe2QzXr+64X9CKDT/LsJoy"
 
 # Whether ssh-keygen can verify signatures (-Y, OpenSSH 8.1 and later).
 ssh_keygen_verifies() {
@@ -587,9 +580,9 @@ sha256_of() {
 	if command -v sha256sum >/dev/null 2>&1; then sha256sum <"$1"; else shasum -a 256 <"$1"; fi | cut -c1-64 | tr 'A-F' 'a-f'
 }
 
-# A Pi-Bolt executable installed here before, which checks the signature with its own crypto (BUN_BE_BUN=1 runs a script):
+# A µPi executable installed here before, which checks the signature with its own crypto (BUN_BE_BUN=1 runs a script):
 # a build in its own folder (not one kept for a rollback, nor one left by an update that stopped).
-installed_pibolt() {
+installed_upi() {
 	for candidate in "$INSTALL/$NAME/pi-bin" "$INSTALL/$NAME/pi" "$INSTALL"/upi-"$PLATFORM"-*/pi-bin "$INSTALL"/upi-"$PLATFORM"-*/pi; do
 		case "${candidate#"$INSTALL"/}" in *.*/*) continue ;; esac
 		if [ -f "$candidate" ] && [ -x "$candidate" ]; then
@@ -616,9 +609,9 @@ unverified_allowed() {
 # fail_unverified WHY: stops, saying how to install this download all the same.
 fail_unverified() {
 	if [ "$LAUNCHER" = 1 ]; then
-		fail "$1 Nothing was installed. Install µPi with its installer instead (curl -fsSL https://upi.opensec.in/install.sh | sh), which says how to go on."
+		fail "$1 Nothing was installed. Install µPi with its installer instead (curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | sh), which says how to go on."
 	fi
-	case "$SHOWN_VERSION" in [0-9]*.[0-9]*.[0-9]*) page="$REPO/releases/tag/bolt-v$SHOWN_VERSION" ;; *) page="$REPO/releases/latest" ;; esac
+	case "$SHOWN_VERSION" in [0-9]*.[0-9]*.[0-9]*) page="$REPO/releases/tag/upi-v$SHOWN_VERSION" ;; *) page="$REPO/releases/latest" ;; esac
 	stale=""
 	if [ -n "${MICROPI_UNVERIFIED:-}" ]; then stale=" (MICROPI_UNVERIFIED is set, but not to this download's SHA-256: it applies to one download only)"; fi
 	fail "$1 Nothing was installed$stale. To install this download without the check, compare the SHA-256 of its SHA256SUMS, $SUMS_SHA256, with the one GitHub shows for SHA256SUMS on $page from a device you trust, and run the installer again with MICROPI_UNVERIFIED=$SUMS_SHA256."
@@ -632,7 +625,7 @@ verify_signature() {
 	bad="the release's signature does not verify: the download is not µPi's. Nothing was installed."
 	if [ ! -f "$TMP/SHA256SUMS.sig" ]; then
 		signed_release && fail "could not download the release's signature from $BASE/SHA256SUMS.sig. µPi $SHOWN_VERSION is signed, so nothing was installed: try again."
-		unverified_allowed || fail_unverified "µPi $SHOWN_VERSION is from before Pi-Bolt signed its releases: nothing shows that this download is Pi-Bolt's."
+		unverified_allowed || fail_unverified "µPi $SHOWN_VERSION is from before µPi signed its releases: nothing shows that this download is µPi's."
 		UNSIGNED=1
 		return 0
 	fi
@@ -650,7 +643,7 @@ verify_signature() {
 		SIGNED=1
 		return 0
 	fi
-	if exe=$(installed_pibolt); then
+	if exe=$(installed_upi); then
 		# (By its full path: it is run from the download's folder, below.)
 		case "$exe" in /*) ;; *) exe="$PWD/$exe" ;; esac
 		printf '%s\n' "$VERIFY_SCRIPT" >"$TMP/verify.js"
@@ -672,7 +665,7 @@ verify_signature() {
 
 # The checksums' first line says which release they are ("# upi X.Y.Z"): an older release's, signed all the same and served
 # as a newer one's, would otherwise install the older release as if it were the newer. (0.7.1 to 0.7.3 were published without
-# that line; every release from 0.8.0 on has it, as install.ps1 requires.)
+# that line; every release from 0.8.0 on has it.)
 check_release_version() {
 	case "$SHOWN_VERSION" in
 	[0-9]*.[0-9]*.[0-9]*) ;;
@@ -771,7 +764,7 @@ install_release() {
 			{ draw_progress "$step" 10000 "${dim}verifying checksum$reset"; (cd "$TMP" && check_sum "$NAME.$ext"); }; then
 			FROM=npm
 		else
-			[ "${MICROPI_SOURCE:-auto}" != npm ] || fail "download failed: $final"
+			[ "${MICROPI_SOURCE:-github}" = npm ] || fail "download failed: $final"
 			rm -rf "$TMP/npm.tgz" "$TMP/package" "$TMP/$NAME.$ext"
 			finish_progress
 			printf '  %snot available from npm; downloading from GitHub instead%s\n' "$dim" "$reset"
@@ -794,11 +787,6 @@ install_release() {
 	fi
 	verify_signature
 	check_release_version
-	# The optional extensions this release pins (extensions.txt, covered by the checksums and their signature).
-	PINS=""
-	if fetch "$TMP/extensions.txt" "$BASE/extensions.txt" 2>/dev/null && (cd "$TMP" && check_sum extensions.txt); then
-		PINS=$(grep -E '^[a-z0-9][a-z0-9._-]* [0-9]+\.[0-9]+\.[0-9]+ sha512-[A-Za-z0-9+/]+=*$' "$TMP/extensions.txt" || true)
-	fi
 	if [ "$ext" = tar.xz ]; then
 		if command -v xz >/dev/null 2>&1; then
 			(xz -T0 -dc "$TMP/$NAME.$ext" 2>/dev/null || xz -dc "$TMP/$NAME.$ext") | tar -C "$TMP" -xf - &
@@ -977,126 +965,13 @@ path_hint() {
 		n | N | no | NO) ;;
 		*)
 			mkdir -p "$(dirname "$config")"
-			printf '\n# Pi-Bolt\n%s\n' "$line" >>"$config"
+			printf '\n# µPi\n%s\n' "$line" >>"$config"
 			printf 'Added it to %s. Restart your shell, or run:\n\n  %s\n' "$(tilde "$config")" "$line"
 			return 0
 			;;
 		esac
 	fi
 	printf 'Add this to %s, then restart your shell:\n\n  %s\n' "$(tilde "$config")" "$line"
-}
-
-# OpenSec's optional extensions: Bun builds that load fast in µPi (see their READMEs on npm). µPi installs them
-# itself, with npm where it is installed and otherwise with the package manager built into µPi: nothing else is needed.
-# The last field matches other extensions of the same kind (an extended regular expression on `upi list`): one of those
-# registers the same tools, so Pi would refuse to load both. A local checkout counts too, by its folder's name.
-EXTENSIONS="opensec-pi-subagents:run specialized agents in separate sessions:subagents
-opensec-pi-todo:a todo list for the model, shown above the editor:rpiv-todo|pi-todo
-opensec-pi-fff:fast file and content search (find, grep, @-mentions):pi-fff"
-
-# pin_of PACKAGE: the release's line for it in extensions.txt ("NAME VERSION sha512-..."); false if there is none.
-pin_of() { printf '%s\n' "${PINS:-}" | grep -m 1 "^$1 "; }
-
-# pinned_tarball_matches PACKAGE VERSION INTEGRITY: whether the registry's tarball of that version has that integrity (SHA-512),
-# which the package manager then installs.
-pinned_tarball_matches() {
-	command -v base64 >/dev/null 2>&1 && command -v od >/dev/null 2>&1 || return 1
-	TMP_PIN=$(mktemp) || return 1
-	fetch "$TMP_PIN" "$NPM_REGISTRY/$1/-/$1-$2.tgz" 2>/dev/null || { rm -f "$TMP_PIN"; return 1; }
-	want=$(printf '%s' "${3#sha512-}" | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
-	if command -v sha512sum >/dev/null 2>&1; then got=$(sha512sum <"$TMP_PIN" | cut -d ' ' -f 1); else got=$(shasum -a 512 <"$TMP_PIN" | cut -d ' ' -f 1); fi
-	rm -f "$TMP_PIN"
-	[ -n "$want" ] && [ "$want" = "$got" ]
-}
-
-# installed_matches PACKAGE INTEGRITY: "same" if the lockfile of the folder Pi installed PACKAGE to (npm's, bun's or pnpm's; `pi
-# list` says where) has INTEGRITY, "different" if it has not, "unknown" if there is none.
-installed_matches() {
-	path=$("$INSTALL/$NAME/pi" list 2>/dev/null | awk -v want="npm:$1" '
-		found { sub(/^ +/, ""); print; exit }
-		{ line = $0; sub(/^ +/, "", line); if (line == want || index(line, want "@") == 1) found = 1 }')
-	[ -n "$path" ] || { echo unknown; return; }
-	root=$(dirname "$(dirname "$path")")
-	for lock in package-lock.json bun.lock pnpm-lock.yaml; do
-		if [ -f "$root/$lock" ]; then
-			if grep -qF -- "$2" "$root/$lock"; then echo same; else echo different; fi
-			return
-		fi
-	done
-	echo unknown
-}
-
-offer_extensions() {
-	choice="${MICROPI_EXTENSIONS:-}"
-	case "$choice" in
-	"" | yes | no) ;;
-	*) printf '  %sMICROPI_EXTENSIONS must be yes or no: no extensions installed%s\n' "$dim" "$reset"; return 0 ;;
-	esac
-	if [ -z "$choice" ] && ! has_tty; then return 0; fi
-	[ "$choice" != no ] || return 0
-	sources=$("$INSTALL/$NAME/pi" list 2>/dev/null || true)
-	wanted=""
-	newline='
-'
-	old_ifs=$IFS
-	IFS=$newline
-	for entry in $EXTENSIONS; do
-		package=${entry%%:*} kind=${entry##*:}
-		# Only what the release pins (a release from before extensions.txt pins none).
-		pin_of "$package" >/dev/null || continue
-		if printf '%s\n' "$sources" | grep -Eq "npm:$package(@.*)?\$"; then continue; fi
-		# (`upi list` prints each source, then its path indented below it: only the sources.)
-		other=$(printf '%s\n' "$sources" | grep -E '^  [^ ]' | grep -Ei "$kind" | head -n 1 | sed 's/^ *//')
-		if [ -n "$other" ]; then
-			printf '  %s%s is not offered: %s is installed and registers the same tools%s\n' "$dim" "$package" "$other" "$reset"
-			continue
-		fi
-		wanted="$wanted $package"
-	done
-	IFS=$old_ifs
-	[ -n "$wanted" ] || return 0
-	if [ -z "$choice" ]; then
-		printf '\n%sOptional extensions by OpenSec%s %s(open source, built for µPi)%s\n\n' "$bold" "$reset" "$dim" "$reset"
-		IFS=$newline
-		for entry in $EXTENSIONS; do
-			package=${entry%%:*} rest=${entry#*:}
-			case " $wanted " in *" $package "*) printf '  %s%-22s%s %s\n' "$cyan" "$package" "$reset" "${rest%:*}" ;; esac
-		done
-		IFS=$old_ifs
-		ask '\nInstall them? [Y/n] '
-		case "$answer" in
-		n | N | no | NO)
-			printf '%sYou can install them later with: upi install --upi npm:<name>%s\n' "$dim" "$reset"
-			return 0
-			;;
-		esac
-	fi
-	for package in $wanted; do
-		pin=$(pin_of "$package")
-		version=${pin#* } integrity=${pin##* }
-		version=${version%% *}
-		if ! pinned_tarball_matches "$package" "$version" "$integrity"; then
-			printf '  %sdid not install %s@%s (µPi itself is installed): the registry'"'"'s package is not the one this release pins%s\n' "$red" "$package" "$version" "$reset"
-			continue
-		fi
-		# (From the registry that was checked, and without the package's install scripts: nothing of it runs before its lockfile
-		# entry is compared with the pin, below, and an extension of Pi needs none.)
-		if out=$(NPM_CONFIG_REGISTRY="$NPM_REGISTRY" NPM_CONFIG_IGNORE_SCRIPTS=true "$INSTALL/$NAME/pi" install --upi "npm:$package@$version" 2>&1); then
-			# What the package manager installed is a download of its own: its lockfile says what it got.
-			case $(installed_matches "$package" "$integrity") in
-			different)
-				"$INSTALL/$NAME/pi" remove --upi "npm:$package@$version" >/dev/null 2>&1 || true
-				printf '  %sremoved %s@%s again: what the package manager installed is not the one this release pins%s\n' "$red" "$package" "$version" "$reset"
-				continue
-				;;
-			unknown) printf '  %snote: the package manager'"'"'s lockfile does not say what it installed of %s@%s; the registry'"'"'s package was checked before%s\n' "$dim" "$package" "$version" "$reset" ;;
-			esac
-			printf '  %s%s%s %s@%s installed\n' "$green" "$CHECK" "$reset" "$package" "$version"
-		else
-			printf '  %scould not install %s (µPi itself is installed): %s%s\n' "$red" "$package" "$(printf '%s' "$out" | tail -1)" "$reset"
-			printf '  %sInstall it later with: upi install --upi npm:%s%s\n' "$dim" "$package" "$reset"
-		fi
-	done
 }
 
 offer_start() {

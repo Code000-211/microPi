@@ -2,13 +2,13 @@ name: runtime
 
 # Builds the µPi runtime (patched WebKit and Bun: scripts/build-runtime.sh, scripts\build-runtime.ps1) of every platform on
 # GitHub's runners, each on its own: Linux x86-64 and ARM64, macOS on Apple silicon, Windows x64. It is what a release needs when
-# the engine changed (docs/RELEASING.md, "When the engine changed"): run it from upi with the release's tag, and it attaches
+# the engine changed (docs/RELEASING.md, "When the engine changed"): run it from pi-bolt with the release's tag, and it attaches
 # upi-runtime-<platform>.tar.gz (Windows: .zip) to that tag's draft release, which the release workflow then uses once it has
-# checked their attestations (the attest job below: only a run from upi counts for a release). A push to
+# checked their attestations (the attest job below: only a run from pi-bolt counts for a release). A push to
 # a branch runtime/<name> builds its commit's runtimes as workflow artifacts only: all four, or the one the name is
 # (runtime/win32-x64).
 #
-#   gh workflow run runtime.yml -R Code000-211/microPi -f tag=bolt-vX.Y.Z [-f ref=<the commit the release is tagged on>]
+#   gh workflow run runtime.yml -R Code000-211/microPi -f tag=upi-vX.Y.Z [-f ref=<the commit the release is tagged on>]
 #
 # The runners are smaller than BUILDING.md asks for (4 cores and 16 GB; 3 cores and 7 GB on macOS): the build runs with swap
 # and fewer jobs, in about two to four hours. Each build job also runs tests/aot and tests/runtime on the runtime it made.
@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "The bolt-vX.Y.Z whose draft release gets the runtimes (empty: workflow artifacts only)"
+        description: "The upi-vX.Y.Z whose draft release gets the runtimes (empty: workflow artifacts only)"
         required: false
         default: ""
       ref:
@@ -272,13 +272,13 @@ jobs:
           merge-multiple: true
       - name: Draft
         run: |
-          printf '%s' "$TAG" | grep -Eq '^bolt-v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a release tag: $TAG"; exit 1; }
+          printf '%s' "$TAG" | grep -Eq '^upi-v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a release tag: $TAG"; exit 1; }
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true ] ||
               { echo "::error::$TAG is published: its runtimes are not replaced"; exit 1; }
           else
             # (Its tag, when pushed later, names the commit that was built.)
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "µPi ${TAG#bolt-v}" --notes "" --target "${REF:-$GITHUB_SHA}"
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "µPi ${TAG#upi-v}" --notes "" --target "${REF:-$GITHUB_SHA}"
           fi
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber runtimes/*
           { echo "### Runtimes attached to the draft of $TAG (built from ${REF:-$GITHUB_SHA})"; echo; (cd runtimes && sha256sum -- *) | sed 's/^/    /'; } >>"$GITHUB_STEP_SUMMARY"

@@ -5,8 +5,6 @@
 # - every other line is a file in DIR with that checksum, and they are exactly the files scripts/release-files.txt names, no more
 #   and none missing (RUNTIME_STAMP among them, so that the runtime a later release reuses is the signed one; install.sh and
 #   install.ps1 too, which `upi update` runs only once they match the signed SHA256SUMS);
-# - extensions.txt has at least one well-formed pin and nothing else: the installers skip a line they cannot read, so a bad one
-#   would quietly offer nothing.
 # Usage: scripts/check-release-files.sh DIR VERSION
 set -euo pipefail
 manifest="$(cd "$(dirname "$0")" && pwd)/release-files.txt"
@@ -28,7 +26,4 @@ if [ "$present" != "$expected" ]; then
 	diff <(printf '%s\n' "$expected") <(printf '%s\n' "$present") || true
 	exit 1
 fi
-pin='^[a-z0-9][a-z0-9._-]* [0-9]+\.[0-9]+\.[0-9]+ sha512-[A-Za-z0-9+/]{86}==$'
-grep -v -e '^#' -e '^$' extensions.txt | grep -Evq "$pin" && { echo "extensions.txt has a line that is not a pin:"; grep -v -e '^#' -e '^$' extensions.txt | grep -Ev "$pin"; exit 1; }
-grep -Eq "$pin" extensions.txt || { echo "extensions.txt pins no extension"; exit 1; }
 echo "SHA256SUMS: $(printf '%s\n' "$listed" | wc -l) files, each as listed"

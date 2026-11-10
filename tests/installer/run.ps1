@@ -14,7 +14,7 @@
 $ErrorActionPreference = 'Continue'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $name = 'upi-win32-x64'
-$work = Join-Path ([IO.Path]::GetTempPath()) "pibolt-installer-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$work = Join-Path ([IO.Path]::GetTempPath()) "upi-installer-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 $script:status = 0
 function Write-Pass([string]$what) { Write-Host "PASS $what" }
 function Write-Fail([string]$what, [string]$out = '') { Write-Host "FAIL $what"; if ($out) { Write-Host $out }; $script:status = 1 }
@@ -62,8 +62,8 @@ $exe = Join-Path $inst "$name\upi.exe"
 function Invoke-Installer([string]$case, [hashtable]$vars = @{}, [switch]$Again) {
 	if (-not $Again) { Remove-Item -LiteralPath $inst -Recurse -Force -ErrorAction SilentlyContinue }
 	$set = @{
-		MICROPI_DOWNLOAD_BASE = "http://127.0.0.1:$port/$case"; MICROPI_INSTALL = $inst; MICROPI_EXTENSIONS = 'no'; MICROPI_NO_START = '1'
-		MICROPI_YES = '1'; MICROPI_NO_PATH = '1'; MICROPI_VERSION = "bolt-v$version"; MICROPI_CHANNEL = $null
+		MICROPI_DOWNLOAD_BASE = "http://127.0.0.1:$port/$case"; MICROPI_INSTALL = $inst; MICROPI_NO_START = '1'
+		MICROPI_YES = '1'; MICROPI_NO_PATH = '1'; MICROPI_VERSION = "upi-v$version"; MICROPI_CHANNEL = $null
 	}
 	foreach ($k in $vars.Keys) { $set[$k] = $vars[$k] }
 	$saved = @{}

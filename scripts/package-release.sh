@@ -6,7 +6,8 @@
 #   --no-build    package the builds already in out/ instead of building them
 #   --runtime-only  only the runtime's archive (.github/workflows/runtime.yml), no Pi and no SHA256SUMS
 # Archives (the names stay the same from release to release, so that releases/latest/download/<name> always works), of what
-# this machine builds:
+# this machine builds; every build has the release's built-in plugins in it (build-pi.sh --builtins: the docsearch addon,
+# project_search, built for this platform with Rust/cargo, and `upi compile` keeps it, for the kit carries it):
 #   upi-linux-x64.tar.gz           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
 #   upi-linux-x64-baseline.tar.gz  JIT off, code for any x86-64 CPU
 #   upi-linux-x64-jit.tar.gz       JIT on, for code loaded at run time
@@ -18,7 +19,8 @@
 #   upi-darwin-arm64-jit.tar.gz    on macOS: JIT on
 #   upi-runtime-darwin-arm64.tar.gz
 #   upi-kit-<platform>.tar.gz      the compile kit of this platform's builds, for `upi compile` (scripts/make-kit.mjs)
-# The Pi archives also come as .tar.xz, about 40% smaller, which install.sh prefers where xz is installed.
+# The Pi archives also come as .tar.xz, about 40% smaller, which install.sh prefers where xz is installed. The release also
+# holds RUNTIME_STAMP, install.sh and install.ps1 (scripts/release-files.txt), all together in one SHA256SUMS.
 source "$(dirname "$0")/lib/common.sh"
 
 PI_DIR="$PIBOLT_PI"; BUILD=1; RUNTIME_ONLY=""
@@ -57,7 +59,7 @@ if [ -n "$BUILD" ]; then
 	for target in "${TARGETS[@]}"; do
 		IFS=: read -r _ out options <<<"$target"
 		# shellcheck disable=SC2086 # options is a list of words
-		"$PIBOLT_ROOT/scripts/build-pi.sh" --pi "$PI_DIR" --out "$PIBOLT_ROOT/out/$out" "${kit[@]}" $options
+		"$PIBOLT_ROOT/scripts/build-pi.sh" --pi "$PI_DIR" --out "$PIBOLT_ROOT/out/$out" --builtins "${kit[@]}" $options
 		kit=()
 	done
 fi
@@ -102,9 +104,14 @@ log "upi-runtime-$PIBOLT_PLATFORM.tar.gz (Bun $("$runtime" --version))"
 "${TAR[@]}" -C "$STAGE" -czf "$DIST/upi-runtime-$PIBOLT_PLATFORM.tar.gz" "upi-runtime-$PIBOLT_PLATFORM"
 [ -z "$RUNTIME_ONLY" ] || exit 0
 
-# The extensions the installers offer, pinned; and checksums whose first line says which release they are (install.ps1 refuses
-# another version's: an older release, signed all the same, served as a newer one).
-cp "$PIBOLT_ROOT/extensions.txt" "$DIST/extensions.txt"
-(cd "$DIST" && { echo "# upi $VERSION"; sha256 -- *.tar.gz *.tar.xz extensions.txt; } >SHA256SUMS)
+# The installers of this checkout (the release runs the same one `upi update` runs, checked against the signed SHA256SUMS), the
+# runtime's stamp (so a later release reuses its runtimes only if the engine is the same), and checksums whose first line says
+# which release they are (install.ps1 refuses another version's: an older release, signed all the same, served as a newer one).
+cp "$PIBOLT_ROOT/install.sh" "$PIBOLT_ROOT/install.ps1" "$DIST/"
+stamp="${PIBOLT_RUNTIME_STAMP:-}"
+[ -n "$stamp" ] || stamp="$(cat "$(dirname "$(runtime_bun)")/RUNTIME_STAMP" 2>/dev/null || true)"
+[ -n "$stamp" ] || stamp="$("$PIBOLT_ROOT/scripts/runtime-stamp.sh")"
+printf '%s\n' "$stamp" >"$DIST/RUNTIME_STAMP"
+(cd "$DIST" && { echo "# upi $VERSION"; sha256 -- *.tar.gz *.tar.xz install.sh install.ps1 RUNTIME_STAMP; } >SHA256SUMS)
 log "release $VERSION in $DIST:"
 (cd "$DIST" && ls -lh -- * | awk '{print "    " $5 "  " $9}')

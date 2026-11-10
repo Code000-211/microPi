@@ -29,17 +29,20 @@
 #                     with --plugins-from-installed: leave out the packages `pi install` installed
 #   --plugin-worker PATH
 #                     a worker script a plugin starts, relative to the manifest's folder (repeatable)
+#   --builtins        also compile in the release's built-in plugins (docsearch: project_search): the addon is built for this
+#                     platform and the manifest is generated (scripts/build-docsearch.mjs, needs Rust/cargo). The kit, if any,
+#                     carries it, so that `upi compile` keeps it besides the extensions installed on the machine
 #   --keep-bytecode   keep the bytecode in the prebuilt heap (by default it is left out, which is what lets the compiler inline
 #                     Pi's own functions, and saves memory)
 #   --stable          build with a stock Bun instead (PIBOLT_STABLE_BUN, default `bun`): the comparison build, no AOT
 #   --kit DIR         also write the compile kit to DIR: the files this build read, its compile command and the training
 #                     profile, for `upi compile` to build the same executable with extensions (scripts/make-kit.mjs).
-#                     Not with --plugins
+#                     With --builtins: the kit carries them. Not with --plugins-from-installed or --stable
 # Environment: PIBOLT_BUN (the µPi runtime; default $PIBOLT_WORK/runtime/bun); PIBOLT_BUILD_LOG (a file for everything the
 #              compiler prints, e.g. with BUN_JSC_verboseAOTCompilation=1)
 source "$(dirname "$0")/lib/common.sh"
 
-PI_DIR="$PIBOLT_PI"; OUT=""; JIT=off; CPU=""; PROFILE=""; PLUGINS=""; PLUGIN_WORKERS=(); KEEP_BYTECODE=""; STABLE=""
+PI_DIR="$PIBOLT_PI"; OUT=""; JIT=off; CPU=""; PROFILE=""; PLUGINS=""; PLUGIN_WORKERS=(); KEEP_BYTECODE=""; STABLE=""; BUILTINS=""; BUILTINS_MANIFEST=""
 FROM_INSTALLED=""; PLUGINS_ONLY=""; PLUGINS_EXCLUDE=""; PLUGINS_AGENT_DIR=""; PLUGINS_NO_PACKAGES=""; KIT=""
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -54,11 +57,12 @@ while [ $# -gt 0 ]; do
 	--plugins-exclude) PLUGINS_EXCLUDE="$2"; shift ;;
 	--plugins-agent-dir) PLUGINS_AGENT_DIR="$2"; shift ;;
 	--plugins-no-packages) PLUGINS_NO_PACKAGES=1 ;;
+	--builtins) BUILTINS=1 ;;
 	--plugin-worker) PLUGIN_WORKERS+=("$2"); shift ;;
 	--keep-bytecode) KEEP_BYTECODE=1 ;;
 	--stable) STABLE=1 ;;
 	--kit) KIT="$2"; shift ;;
-	-h | --help) sed -n '2,38p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,42p' "$0"; exit 0 ;;
 	*) die "unknown option $1" ;;
 	esac
 	shift
@@ -69,7 +73,7 @@ done
 # (On macOS there is one build: every Apple silicon CPU has what the compiler uses, and the executable checks it at launch.)
 [ "$CPU" = native ] || [ "$PIBOLT_OS" = linux ] || die "--cpu baseline is for Linux only"
 [ -z "$FROM_INSTALLED" ] || [ -z "$PLUGINS" ] || die "--plugins-from-installed and --plugins are two ways to say the same thing: use one"
-[ -z "$KIT" ] || { [ -z "$PLUGINS" ] && [ -z "$FROM_INSTALLED" ] && [ -z "$STABLE" ]; } || die "--kit is for a build of Pi alone (no plugins, not --stable)"
+[ -z "$KIT" ] || { [ -z "$FROM_INSTALLED" ] && [ -z "$STABLE" ]; } || die "--kit is for a build with the release's built-in plugins (--builtins) or a build of Pi alone: not with --plugins-from-installed or --stable"
 if [ -z "$FROM_INSTALLED" ]; then
 	[ -z "$PLUGINS_ONLY" ] || die "--plugins-only needs --plugins-from-installed"
 	[ -z "$PLUGINS_EXCLUDE" ] || die "--plugins-exclude needs --plugins-from-installed"
@@ -107,10 +111,20 @@ if [ -n "$FROM_INSTALLED" ]; then
 	[ -n "$PLUGINS" ] || die "no plugin manifest was generated"
 fi
 
+# The release's built-in plugins (docsearch: project_search): their manifest and the addon built for this platform, staged
+# into the Pi tree below. `upi compile` keeps them (the kit records them), so a user's extensions never drop them from the
+# executable.
+if [ -n "$BUILTINS" ]; then
+	need node
+	log "building the docsearch addon:"
+	BUILTINS_MANIFEST="$(node "$PIBOLT_ROOT/scripts/build-docsearch.mjs" --out "$PIBOLT_WORK/plugins/builtins")"
+	[ -f "$BUILTINS_MANIFEST" ] || die "no builtins manifest was generated"
+fi
+
 ENTRY=""
-if [ -n "$PLUGINS" ]; then
+if [ -n "$PLUGINS" ] || [ -n "$BUILTINS" ]; then
 	trap 'rm -rf "$AGENT/.pibolt-plugins"' EXIT
-	ENTRY="$(stage_plugins "$AGENT" "$PLUGINS")"
+	ENTRY="$(stage_plugins "$AGENT" "$PLUGINS" "$BUILTINS_MANIFEST")"
 fi
 mapfile -t ENTRIES < <(pi_entries "$AGENT" "$ENTRY")
 # Workers a plugin starts (new Worker(new URL("./worker.ts", import.meta.url))) are entry points of their own.
@@ -185,7 +199,8 @@ RUNTIME_STAMP="${PIBOLT_RUNTIME_STAMP:-$(cat "$(dirname "$BUN")/RUNTIME_STAMP" 2
 # Everything the compiler prints, for when the build stops: the reason is often an "AOT: " line, which is not shown otherwise.
 TEMP_DIR="${TMPDIR:-/tmp}"
 BUILD_LOG="${PIBOLT_BUILD_LOG:-$(mktemp "${TEMP_DIR%/}/pibolt-build.XXXXXX")}"
-log "Pi $VERSION, ahead of time: JIT $JIT, CPU $CPU, $([ -n "$KEEP_BYTECODE" ] && echo "bytecode kept" || echo "bytecode left out")$([ -n "$PLUGINS" ] && echo ", plugins from $PLUGINS") -> $OUT"
+plugins_note=""; [ -n "$PLUGINS" ] && plugins_note=", plugins from $PLUGINS"; [ -n "$BUILTINS" ] && plugins_note="$plugins_note, builtins (docsearch)"
+log "Pi $VERSION, ahead of time: JIT $JIT, CPU $CPU, $([ -n "$KEEP_BYTECODE" ] && echo "bytecode kept" || echo "bytecode left out")$plugins_note -> $OUT"
 BUILD_ENV=(BUN_JSC_useJIT=0 BUN_STATIC_HEAP=1 BUN_AOT=1)
 [ "$JIT" = off ] && BUILD_ENV+=(BUN_AOT_JIT=0)
 [ "$CPU" = baseline ] && BUILD_ENV+=(BUN_AOT_CPU=baseline)
@@ -238,6 +253,7 @@ if [ "$PIBOLT_OS" = darwin ]; then
 fi
 stage_assets "$OUT"
 printf 'µPi %s (Pi %s), %s-%s, JIT %s, built %s\n' "$PIBOLT_VERSION" "$VERSION" "$PIBOLT_OS" "$CPU_VARIANT" "$JIT" "$(date -u +%Y-%m-%d)" >"$OUT/upi.txt"
+[ -z "$BUILTINS" ] || printf 'built-in: docsearch (project_search)\n' >>"$OUT/upi.txt"
 
 check=$(BUN_STATIC_HEAP_VERBOSE=1 "$OUT/pi" --version 2>&1)
 grep -q "image registered: true" <<<"$check" || die "the executable does not use its compiled code:"$'\n'"$check"
@@ -258,7 +274,9 @@ n = int(argv[0]); env = argv[1:1 + n]; argv = argv[1 + n:]
 n = int(argv[0]); args = argv[1:1 + n]; entries = argv[1 + n:]
 json.dump({"env": dict(e.split("=", 1) for e in env), "args": args, "entries": entries}, open(sys.argv[1], "w"), indent=1)' \
 		"$record" "${#BUILD_ENV[@]}" "${BUILD_ENV[@]}" "${#BUILD_ARGS[@]}" "${BUILD_ARGS[@]}" "${ENTRIES[@]}"
+	KIT_BUILTINS=()
+	[ -z "$BUILTINS" ] || KIT_BUILTINS+=(--builtins "./.pibolt-plugins/builtins/$(basename "$BUILTINS_MANIFEST")=docsearch (project_search)")
 	"$BUN" "$PIBOLT_ROOT/scripts/make-kit.mjs" --bun "$BUN" --pi "$(realpath "$PI_DIR")" --agent "$AGENT" --record "$record" \
-		--profile "$PROFILE" --platform "$PIBOLT_PLATFORM" --version "$PIBOLT_VERSION" --out "$(abspath "$KIT")"
+		--profile "$PROFILE" --platform "$PIBOLT_PLATFORM" --version "$PIBOLT_VERSION" --out "$(abspath "$KIT")" "${KIT_BUILTINS[@]}"
 	rm -f "$record"
 fi

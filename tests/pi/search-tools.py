@@ -1,6 +1,6 @@
-"""µPi's grep and find tools in a built Pi: not on by default (models searched with rg in bash), but turned on by --tools
-and then searching in-process (no ripgrep or fd on PATH, nothing downloaded: PI_OFFLINE), following .gitignore, in path
-order; not on by default with FFF's extension loaded either; and still there when --tools names them.
+"""µPi's grep and find tools in a built Pi: searching in-process (no ripgrep or fd on PATH, nothing downloaded:
+PI_OFFLINE), following .gitignore, in path order; off by default (their schemas are there to turn on with --tools), on with it,
+and not on with FFF's extension loaded.
   python3 tests/pi/search-tools.py PI
 """
 import json
@@ -93,9 +93,9 @@ try:
                            timeout=120)
         return r, list(seen["tools"]), list(seen["results"])
 
-    r, tools, _ = session({})
-    check("grep and find are not on by default", r.returncode == 0 and "grep" not in tools and "find" not in tools,
-          f"exit {r.returncode}, tools {tools}, {r.stderr[-300:]}")
+    r, tools, results = session({})
+    check("grep and find are not on by default (settings-manager: their schemas are off until turned on)",
+          r.returncode == 0 and "grep" not in tools and "find" not in tools, f"exit {r.returncode}, tools {tools}")
     r, tools, results = session({}, "--tools", "grep,find")
     check("--tools grep and find turn them on", "grep" in tools and "find" in tools,
           f"exit {r.returncode}, tools {tools}, {r.stderr[-300:]}")

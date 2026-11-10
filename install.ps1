@@ -5,12 +5,12 @@
 #
 # Downloads a release, verifies its SHA-256 checksum and the Ed25519 signature of the checksums, installs it to
 # %USERPROFILE%\.micropi and puts `upi` on your PATH (it asks first). Run it again to reinstall, update or uninstall. The
-# executable comes from the npm registry (a CDN, fast in most places) and falls back to GitHub; the checksums and their signature
-# always come from the GitHub release, so a download from npm is checked against them. Nothing here needs administrator rights,
-# and nothing changes a security setting: the installation is the user's own folder and the user's own PATH.
+# executable comes from the GitHub release by default (a CDN mirror of it is on npm, for MICROPI_SOURCE=npm); the checksums and
+# their signature always come from the GitHub release, so a download from npm is checked against them. Nothing here needs
+# administrator rights, and nothing changes a security setting: the installation is the user's own folder and the user's own PATH.
 #
 # Environment:
-#   MICROPI_VERSION   a release tag such as bolt-v0.8.0 (default: the latest release)
+#   MICROPI_VERSION   a release tag such as upi-v0.8.0 (default: the latest release)
 #   MICROPI_CHANNEL   stable (the latest release; the default) or beta (the newest release, pre-releases included), for this
 #                    installation and its updates (`upi update --channel` changes it)
 #   MICROPI_VARIANT   x64 (default), x64-baseline (any x86-64 CPU; picked when the CPU has no AVX2 and the release has one) or
@@ -19,11 +19,9 @@
 #   MICROPI_NO_PATH=1 leave PATH as it is: do not add the installation, nor take another variant off (upi update sets it)
 #   MICROPI_YES=1     do not ask: take the default action and do not offer to start µPi
 #   MICROPI_LAUNCHER=1  used by the npm package's first run: download only, no menu, PATH or prompts
-#   MICROPI_SOURCE    where to download the executable from: auto (npm, then GitHub; the default), npm or github
-#   MICROPI_NPM_REGISTRY  the npm registry or mirror to use (default: https://registry.npmjs.org)
-#   MICROPI_EXTENSIONS  yes or no: whether to install OpenSec's optional extensions (opensec-pi-subagents, opensec-pi-todo, opensec-pi-fff)
-#                    without asking. Without it the installer asks when it can; a run that cannot ask, or MICROPI_YES=1,
-#                    installs none.
+#   MICROPI_SOURCE    where to download the executable from: auto (GitHub; the default), npm (the npm package of the build, a
+#                    mirror of the release) or github
+#   MICROPI_NPM_REGISTRY  the npm registry or mirror to use with MICROPI_SOURCE=npm (default: https://registry.npmjs.org)
 #   MICROPI_DOWNLOAD_BASE  a mirror of a release to download everything from (its SHA256SUMS.sig too)
 #   MICROPI_ALLOW_UNSIGNED  the SHA-256 of a release's SHA256SUMS (the installer shows it), to install that download although it
 #                    has no signature (a build of your own); never needed otherwise. It matches those checksums only, so a
@@ -489,21 +487,11 @@ function Install-PiBoltRelease($state) {
 			Stop-PiBolt "the download is µPi $($Matches[1]), not $($state.Version) as asked for (an older release served as a newer one?). Nothing was installed."
 		}
 		$state.Version = $Matches[1]; $state.Shown = $Matches[1]
-		# The optional extensions this release pins (extensions.txt, covered by the signed checksums).
-		$state.Extensions = @()
-		$pins = Join-Path $tmp 'extensions.txt'
-		if ((Get-PiBoltFile $client "$($state.Base)/extensions.txt" $pins '') -and (Test-PiBoltChecksum $sums 'extensions.txt' $pins)) {
-			foreach ($line in Get-Content -LiteralPath $pins) {
-				if ($line -match '^([a-z0-9][a-z0-9._-]*) (\d+\.\d+\.\d+) (sha512-[A-Za-z0-9+/]+=*)$') {
-					$state.Extensions += @{ Package = $Matches[1]; Version = $Matches[2]; Integrity = $Matches[3] }
-				}
-			}
-		}
 		$file = Join-Path $tmp $archive
 		$from = ''
-		if ($state.Source -ne 'github' -and -not $env:MICROPI_DOWNLOAD_BASE) {
+		if ($state.Source -eq 'npm' -and -not $env:MICROPI_DOWNLOAD_BASE) {
 			# The npm package @kushalkhemka/upi-win32-x64 (of the same version) is a .tgz with the release's .zip in it. (Releases
-			# before 0.8.5 have none: they come from GitHub.)
+			# before 0.8.5 have none: they come from GitHub.) The default is GitHub; npm is only asked for with MICROPI_SOURCE=npm.
 			$registry = if ($env:MICROPI_NPM_REGISTRY) { $env:MICROPI_NPM_REGISTRY.TrimEnd('/') } else { 'https://registry.npmjs.org' }
 			$tgz = Join-Path $tmp 'npm.tgz'
 			if ((Get-PiBoltFile $client "$registry/@kushalkhemka/$name/-/$name-$($state.Version).tgz" $tgz 'downloading')) {
@@ -512,11 +500,7 @@ function Install-PiBoltRelease($state) {
 					if (Test-PiBoltChecksum $sums $archive $file) { $from = 'npm' }
 				}
 			}
-			if (-not $from) {
-				if ($state.Source -eq 'npm') { Stop-PiBolt "npm does not have µPi $($state.Version), or its download does not match the release's checksum" }
-				Clear-PiBoltProgress
-				Write-Host "  ${dim}not available from npm; downloading from GitHub instead$reset"
-			}
+			if (-not $from) { Stop-PiBolt "npm does not have µPi $($state.Version), or its download does not match the release's checksum" }
 		} elseif ($state.Source -eq 'npm') {
 			Stop-PiBolt 'MICROPI_SOURCE=npm needs the release from GitHub (no MICROPI_DOWNLOAD_BASE)'
 		}
@@ -703,135 +687,6 @@ function Select-PiBoltAction($state) {
 	$choice
 }
 
-# Whether the registry has the pinned version of an extension as pinned: its record says the pinned integrity, and its tarball has
-# it. (The package manager then installs that version, and checks the tarball against the same record.)
-function Test-PiBoltExtension([string]$registry, $extension) {
-	try {
-		$client = New-PiBoltClient
-		$record = $client.GetStringAsync("$registry/$($extension.Package)/$($extension.Version)").GetAwaiter().GetResult() | ConvertFrom-Json
-		if ($record.dist.integrity -cne $extension.Integrity) { return $false }
-		$tarball = $client.GetByteArrayAsync($record.dist.tarball).GetAwaiter().GetResult()
-		$digest = [Convert]::ToBase64String([System.Security.Cryptography.SHA512]::Create().ComputeHash($tarball))
-		return "sha512-$digest" -ceq $extension.Integrity
-	} catch {
-		return $false
-	}
-}
-
-# Whether what the package manager installed of an extension has the pinned integrity, by its lockfile (npm's, bun's or pnpm's,
-# in the folder Pi installs npm packages to; `upi list` says where): 'same', 'different', or 'unknown' (no lockfile).
-# `upi list`, run in µPi's own folder: in a project with resources that need trust (the folder the installer was started
-# in), `list` loads the extensions to settle it, the one just installed among them, before its pin has been compared.
-function Get-PiBoltPackageList([string]$exe) {
-	Push-Location -LiteralPath (Split-Path $exe)
-	try { @(& $exe list 2>$null) } finally { Pop-Location }
-}
-
-function Test-PiBoltInstalledExtension([string]$exe, $extension) {
-	$lines = Get-PiBoltPackageList $exe
-	for ($i = 0; $i -lt $lines.Count - 1; $i++) {
-		if ($lines[$i] -match "^\s+npm:$([regex]::Escape($extension.Package))(@\S*)?\s*$") {
-			$root = Split-Path (Split-Path $lines[$i + 1].Trim()) # <root>\node_modules\<package>
-			foreach ($lock in 'package-lock.json', 'bun.lock', 'pnpm-lock.yaml') {
-				$path = Join-Path $root $lock
-				if (Test-Path -LiteralPath $path) {
-					if ([IO.File]::ReadAllText($path).Contains($extension.Integrity)) { return 'same' } else { return 'different' }
-				}
-			}
-			return 'unknown'
-		}
-	}
-	'unknown'
-}
-
-# OpenSec's optional extensions (see install.sh, which offers the same), at the versions the release pins.
-function Install-PiBoltExtensions($state) {
-	$choice = $env:MICROPI_EXTENSIONS
-	if ($choice -and $choice -ne 'yes' -and $choice -ne 'no') { Write-Host "  ${dim}MICROPI_EXTENSIONS must be yes or no: no extensions installed$reset"; return }
-	if (-not $choice -and -not (Test-PiBoltCanAsk)) { return }
-	if ($choice -eq 'no') { return }
-	$exe = Join-Path $state.Dir 'upi.exe'
-	$sources = (Get-PiBoltPackageList $exe) -join "`n"
-	$extensions = @(
-		@{ Package = 'opensec-pi-subagents'; What = 'run specialized agents in separate sessions'; Kind = 'subagents' },
-		@{ Package = 'opensec-pi-todo'; What = 'a todo list for the model, shown above the editor'; Kind = 'rpiv-todo|pi-todo' },
-		@{ Package = 'opensec-pi-fff'; What = 'fast file and content search (find, grep, @-mentions)'; Kind = 'pi-fff' })
-	# Only the versions the release pins, and only with the integrity it says they have.
-	foreach ($e in $extensions) {
-		$pin = $state.Extensions | Where-Object { $_.Package -eq $e.Package } | Select-Object -First 1
-		if ($pin) { $e.Version = $pin.Version; $e.Integrity = $pin.Integrity }
-	}
-	$extensions = @($extensions | Where-Object { $_.Version })
-	# What the executable has compiled in already (upi.txt's `plugins:` line, scripts\build-pi.ps1): not offered again. (It can be
-	# turned off with `-builtin:<name>` in the extensions setting; installed from npm, a copy replaces the compiled one.)
-	$about = Join-Path $state.Dir 'upi.txt'
-	$compiledIn = if (Test-Path -LiteralPath $about) { (Get-Content -LiteralPath $about | Where-Object { $_ -like 'plugins: *' } | Select-Object -First 1) } else { $null }
-	if ($compiledIn) {
-		$extensions = @($extensions | Where-Object { $compiledIn -notmatch "(^plugins: |, )$([regex]::Escape($_.Package)) " })
-		if (-not $extensions) { return }
-	}
-	if (-not $extensions) {
-		if ($choice -eq 'yes') { Write-Host "  ${dim}this release pins no extensions (extensions.txt): none installed$reset" }
-		return
-	}
-	$wanted = @()
-	foreach ($e in $extensions) {
-		if ($sources -match "npm:$($e.Package)(@\S*)?(\r?\n|$)") { continue }
-		$other = ($sources -split "`n") | Where-Object { $_ -match '^  [^ ]' -and $_ -match $e.Kind } | Select-Object -First 1
-		if ($other) { Write-Host "  $dim$($e.Package) is not offered: $($other.Trim()) is installed and registers the same tools$reset"; continue }
-		$wanted += $e
-	}
-	if (-not $wanted) { return }
-	if (-not $choice) {
-		Write-Host "`n${bold}Optional extensions by OpenSec$reset $dim(open source, built for µPi)$reset`n"
-		foreach ($e in $wanted) { Write-Host ("  $cyan{0,-22}$reset {1}" -f $e.Package, $e.What) }
-		if ((Read-PiBoltAnswer "`nInstall them? [Y/n] ") -match '^(n|no)$') { Write-Host "${dim}You can install them later with: upi install --upi npm:<name>$reset"; return }
-	}
-	$registry = if ($env:MICROPI_NPM_REGISTRY) { $env:MICROPI_NPM_REGISTRY.TrimEnd('/') } else { 'https://registry.npmjs.org' }
-	foreach ($e in $wanted) {
-		$spec = "$($e.Package)@$($e.Version)"
-		if (-not (Test-PiBoltExtension $registry $e)) {
-			Write-Host "  ${red}did not install $spec (µPi itself is installed): the registry's package is not the one this release pins$reset"
-			continue
-		}
-		# From the registry that was checked, and without running the package's install scripts: nothing of it runs until its
-		# lockfile entry has been compared with the pin (below), and an extension of Pi needs none.
-		$saved = @{ NPM_CONFIG_REGISTRY = $env:NPM_CONFIG_REGISTRY; NPM_CONFIG_IGNORE_SCRIPTS = $env:NPM_CONFIG_IGNORE_SCRIPTS }
-		$env:NPM_CONFIG_REGISTRY = $registry
-		$env:NPM_CONFIG_IGNORE_SCRIPTS = 'true'
-		# (In µPi's own folder, as `list`: in a project with resources that need trust, the commands load the extensions
-		# to settle it, and with them the one just downloaded, before its pin is compared.)
-		Push-Location -LiteralPath (Split-Path $exe)
-		try {
-			$out = & $exe install --upi "npm:$spec" 2>&1
-			$installed = $LASTEXITCODE -eq 0
-		} finally {
-			Pop-Location
-			$env:NPM_CONFIG_REGISTRY = $saved.NPM_CONFIG_REGISTRY
-			$env:NPM_CONFIG_IGNORE_SCRIPTS = $saved.NPM_CONFIG_IGNORE_SCRIPTS
-		}
-		if ($installed) {
-			# What the package manager installed is a download of its own: its lockfile says what it got.
-			$check = Test-PiBoltInstalledExtension $exe $e
-			if ($check -ne 'same') {
-				# (Not known is not the pin either: what was installed is a download the installer has not seen.)
-				Push-Location -LiteralPath (Split-Path $exe)
-				try { & $exe remove --upi "npm:$spec" *> $null; $removed = $LASTEXITCODE -eq 0 } finally { Pop-Location }
-				$why = if ($check -eq 'different') { 'is not the one this release pins' } else { 'cannot be checked against the pin (no lockfile says what it is)' }
-				if ($removed) { Write-Host "  ${red}removed $spec again: what the package manager installed $why$reset" }
-				else { Write-Host "  ${red}$spec $why, and removing it failed: remove it yourself (upi remove --upi npm:$spec)$reset" }
-				Write-Host "  ${dim}Install it yourself if you want it: upi install --upi npm:$spec$reset"
-				continue
-			}
-		}
-		if ($installed) { Write-Host "  ${green}ok$reset $spec installed" }
-		else {
-			Write-Host "  ${red}could not install $($e.Package) (µPi itself is installed): $(($out | Select-Object -Last 1))$reset"
-			Write-Host "  ${dim}Install it later with: upi install --upi npm:$($e.Package)$reset"
-		}
-	}
-}
-
 # --- Main -------------------------------------------------------------------------------------------------------------
 
 function Install-PiBolt {
@@ -852,30 +707,30 @@ function Install-PiBolt {
 	# release published meanwhile cannot mix two. The version is then checked against the signed checksums.
 	$shown = ''
 	if ($version -ne 'latest') {
-		if ($version -notmatch '^bolt-v(\d+\.\d+\.\d+)$') { Stop-PiBolt 'MICROPI_VERSION must be a release tag such as bolt-v0.8.0' }
+		if ($version -notmatch '^upi-v(\d+\.\d+\.\d+)$') { Stop-PiBolt 'MICROPI_VERSION must be a release tag such as upi-v0.8.0' }
 		$shown = $Matches[1]
 	} elseif (-not $env:MICROPI_DOWNLOAD_BASE -and $channel -eq 'beta') {
-		# The newest release, pre-releases included: the highest bolt-vX.Y.Z tag GitHub lists (it lists no drafts to anyone without
+		# The newest release, pre-releases included: the highest upi-vX.Y.Z tag GitHub lists (it lists no drafts to anyone without
 		# write access).
 		try {
 			$releases = (New-PiBoltClient).GetStringAsync("$PiBoltApi/releases?per_page=30").GetAwaiter().GetResult() | ConvertFrom-Json
-			$newest = $releases | Where-Object { -not $_.draft -and $_.tag_name -match '^bolt-v\d+\.\d+\.\d+$' } |
-				ForEach-Object { [version]($_.tag_name -replace '^bolt-v', '') } | Sort-Object -Descending | Select-Object -First 1
+			$newest = $releases | Where-Object { -not $_.draft -and $_.tag_name -match '^upi-v\d+\.\d+\.\d+$' } |
+				ForEach-Object { [version]($_.tag_name -replace '^upi-v', '') } | Sort-Object -Descending | Select-Object -First 1
 			if ($newest) { $shown = $newest.ToString() }
 		} catch { }
-		if (-not $shown) { Stop-PiBolt "could not find the newest release ($PiBoltApi/releases): try again, or set MICROPI_VERSION=bolt-vX.Y.Z" }
+		if (-not $shown) { Stop-PiBolt "could not find the newest release ($PiBoltApi/releases): try again, or set MICROPI_VERSION=upi-vX.Y.Z" }
 	} elseif (-not $env:MICROPI_DOWNLOAD_BASE) {
 		try {
 			$response = (New-PiBoltClient).GetAsync("$PiBoltRepo/releases/latest").GetAwaiter().GetResult()
-			if ($response.RequestMessage.RequestUri.AbsoluteUri -match '/tag/bolt-v(\d+\.\d+\.\d+)$') { $shown = $Matches[1] }
+			if ($response.RequestMessage.RequestUri.AbsoluteUri -match '/tag/upi-v(\d+\.\d+\.\d+)$') { $shown = $Matches[1] }
 		} catch { }
-		if (-not $shown) { Stop-PiBolt "could not find out which release is the latest ($PiBoltRepo/releases/latest): try again, or set MICROPI_VERSION=bolt-vX.Y.Z" }
+		if (-not $shown) { Stop-PiBolt "could not find out which release is the latest ($PiBoltRepo/releases/latest): try again, or set MICROPI_VERSION=upi-vX.Y.Z" }
 	} else {
 		# A mirror says which release it serves: without the version asked for, its checksums would be taken for whichever release
 		# they are (an older one, signed all the same, installed as the latest).
-		Stop-PiBolt 'MICROPI_DOWNLOAD_BASE needs MICROPI_VERSION (the release it serves, such as bolt-v0.8.0)'
+		Stop-PiBolt 'MICROPI_DOWNLOAD_BASE needs MICROPI_VERSION (the release it serves, such as upi-v0.8.0)'
 	}
-	$base = "$PiBoltRepo/releases/download/bolt-v$shown"
+	$base = "$PiBoltRepo/releases/download/upi-v$shown"
 	if ($env:MICROPI_DOWNLOAD_BASE) { $base = $env:MICROPI_DOWNLOAD_BASE.TrimEnd('/') }
 	if (-not $variant) {
 		$variant = 'x64'
@@ -923,14 +778,9 @@ function Install-PiBolt {
 	if ($channel -eq 'beta') { Set-Content -LiteralPath (Join-Path $install 'channel') -Value 'beta' -Encoding ascii }
 	elseif ($channel -eq 'stable') { Remove-Item -LiteralPath (Join-Path $install 'channel') -Force -ErrorAction SilentlyContinue }
 	$exe = Join-Path $state.Dir 'upi.exe'
-	# µPi keeps the packages only it runs (OpenSec's extensions) out of Pi's list, which it does as it starts: once now, so
-	# that Pi, if it is started before µPi, does not find them (an earlier installer put them there).
-	Push-Location -LiteralPath $state.Dir
-	try { & $exe list *> $null } catch { } finally { Pop-Location }
 	$word = if ($action -eq 'reinstall' -and $state.Installed -and $state.Installed -ne $state.Shown) { 'updated' } elseif ($action -eq 'reinstall') { 'reinstalled' } else { 'installed' }
 	Write-Host "`nµPi $($state.Shown) was $word successfully $dim(Pi $(& $exe --version))$reset."
 	Add-PiBoltToPath $state.Dir ([bool]$state.Existed)
-	Install-PiBoltExtensions $state
 	if ((Get-Command upi -ErrorAction SilentlyContinue).Source -ieq $exe) { Write-Host "`nRun it with: ${bold}upi$reset" }
 	if ((Test-PiBoltCanAsk) -and $env:MICROPI_NO_START -ne '1') {
 		if ((Read-PiBoltAnswer "`nStart upi now? [Y/n] ") -notmatch '^(n|no)$') { Write-Host ''; & $exe }

@@ -190,5 +190,14 @@ if ((Test-Path -LiteralPath $about) -and (Select-String -LiteralPath $about -Pat
 & py -3 (Join-Path $here 'search-tools.py') $Pi
 if ($LASTEXITCODE -ne 0) { $script:status = 1 }
 
+# microPi's built-in docsearch (build-pi.sh --builtins), if the build has it (its upi.txt says so): project_search is
+# offered when nothing is installed, and works.
+if (Test-Path -LiteralPath $about) {
+	if (Select-String -LiteralPath $about -Pattern '^built-in: docsearch' -Quiet) {
+		& py -3 (Join-Path $here 'docsearch.py') $Pi
+		if ($LASTEXITCODE -ne 0) { $script:status = 1 }
+	}
+}
+
 Remove-Item -LiteralPath $home_ -Recurse -Force -ErrorAction SilentlyContinue
 exit $script:status

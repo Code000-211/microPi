@@ -14,6 +14,8 @@ const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
 
 beforeEach(() => {
 	allowNetwork();
+	// These are tests of the automatic check, which the harness's PI_SKIP_VERSION_CHECK would turn off.
+	delete process.env.PI_SKIP_VERSION_CHECK;
 });
 
 afterEach(() => {

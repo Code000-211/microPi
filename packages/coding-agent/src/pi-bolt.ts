@@ -92,8 +92,8 @@ export function piBoltInstallerProcess(installerFile?: string): { command: strin
 export const MICROPI_HAS_RELEASES = false;
 export const PIBOLT_RELEASES_URL = "https://github.com/opensec-git/Pi-Bolt/releases";
 /** The key releases' SHA256SUMS are signed with (keys/release.pub; the installers carry it too). */
-export const PIBOLT_RELEASE_KEY = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAoLboJqtKaoISPqffk03vHZr+1sRBG3uIRIWeKOew+aY=
+export const MICROPI_RELEASE_KEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI=
 -----END PUBLIC KEY-----
 `;
 /** Redirects to the latest release's page (.../releases/tag/bolt-v1.0.2); not counted against GitHub's API limit. */

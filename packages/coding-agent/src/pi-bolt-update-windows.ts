@@ -32,7 +32,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { gunzipSync } from "node:zlib";
 import chalk from "chalk";
-import { PIBOLT_RELEASE_KEY } from "./pi-bolt.ts";
+import { MICROPI_RELEASE_KEY } from "./pi-bolt.ts";
 
 const REPO = "https://github.com/opensec-git/Pi-Bolt";
 const ASIDE = /\.pibolt-(old|new)$/;
@@ -49,7 +49,7 @@ export function isInProfile(dir: string, env: NodeJS.ProcessEnv = process.env): 
 export function sumsSignatureValid(
 	sums: Buffer,
 	signature: Buffer,
-	publicKeyPem: string = PIBOLT_RELEASE_KEY,
+	publicKeyPem: string = MICROPI_RELEASE_KEY,
 ): boolean {
 	try {
 		return verify(null, sums, createPublicKey(publicKeyPem), signature);
@@ -248,7 +248,7 @@ export function releaseDownloadBase(version: string): string {
  * Release `version`'s SHA256SUMS, once its signature (SHA256SUMS.sig) verifies with the release key and its first line names
  * that version. Throws otherwise: nothing else is looked at in a release whose checksums are not Pi-Bolt's.
  */
-export async function fetchSignedSums(version: string, publicKeyPem: string = PIBOLT_RELEASE_KEY): Promise<string> {
+export async function fetchSignedSums(version: string, publicKeyPem: string = MICROPI_RELEASE_KEY): Promise<string> {
 	const base = releaseDownloadBase(version);
 	const sumsBytes = await download(`${base}/SHA256SUMS`, undefined);
 	if (!sumsBytes) throw new Error(`download failed: ${base}/SHA256SUMS`);

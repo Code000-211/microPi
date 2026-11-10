@@ -19,7 +19,7 @@ import {
 	verifyReleaseSums,
 } from "../src/cli/doctor.ts";
 import type * as PiBoltModule from "../src/pi-bolt.ts";
-import { PIBOLT_RELEASE_KEY, type PiBoltBuild } from "../src/pi-bolt.ts";
+import { MICROPI_RELEASE_KEY, type PiBoltBuild } from "../src/pi-bolt.ts";
 
 const build = vi.hoisted(() => ({ value: undefined as PiBoltBuild | undefined }));
 vi.mock("../src/pi-bolt.ts", async (importOriginal) => {
@@ -84,7 +84,7 @@ describe("the release signature", () => {
 
 	it("checks with the key releases are signed with", () => {
 		const repositoryKey = readFileSync(join(__dirname, "..", "..", "..", "keys", "release.pub"), "utf8");
-		expect(PIBOLT_RELEASE_KEY.trim()).toBe(repositoryKey.trim());
+		expect(MICROPI_RELEASE_KEY.trim()).toBe(repositoryKey.trim());
 	});
 });
 

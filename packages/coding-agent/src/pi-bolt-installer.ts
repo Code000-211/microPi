@@ -11,7 +11,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { PIBOLT_RELEASE_KEY, piBoltInstallerProcess } from "./pi-bolt.ts";
+import { MICROPI_RELEASE_KEY, piBoltInstallerProcess } from "./pi-bolt.ts";
 import { download, fetchSignedSums, releaseDownloadBase, sha256, sumsEntry } from "./pi-bolt-update-windows.ts";
 import { spawnProcess, waitForChildProcess } from "./utils/child-process.ts";
 
@@ -31,7 +31,7 @@ export interface ReleaseInstaller {
 export async function fetchReleaseInstaller(
 	version: string,
 	name: string = PIBOLT_INSTALLER_NAME,
-	publicKeyPem: string = PIBOLT_RELEASE_KEY,
+	publicKeyPem: string = MICROPI_RELEASE_KEY,
 ): Promise<ReleaseInstaller> {
 	const sums = await fetchSignedSums(version, publicKeyPem);
 	const expected = sumsEntry(sums, name);

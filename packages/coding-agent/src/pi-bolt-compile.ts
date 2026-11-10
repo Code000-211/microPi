@@ -45,8 +45,8 @@ import { getPackageIdentity } from "./core/package-source.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { namesPlugin, type PluginPlan, planPlugins, selectionProblem } from "./gen-plugin-manifest.mjs";
 import {
+	MICROPI_RELEASE_KEY,
 	PIBOLT,
-	PIBOLT_RELEASE_KEY,
 	PIBOLT_RELEASES_URL,
 	piBoltInstallDir,
 	piBoltInstallMethod,
@@ -403,7 +403,7 @@ export function checkReleaseSums(
 	sums: Buffer,
 	signature: Buffer,
 	version: string,
-	key = PIBOLT_RELEASE_KEY,
+	key = MICROPI_RELEASE_KEY,
 ): Map<string, string> {
 	let signed = false;
 	try {
@@ -479,7 +479,7 @@ export async function releaseArchives(
 	version: string,
 	platform: string,
 	cacheDir: string,
-	key = PIBOLT_RELEASE_KEY,
+	key = MICROPI_RELEASE_KEY,
 ): Promise<{ runtime: string; kit: string }> {
 	const names = { runtime: `pi-bolt-runtime-${platform}.tar.gz`, kit: `pi-bolt-kit-${platform}.tar.gz` };
 	let sha = cachedReleaseSums(cacheDir, version, key);

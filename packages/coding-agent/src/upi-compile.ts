@@ -1703,7 +1703,7 @@ async function buildExecutable(
 	// The check build-pi.sh makes: that the executable runs, as this version, from its compiled code.
 	const check = run(join(stage, "pi"), ["--version"], { env: { ...process.env, BUN_STATIC_HEAP_VERBOSE: "1" } });
 	const said = `${check.stdout}${check.stderr}`;
-	if (check.status !== 0 || !said.includes("image registered: true") || !said.includes(`µPi ${build.version},`)) {
+	if (check.status !== 0 || !said.includes("image registered: true") || !said.includes(`µPi ${build.version} (Pi`)) {
 		throw new CompileError(`the new executable does not run as it should:\n${said.trim()}`);
 	}
 }

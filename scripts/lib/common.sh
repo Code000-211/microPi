@@ -154,7 +154,8 @@ stage_plugins() {
 		// A named plugin is a built-in extension (\`builtin:<name>\`): it can be turned off (\`-builtin:<name>\` in the \`extensions\`
 		// setting, or the config screen), and an extension of the same tools loaded at run time replaces it (replaceable) instead of
 		// conflicting. The manifest decides where it says (builtin or replaceable set); an unnamed factory stays an inline extension.
-		const extensionFactories = [$factories].map((plugin) =>
+		// (A flat: a manifest's default is an array of factories, and the builtins' is beside or instead of it.)
+		const extensionFactories = [$factories].flat().map((plugin) =>
 			typeof plugin === "function" || plugin.builtin !== undefined
 				? plugin
 				: { ...plugin, builtin: true, replaceable: plugin.replaceable ?? true },

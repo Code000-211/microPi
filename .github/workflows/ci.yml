@@ -71,7 +71,7 @@ jobs:
         name: Whether the latest release's runtime is this engine
         # (For the Windows job, which has no bash to compute it: scripts/runtime-stamp.sh.)
         run: |
-          released=$(curl -fsSL "${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
+          released=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
           if [ "$(scripts/runtime-stamp.sh)" = "$released" ]; then echo "older=false"; else echo "older=true"; fi >>"$GITHUB_OUTPUT"
 
   lint:
@@ -198,7 +198,7 @@ jobs:
           Darwin-arm64) NAME=upi-runtime-darwin-arm64.tar.gz ;;
           *) echo "no runtime name for $(uname -s)-$(uname -m)"; exit 1 ;;
           esac
-          if ! curl -fsIL -o /dev/null "${GITHUB_REPOSITORY}/releases/latest/download/$NAME"; then
+          if ! curl -fsIL -o /dev/null "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/$NAME"; then
             echo "::notice title=No µPi runtime::µPi's latest release has no $NAME (or there is no release yet): the runtime comes from Pi-Bolt's latest release."
           fi
           scripts/fetch-runtime.sh
@@ -213,10 +213,10 @@ jobs:
           scripts/build-pi.sh --jit on --out out/upi-jit
           out/upi/pi --version | tee /dev/stderr | grep -q "µPi $(cat VERSION)"
       - name: macOS 13 and later
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock' && runner.os == 'macOS'
+        if: steps.runtime.outputs.available == 'true' && runner.os == 'macOS'
         run: scripts/check-macos-floor.sh out/upi out/upi-jit
       - name: µPi's tests
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock'
+        if: steps.runtime.outputs.available == 'true'
         run: |
           tests/pi/run.sh "$PWD/out/upi/pi"
           tests/pi/run.sh "$PWD/out/upi-jit/pi"
@@ -226,39 +226,21 @@ jobs:
             sudo env PATH="$PATH" PIBOLT_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/out/upi"
           fi
       - name: Engine tests
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock'
+        if: steps.runtime.outputs.available == 'true'
         run: tests/aot/run.sh
       - name: Runtime tests
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock'
+        if: steps.runtime.outputs.available == 'true'
         # A test of what the engine in this commit does is skipped while the released runtime is an older engine; the
         # release workflow runs it on the runtime built from this engine (docs/RELEASING.md).
         run: |
-          released=$(curl -fsSL "${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
+          released=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
           [ "$(scripts/runtime-stamp.sh)" = "$released" ] || export PIBOLT_RUNTIME_OLDER=1
           tests/runtime/run.sh
-      - name: The same as stock Pi
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'tests'
-        run: |
-          scripts/build-pi.sh --stable --out out/pi-stable
-          python3 bench/e2e_tools.py --reference bun=out/pi-stable/pi --build upi=out/upi/pi --build jit=out/upi-jit/pi
-          python3 bench/e2e_screen.py --reference bun=out/pi-stable/pi --build upi=out/upi/pi
-          python3 bench/e2e_fullscreen.py --build upi=out/upi/pi
-
-  # macOS, the slowest runner, does the same in two jobs side by side: µPi's, engine and runtime tests in one, the comparison
-  # with stock Pi in the other (about 14 minutes one after the other, 7 of them the comparison). µPi on macOS Apple silicon
-  # passes when both have.
+  # macOS, the slowest runner, has one job next to the Linux ones: µPi's, engine and runtime tests. The comparison with
+  # stock Pi is gone: bench's e2e_*.py scripts were removed by the slim cleanup.
   upi-macos-part:
-    name: µPi on macOS Apple silicon (${{ matrix.label }})
+    name: µPi on macOS Apple silicon
     needs: changes
-    if: ${{ !cancelled() }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - part: tests
-            label: tests
-          - part: stock
-            label: the same as stock Pi
     runs-on: macos-15
     timeout-minutes: 60
     steps: *upi-steps
@@ -270,9 +252,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Its tests and the comparison with stock Pi passed
+      - name: Its tests passed
         run: |
-          echo "µPi on macOS Apple silicon (tests, the same as stock Pi): $RESULT"
+          echo "µPi on macOS Apple silicon (tests): $RESULT"
           [ "$RESULT" = success ]
         env:
           RESULT: ${{ needs.upi-macos-part.result }}
@@ -522,7 +504,7 @@ jobs:
       - name: Whether the release's runtime is still this engine
         run: |
           stamp=$(scripts/runtime-stamp.sh)
-          released=$(curl -fsSL "${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
+          released=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
           if [ "$stamp" != "$released" ]; then
             echo "::notice title=Engine changed::The engine differs from the latest release's runtime ($released, now $stamp): the next release needs its runtime built (docs/RELEASING.md). The µPi jobs above used the released runtime."
           fi

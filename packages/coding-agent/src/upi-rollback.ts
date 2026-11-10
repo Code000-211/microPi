@@ -142,7 +142,7 @@ export function rollbackPiBolt(): number {
 		console.error(
 			`This µPi was installed with ${manager.name}, which keeps no earlier build to go back to. To run another version, uninstall it and install that version with the installer:`,
 		);
-		console.error(`  ${manager.uninstall} && curl -fsSL ${MICROPI_INSTALL_URL} | MICROPI_VERSION=bolt-v<version> sh`);
+		console.error(`  ${manager.uninstall} && curl -fsSL ${MICROPI_INSTALL_URL} | MICROPI_VERSION=upi-v<version> sh`);
 		return 1;
 	}
 	if (!piBoltInstallDir()) {

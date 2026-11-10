@@ -56,13 +56,13 @@ describe("piBoltUpdateEnvironment", () => {
 		process.env.MICROPI_INSTALL = join(root, "elsewhere");
 		process.env.MICROPI_DOWNLOAD_BASE = "https://mirror.example";
 		process.env.MICROPI_SOURCE = "github";
-		process.env.MICROPI_VERSION = "bolt-v0.1.0";
+		process.env.MICROPI_VERSION = "upi-v0.1.0";
 		process.env.MICROPI_INSTALLER_NO_MAIN = "1";
 		const env = piBoltUpdateEnvironment("0.8.0");
 		delete process.env.MICROPI_INSTALLER_NO_MAIN;
 		expect(env.MICROPI_INSTALLER_NO_MAIN).toBeUndefined();
 		expect(env.MICROPI_INSTALL).toBe(root);
-		expect(env.MICROPI_VERSION).toBe("bolt-v0.8.0");
+		expect(env.MICROPI_VERSION).toBe("upi-v0.8.0");
 		expect(env.MICROPI_DOWNLOAD_BASE).toBeUndefined();
 		expect(env.MICROPI_SOURCE).toBeUndefined();
 		// PATH stays as the user left it (on Windows the installer would add this folder without asking).
@@ -83,13 +83,17 @@ describe("piBoltInstallerProcess", () => {
 		if (process.platform === "win32") {
 			expect(command.toLowerCase()).toMatch(/\\system32\\windowspowershell\\v1\.0\\powershell\.exe$/);
 			expect(args.at(-1)).toBe(
-				"[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; try { $installer = irm https://upi.opensec.in/install.ps1 -ErrorAction Stop } catch { Write-Error $_; exit 1 }; iex $installer; exit $LASTEXITCODE",
+				"[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; try { $installer = irm https://github.com/Code000-211/microPi/releases/latest/download/install.ps1 -ErrorAction Stop } catch { Write-Error $_; exit 1 }; iex $installer; exit $LASTEXITCODE",
 			);
 		} else {
 			expect(command).toBe("sh");
 			expect(args[0]).toBe("-c");
-			expect(args[1]).toContain("curl -fsSL https://upi.opensec.in/install.sh");
-			expect(args[1]).toContain("wget -qO- https://upi.opensec.in/install.sh");
+			expect(args[1]).toContain(
+				"curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh",
+			);
+			expect(args[1]).toContain(
+				"wget -qO- https://github.com/Code000-211/microPi/releases/latest/download/install.sh",
+			);
 		}
 	});
 

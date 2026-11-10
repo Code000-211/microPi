@@ -98,11 +98,11 @@ describe.skipIf(process.platform === "win32")("upi update --rollback", () => {
 describe("the release channel", () => {
 	test("the newest release, pre-releases included, drafts and other tags not", () => {
 		const releases = [
-			{ tag_name: "bolt-v0.8.7", prerelease: false, draft: false },
-			{ tag_name: "bolt-v0.9.0", prerelease: true, draft: false },
-			{ tag_name: "bolt-v0.10.0", prerelease: false, draft: true },
+			{ tag_name: "upi-v0.8.7", prerelease: false, draft: false },
+			{ tag_name: "upi-v0.9.0", prerelease: true, draft: false },
+			{ tag_name: "upi-v0.10.0", prerelease: false, draft: true },
 			{ tag_name: "v1.2.0", prerelease: false, draft: false },
-			{ tag_name: "bolt-v0.8.10", prerelease: false, draft: false },
+			{ tag_name: "upi-v0.8.10", prerelease: false, draft: false },
 		];
 		expect(newestPiBoltVersion(releases)).toBe("0.9.0");
 		expect(newestPiBoltVersion(releases.slice(0, 1))).toBe("0.8.7");

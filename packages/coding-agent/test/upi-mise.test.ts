@@ -27,7 +27,7 @@ vi.mock("../src/utils/version-check.ts", async (importOriginal) => ({
 	getLatestPiRelease: async () => ({ version: "1.0.1" }),
 }));
 
-const GITHUB_TOOL = "github:opensec-git/Pi-Bolt";
+const GITHUB_TOOL = "github:Code000-211/microPi";
 const realExecPath = process.execPath;
 let dir: string;
 let installs: string;
@@ -37,11 +37,11 @@ function runningFrom(execPath: string): void {
 }
 
 /**
- * What `mise use github:opensec-git/Pi-Bolt` installs (with the options in docs: the release's archive, `pi` renamed to
+ * What `mise use github:Code000-211/microPi` installs (with the options in docs: the release's archive, `pi` renamed to
  * `upi`, and only that on PATH): the archive's folder, unpacked into <data>/installs/<tool folder>/<version>, with links
  * for the version prefixes. Returns the folder; upi there starts pi-bin beside it.
  */
-function miseInstall(data: string, toolFolder = "github-opensec-git-upi"): string {
+function miseInstall(data: string, toolFolder = "github-Code000-211-microPi"): string {
 	installs = join(data, "installs", toolFolder);
 	const version = join(installs, "1.0.0");
 	mkdirSync(join(version, ".mise-bins"), { recursive: true });
@@ -88,7 +88,7 @@ describe.skipIf(process.platform === "win32")("a µPi installed with mise", () =
 		runningFrom("/home/me/.local/share/mise/installs/upi/1.0.0/pi-bin");
 		expect(piBoltInstallMethod()).toBe("mise");
 		expect(piBoltMiseTool()).toBe("upi");
-		runningFrom("C:\\Users\\me\\AppData\\Local\\mise\\installs\\github-opensec-git-upi\\1.0.0\\upi.exe");
+		runningFrom("C:\\Users\\me\\AppData\\Local\\mise\\installs\\github-Code000-211-microPi\\1.0.0\\upi.exe");
 		expect(piBoltInstallMethod()).toBe("mise");
 		// Another tool of mise's, and the installer's folder, are not.
 		runningFrom("/home/me/.local/share/mise/installs/node/24.0.0/bin/node");
@@ -98,7 +98,7 @@ describe.skipIf(process.platform === "win32")("a µPi installed with mise", () =
 		runningFrom(join(version, "pi-bin"));
 		expect(piBoltUpdateCommand("mise")).toBe(`mise upgrade --bump ${GITHUB_TOOL}`);
 		expect(piBoltJitSwitchCommand("mise", "darwin", "arm64-jit")).toBe(
-			`mise unuse -g ${GITHUB_TOOL} && curl -fsSL https://upi.opensec.in/install.sh | MICROPI_VARIANT=arm64-jit sh`,
+			`mise unuse -g ${GITHUB_TOOL} && curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | MICROPI_VARIANT=arm64-jit sh`,
 		);
 	});
 
@@ -164,6 +164,6 @@ describe.skipIf(process.platform === "win32")("a µPi installed with mise", () =
 			return true;
 		});
 		expect(await runDoctor(["--offline"], { cwd: home, agentDir, extensionFactories: [] })).toBe(0);
-		expect(output).toMatch(/installed +mise \(github:opensec-git\/Pi-Bolt\), run from .*1\.0\.0/);
+		expect(output).toMatch(/installed +mise \(github:Code000-211\/microPi\), run from .*1\.0\.0/);
 	});
 });

@@ -49,7 +49,7 @@ import { resetTimings } from "./timings.ts";
 // µPi shares Pi's agent directory, so a package installed for one runtime is loaded by the other too.
 const TOOL_CONFLICT_HINT =
 	". Two packages provide this tool: exclude one with upi remove --upi <source>" +
-	" (add --local for a project package; https://github.com/opensec-git/Pi-Bolt#pi-and-upi-side-by-side)";
+	" (add --local for a project package; https://github.com/Code000-211/microPi#pi-and-upi-side-by-side)";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;

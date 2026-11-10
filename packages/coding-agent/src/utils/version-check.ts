@@ -117,7 +117,7 @@ export function newestPiBoltVersion(releases: unknown): string | undefined {
 	);
 }
 
-/** The version of a release page's address (".../releases/tag/bolt-v1.0.2" -> "1.0.2"), or undefined for any other. */
+/** The version of a release page's address (".../releases/tag/upi-v1.0.2" -> "1.0.2"), or undefined for any other. */
 export function piBoltVersionOfReleaseUrl(url: string | null | undefined): string | undefined {
 	if (!url) return undefined;
 	try {

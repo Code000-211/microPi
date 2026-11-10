@@ -72,10 +72,10 @@ describe("the JIT build to switch to", () => {
 
 	it("is installed as this one was installed", () => {
 		expect(piBoltJitSwitchCommand("installer", "linux", "x64-jit")).toBe(
-			"curl -fsSL https://upi.opensec.in/install.sh | MICROPI_VARIANT=x64-jit sh",
+			"curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | MICROPI_VARIANT=x64-jit sh",
 		);
 		expect(piBoltJitSwitchCommand("installer", "win32", "x64-jit")).toBe(
-			'$env:MICROPI_VARIANT = "x64-jit"; irm https://upi.opensec.in/install.ps1 | iex',
+			'$env:MICROPI_VARIANT = "x64-jit"; irm https://github.com/Code000-211/microPi/releases/latest/download/install.ps1 | iex',
 		);
 		// The npm package reads MICROPI_VARIANT at every run on macOS and Linux, and when it is installed on Windows.
 		expect(piBoltJitSwitchCommand("npm", "darwin", "arm64-jit")).toBe(

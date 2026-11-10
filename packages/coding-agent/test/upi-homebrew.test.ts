@@ -84,7 +84,7 @@ describe.skipIf(process.platform === "win32")("a µPi installed with Homebrew", 
 		expect(piBoltUpdateCommand("homebrew")).toBe("brew upgrade upi");
 		expect(piBoltUpdateCommand("installer")).toBe("upi update");
 		expect(piBoltJitSwitchCommand("homebrew", "darwin", "arm64-jit")).toBe(
-			"brew uninstall upi && curl -fsSL https://upi.opensec.in/install.sh | MICROPI_VARIANT=arm64-jit sh",
+			"brew uninstall upi && curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | MICROPI_VARIANT=arm64-jit sh",
 		);
 	});
 
@@ -145,7 +145,7 @@ describe.skipIf(process.platform === "win32")("a µPi installed with Homebrew", 
 			return true;
 		});
 		expect(await runDoctor(["--offline"], { cwd: home, agentDir, extensionFactories: [] })).toBe(0);
-		expect(output).toMatch(/installed +Homebrew \(the opensec-git\/tap\/upi formula\), run from .*libexec/);
+		expect(output).toMatch(/installed +Homebrew \(the Code000-211\/tap\/upi formula\), run from .*libexec/);
 		expect(output).toContain("(this µPi)");
 	});
 });

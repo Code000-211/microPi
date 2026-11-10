@@ -97,6 +97,8 @@ try:
     check("grep and find are not on by default (settings-manager: their schemas are off until turned on)",
           r.returncode == 0 and "grep" not in tools and "find" not in tools, f"exit {r.returncode}, tools {tools}")
     r, tools, results = session({}, "--tools", "grep,find")
+    check("--tools grep and find turn them on", "grep" in tools and "find" in tools,
+          f"exit {r.returncode}, tools {tools}, {r.stderr[-300:]}")
     check("grep searches in-process, leaving out what .gitignore does, in path order",
           len(results) == 2 and results[0] == "a/c.ts:1: needle c\nb.ts:1: needle b", repr(results[:1]))
     check("find too", len(results) == 2 and results[1] == "a/c.ts\nb.ts", repr(results[1:]))

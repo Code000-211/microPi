@@ -37,7 +37,7 @@ function build() {
 		if (!hasCommand(compiler)) continue;
 		const args =
 			platform === "darwin"
-				? ["-dynamiclib", "-undefined", "dynamic_lookup", "-O2", "-fPIC", sourceFile, "-o", outputFile]
+				? ["-dynamiclib", "-mmacosx-version-min=13.0", "-undefined", "dynamic_lookup", "-O2", "-fPIC", sourceFile, "-o", outputFile]
 				: ["-shared", "-O2", "-fPIC", sourceFile, "-ldl", "-lpthread", "-o", outputFile];
 		const res = spawnSync(compiler, args, { stdio: "inherit" });
 		if (res.status === 0) return true;

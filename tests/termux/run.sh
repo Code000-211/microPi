@@ -76,7 +76,7 @@ SERVER=$!
 for _ in $(seq 50); do curl -fs "http://127.0.0.1:$port/SHA256SUMS" >/dev/null && break; sleep 0.1; done
 
 # The installer, in a POSIX shell as Termux's (dash). (Without the LD_PRELOAD: the tools it runs are this system's, glibc's.)
-INSTALL="$HOME/.upi"
+INSTALL="$HOME/.micropi"	# ...as install.sh installs it (MICROPI_INSTALL's default)
 
 # Where Termux's repository has no glibc-repo (Termux from Google Play, whose termux.net leaves the glibc packages out; or a
 # mirror without it), the installer says what to do instead of failing in pkg. (Termux's apt and pkg stand in as scripts.)

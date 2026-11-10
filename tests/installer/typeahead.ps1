@@ -1,4 +1,4 @@
-# install.ps1's questions and what was typed before them (#103), with its functions only (PIBOLT_INSTALLER_NO_MAIN):
+# install.ps1's questions and what was typed before them (#103), with its functions only (MICROPI_INSTALLER_NO_MAIN):
 #   - on a console of its own, "y" and Enter typed together at the action menu: the menu takes the "y", and the Enter left in the
 #     console's input does not answer the next question, which takes the "n" typed once it is shown;
 #   - with input redirected (no console to read), dropping type-ahead does not fail, and the question takes the line given.
@@ -136,7 +136,7 @@ function Invoke-ConsoleCase([string]$case, [string]$ask) {
 	# The installer's side: the menu's key, a second (the download, in a real run), then the question.
 	$user = Join-Path $dir 'user.ps1'
 	Set-Content -LiteralPath $user -Encoding utf8 -Value @"
-`$env:PIBOLT_INSTALLER_NO_MAIN = '1'
+`$env:MICROPI_INSTALLER_NO_MAIN = '1'
 . '$installer'
 Set-Content -LiteralPath '$at\ready' -Value ''
 while (-not (Test-Path -LiteralPath '$at\typed')) { Start-Sleep -Milliseconds 100 }
@@ -169,7 +169,7 @@ try {
 	# No console to read: input from a file.
 	$redirected = Join-Path $work 'redirected.ps1'
 	Set-Content -LiteralPath $redirected -Encoding utf8 -Value @"
-`$env:PIBOLT_INSTALLER_NO_MAIN = '1'
+`$env:MICROPI_INSTALLER_NO_MAIN = '1'
 . '$installer'
 Clear-PiBoltTypeahead
 `$answer = Read-PiBoltAnswer 'Install them? [Y/n] '

@@ -75,6 +75,6 @@ if [ "$PIBOLT_OS" = darwin ]; then
 		codesign -s - -f -i bun "$executable"
 	done
 fi
-# Which engine it is (scripts/build-pi.sh records it in the executables it builds, for `pi-bolt doctor`).
+# Which engine it is (scripts/build-pi.sh records it in the executables it builds, for `upi doctor`).
 "$PIBOLT_ROOT/scripts/runtime-stamp.sh" >"$PIBOLT_WORK/runtime/RUNTIME_STAMP" 2>/dev/null || rm -f "$PIBOLT_WORK/runtime/RUNTIME_STAMP"
 log "runtime: $PIBOLT_WORK/runtime/bun ($("$PIBOLT_WORK/runtime/bun" --version))"

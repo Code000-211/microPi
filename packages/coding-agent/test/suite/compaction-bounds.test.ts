@@ -123,7 +123,7 @@ describe("compaction bounds", () => {
 	});
 
 	// Normal compactions must send exactly the requests they sent before the bounds were added.
-	// The fixture was captured from pi-bolt before this change; update it only when the summary
+	// The fixture was captured from upi before this change; update it only when the summary
 	// prompts change on purpose.
 	it("sends unchanged summary requests for normal compactions", async () => {
 		const captured: unknown[] = [];

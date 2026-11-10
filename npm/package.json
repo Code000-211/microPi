@@ -1,6 +1,6 @@
 {
-	"name": "pi-bolt",
-	"version": "1.0.9",
+	"name": "upi",
+	"version": "0.1.0",
 	"description": "Pi, the coding agent, compiled ahead of time to native code: one executable for Linux x86-64 and ARM64 (Android too, in Termux), macOS on Apple silicon and Windows x64, starts 2-3x sooner than Pi on Bun and uses about a third of its CPU over a session",
 	"keywords": [
 		"pi",
@@ -10,21 +10,21 @@
 		"aot",
 		"bun"
 	],
-	"homepage": "https://github.com/opensec-git/Pi-Bolt",
+	"homepage": "https://github.com/Code000-211/microPi",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/opensec-git/Pi-Bolt.git",
+		"url": "git+https://github.com/Code000-211/microPi.git",
 		"directory": "npm"
 	},
-	"bugs": "https://github.com/opensec-git/Pi-Bolt/issues",
+	"bugs": "https://github.com/Code000-211/microPi/issues",
 	"license": "MIT",
 	"author": "OpenSec",
 	"bin": {
-		"pi-bolt": "bin/pi-bolt.exe"
+		"upi": "bin/upi.exe"
 	},
 	"files": [
-		"bin/pi-bolt",
-		"bin/pi-bolt.exe",
+		"bin/upi",
+		"bin/upi.exe",
 		"install.cjs",
 		"install.sh",
 		"README.md"

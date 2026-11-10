@@ -11,7 +11,7 @@
     "patches": "patches/bun.patch"
   },
   "pi": {
-    "note": "µPi is a fork of Pi: Pi is this repository's own tree, forked at the tag below",
+    "note": "\u00b5Pi is a fork of Pi: Pi is this repository's own tree, forked at the tag below",
     "upstream": "https://github.com/earendil-works/pi.git",
     "tag": "v1.4.0",
     "profile": "profiles/pi-1.4.0"

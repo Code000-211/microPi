@@ -48,18 +48,18 @@ embeddings (docs Hit@10 88% → 97%, but ~22 ms per search on the CPU).
 
 ## Build and install
 
-Needs Rust (stable) and µPi's `pi-bolt compile`.
+Needs Rust (stable) and µPi's `upi compile`.
 
 ```sh
 packages/docsearch/install.sh                 # builds the addon, copies it and the extension to ~/.pi/agent/extensions/docsearch
-pi-bolt compile --only klar-ui,docsearch      # compiles it into the executable (list the extensions you compile in)
+upi compile --only klar-ui,docsearch      # compiles it into the executable (list the extensions you compile in)
 ```
 
 `install.sh` builds for the platform it runs on (Linux, macOS, Windows in Git Bash; x64 or arm64), copies the addon as
 `docsearch.<platform>-<arch>.node` and writes that name into the extension it installs. Run on Linux x64 only; the core
 compiles for Windows (`cargo check --target x86_64-pc-windows-gnu`), but the addon has not been built or run there. On
 Windows an index file mapped by another process cannot be replaced, so a process whose save fails keeps its build in
-memory. `install.sh` honours `PI_CODING_AGENT_DIR`. The addon is loaded by a literal `require`, so `pi-bolt compile` embeds
+memory. `install.sh` honours `PI_CODING_AGENT_DIR`. The addon is loaded by a literal `require`, so `upi compile` embeds
 it in the executable. `PI_DOCSEARCH=off` leaves the extension out of a run (no tool, no recall), to measure without it.
 
 ## Settings

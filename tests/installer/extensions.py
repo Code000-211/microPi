@@ -107,8 +107,8 @@ offer_extensions
                     "COMMAND_LOG": str(log),
                     "INSTALL_STATUS": str(install_status),
                     "TEST_INTEGRITY": integrity,
-                    "PIBOLT_EXTENSIONS": choice,
-                    "PIBOLT_YES": "1",
+                    "MICROPI_EXTENSIONS": choice,
+                    "MICROPI_YES": "1",
                 },
                 capture_output=True,
                 text=True,
@@ -119,20 +119,20 @@ offer_extensions
 
     def test_installs_only_into_explicit_pi_bolt_scope(self):
         commands, _ = self.run_offer()
-        self.assertEqual(commands, [f"install --pi-bolt npm:{name}@1.0.0" for name in PACKAGES])
+        self.assertEqual(commands, [f"install --upi npm:{name}@1.0.0" for name in PACKAGES])
 
     def test_integrity_failure_removes_from_the_same_scope(self):
         commands, _ = self.run_offer(integrity="different")
         self.assertEqual(commands, [
-            f"{action} --pi-bolt npm:{name}@1.0.0"
+            f"{action} --upi npm:{name}@1.0.0"
             for name in PACKAGES for action in ("install", "remove")
         ])
 
     def test_failed_install_guidance_keeps_explicit_scope(self):
         commands, output = self.run_offer(install_status=1)
-        self.assertEqual(commands, [f"install --pi-bolt npm:{name}@1.0.0" for name in PACKAGES])
+        self.assertEqual(commands, [f"install --upi npm:{name}@1.0.0" for name in PACKAGES])
         for name in PACKAGES:
-            self.assertIn(f"Install it later with: pi-bolt install --pi-bolt npm:{name}", output)
+            self.assertIn(f"Install it later with: upi install --upi npm:{name}", output)
 
     def test_opt_out_does_not_install(self):
         commands, _ = self.run_offer(choice="no")
@@ -156,7 +156,7 @@ offer_extensions
     def test_enter_or_yes_typed_after_the_menu_installs(self):
         for answer in ("\r", "y\r"):
             commands, output = self.run_offer(choice="", typed=[("Choose an action", "y\r"), ("Install them?", answer)])
-            self.assertEqual(commands, [f"install --pi-bolt npm:{name}@1.0.0" for name in PACKAGES], output)
+            self.assertEqual(commands, [f"install --upi npm:{name}@1.0.0" for name in PACKAGES], output)
 
 
 if __name__ == "__main__":

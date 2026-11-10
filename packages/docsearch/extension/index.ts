@@ -14,7 +14,7 @@
  * Settings: ~/.pi/agent/docsearch.json
  *   { "project": true, "roots": ["~/notes"], "autoRecall": true }
  *
- * Install: packages/docsearch/install.sh, then `pi-bolt compile` (see packages/docsearch/README.md).
+ * Install: packages/docsearch/install.sh, then `upi compile` (see packages/docsearch/README.md).
  */
 
 import { spawnSync } from "node:child_process";
@@ -25,7 +25,7 @@ import { Type } from "typebox";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
-// A literal path, so that `pi-bolt compile` embeds the addon in the executable; install.sh puts in the platform it
+// A literal path, so that `upi compile` embeds the addon in the executable; install.sh puts in the platform it
 // builds on (docsearch.darwin-arm64.node, docsearch.win32-x64.node, ...). One that does not load here (built against a
 // newer C library than this system's, say) leaves the extension out instead of stopping Pi.
 let DocIndex: any;

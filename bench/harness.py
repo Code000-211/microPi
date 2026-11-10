@@ -2,7 +2,7 @@
 
 A *build* is a name and the command that starts Pi, given as ``name=command`` on the command line, e.g.::
 
-    --build pi-bolt=./dist/pi/pi --build bun=~/.bun/bin/bun ./pi/dist/bun/cli.js --build node="node ./pi/dist/cli.js"
+    --build upi=./dist/pi/pi --build bun=~/.bun/bin/bun ./pi/dist/bun/cli.js --build node="node ./pi/dist/cli.js"
 
 Every run gets its own fake model server (fake_model.py) on a free port and a throwaway Pi home that points at it, so runs are
 isolated from the user's Pi configuration and from each other.

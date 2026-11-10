@@ -12,7 +12,7 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
 import { isHerdrPiIntegration } from "../../extensions/herdr/integration-file.ts";
-import { PIBOLT } from "../../pi-bolt.ts";
+import { PIBOLT } from "../../upi.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
@@ -688,7 +688,7 @@ async function loadExtension(
 ): Promise<{ extension: Extension | null; error: string | null; warning?: string }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
-	// µPi: an extension `pi-bolt compile` built in, while its files are as they were then (core/extensions/compiled.ts).
+	// µPi: an extension `upi compile` built in, while its files are as they were then (core/extensions/compiled.ts).
 	const compiled = PIBOLT ? compiledExtensionFor(resolvedPath) : undefined;
 	let failedCompiledIn: string | undefined;
 	if (compiled && "factory" in compiled) {
@@ -725,14 +725,14 @@ async function loadExtension(
 		const extension = await initializeExtension(factory, extensionPath, resolvedPath, cwd, eventBus, runtime);
 
 		if (compiled && "changed" in compiled) {
-			const warning = `changed since it was compiled in, so it was loaded from its files: run \`pi-bolt compile\` to compile it in again`;
+			const warning = `changed since it was compiled in, so it was loaded from its files: run \`upi compile\` to compile it in again`;
 			return { extension, error: null, warning };
 		}
 		if (failedCompiledIn !== undefined && compiled && "extension" in compiled)
 			compiled.extension.failed = failedCompiledIn;
 		const failed = compiled && "failed" in compiled ? compiled.failed.failed : failedCompiledIn;
 		if (failed !== undefined) {
-			const warning = `it failed compiled in (${failed}), so it was loaded from its files: \`pi-bolt compile\` builds without it`;
+			const warning = `it failed compiled in (${failed}), so it was loaded from its files: \`upi compile\` builds without it`;
 			return { extension, error: null, warning };
 		}
 		return { extension, error: null };

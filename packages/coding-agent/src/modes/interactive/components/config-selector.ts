@@ -20,7 +20,7 @@ import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../cor
 import { getPackageIdentity } from "../../../core/package-source.ts";
 import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
 import { BUILTIN_PATH_PREFIX } from "../../../core/source-info.ts";
-import { PIBOLT } from "../../../pi-bolt.ts";
+import { PIBOLT } from "../../../upi.ts";
 import { canonicalizePath, isLocalPath, resolvePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";

@@ -2,14 +2,14 @@
 # engine: crashes, and extensions that failed to load; and what Windows needs of it besides (programs started as Pi starts
 # them, workers, the DLLs it loads).
 #
-# Usage: tests\pi\run.ps1 [PI]     (default: out\pi-bolt\pi.exe)
+# Usage: tests\pi\run.ps1 [PI]     (default: out\upi\pi.exe)
 # Each test runs several times: the crashes they guard against depended on when the collector ran. Needs Python 3 (`py`) for the
 # image check, which uses bench's local fake model.
 param([string]$Pi = '')
 $ErrorActionPreference = 'Continue'
 $here = $PSScriptRoot
 $root = (Resolve-Path (Join-Path $here '..\..')).Path
-if (-not $Pi) { $Pi = Join-Path $root 'out\pi-bolt\pi.exe' }
+if (-not $Pi) { $Pi = Join-Path $root 'out\upi\pi.exe' }
 $Pi = (Resolve-Path -LiteralPath $Pi -ErrorAction SilentlyContinue).Path
 if (-not $Pi) { Write-Host 'no Pi executable (scripts\build-pi.ps1)'; exit 1 }
 $home_ = Join-Path ([IO.Path]::GetTempPath()) "pibolt-tests-pi-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
@@ -179,8 +179,8 @@ Test-Bedrock 'Bedrock loads behind a proxy (the proxy refuses)' @{ AWS_ENDPOINT_
 & py -3 (Join-Path $here 'image.py') $Pi
 if ($LASTEXITCODE -ne 0) { $script:status = 1 }
 
-# OpenSec's extensions, if this executable has them compiled in (its pi-bolt.txt says so): there, working, switchable, replaceable.
-$about = Join-Path (Split-Path $Pi) 'pi-bolt.txt'
+# OpenSec's extensions, if this executable has them compiled in (its upi.txt says so): there, working, switchable, replaceable.
+$about = Join-Path (Split-Path $Pi) 'upi.txt'
 if ((Test-Path -LiteralPath $about) -and (Select-String -LiteralPath $about -Pattern '^plugins: .*opensec-pi-todo' -Quiet)) {
 	& py -3 (Join-Path $here 'compiled-plugins.py') $Pi
 	if ($LASTEXITCODE -ne 0) { $script:status = 1 }

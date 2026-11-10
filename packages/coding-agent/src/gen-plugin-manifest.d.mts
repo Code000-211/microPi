@@ -1,4 +1,4 @@
-/** The types of gen-plugin-manifest.mjs, which `pi-bolt compile` (pi-bolt-compile.ts) imports. */
+/** The types of gen-plugin-manifest.mjs, which `upi compile` (upi-compile.ts) imports. */
 
 /** An extension the plan compiles in. */
 export interface PlannedPlugin {

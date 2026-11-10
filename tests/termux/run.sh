@@ -9,11 +9,11 @@
 #   - Android's 39-bit address space (512 GB): what µPi maps at fixed addresses must be below it. (Only where it is: qemu-user's
 #     reserved_va, which would make the limit real, stops on stock Bun as well, at mimalloc's address hints above it.)
 # The build is served from a local folder as a release from before releases were signed, which install.sh takes with
-# PIBOLT_UNVERIFIED set to the SHA-256 of its SHA256SUMS. Not covered: Termux's patched glibc itself, Android's SELinux policy and kernel.
+# MICROPI_UNVERIFIED set to the SHA-256 of its SHA256SUMS. Not covered: Termux's patched glibc itself, Android's SELinux policy and kernel.
 #
-# Usage: tests/termux/run.sh --build DIR    (DIR: an unpacked pi-bolt-linux-arm64 build, or out/pi-bolt)
+# Usage: tests/termux/run.sh --build DIR    (DIR: an unpacked upi-linux-arm64 build, or out/upi)
 # Run it as root in a throwaway container (it writes /data and /system), for instance:
-#   docker run --rm -v "$PWD:/repo" -w /repo pibolt-build tests/termux/run.sh --build out/pi-bolt
+#   docker run --rm -v "$PWD:/repo" -w /repo pibolt-build tests/termux/run.sh --build out/upi
 # Needs: cc with static libc (libc6-dev), readelf, python3, curl, xz, a static busybox (the shell of the launcher install.sh writes:
 # Termux's is Android's, which the LD_PRELOAD does not stop).
 set -uo pipefail
@@ -63,12 +63,12 @@ cc -static -O2 -o "$WORK/android-filter" "$ROOT/tests/termux/android-filter.c" |
 
 if out=$(LD_PRELOAD="$PRELOAD" /bin/true 2>&1); then fail "the LD_PRELOAD stops a glibc program, as Termux's does" "$out"; else pass "the LD_PRELOAD stops a glibc program, as Termux's does"; fi
 
-# The release: the build as pi-bolt-linux-arm64, unsigned (0.5.99).
-NAME=pi-bolt-linux-arm64
+# The release: the build as upi-linux-arm64, unsigned (0.5.99).
+NAME=upi-linux-arm64
 mkdir -p "$WORK/release/$NAME"
 cp -R "$BUILD/." "$WORK/release/$NAME/"
 (cd "$WORK/release" && tar -cf - "$NAME" | xz -T0 -1 >"$NAME.tar.xz" && rm -rf "$NAME" &&
-	{ echo "# pi-bolt 0.5.99"; sha256sum "$NAME.tar.xz"; } >SHA256SUMS)
+	{ echo "# upi 0.5.99"; sha256sum "$NAME.tar.xz"; } >SHA256SUMS)
 SUMS_SHA256=$(sha256sum "$WORK/release/SHA256SUMS" | cut -c1-64)
 port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 python3 -m http.server "$port" --bind 127.0.0.1 --directory "$WORK/release" >/dev/null 2>&1 &
@@ -76,7 +76,7 @@ SERVER=$!
 for _ in $(seq 50); do curl -fs "http://127.0.0.1:$port/SHA256SUMS" >/dev/null && break; sleep 0.1; done
 
 # The installer, in a POSIX shell as Termux's (dash). (Without the LD_PRELOAD: the tools it runs are this system's, glibc's.)
-INSTALL="$HOME/.pi-bolt"
+INSTALL="$HOME/.upi"
 
 # Where Termux's repository has no glibc-repo (Termux from Google Play, whose termux.net leaves the glibc packages out; or a
 # mirror without it), the installer says what to do instead of failing in pkg. (Termux's apt and pkg stand in as scripts.)
@@ -90,26 +90,26 @@ for repo in "https://termux.net stable main|Google Play" "https://mirror.example
 	printf 'deb %s\n' "${repo%|*}" >"$PREFIX/etc/apt/sources.list"
 	want=${repo#*|}
 	what="without glibc-repo in Termux's repository, install.sh says so ($want)"
-	out=$(PIBOLT_VERSION=bolt-v0.5.99 PIBOLT_UNVERIFIED="$SUMS_SHA256" PIBOLT_DOWNLOAD_BASE="http://127.0.0.1:$port" PIBOLT_YES=1 PIBOLT_EXTENSIONS=no PIBOLT_NO_START=1 \
+	out=$(MICROPI_VERSION=bolt-v0.5.99 MICROPI_UNVERIFIED="$SUMS_SHA256" MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port" MICROPI_YES=1 MICROPI_EXTENSIONS=no MICROPI_NO_START=1 \
 		/bin/sh "$ROOT/install.sh" </dev/null 2>&1)
 	if [ $? -ne 0 ] && grep -qF "$want" <<<"$out" && [ ! -e "$WORK/pkg-calls" ]; then pass "$what"; else fail "$what" "$out"; fi
 done
 rm -f "$PREFIX/bin/apt-get" "$PREFIX/bin/apt-cache" "$PREFIX/bin/pkg" "$PREFIX/etc/apt/sources.list"
 ln -sf /lib/ld-linux-aarch64.so.1 "$PREFIX/glibc/lib/ld-linux-aarch64.so.1"
 
-out=$(PIBOLT_VERSION=bolt-v0.5.99 PIBOLT_UNVERIFIED="$SUMS_SHA256" PIBOLT_DOWNLOAD_BASE="http://127.0.0.1:$port" PIBOLT_YES=1 PIBOLT_EXTENSIONS=no PIBOLT_NO_START=1 \
+out=$(MICROPI_VERSION=bolt-v0.5.99 MICROPI_UNVERIFIED="$SUMS_SHA256" MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port" MICROPI_YES=1 MICROPI_EXTENSIONS=no MICROPI_NO_START=1 \
 	/bin/sh "$ROOT/install.sh" </dev/null 2>&1)
-if [ -x "$INSTALL/$NAME/pi-termux" ] && [ "$(readlink "$PREFIX/bin/pi-bolt")" = "$INSTALL/$NAME/pi-termux" ]; then
-	pass "install.sh installs it, pi-bolt in \$PREFIX/bin is the Termux launcher"
+if [ -x "$INSTALL/$NAME/pi-termux" ] && [ "$(readlink "$PREFIX/bin/upi")" = "$INSTALL/$NAME/pi-termux" ]; then
+	pass "install.sh installs it, upi in \$PREFIX/bin is the Termux launcher"
 else
-	fail "install.sh installs it, pi-bolt in \$PREFIX/bin is the Termux launcher" "$out"
+	fail "install.sh installs it, upi in \$PREFIX/bin is the Termux launcher" "$out"
 fi
 interp=$(readelf -l "$INSTALL/$NAME/pi" 2>/dev/null | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
 if [ "$interp" = "$PREFIX/glibc/lib/ld-linux-aarch64.so.1" ]; then pass "its loader is Termux's glibc's"; else fail "its loader is Termux's glibc's" "$interp"; fi
 if [ -f "$PREFIX/glibc/etc/resolv.conf" ]; then pass "Termux's resolv.conf is where its glibc reads it"; else fail "Termux's resolv.conf is where its glibc reads it"; fi
 
-out=$(LD_PRELOAD="$PRELOAD" pi-bolt --version 2>&1) && pass "pi-bolt --version, with Termux's LD_PRELOAD set ($out)" || fail "pi-bolt --version, with Termux's LD_PRELOAD set" "$out"
-out=$(LD_PRELOAD="$PRELOAD" BUN_STATIC_HEAP_VERBOSE=1 pi-bolt --version 2>&1)
+out=$(LD_PRELOAD="$PRELOAD" upi --version 2>&1) && pass "upi --version, with Termux's LD_PRELOAD set ($out)" || fail "upi --version, with Termux's LD_PRELOAD set" "$out"
+out=$(LD_PRELOAD="$PRELOAD" BUN_STATIC_HEAP_VERBOSE=1 upi --version 2>&1)
 if grep -q "image registered: true" <<<"$out"; then pass "it runs its compiled code"; else fail "it runs its compiled code" "$out"; fi
 
 # Under Android's filter: a program without the runtime's SIGSYS handling is killed by it (stock Bun's event loop calls
@@ -119,17 +119,17 @@ if command -v bun >/dev/null 2>&1; then
 	code=$?
 	if [ "$code" = 159 ]; then pass "the filter kills stock Bun (SIGSYS)"; else fail "the filter kills stock Bun (SIGSYS): exit $code"; fi
 fi
-out=$(LD_PRELOAD="$PRELOAD" "$WORK/android-filter" pi-bolt --version 2>&1) && pass "pi-bolt --version under Android's filter" || fail "pi-bolt --version under Android's filter" "$out"
+out=$(LD_PRELOAD="$PRELOAD" "$WORK/android-filter" upi --version 2>&1) && pass "upi --version under Android's filter" || fail "upi --version under Android's filter" "$out"
 mkdir -p "$WORK/extensions" && cp "$ROOT/tests/termux/termux-env.js" "$ROOT/tests/termux/address-space.js" "$WORK/extensions/"
 for filter in "" "$WORK/android-filter"; do
 	what="the programs Pi starts get Termux's LD_PRELOAD back, in Android's time zone${filter:+, under the Android filter}"
-	out=$(LD_PRELOAD="$PRELOAD" $filter pi-bolt -ne -e "$WORK/extensions/termux-env.js" --offline --no-session -p hi 2>&1 </dev/null)
+	out=$(LD_PRELOAD="$PRELOAD" $filter upi -ne -e "$WORK/extensions/termux-env.js" --offline --no-session -p hi 2>&1 </dev/null)
 	want="termux-env: sync=$PRELOAD async=$PRELOAD glibc-after=true tz=Asia/Kolkata"
 	if grep -qxF "$want" <<<"$out"; then pass "$what"; else fail "$what" "$out"; fi
 done
 
 # Android's 512 GB of addresses: the prebuilt heap and code (mapped from the executable) and the Structures are below them.
-out=$(LD_PRELOAD="$PRELOAD" pi-bolt -ne -e "$WORK/extensions/address-space.js" --offline --no-session -p hi 2>&1 </dev/null)
+out=$(LD_PRELOAD="$PRELOAD" upi -ne -e "$WORK/extensions/address-space.js" --offline --no-session -p hi 2>&1 </dev/null)
 line=$(grep '^address-space: ' <<<"$out")
 highest=$(sed -n 's/.* highest=\(0x[0-9a-f]*\) .*/\1/p' <<<"$line")
 if [ -n "$highest" ] && [ "$((highest))" -le $((0x8000000000)) ] && ! grep -q 'from-file=0 ' <<<"$line" && grep -q 'structures=true' <<<"$line"; then

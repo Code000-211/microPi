@@ -6,7 +6,7 @@
  * installs it:
  *
  *   Failed to load extension: bun:ffi requires the JIT. pi-foo needs µPi's JIT build (bun:ffi); switch with:
- *   curl -fsSL https://pi-bolt.opensec.in/install.sh | PIBOLT_VARIANT=arm64-jit sh
+ *   curl -fsSL https://upi.opensec.in/install.sh | MICROPI_VARIANT=arm64-jit sh
  *
  * Nothing is looked at before such an error is shown (bun:ffi is not even loaded), so this costs nothing otherwise. In every
  * other build (stock Pi, the -jit build) messages are left as they are.
@@ -15,7 +15,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, sep } from "node:path";
-import { PIBOLT, piBoltJitSwitchCommand } from "../../pi-bolt.ts";
+import { PIBOLT, piBoltJitSwitchCommand } from "../../upi.ts";
 
 /** The engine's message (patches/bun.patch): a TypeError from the bun:ffi functions that make native code. */
 export const JIT_REQUIRED_MESSAGE = "bun:ffi requires the JIT";

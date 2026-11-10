@@ -19,10 +19,10 @@ Needs git, Node.js 22.19 or later with npm (to build Pi), Python 3, and rsync (f
 
 ```bash
 git clone https://github.com/opensec-git/Pi-Bolt.git && cd Pi-Bolt
-scripts/fetch-runtime.sh     # the Pi-Bolt runtime from the latest release -> .work/runtime/bun
+scripts/fetch-runtime.sh     # the µPi runtime from the latest release -> .work/runtime/bun
 scripts/prepare-pi.sh        # builds the Pi in this repository (µPi is a fork of Pi)
-scripts/build-pi.sh          # -> out/pi-bolt/pi
-out/pi-bolt/pi --version
+scripts/build-pi.sh          # -> out/upi/pi
+out/upi/pi --version
 ```
 
 Apart from downloading the runtime and npm packages, the build is offline: Pi's model catalog
@@ -124,7 +124,7 @@ scripts/build-pi.sh [options]
 | Option | Default | |
 |---|---|---|
 | `--pi DIR` | this repository | A built Pi tree (`scripts/prepare-pi.sh`). |
-| `--out DIR` | `out/pi-bolt` | Where the executable and its asset files go. |
+| `--out DIR` | `out/upi` | Where the executable and its asset files go. |
 | `--jit on\|off` | `off` | `on` also JIT-compiles code loaded at run time, such as run-time plugins. |
 | `--cpu native\|baseline` | `native` (Linux ARM64: `baseline`) | `native`: code for the build machine's instruction set (AVX2 class); on a CPU without it, the executable runs from bytecode. `baseline`: any x86-64 CPU; on Linux ARM64, any ARMv8.0 CPU (none of LSE, JSCVT, FP16, FRINTTS, SHA3, DotProd), the build that is released. On macOS there is one build, for every Apple silicon CPU. |
 | `--profile DIR` | `profiles/pi-<version>` | Training profile ([below](#training-profiles)). |
@@ -144,7 +144,7 @@ The script checks the result: the executable must report `image registered: true
 ```bash
 scripts/prepare-pi.sh --tag v1.0.1 --dir .work/pi-1.0.1   # clones that release from upstream
 scripts/train-profile.sh --pi .work/pi-1.0.1        # records profiles/pi-1.0.1
-scripts/build-pi.sh --pi .work/pi-1.0.1 --out out/pi-bolt-1.0.1
+scripts/build-pi.sh --pi .work/pi-1.0.1 --out out/upi-1.0.1
 ```
 
 A build without a profile works, with somewhat slower startup. `build-pi.sh` warns when there is none.
@@ -173,7 +173,7 @@ scripts/train-profile.sh [--pi DIR] [--plugins FILE] [--out DIR] [--with DIR]
 `--with DIR` merges in a profile recorded on another platform (`--out DIR` there), so that what only that platform runs has its
 place too. Recording into an existing profile keeps its strings' order (the prebuilt heap's, from `train-heap.ps1`).
 
-`bench/aot_coverage.py --build pi-bolt=out/pi-bolt/pi --profile profiles/pi-<version>` lists what a build still runs outside its
+`bench/aot_coverage.py --build upi=out/upi/pi --profile profiles/pi-<version>` lists what a build still runs outside its
 compiled code: regular expressions that are not in the profile, and functions that have no code in the image.
 
 ### The runtime's order file (macOS)
@@ -187,7 +187,7 @@ names, so they hold from one build of the runtime to the next; record them again
 part of the runtime stamp, so a release after a change to them needs its runtime built ([RELEASING.md](RELEASING.md#when-the-engine-changed)):
 
 ```bash
-scripts/train-runtime-hints.sh [--pi BUILD]   # traces sessions of out/pi-bolt (bench/orderfile_session.py) -> profiles/runtime-darwin-arm64.hints
+scripts/train-runtime-hints.sh [--pi BUILD]   # traces sessions of out/upi (bench/orderfile_session.py) -> profiles/runtime-darwin-arm64.hints
 ```
 
 ## Packaging a release
@@ -199,7 +199,7 @@ scripts/package-release.sh [--pi DIR] [--no-build]
 This builds the Pi targets of the machine it runs on (on Linux x86-64 `linux-x64`, `linux-x64-baseline` and `linux-x64-jit`; on
 Linux ARM64 `linux-arm64` and `linux-arm64-jit`; on macOS `darwin-arm64` and `darwin-arm64-jit`) and checks that each uses its compiled code. It writes them as `.tar.xz` and `.tar.gz`, the
 runtime and `SHA256SUMS` to `dist/<VERSION>/`. A release puts the archives of every platform together, with one `SHA256SUMS`. Each archive includes the license
-notices and a `pi-bolt.txt` naming the build. Publishing a release, by the release workflow or by hand, is described in
+notices and a `upi.txt` naming the build. Publishing a release, by the release workflow or by hand, is described in
 [RELEASING.md](RELEASING.md).
 
 ## Tests
@@ -210,16 +210,16 @@ notices and a `pi-bolt.txt` naming the build. Publishing a release, by the relea
 | `tests/aot/fuzz/run.sh --count 2000` | Differential fuzzing: random programs aimed at loops and their guards, compiled ahead of time (`--mode jit-off`, `jit-on`, `baseline` or `compact`), must print what the same bundle prints as bytecode. 0.5.0 was released after 32,000 programs (four rounds; the last 10,000, on its compiler, all passed). |
 | `tests/runtime/run.sh` | The runtime itself: `Error.captureStackTrace()` on objects that are not Errors, and fetch's keep-alive pool (how long an idle connection waits, the server's `Keep-Alive` timeout, a connection that went dead while idle). Takes about a minute: it waits out the timeouts. |
 | `tests/pi/run.sh` | Pi itself, under conditions that once crashed it: errors formatted at the end of a garbage collection. |
-| `python3 bench/e2e_tools.py --reference bun=out/pi-stable/pi --build pi-bolt=out/pi-bolt/pi` | Every Pi tool (`ls`, `find`, `grep`, `write`, `edit`, `bash`, `read`) driven by a scripted model. The transcript and resulting files must be byte-identical to the reference build's. |
-| `python3 bench/ui_check.py --project . --build pi-bolt=out/pi-bolt/pi` | The TUI on a pseudo-terminal: trust prompt, `/` commands, `/hotkeys`, `/session`, `!` bash, a model turn with tool calls, `/model`, `/quit`. |
-| `python3 bench/stress.py --reference bun=out/pi-stable/pi --build pi-bolt=out/pi-bolt/pi --concurrency 32 --soak 600` | Load and failures: 32 Pi processes at once doing large tool work (tool results and requests byte-identical to the reference's), streamed and cut-off answers, HTTP errors, signals, and 600 prompts in one RPC session with a flat memory floor. `--api anthropic` and `--api responses` run it through Pi's Anthropic and OpenAI Responses clients instead of chat completions. |
-| `python3 bench/e2e_screen.py --reference bun=out/pi-stable/pi --build pi-bolt=out/pi-bolt/pi` | What the terminal shows: a long answer with every kind of Markdown and code block streams in, and the whole scrollback, text and colors, must be the reference's. |
-| `python3 bench/e2e_fullscreen.py --build pi-bolt=out/pi-bolt/pi` | The fullscreen TUI's scrolling of rows that only moved: after a long answer, paging and a resize, each screen (text and colors) must be what it is when every row is drawn, in tmux and in zmx. `--docker IMAGE` runs Pi and the terminals in a container. |
-| `python3 bench/pauses.py --build pi-bolt=out/pi-bolt/pi` | Large files written through a tool call in the TUI: the longest pause in drawing must not grow with the file. |
-| `python3 bench/long_answer.py --build pi-bolt=out/pi-bolt/pi` | The CPU it takes to stream answers of 5,000 to 60,000 characters: the share of a core must not grow with the length. |
+| `python3 bench/e2e_tools.py --reference bun=out/pi-stable/pi --build upi=out/upi/pi` | Every Pi tool (`ls`, `find`, `grep`, `write`, `edit`, `bash`, `read`) driven by a scripted model. The transcript and resulting files must be byte-identical to the reference build's. |
+| `python3 bench/ui_check.py --project . --build upi=out/upi/pi` | The TUI on a pseudo-terminal: trust prompt, `/` commands, `/hotkeys`, `/session`, `!` bash, a model turn with tool calls, `/model`, `/quit`. |
+| `python3 bench/stress.py --reference bun=out/pi-stable/pi --build upi=out/upi/pi --concurrency 32 --soak 600` | Load and failures: 32 Pi processes at once doing large tool work (tool results and requests byte-identical to the reference's), streamed and cut-off answers, HTTP errors, signals, and 600 prompts in one RPC session with a flat memory floor. `--api anthropic` and `--api responses` run it through Pi's Anthropic and OpenAI Responses clients instead of chat completions. |
+| `python3 bench/e2e_screen.py --reference bun=out/pi-stable/pi --build upi=out/upi/pi` | What the terminal shows: a long answer with every kind of Markdown and code block streams in, and the whole scrollback, text and colors, must be the reference's. |
+| `python3 bench/e2e_fullscreen.py --build upi=out/upi/pi` | The fullscreen TUI's scrolling of rows that only moved: after a long answer, paging and a resize, each screen (text and colors) must be what it is when every row is drawn, in tmux and in zmx. `--docker IMAGE` runs Pi and the terminals in a container. |
+| `python3 bench/pauses.py --build upi=out/upi/pi` | Large files written through a tool call in the TUI: the longest pause in drawing must not grow with the file. |
+| `python3 bench/long_answer.py --build upi=out/upi/pi` | The CPU it takes to stream answers of 5,000 to 60,000 characters: the share of a core must not grow with the length. |
 | `tests/compat/run.sh --builds DIR` | Linux only. Other systems and CPUs, without root: the builds in the userlands of CentOS 7 (glibc 2.17), Debian 9 and Amazon Linux 2 (bubblewrap), and on emulated CPUs (qemu-user): Intel Haswell, Skylake, Sandy Bridge and Nehalem; on ARM64, Cortex-A53, Cortex-A72 and Neoverse N1. |
 | `tests/termux/run.sh --build DIR` | Linux ARM64. What the installer does in Termux, in a container that imitates Android's: Termux's prefix with a glibc loader there, its `LD_PRELOAD` (a library glibc cannot load), and a system call filter that kills a process for calls Android refuses, as Android's does. |
-| `python3 bench/tmux_check.py --build pi-bolt=out/pi-bolt/pi` | Pi in a real tmux pane: keystroke latency, paste, streaming, resize, Escape to abort, idle CPU, memory. |
+| `python3 bench/tmux_check.py --build upi=out/upi/pi` | Pi in a real tmux pane: keystroke latency, paste, streaming, resize, Escape to abort, idle CPU, memory. |
 
 `out/pi-stable/pi` is the stock-Bun comparison build: `scripts/build-pi.sh --stable --out out/pi-stable`.
 
@@ -237,15 +237,15 @@ environment loaded (`Launch-VsDevShell.ps1`):
 scripts\fetch-sources.ps1                      # WebKit and Bun at the pinned commits, with patches\*.patch applied
 scripts\build-runtime.ps1                      # the runtime -> .work\runtime\bun.exe (-Lto off for a faster build)
 npm ci --ignore-scripts; npm run build:offline # Pi
-scripts\build-pi.ps1                           # -> out\pi-bolt\pi.exe (-Jit on for the -jit build)
+scripts\build-pi.ps1                           # -> out\upi\pi.exe (-Jit on for the -jit build)
 scripts\package-release.ps1                    # the release's win32-x64 archives, the runtime and SHA256SUMS -> dist\<VERSION>\
 ```
 
 The runtime needs Visual Studio 2022 (or its Build Tools) with the C++ workload, the Windows SDK and "C++ Clang tools for
 Windows", LLVM 23.1, CMake, Rust, Bun 1.4.2, Go, NASM, Ruby, Python 3 with the `py` launcher and Git for Windows: the head of
-`scripts\build-runtime.ps1` lists them. There is no `fetch-runtime.ps1`: take `pi-bolt-runtime-win32-x64.zip` from a release
-into `.work\runtime\` to build Pi without building the runtime. Tests: `tests\pi\run.ps1 out\pi-bolt\pi.exe` and
-`scripts\windows-selftest.ps1 -Pi out\pi-bolt\pi.exe`; the `bench\` tools run on Windows too (bench/README.md).
+`scripts\build-runtime.ps1` lists them. There is no `fetch-runtime.ps1`: take `upi-runtime-win32-x64.zip` from a release
+into `.work\runtime\` to build Pi without building the runtime. Tests: `tests\pi\run.ps1 out\upi\pi.exe` and
+`scripts\windows-selftest.ps1 -Pi out\upi\pi.exe`; the `bench\` tools run on Windows too (bench/README.md).
 
 ## Where things go
 

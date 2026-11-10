@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
-import type * as PiBolt from "../src/pi-bolt.ts";
-import { MICROPI_HAS_RELEASES } from "../src/pi-bolt.ts";
+import type * as PiBolt from "../src/upi.ts";
+import { MICROPI_HAS_RELEASES } from "../src/upi.ts";
 import {
 	getLatestPiRelease,
 	newestPiBoltVersionInFeed,
@@ -14,15 +14,15 @@ import {
 import { allowNetwork } from "./test-network-env.ts";
 
 // A Pi-Bolt build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
-vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
+vi.mock("../src/upi.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof PiBolt>()),
 	PIBOLT: { version: "1.0.2", variant: "x64", jit: false },
 }));
 
-const LATEST = "https://github.com/opensec-git/Pi-Bolt/releases/latest";
-const FEED = "https://github.com/opensec-git/Pi-Bolt/releases.atom";
-const API_LATEST = "https://api.github.com/repos/opensec-git/Pi-Bolt/releases/latest";
-const API_RELEASES = "https://api.github.com/repos/opensec-git/Pi-Bolt/releases?per_page=30";
+const LATEST = "https://github.com/Code000-211/microPi/releases/latest";
+const FEED = "https://github.com/Code000-211/microPi/releases.atom";
+const API_LATEST = "https://api.github.com/repos/Code000-211/microPi/releases/latest";
+const API_RELEASES = "https://api.github.com/repos/Code000-211/microPi/releases?per_page=30";
 
 /** What api.github.com answers an address that has used up its 60 requests an hour. */
 function rateLimited(): Response {
@@ -39,13 +39,13 @@ function redirectTo(location: string): Response {
 const feed = (tags: string[]): string =>
 	`<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
-  <link type="text/html" rel="alternate" href="https://github.com/opensec-git/Pi-Bolt/releases"/>
+  <link type="text/html" rel="alternate" href="https://github.com/Code000-211/microPi/releases"/>
 ${tags
 	.map(
 		(tag) => `  <entry>
     <id>tag:github.com,2008:Repository/1402211512/${tag}</id>
-    <link rel="alternate" type="text/html" href="https://github.com/opensec-git/Pi-Bolt/releases/tag/${tag}"/>
-    <content type="html">&lt;a href=&quot;https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v9.9.9&quot;&gt;&lt;/a&gt;</content>
+    <link rel="alternate" type="text/html" href="https://github.com/Code000-211/microPi/releases/tag/${tag}"/>
+    <content type="html">&lt;a href=&quot;https://github.com/Code000-211/microPi/releases/tag/bolt-v9.9.9&quot;&gt;&lt;/a&gt;</content>
   </entry>`,
 	)
 	.join("\n")}
@@ -72,16 +72,16 @@ let dir: string;
 beforeEach(() => {
 	allowNetwork();
 	dir = mkdtempSync(join(tmpdir(), "pibolt-latest-"));
-	vi.stubEnv("PIBOLT_CHANNEL", "");
-	vi.stubEnv("PIBOLT_NPM", "");
+	vi.stubEnv("MICROPI_CHANNEL", "");
+	vi.stubEnv("MICROPI_NPM", "");
 	vi.stubEnv("SCOOP", "");
 	vi.stubEnv("SCOOP_GLOBAL", "");
 	vi.stubEnv("MISE_DATA_DIR", "");
 	vi.stubEnv(ENV_AGENT_DIR, join(dir, "agent"));
-	// An installation of the installer's (~/.pi-bolt/pi-bolt-<platform>-x64), with no channel file: stable.
-	const variantDir = join(dir, ".pi-bolt", `pi-bolt-${process.platform}-x64`);
+	// An installation of the installer's (~/.micropi/upi-<platform>-x64), with no channel file: stable.
+	const variantDir = join(dir, ".micropi", `upi-${process.platform}-x64`);
 	mkdirSync(variantDir, { recursive: true });
-	const exe = join(variantDir, process.platform === "win32" ? "pi-bolt.exe" : "pi");
+	const exe = join(variantDir, process.platform === "win32" ? "upi.exe" : "pi");
 	writeFileSync(exe, "");
 	Object.defineProperty(process, "execPath", { value: exe, configurable: true });
 });
@@ -97,12 +97,12 @@ afterEach(() => {
 
 describe("the latest Pi-Bolt release", () => {
 	it("is read from a release page's address", () => {
-		expect(piBoltVersionOfReleaseUrl("https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.3")).toBe(
+		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.3")).toBe(
 			"1.0.3",
 		);
-		expect(piBoltVersionOfReleaseUrl("/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.3")).toBe("1.0.3");
-		expect(piBoltVersionOfReleaseUrl("https://github.com/opensec-git/Pi-Bolt/releases")).toBeUndefined();
-		expect(piBoltVersionOfReleaseUrl("https://github.com/opensec-git/Pi-Bolt/releases/tag/v1.4.0")).toBeUndefined();
+		expect(piBoltVersionOfReleaseUrl("/Code000-211/microPi/releases/tag/bolt-v1.0.3")).toBe("1.0.3");
+		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases")).toBeUndefined();
+		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases/tag/v1.4.0")).toBeUndefined();
 		expect(piBoltVersionOfReleaseUrl("https://github.com/login?return_to=x")).toBeUndefined();
 		expect(piBoltVersionOfReleaseUrl(null)).toBeUndefined();
 	});
@@ -110,7 +110,7 @@ describe("the latest Pi-Bolt release", () => {
 	it("is found where releases/latest redirects, without GitHub's API", async () => {
 		// #149: the API had answered 403 (its limit for an address without a token), and the update stopped there.
 		const fetchMock = serve({
-			[LATEST]: () => redirectTo("https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.3"),
+			[LATEST]: () => redirectTo("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.3"),
 			[API_LATEST]: rateLimited,
 		});
 		await expect(getLatestPiRelease("1.0.2", { retry: true })).resolves.toEqual({ version: "1.0.3" });
@@ -135,7 +135,7 @@ describe("the latest Pi-Bolt release", () => {
 	});
 
 	it("on the beta channel, is the newest release the feed lists when the API is limited", async () => {
-		vi.stubEnv("PIBOLT_CHANNEL", "beta");
+		vi.stubEnv("MICROPI_CHANNEL", "beta");
 		// (A link in a release's notes, escaped in the feed, is not a release.)
 		expect(newestPiBoltVersionInFeed(feed(["bolt-v1.0.2", "v1.4.0", "bolt-v1.0.10", "bolt-v1.0.9"]))).toBe("1.0.10");
 		const fetchMock = serve({
@@ -146,10 +146,10 @@ describe("the latest Pi-Bolt release", () => {
 		expect(requested(fetchMock)).toEqual([API_RELEASES, FEED]);
 	});
 
-	it.skipIf(!MICROPI_HAS_RELEASES)("pi-bolt update works while GitHub's API is limited", async () => {
-		// #149: "Error: Could not determine latest pi-bolt version." on 1.0.2, with the latest release 1.0.2.
+	it.skipIf(!MICROPI_HAS_RELEASES)("upi update works while GitHub's API is limited", async () => {
+		// #149: "Error: Could not determine latest upi version." on 1.0.2, with the latest release 1.0.2.
 		serve({
-			[LATEST]: () => redirectTo("https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.2"),
+			[LATEST]: () => redirectTo("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.2"),
 			[API_LATEST]: rateLimited,
 		});
 		const log = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -161,7 +161,7 @@ describe("the latest Pi-Bolt release", () => {
 	});
 
 	it.skipIf(!MICROPI_HAS_RELEASES)(
-		"pi-bolt update says why, and how to update without it, when the release cannot be found",
+		"upi update says why, and how to update without it, when the release cannot be found",
 		async () => {
 			serve({ [LATEST]: () => new Response("", { status: 503 }), [API_LATEST]: rateLimited });
 			vi.spyOn(console, "log").mockImplementation(() => {});

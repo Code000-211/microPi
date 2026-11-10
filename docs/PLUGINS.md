@@ -6,7 +6,7 @@ and how to write plugin code that the ahead-of-time compiler handles well.
 
 - [Short answer](#short-answer)
 - [Three ways to run a plugin](#three-ways-to-run-a-plugin)
-- [pi-bolt compile](#pi-bolt-compile)
+- [upi compile](#upi-compile)
 - [Compile in the plugins you already have](#compile-in-the-plugins-you-already-have)
 - [Compile plugins into the executable](#compile-plugins-into-the-executable)
 - [Compatibility checklist](#compatibility-checklist)
@@ -44,13 +44,13 @@ A compiled-in plugin:
 
 ## Three ways to run a plugin
 
-| | Compiled in (`pi-bolt compile`) | Run-time loaded, JIT-off build | Run-time loaded, JIT-on build |
+| | Compiled in (`upi compile`) | Run-time loaded, JIT-off build | Run-time loaded, JIT-on build |
 |---|---|---|---|
 | Changes to the plugin | none (see the [checklist](#compatibility-checklist)) | none | none |
 | Startup cost | none | jiti + TypeScript compile per start | jiti + TypeScript compile per start |
 | Hot code runs as | AOT machine code | bytecode interpreter | interpreter, then JIT after warm-up |
 | Memory | lowest | low | higher (JIT code and compiler threads) |
-| Update the plugin | `pi-bolt compile` again (~20 s; ~40 s on a JIT build) | edit the file and restart | edit the file and restart |
+| Update the plugin | `upi compile` again (~20 s; ~40 s on a JIT build) | edit the file and restart | edit the file and restart |
 | Best for | plugins you use every day | trying out a plugin, light plugins | many third-party plugins you cannot rebuild |
 
 Run-time loading keeps working in every µPi build: `~/.pi/agent/extensions`, project `.pi/extensions`, `pi --extension`, and
@@ -62,40 +62,40 @@ the plugins you rely on. Keep run-time loading for plugins you are developing or
 with the JIT off, run-time loaded extensions start fastest, use the least memory, and cost nothing per prompt or per frame; their
 typical actions take the same time as with the JIT on, because they spend it in I/O, child processes or a few milliseconds of
 work. The exception is an extension that does heavy JavaScript work itself: pi-lens's `module_report` takes 838 ms with the JIT
-off against 154 ms with it on. **For such an extension, use the JIT build** (`pi-bolt-win32-x64-jit`, `PIBOLT_VARIANT=x64-jit`
+off against 154 ms with it on. **For such an extension, use the JIT build** (`upi-win32-x64-jit`, `MICROPI_VARIANT=x64-jit`
 for the installer), or compile it in.
 
 **OpenSec's extensions** (opensec-pi-subagents, opensec-pi-todo, opensec-pi-fff) are offered by the installers and installed from npm at the
-versions the release pins. They are not compiled into the release executables. Compiled in, they cost every `pi-bolt -p`
+versions the release pins. They are not compiled into the release executables. Compiled in, they cost every `upi -p`
 +66 ms (114 -> 180 ms), mostly opensec-pi-subagents loading itself, and their actions get only a little faster
 ([results](../bench/results/2026-10-10-opensec-compiled/summary.md)). To build them in anyway (Windows), retrain the profile
 with them (`scripts\train-heap.ps1 -Plugins plugins\opensec\plugins.ts`), then run
 `scripts\package-release.ps1 -WithOpenSec`. There, `-builtin:opensec-pi-todo` (or `-builtin:opensec-pi-subagents`) in the
 `extensions` list of `~/.pi/agent/settings.json` turns one off, and an npm copy of one replaces the compiled one.
 
-## pi-bolt compile
+## upi compile
 
 ```bash
-pi-bolt compile                             # the extensions installed here
-pi-bolt compile --list                      # which those are, by name: nothing is downloaded or built
-pi-bolt compile --only pdf-reader,preset    # only these
-pi-bolt compile --exclude big-bundle        # all but these, and those excluded before, on later compiles and updates too
-pi-bolt compile --include big-bundle        # this one again, excluded before
-pi-bolt compile --no-exclude                # all, those excluded before too
-pi-bolt compile --status                    # what is compiled in
-pi-bolt compile --off                       # the release's executable again
+upi compile                             # the extensions installed here
+upi compile --list                      # which those are, by name: nothing is downloaded or built
+upi compile --only pdf-reader,preset    # only these
+upi compile --exclude big-bundle        # all but these, and those excluded before, on later compiles and updates too
+upi compile --include big-bundle        # this one again, excluded before
+upi compile --no-exclude                # all, those excluded before too
+upi compile --status                    # what is compiled in
+upi compile --off                       # the release's executable again
 ```
 
-`pi-bolt compile` builds your µPi again with the extensions installed on this machine compiled in: the agent directory's
+`upi compile` builds your µPi again with the extensions installed on this machine compiled in: the agent directory's
 `extensions` folder, the paths in its `extensions` setting, and the packages µPi loads: `packages` with `piBolt.packages`
-applied, as `pi-bolt list` shows them, npm packages, git checkouts and local folders alike (`--no-packages` leaves those out).
+applied, as `upi list` shows them, npm packages, git checkouts and local folders alike (`--no-packages` leaves those out).
 It needs no checkout of this repository and no tools.
 
 **Network.** The first compile of a version downloads that release's runtime and compile kit (37 MB on macOS, 51-52 MB on Linux)
-from GitHub, checks them against the release's signed `SHA256SUMS` as the installer does, and keeps them in `~/.pi-bolt/cache`
+from GitHub, checks them against the release's signed `SHA256SUMS` as the installer does, and keeps them in `~/.micropi/cache`
 with the `SHA256SUMS` and its signature. Later compiles of that version, `--out` ones included, check the cached files against
 the cached signed checksums again and need no network. A download that gets nothing for 20 seconds is given up, and the error
-names the URL. Offline from the start, give the two files with `--kit` and `--runtime`. `pi-bolt update` downloads the new
+names the URL. Offline from the start, give the two files with `--kit` and `--runtime`. `upi update` downloads the new
 release's two files when it compiles the extensions into it.
 
 **Time.** About 20 seconds on a fast machine for the default build, and about 40 seconds for a JIT build, plus the first
@@ -104,46 +104,46 @@ compiling ahead of time) and how long the whole compile took.
 
 **A project's extensions** (`.pi/extensions`, and the extensions and packages a project's `.pi/settings.json` names) are not
 compiled in: what is compiled in is for every project, and Pi loads a project's extensions only in a trusted project. They load
-from their files as before. `pi-bolt compile` lists the ones of the folder it runs in, with that reason.
+from their files as before. `upi compile` lists the ones of the folder it runs in, with that reason.
 
 **`--exclude`** leaves out the extensions it names, and compile.json records them: later compiles without `--only`, and
-`pi-bolt update`, leave them out too. A later `--exclude` adds to the recorded ones, `--include` takes one back, and
+`upi update`, leave them out too. A later `--exclude` adds to the recorded ones, `--include` takes one back, and
 `--no-exclude` compiles them all in again (with `--exclude`, only those it names are left out).
 
 A compile works in a folder `.compile-*` beside the installation (beside the `--out` folder with `--out`), removed when it ends.
 One left by a compile that was killed is removed by the next one. A failed build leaves all the compiler printed in
 `compile.log` there (`<folder>.compile.log` beside an `--out` folder); the next successful compile removes it.
 
-The new executable takes the place of the installed one, and the one it replaces is kept: `pi-bolt update --rollback` puts it
-back. `pi-bolt update` compiles the same extensions into each release it installs; when that fails, the release is installed
+The new executable takes the place of the installed one, and the one it replaces is kept: `upi update --rollback` puts it
+back. `upi update` compiles the same extensions into each release it installs; when that fails, the release is installed
 without them, and the update says so.
 
 An extension compiled in stands in for its installed copy while that copy is unchanged. Pi finds, orders and turns extensions on
 and off as always, and uses the compiled one instead of loading the files. "Unchanged" is by the files it was compiled from: each
 module of the extension and of its dependencies that the bundler took in, and the `package.json` nearest each, by size and
 modification time. An extension changed since (a package updated, a module edited, a dependency patched) is loaded from its
-files, with a warning to run `pi-bolt compile` again; files it writes into its own folder (state, logs, caches) are not a
+files, with a warning to run `upi compile` again; files it writes into its own folder (state, logs, caches) are not a
 change. One removed or turned off is not loaded.
 
-`--only`, `--exclude` and `--include` take each extension by the name `pi-bolt compile` lists for it, a package also by its
+`--only`, `--exclude` and `--include` take each extension by the name `upi compile` lists for it, a package also by its
 name or source (`@acme/pi-tools`, which is listed as `acme-pi-tools`; `npm:pi-lens`) or its folder, and any extension by its
 file or folder. A name that matches no extension stops the compile, with the names there are, before anything is downloaded.
 
 A compiled-in extension's code runs when Pi loads that extension, as from its files: one turned off never runs, and one whose
 top-level code throws fails alone, with Pi's own error. One that fails compiled in but not from its files (it reads the staged
-copy, which a compile removes, in a way [what it copies](#what-it-copies) does not cover) is loaded from its files, with a warning. `pi-bolt
-doctor`, `pi-bolt compile` and `pi-bolt update --rollback` run no compiled-in extension's code at all, so they work whatever an
+copy, which a compile removes, in a way [what it copies](#what-it-copies) does not cover) is loaded from its files, with a warning. `upi
+doctor`, `upi compile` and `upi update --rollback` run no compiled-in extension's code at all, so they work whatever an
 extension does as it loads.
 
-Pi loads each extension on its own, and `pi-bolt compile` compiles in what it can: an extension it cannot build (a static
+Pi loads each extension on its own, and `upi compile` compiles in what it can: an extension it cannot build (a static
 `import` or `require()` that does not resolve, such as a package that is not installed), one whose function is too big for the
 compiler, and one that fails in the new build as it starts (it checks the build with `pi --help`, which loads every extension)
 are each left out, with a line that names it and says why, and load from their files. The rest are compiled in. These are found
 again at each compile, not recorded.
 
-`pi-bolt compile --status` and `pi-bolt doctor` say which extensions are compiled in, which changed since and load from their
+`upi compile --status` and `upi doctor` say which extensions are compiled in, which changed since and load from their
 files, and when the build has none of the extensions compile.json records: the installer, run again, or a switch to or from the
-JIT build installs the release's executable. Run `pi-bolt compile` to compile them in again.
+JIT build installs the release's executable. Run `upi compile` to compile them in again.
 
 One difference remains: a compiled-in extension's modules are loaded once per process. Pi loads an extension from its files
 again at `/reload`, with fresh module state; compiled in, `/reload` calls its factory again with the module state it had (a
@@ -161,7 +161,7 @@ can reach it, and bring its dependencies. `scripts/gen-plugin-manifest.mjs` does
 machine, and `--plugins-from-installed` runs it as part of a build:
 
 ```bash
-scripts/build-pi.sh --plugins-from-installed --out out/pi-bolt-plugins
+scripts/build-pi.sh --plugins-from-installed --out out/upi-plugins
 scripts/build-pi.sh --plugins-from-installed --plugins-only pdf-reader,preset
 scripts/gen-plugin-manifest.mjs --out plugins/mine      # the folder and its manifest, without a build
 ```
@@ -171,7 +171,7 @@ On Windows: `scripts\build-pi.ps1 -PluginsFromInstalled`, with `-PluginsOnly`, `
 
 It takes the agent directory's `extensions` folder, the paths in that directory's `extensions` setting, and the packages
 `pi install` installed, as Pi finds them: a relative path in the setting is from the agent directory, and dot files, a link to
-nothing, `node_modules` and what the folder's `.gitignore`, `.ignore` and `.fdignore` leave out are passed over. `pi-bolt
+nothing, `node_modules` and what the folder's `.gitignore`, `.ignore` and `.fdignore` leave out are passed over. `upi
 compile` also passes over what the setting turns off (`-path`, `!pattern`). `--cwd DIR` adds a project's own `.pi/extensions`.
 A project's *settings* are not read, because Pi honours those only in a trusted project and a script cannot tell whether a
 project is trusted.
@@ -191,7 +191,7 @@ it. The generator copies that dependency closure to a `node_modules` beside the 
 expects. It copies only the dependencies of the packages being compiled in. An `optionalDependency` counts once it is
 installed, because the plugin then imports it like any other package, and so does a `peerDependency` that is not Pi's. A
 package an extension imports without declaring it, such as one installed in the agent directory's `node_modules` above
-`extensions/`, is copied too when Pi finds it from the extension's file (with Bun, which `pi-bolt compile` runs it with).
+`extensions/`, is copied too when Pi finds it from the extension's file (with Bun, which `upi compile` runs it with).
 
 Pi's own packages are left out of every copy, so a plugin cannot carry a second Pi: `typebox` and
 `@earendil-works/pi-coding-agent`, `pi-ai`, `pi-agent-core` and `pi-tui`. Other packages of the `@earendil-works` scope are
@@ -199,7 +199,7 @@ dependencies like any other. So are an extension's `tsconfig.json` and `jsconfig
 either: the bundler takes the nearest one, and under the extension's own its imports of Pi's packages found a second copy of
 them, whose classes are not Pi's.
 
-Without the JIT (`pi-bolt compile` on a build without `-jit`), a package's `"bun"` export condition is not taken, so the
+Without the JIT (`upi compile` on a build without `-jit`), a package's `"bun"` export condition is not taken, so the
 bundler takes the `"node"` one, as Pi does loading the package from its files; and a package that works only through
 `bun:ffi` (`@ff-labs/fff-bun`) fails at its import, as there, so an extension falls back to its Node package.
 
@@ -213,12 +213,12 @@ by one of these names (`import`, `export ... from`, `import()`, `require()`) imp
 resolves to the same module, `@earendil-works/pi-tui`, `typebox` or `@earendil-works/pi-ai/compat`. A string that imports
 nothing keeps its text, and so does any other subpath of those packages.
 
-`pi-bolt compile` also handles an `import()` of a package the extension neither declares nor has installed, made only for
+`upi compile` also handles an `import()` of a package the extension neither declares nor has installed, made only for
 something it does when that package is there (`@plannotator/pi-extension` loads the Claude Agent SDK and the OpenCode SDK
 this way). The bundler would stop the whole build at it (#160). Instead, in the copy, the `import()` resolves its string
 when it runs, from the installed file's folder, and prints a line saying so. It then fails as it does when Pi loads the
 extension from its files, inside the extension's own error handling, and finds the package if it is installed later. An
-extension with a static `import` or a `require()` that does not resolve needs it: `pi-bolt compile` leaves it out of the build,
+extension with a static `import` or a `require()` that does not resolve needs it: `upi compile` leaves it out of the build,
 and it loads (or fails) from its files. A build with `build-pi.sh --plugins-from-installed` does neither.
 
 In the copies, `import.meta.url` is the URL of the file it was copied from, and `import.meta.dir`, `dirname`, `filename`,
@@ -229,10 +229,10 @@ it from its files. So are `__dirname` and `__filename` (a data file read with `j
 loaded as node-gyp-build and bindings load one), `require.resolve()` and `import.meta.resolve()`, and a `require()` or
 `import()` of a path or name computed as it runs resolves from the installed file, where a module it loads from disk gets Pi's
 own packages as from its files. A module that declares `__dirname`, `__filename` or `require` itself keeps its own. Only the
-copies are changed, and only in code: comments and strings keep their text. `pi-bolt compile` uses a compiled-in extension only
+copies are changed, and only in code: comments and strings keep their text. `upi compile` uses a compiled-in extension only
 while its installed copy is unchanged, so those files are always there. An executable built with `--plugins-from-installed`
 has no such check: keep its extensions installed. An extension that
-still fails compiled in, and not from its files, is found when `pi-bolt compile` checks the new build, and left out.
+still fails compiled in, and not from its files, is found when `upi compile` checks the new build, and left out.
 
 ### What it cannot do
 
@@ -247,7 +247,7 @@ splits its code (`--splitting`), and the generated manifest loads each plugin wi
 with the modules only it imports, is a file of its own, apart from Pi's code and from the other plugins. So the limit is one
 plugin's top-level code, or one function's: a bundled `dist/index.js`, or embedded data such as a tokeniser's rank table, can
 pass it, and many small plugins together do not. Each plugin's module runs when Pi loads that plugin, as from its files, one
-after the other: one that waits at its top level (`await`) finishes before the next one starts. `pi-bolt compile` leaves a
+after the other: one that waits at its top level (`await`) finishes before the next one starts. `upi compile` leaves a
 plugin with a function too big to compile out of the build, with a line naming it, and it loads from its files. (Until Pi-Bolt 1.0.1 the manifest imported the plugins, and every plugin's
 top-level code joined Pi's, about 200 KB of it, in one function: a few plugins together stopped the build, and leaving out any
 one of them did not help, #129. Pi-Bolt 1.0.2 required the manifest, which cannot load a plugin with an `await` at its top
@@ -296,10 +296,10 @@ dependencies (`npm install` there first). [`examples/plugins/plugins.ts`](../exa
 ### 2. Build
 
 ```bash
-scripts/build-pi.sh --plugins my-plugins/plugins.ts --out out/pi-bolt-plugins
+scripts/build-pi.sh --plugins my-plugins/plugins.ts --out out/upi-plugins
 ```
 
-On Windows: `scripts\build-pi.ps1 -Plugins my-plugins\plugins.ts -Out out\pi-bolt-plugins`, with `-PluginWorker` and `-Jit on`
+On Windows: `scripts\build-pi.ps1 -Plugins my-plugins\plugins.ts -Out out\upi-plugins`, with `-PluginWorker` and `-Jit on`
 for the options below.
 
 The script copies the manifest's folder into the Pi tree and generates an entry point. It also writes a `tsconfig.json` beside
@@ -317,7 +317,7 @@ compiles everything ahead of time, checks that the executable uses its compiled 
 ### 3. Turning a compiled-in plugin off, and run-time copies
 
 A plugin the manifest names (`{ name, factory }`) is compiled in as a built-in extension, `builtin:<name>`, like Pi's own MCP
-support: `-builtin:<name>` in the `extensions` setting (or `pi-bolt config`) turns it off, and `-e builtin:<name>` loads it
+support: `-builtin:<name>` in the `extensions` setting (or `upi config`) turns it off, and `-e builtin:<name>` loads it
 explicitly. It is also replaceable: if the same extension is installed at run time too (in `~/.pi/agent/extensions`, or as a Pi
 package), the run-time copy registers its tools and commands and the compiled-in one steps aside, instead of a conflict. Set
 `builtin: false` (or `replaceable: false`) on an entry to have it load as before; an unnamed factory stays an inline extension that
@@ -332,7 +332,7 @@ session. With plugins that do a lot at startup, record a profile of your own:
 
 ```bash
 scripts/train-profile.sh --plugins my-plugins/plugins.ts --out profiles/my-plugins
-scripts/build-pi.sh --plugins my-plugins/plugins.ts --profile profiles/my-plugins --out out/pi-bolt-plugins
+scripts/build-pi.sh --plugins my-plugins/plugins.ts --profile profiles/my-plugins --out out/upi-plugins
 ```
 
 ## Compatibility checklist
@@ -340,7 +340,7 @@ scripts/build-pi.sh --plugins my-plugins/plugins.ts --profile profiles/my-plugin
 These are the rules for any code bundled into a single executable. Most plugins already follow them.
 
 **Import Pi from its packages, and do not bundle a copy.** Import Pi's API from `@earendil-works/pi-coding-agent`,
-`@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-tui` and `typebox` (`pi-bolt compile` and
+`@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-tui` and `typebox` (`upi compile` and
 `gen-plugin-manifest.mjs` also take the older names Pi's loader takes: [what it copies](#what-it-copies)). List these as
 `peerDependencies` (as Pi's [package guide](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md)
 requires), not as `dependencies`. The build resolves them to Pi's own modules and leaves out any copy found in the plugin's
@@ -363,7 +363,7 @@ const mod = await providers[name]();
 **Embed files instead of reading them next to the source.** In an executable built from a manifest of your own, `import.meta.url`
 and `import.meta.dir` point into the executable's embedded file system, and `__dirname` at the folder the build copied the
 plugin to. A prompt, template or WASM file read with `readFile(join(__dirname, "prompt.md"))` is not there unless it is
-imported. (A manifest `pi-bolt compile` or `gen-plugin-manifest.mjs` wrote points `import.meta` at the installed files
+imported. (A manifest `upi compile` or `gen-plugin-manifest.mjs` wrote points `import.meta` at the installed files
 instead: [what it copies](#what-it-copies).) Import it instead:
 
 ```ts
@@ -386,7 +386,7 @@ const compiledIn = url.href.includes("/$bunfs/");          // running from a com
 const worker = new Worker(compiledIn ? "./.pibolt-plugins/src/workers/sum.ts" : url);
 ```
 
-In a manifest `pi-bolt compile` or `gen-plugin-manifest.mjs` wrote, `import.meta.url` is the installed file's, so `compiledIn`
+In a manifest `upi compile` or `gen-plugin-manifest.mjs` wrote, `import.meta.url` is the installed file's, so `compiledIn`
 is false there and the worker is loaded from the installed file at run time.
 
 **Keep the factory light.** As in stock Pi, register tools, commands and event handlers in the factory. Start processes, sockets,
@@ -484,7 +484,7 @@ plugin depends on them heavily, use the JIT-on build (`--jit on`).
 Check that an executable uses its compiled code:
 
 ```bash
-BUN_STATIC_HEAP_VERBOSE=1 out/pi-bolt-plugins/pi --version 2>&1 | grep "image registered"
+BUN_STATIC_HEAP_VERBOSE=1 out/upi-plugins/pi --version 2>&1 | grep "image registered"
 # image registered: true
 ```
 
@@ -493,14 +493,14 @@ Check that your plugins are loaded: Pi lists them at startup under `[Extensions]
 Time Pi's startup phases, including each plugin's factory:
 
 ```bash
-PI_TIMING=1 out/pi-bolt-plugins/pi -p "hello"
+PI_TIMING=1 out/upi-plugins/pi -p "hello"
 ```
 
 Compare builds end to end with the benchmark tools (see [BENCHMARKS.md](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/BENCHMARKS.md)):
 
 ```bash
-python3 bench/benchmark.py --runs 10 --build plugins=out/pi-bolt-plugins/pi --build plain=out/pi-bolt/pi
-python3 bench/ui_check.py --project . --build plugins=out/pi-bolt-plugins/pi
+python3 bench/benchmark.py --runs 10 --build plugins=out/upi-plugins/pi --build plain=out/upi/pi
+python3 bench/ui_check.py --project . --build plugins=out/upi-plugins/pi
 ```
 
 ## Troubleshooting
@@ -508,10 +508,10 @@ python3 bench/ui_check.py --project . --build plugins=out/pi-bolt-plugins/pi
 | Symptom | Cause and fix |
 |---|---|
 | The build stops with "the build stopped" | `build-pi.sh` shows the end of what the compiler printed, and the file with all of it (set `PIBOLT_BUILD_LOG` to choose the file). An `AOT: ` line there gives the reason, most often a module the compiler refused, such as a plugin's bundled `dist`: the row below. |
-| `a function of N bytes of bytecode (...) is bigger than maximumAOTCandidateBytecodeSize` | One function holds more than 256 KB of bytecode. `(a function)`: one module of a plugin, each being a function of its own, usually with a single large literal (a bundled `dist/index.js`, or embedded data such as a tokeniser's rank table), or one very large function. `(the top-level code of a module)`: the top-level code of the whole program, which Pi's own fills to about 200 KB and each module of a plugin adds the few bytes that start it to. `pi-bolt compile` says which module and extension it is, or each extension's share. Leave that plugin out of the manifest; or set `BUN_JSC_maximumAOTCandidateBytecodeSize=N` to compile it anyway (the compiler warns that a big function takes minutes and tens of GB; one of a few hundred KB has taken seconds); or set `BUN_JSC_omitBytecodeFromStaticHeap=0` to run it from bytecode. A plugin left out still loads at run time, and on the JIT-off build its code runs in the interpreter. |
-| `Could not resolve "./something"` during the build | A dynamic import or a file outside the manifest's folder. Use literal imports and keep the plugin's files under the manifest's folder. (`pi-bolt compile` leaves an `import()` it cannot resolve to run time: [what it copies](#what-it-copies).) |
+| `a function of N bytes of bytecode (...) is bigger than maximumAOTCandidateBytecodeSize` | One function holds more than 256 KB of bytecode. `(a function)`: one module of a plugin, each being a function of its own, usually with a single large literal (a bundled `dist/index.js`, or embedded data such as a tokeniser's rank table), or one very large function. `(the top-level code of a module)`: the top-level code of the whole program, which Pi's own fills to about 200 KB and each module of a plugin adds the few bytes that start it to. `upi compile` says which module and extension it is, or each extension's share. Leave that plugin out of the manifest; or set `BUN_JSC_maximumAOTCandidateBytecodeSize=N` to compile it anyway (the compiler warns that a big function takes minutes and tens of GB; one of a few hundred KB has taken seconds); or set `BUN_JSC_omitBytecodeFromStaticHeap=0` to run it from bytecode. A plugin left out still loads at run time, and on the JIT-off build its code runs in the interpreter. |
+| `Could not resolve "./something"` during the build | A dynamic import or a file outside the manifest's folder. Use literal imports and keep the plugin's files under the manifest's folder. (`upi compile` leaves an `import()` it cannot resolve to run time: [what it copies](#what-it-copies).) |
 | `Could not resolve "<package>"` for a plugin's own dependency | The manifest's folder has no `node_modules` entry for that package. Run `npm install` there. An `optionalDependency` counts: once it is installed, the plugin imports it like any other, so it must be in the folder too. |
-| "changed since it was compiled in, so it was loaded from its files" | The extension changed after `pi-bolt compile` compiled it in. Run `pi-bolt compile` again. |
+| "changed since it was compiled in, so it was loaded from its files" | The extension changed after `upi compile` compiled it in. Run `upi compile` again. |
 | A tool or command "conflicts" at startup | The plugin is also loaded at run time. Remove the run-time copy ([step 3](#3-turning-a-compiled-in-plugin-off-and-run-time-copies)). |
 | `ENOENT` for a file next to the plugin's source | Embed the file with an `import ... with { type: "text" }` or `{ type: "file" }`. |
 | A plugin's hot path is slow on the JIT-off build | Check it against the [performance guide](#performance-guide). As a stopgap, build with `--jit on`. |

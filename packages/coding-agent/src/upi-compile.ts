@@ -1,16 +1,16 @@
 /**
- * `pi-bolt compile`: compiles the extensions installed on this machine into this µPi, as scripts/build-pi.sh
+ * `upi compile`: compiles the extensions installed on this machine into this µPi, as scripts/build-pi.sh
  * --plugins-from-installed does in a checkout of the repository, with nothing but what the release has.
  *
- * What a build needs besides the extensions: the runtime (pi-bolt-runtime-<platform>.tar.gz, the Bun with the compiler) and the
- * compile kit (pi-bolt-kit-<platform>.tar.gz: the files of Pi the release was built from, the training profile and the build's
+ * What a build needs besides the extensions: the runtime (upi-runtime-<platform>.tar.gz, the Bun with the compiler) and the
+ * compile kit (upi-kit-<platform>.tar.gz: the files of Pi the release was built from, the training profile and the build's
  * command; scripts/make-kit.mjs). Both are this build's own release's, checked as the installers check a release: the
  * signature of its SHA256SUMS by the release key, the version its first line names, then each file's SHA-256. They are kept
  * in <install>/cache with the SHA256SUMS and its signature, checked again each time: the next compile needs no network.
  *
  * The new executable takes the place of this one, in the same folder; the one it replaces is kept beside it as
- * <folder>.previous (`pi-bolt update --rollback` puts it back). <install>/compile.json keeps what was asked for (and a raised
- * limit on the size of a function), and `pi-bolt update` compiles the same extensions into the release it installs.
+ * <folder>.previous (`upi update --rollback` puts it back). <install>/compile.json keeps what was asked for (and a raised
+ * limit on the size of a function), and `upi update` compiles the same extensions into the release it installs.
  *
  * Each extension compiled in stands in for its installed copy while that is unchanged (core/extensions/compiled.ts).
  */
@@ -46,14 +46,14 @@ import { SettingsManager } from "./core/settings-manager.ts";
 import { namesPlugin, type PluginPlan, planPlugins, selectionProblem } from "./gen-plugin-manifest.mjs";
 import {
 	MICROPI_RELEASE_KEY,
+	MICROPI_RELEASES_URL,
 	PIBOLT,
-	PIBOLT_RELEASES_URL,
 	piBoltInstallDir,
 	piBoltInstallMethod,
 	piBoltPackageManager,
-} from "./pi-bolt.ts";
+} from "./upi.ts";
 
-/** What `pi-bolt compile` was asked for, kept in <install>/compile.json for the next update. */
+/** What `upi compile` was asked for, kept in <install>/compile.json for the next update. */
 export interface CompileSelection {
 	only?: string[];
 	exclude?: string[];
@@ -124,7 +124,7 @@ export interface CompilePackages {
 }
 
 /**
- * The packages in the agent directory's settings, resolved as `pi-bolt list` and `pi-bolt doctor` resolve them: the
+ * The packages in the agent directory's settings, resolved as `upi list` and `upi doctor` resolve them: the
  * settings manager applies piBolt.packages (additions, `-` removals, replacements) to `packages`, and the package manager
  * finds each one's folder and the extension files Pi loads from it. A project's settings are not read: what is compiled in
  * is for every project, as gen-plugin-manifest.mjs reads only the agent directory too. Nothing is installed.
@@ -251,11 +251,11 @@ export function canRaiseLimit(size: number, memory = totalmem()): boolean {
 /** Where kit.json's paths say "the kit's folder" (scripts/make-kit.mjs). */
 const KIT_FOLDER = "@KIT@";
 
-const USAGE = `Usage: pi-bolt compile [options]
+const USAGE = `Usage: upi compile [options]
 
 Compile the extensions installed on this machine into µPi: they then run as machine code, like Pi itself, and cost
 nothing to load. Each one compiled in is used while its installed copy is unchanged; a changed one is loaded from its files
-again until it is compiled in again. \`pi-bolt update\` compiles the same extensions into the release it installs.
+again until it is compiled in again. \`upi update\` compiles the same extensions into the release it installs.
 
 The first compile downloads this release's runtime and compile kit (37-52 MB) and keeps them, with the release's signed
 checksums, in the installation's cache: later compiles of this version need no network. A project's own extensions
@@ -265,10 +265,10 @@ Options:
   --list             List the extensions a compile takes, by the names it gives them, and stop: nothing is downloaded
   --only a,b         Only these extensions
   --exclude a,b      Every extension except these. They are recorded: later compiles without --only, and
-                     \`pi-bolt update\`, leave them out too, and a later --exclude adds to them
+                     \`upi update\`, leave them out too, and a later --exclude adds to them
   --include a,b      Compile these in again, which --exclude left out before
   --no-exclude       Leave out none of the extensions --exclude left out before (with --exclude: only those it names)
-  --no-packages      Leave out the packages \`pi-bolt install\` installed
+  --no-packages      Leave out the packages \`upi install\` installed
   --off              Go back to the release's executable, with no extensions compiled in
   --status           Show what is compiled in
   --kit FILE         Build with this compile kit instead of the release's (an archive or an unpacked folder)
@@ -281,7 +281,7 @@ Options:
 Environment:
   BUN_JSC_maximumAOTCandidateBytecodeSize=N
                      Compile functions of up to N bytes of bytecode (default 262144). compile.json keeps it: a later
-                     \`pi-bolt compile\` without it, and \`pi-bolt update\`, use it too; N=262144 takes it back
+                     \`upi compile\` without it, and \`upi update\`, use it too; N=262144 takes it back
 `;
 
 export function piBoltCompileUsage(): string {
@@ -340,7 +340,7 @@ const DOWNLOAD_IDLE_SECONDS = 20;
 
 /** What to do when a download fails: said after the reason. */
 const NETWORK_HINT =
-	"pi-bolt compile downloads this release's runtime and compile kit once (37-52 MB), then compiles offline from its cache. Check the connection or the proxy (HTTPS_PROXY), or give the files with --kit and --runtime (docs/PLUGINS.md#pi-bolt-compile).";
+	"upi compile downloads this release's runtime and compile kit once (37-52 MB), then compiles offline from its cache. Check the connection or the proxy (HTTPS_PROXY), or give the files with --kit and --runtime (docs/PLUGINS.md#upi-compile).";
 
 function megabytes(bytes: number): string {
 	return `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB`;
@@ -396,7 +396,7 @@ export async function download(
 }
 
 /**
- * The release's checksums, if they are Pi-Bolt `version`'s: signed by the release key (keys/release.pub), and naming that
+ * The release's checksums, if they are µPi `version`'s: signed by the release key (keys/release.pub), and naming that
  * version on their first line. As the installers check them; there is no way round either check.
  */
 export function checkReleaseSums(
@@ -411,10 +411,10 @@ export function checkReleaseSums(
 	} catch {
 		signed = false;
 	}
-	if (!signed) throw new CompileError("the release's signature does not verify: its files are not Pi-Bolt's");
+	if (!signed) throw new CompileError("the release's signature does not verify: its files are not µPi's");
 	const lines = sums.toString("utf8").split(/\r?\n/);
-	if (lines[0] !== `# pi-bolt ${version}`) {
-		throw new CompileError(`the release's checksums are not Pi-Bolt ${version}'s (they begin "${lines[0]}")`);
+	if (lines[0] !== `# upi ${version}`) {
+		throw new CompileError(`the release's checksums are not µPi ${version}'s (they begin "${lines[0]}")`);
 	}
 	const sha = new Map<string, string>();
 	for (const line of lines.slice(1)) {
@@ -455,7 +455,7 @@ async function releaseFile(base: string, name: string, sha: Map<string, string>,
 const CACHED_SUMS = "SHA256SUMS";
 const CACHED_SIGNATURE = "SHA256SUMS.sig";
 
-/** The checksums the cache keeps, if they are Pi-Bolt `version`'s and their signature verifies (checkReleaseSums). */
+/** The checksums the cache keeps, if they are µPi `version`'s and their signature verifies (checkReleaseSums). */
 function cachedReleaseSums(cacheDir: string, version: string, key: string): Map<string, string> | undefined {
 	try {
 		return checkReleaseSums(
@@ -481,7 +481,7 @@ export async function releaseArchives(
 	cacheDir: string,
 	key = MICROPI_RELEASE_KEY,
 ): Promise<{ runtime: string; kit: string }> {
-	const names = { runtime: `pi-bolt-runtime-${platform}.tar.gz`, kit: `pi-bolt-kit-${platform}.tar.gz` };
+	const names = { runtime: `upi-runtime-${platform}.tar.gz`, kit: `upi-kit-${platform}.tar.gz` };
 	let sha = cachedReleaseSums(cacheDir, version, key);
 	const cached =
 		sha &&
@@ -523,7 +523,7 @@ function localFile(given: string, work: string, folder: string): string {
 	return join(work, folder, top);
 }
 
-/** The runtime's bun in an unpacked runtime archive (pi-bolt-runtime-<platform>/bun), or the path given. */
+/** The runtime's bun in an unpacked runtime archive (upi-runtime-<platform>/bun), or the path given. */
 function runtimeBun(path: string): string {
 	const bun = statSync(path).isDirectory() ? join(path, "bun") : path;
 	if (!existsSync(bun)) throw new CompileError(`no bun in ${path}`);
@@ -585,9 +585,9 @@ function sourceOf(
  * PIBOLT_COMPILE_CHECK=<file>: the compile's check of a new build (checkCompiledStart), which writes there as it exits which
  * compiled-in extensions loaded, and what failed.
  */
-const ENTRY = `// Generated by \`pi-bolt compile\`: Pi's Bun entry (packages/coding-agent/src/bun/cli.ts), with extensions compiled in.
+const ENTRY = `// Generated by \`upi compile\`: Pi's Bun entry (packages/coding-agent/src/bun/cli.ts), with extensions compiled in.
 import "../dist/bun/sandbox-env-setup.js";
-// (\`pi-bolt --version\` answered before the rest of Pi, and the extensions, are loaded: as Pi's own entry does.)
+// (\`upi --version\` answered before the rest of Pi, and the extensions, are loaded: as Pi's own entry does.)
 import "../dist/bun/version-fast-path.js";
 import "../dist/bun/runtime-setup.js";
 import { writeFileSync } from "node:fs";
@@ -601,7 +601,7 @@ import { main } from "../dist/main.js";
 import sources from "./sources.json" with { type: "json" };
 
 const args = process.argv.slice(2);
-// (Loaded with import(), not imported with this module nor required: ENTRY in pi-bolt-compile.ts.)
+// (Loaded with import(), not imported with this module nor required: ENTRY in upi-compile.ts.)
 const manifest = startsWithoutCompiledExtensions(args) ? undefined : await import("./src/plugins.ts");
 const check = process.env.PIBOLT_COMPILE_CHECK;
 if (check) {
@@ -662,7 +662,7 @@ export function buildFailureReason(output: string, tooBig: string[] = []): strin
 			...(tooBig.length > 0
 				? tooBig
 				: [
-						`Leave that extension out with \`pi-bolt compile --exclude <name>\`, or compile it anyway with \`${SIZE_LIMIT}=<n> pi-bolt compile\`, which compile.json keeps for \`pi-bolt update\` (docs/TROUBLESHOOTING.md).`,
+						`Leave that extension out with \`upi compile --exclude <name>\`, or compile it anyway with \`${SIZE_LIMIT}=<n> upi compile\`, which compile.json keeps for \`upi update\` (docs/TROUBLESHOOTING.md).`,
 					]),
 		);
 	}
@@ -673,7 +673,7 @@ export function buildFailureReason(output: string, tooBig: string[] = []): strin
 
 /**
  * The limit a compile builds with: the one the environment sets, else the one compile.json keeps (a compile that raised it
- * records it, so that `pi-bolt update` compiles the same extensions again). Undefined: the compiler's own.
+ * records it, so that `upi update` compiles the same extensions again). Undefined: the compiler's own.
  */
 export function bytecodeSizeLimit(env: NodeJS.ProcessEnv, record: { maximumBytecodeSize?: number } | undefined) {
 	const set = env[SIZE_LIMIT];
@@ -951,7 +951,7 @@ function explainTooBig(
 	if (pieces.length === 0) return nothing;
 	const sizes = measurePieces(bun, pieces, names, work, env);
 	const kb = (bytes: number) => (bytes < 10240 ? `${bytes} bytes` : `${Math.round(bytes / 1024)} KB`);
-	const raise = `compile it anyway with \`${SIZE_LIMIT}=${tooBig.size} pi-bolt compile\`, which compile.json keeps for \`pi-bolt update\` (docs/TROUBLESHOOTING.md).`;
+	const raise = `compile it anyway with \`${SIZE_LIMIT}=${tooBig.size} upi compile\`, which compile.json keeps for \`upi update\` (docs/TROUBLESHOOTING.md).`;
 
 	if (!tooBig.topLevel) {
 		const ranked = pieces
@@ -964,8 +964,8 @@ function explainTooBig(
 		const lines = [
 			`That function is ${describePiece(largest.piece, plan, names)}: the largest of the extensions' functions, about ${kb(largest.size)} of bytecode as measured outside the compiler (which encodes it shorter)${next ? `, where the next largest is ${kb(next.size)}` : ""}.`,
 			names.length > 0
-				? `Leave it out with \`pi-bolt compile --exclude ${names.join(",")}\`, or ${raise}`
-				: `Leave out the extensions that use it (\`pi-bolt compile --exclude <name>\`), or ${raise}`,
+				? `Leave it out with \`upi compile --exclude ${names.join(",")}\`, or ${raise}`
+				: `Leave out the extensions that use it (\`upi compile --exclude <name>\`), or ${raise}`,
 		];
 		return { lines, names };
 	}
@@ -986,8 +986,8 @@ function explainTooBig(
 		const lines = [
 			`That is the top-level code of ${names.length > 0 ? `the extension ${names.join(", ")}` : owner}, a file of its own: about ${kb(size)} of bytecode as measured outside the compiler (which encodes it shorter)${next ? `, where the next largest is ${kb(next[1])} (${next[0]})` : ""}.`,
 			names.length > 0
-				? `Leave it out with \`pi-bolt compile --exclude ${names.join(",")}\`, or ${raise}`
-				: `Leave out the extensions that use it (\`pi-bolt compile --exclude <name>\`), or ${raise}`,
+				? `Leave it out with \`upi compile --exclude ${names.join(",")}\`, or ${raise}`
+				: `Leave out the extensions that use it (\`upi compile --exclude <name>\`), or ${raise}`,
 		];
 		return { lines, names };
 	}
@@ -995,7 +995,7 @@ function explainTooBig(
 	const more = shares.size - listed.length;
 	const lines = [
 		`That is the top-level code of the whole program, not of one extension: Pi's own (about ${kb(Math.max(0, tooBig.size - theirs))}) and what each extension adds to it, measured outside the compiler: ${listed.join(", ")}${more > 0 ? ` and ${more} more` : ""}.`,
-		`Leave out the extensions with the largest shares (\`pi-bolt compile --exclude <name>\`), or ${raise}`,
+		`Leave out the extensions with the largest shares (\`upi compile --exclude <name>\`), or ${raise}`,
 	];
 	return { lines, names: [] };
 }
@@ -1069,8 +1069,8 @@ export function bundlerErrorAdvice(
 		const one = names.size === 1;
 		const rest = chosen.only?.filter((name) => !names.has(name));
 		const command = rest
-			? rest.length > 0 && `pi-bolt compile --only ${rest.join(",")}`
-			: `pi-bolt compile --exclude ${[...new Set([...(chosen.exclude ?? []), ...names])].join(",")}`;
+			? rest.length > 0 && `upi compile --only ${rest.join(",")}`
+			: `upi compile --exclude ${[...new Set([...(chosen.exclude ?? []), ...names])].join(",")}`;
 		advice.push(
 			`${one ? "That is in the extension" : "Those are in the extensions"} ${[...names].join(", ")} (${inExtensions.join(", ")}).` +
 				(command
@@ -1080,7 +1080,7 @@ export function bundlerErrorAdvice(
 	}
 	if (inDependencies.length > 0) {
 		advice.push(
-			`${inDependencies.length === 1 ? "That is in a package" : "Those are in packages"} the extensions depend on (${inDependencies.join(", ")}). Leave out the extensions that use ${inDependencies.length === 1 ? "it" : "them"} with \`pi-bolt compile --exclude <name>\`, by the names listed above.`,
+			`${inDependencies.length === 1 ? "That is in a package" : "Those are in packages"} the extensions depend on (${inDependencies.join(", ")}). Leave out the extensions that use ${inDependencies.length === 1 ? "it" : "them"} with \`upi compile --exclude <name>\`, by the names listed above.`,
 		);
 	}
 	return advice;
@@ -1576,7 +1576,7 @@ export function runBuild(
 }
 
 /** The first line of a compile.log this command wrote: a log without it may be someone else's file of that name. */
-const LOG_HEADER = "# pi-bolt compile: all of what the compiler printed";
+const LOG_HEADER = "# upi compile: all of what the compiler printed";
 
 /**
  * Builds µPi with the extensions of `plan` into `stage`, a folder like this build's. A failed build leaves all of
@@ -1662,17 +1662,17 @@ async function buildExecutable(
 	for (const name of readdirSync(buildDir)) {
 		if (!own.has(name)) cpSync(join(buildDir, name), join(stage, name), { recursive: true, verbatimSymlinks: true });
 	}
-	const about = existsSync(join(buildDir, "pi-bolt.txt"))
-		? readFileSync(join(buildDir, "pi-bolt.txt"), "utf8").split("\n")[0]
-		: `Pi-Bolt ${build.version}`;
+	const about = existsSync(join(buildDir, "upi.txt"))
+		? readFileSync(join(buildDir, "upi.txt"), "utf8").split("\n")[0]
+		: `µPi ${build.version}`;
 	writeFileSync(
-		join(stage, "pi-bolt.txt"),
-		`${about}\nExtensions compiled in (pi-bolt compile, ${new Date().toISOString().slice(0, 10)}): ${plan.plugins.map((p) => p.name).join(", ")}\n`,
+		join(stage, "upi.txt"),
+		`${about}\nExtensions compiled in (upi compile, ${new Date().toISOString().slice(0, 10)}): ${plan.plugins.map((p) => p.name).join(", ")}\n`,
 	);
 	// The check build-pi.sh makes: that the executable runs, as this version, from its compiled code.
 	const check = run(join(stage, "pi"), ["--version"], { env: { ...process.env, BUN_STATIC_HEAP_VERBOSE: "1" } });
 	const said = `${check.stdout}${check.stderr}`;
-	if (check.status !== 0 || !said.includes("image registered: true") || !said.includes(`Pi-Bolt ${build.version},`)) {
+	if (check.status !== 0 || !said.includes("image registered: true") || !said.includes(`µPi ${build.version},`)) {
 		throw new CompileError(`the new executable does not run as it should:\n${said.trim()}`);
 	}
 }
@@ -1752,7 +1752,7 @@ export function chooseExtensions(
 	};
 }
 
-/** Whether an update should compile extensions into the release it installed (`pi-bolt compile` was run here). */
+/** Whether an update should compile extensions into the release it installed (`upi compile` was run here). */
 export function piBoltCompileWanted(installDir: string): boolean {
 	return existsSync(join(installDir, "compile.json"));
 }
@@ -1834,7 +1834,7 @@ export function removeOldLog(log: string, ours: boolean): void {
 export function projectExtensionLines(cwd: string, agentDir: string): string[] {
 	const projectDir = resolve(cwd, CONFIG_DIR_NAME);
 	if (projectDir === resolve(agentDir)) return [];
-	const reason = "not compiled in: a project's extensions load from their files (docs/PLUGINS.md#pi-bolt-compile)";
+	const reason = "not compiled in: a project's extensions load from their files (docs/PLUGINS.md#upi-compile)";
 	const shown = (path: string) => relative(cwd, path) || path;
 	const lines = collectAutoExtensionEntries(join(projectDir, "extensions")).map(
 		(entry) => `${shown(entry)} (project): ${reason}`,
@@ -1896,7 +1896,7 @@ async function planCompile(
 		);
 		if (selection.only?.length === 0) {
 			throw new CompileError(
-				`none of the extensions compile.json names in --only is here any more: run pi-bolt compile to choose again`,
+				`none of the extensions compile.json names in --only is here any more: run upi compile to choose again`,
 			);
 		}
 	}
@@ -1943,16 +1943,16 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 		} else {
 			if (options.kit || options.runtime) throw new CompileError("--kit and --runtime go together");
 			const base =
-				process.env.PIBOLT_DOWNLOAD_BASE?.replace(/\/+$/, "") ??
-				`${PIBOLT_RELEASES_URL}/download/bolt-v${build.version}`;
+				process.env.MICROPI_DOWNLOAD_BASE?.replace(/\/+$/, "") ??
+				`${MICROPI_RELEASES_URL}/download/bolt-v${build.version}`;
 			// (The installation's cache, with --out too.)
 			const installDir = where?.installDir ?? piBoltInstallDir();
 			const archives = await releaseArchives(base, build.version, platform, join(installDir ?? work, "cache"));
 			process.stderr.write(chalk.dim("unpacking the runtime and kit\n"));
 			untar(archives.runtime, join(work, "runtime"));
 			untar(archives.kit, join(work, "kit"));
-			bun = runtimeBun(join(work, "runtime", `pi-bolt-runtime-${platform}`));
-			kitDir = join(work, "kit", `pi-bolt-kit-${platform}`);
+			bun = runtimeBun(join(work, "runtime", `upi-runtime-${platform}`));
+			kitDir = join(work, "kit", `upi-kit-${platform}`);
 		}
 		kitDir = realpathSync(kitDir);
 		const kit = JSON.parse(readFileSync(join(kitDir, "kit.json"), "utf8")) as Kit;
@@ -2038,7 +2038,7 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 				if (!(error instanceof TooBigToCompile) || attempt >= 4) throw error;
 				const limit = options.maximumBytecodeSize ?? DEFAULT_SIZE_LIMIT;
 				if (error.names.length === 0) {
-					// (Kept in compile.json, as one the command was given: `pi-bolt update` then builds with it at once.)
+					// (Kept in compile.json, as one the command was given: `upi update` then builds with it at once.)
 					options.maximumBytecodeSize = error.size;
 					process.stderr.write(
 						chalk.dim(
@@ -2051,7 +2051,7 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 					error.names.map((name) => ({
 						name,
 						origin: plan.plugins.find((plugin) => plugin.name === name)?.origin ?? "?",
-						reason: `a function of it is too big for the compiler (${error.size} bytes of bytecode, over ${limit}; \`${SIZE_LIMIT}=${error.size} pi-bolt compile\` compiles it in)`,
+						reason: `a function of it is too big for the compiler (${error.size} bytes of bytecode, over ${limit}; \`${SIZE_LIMIT}=${error.size} upi compile\` compiles it in)`,
 					})),
 				);
 				continue;
@@ -2074,7 +2074,7 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 			}));
 			if (attempt >= 2) {
 				throw new CompileError(
-					`the new executable's extensions still fail to load:\n${left.map(leftOutLine).join("\n")}\nLeave them out with \`pi-bolt compile --exclude <name>\`.`,
+					`the new executable's extensions still fail to load:\n${left.map(leftOutLine).join("\n")}\nLeave them out with \`upi compile --exclude <name>\`.`,
 				);
 			}
 			leave(left);
@@ -2109,7 +2109,7 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 		writeFileSync(join(where!.installDir, "compile.json"), `${JSON.stringify(record, null, "\t")}\n`);
 		console.log(chalk.green(`Compiled into µPi ${build.version} in ${took}: ${names.join(", ")}${leftNote}`));
 		if (!options.afterUpdate) {
-			console.log(chalk.dim(`The build before is kept: pi-bolt update --rollback puts it back.`));
+			console.log(chalk.dim(`The build before is kept: upi update --rollback puts it back.`));
 		}
 	} finally {
 		rmSync(work, { recursive: true, force: true });
@@ -2119,14 +2119,14 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 function status(): void {
 	const { installDir, buildDir } = installation();
 	const record = readRecord(installDir);
-	const about = existsSync(join(buildDir, "pi-bolt.txt")) ? readFileSync(join(buildDir, "pi-bolt.txt"), "utf8") : "";
+	const about = existsSync(join(buildDir, "upi.txt")) ? readFileSync(join(buildDir, "upi.txt"), "utf8") : "";
 	const line = about.split("\n").find((l) => l.startsWith("Extensions compiled in"));
 	console.log(line ?? "No extensions are compiled into this µPi.");
 	for (const state of compiledStateLines(compiledExtensionList(), record)) console.log(chalk.yellow(state));
 }
 
 /**
- * `pi-bolt compile --off`: the release's executable back (from the installer, which does not compile anything in for it), and no
+ * `upi compile --off`: the release's executable back (from the installer, which does not compile anything in for it), and no
  * extensions compiled in by later updates. The record goes only once the release is installed: a failed reinstall leaves the
  * compiled build running, and the next update compiling the same extensions into it.
  */
@@ -2138,7 +2138,7 @@ async function off(installAgain: () => Promise<boolean>): Promise<boolean> {
 }
 
 /**
- * `pi-bolt compile [options]`. Returns the exit status. `installAgain` installs this version's release again, without compiling
+ * `upi compile [options]`. Returns the exit status. `installAgain` installs this version's release again, without compiling
  * extensions into it.
  */
 export async function runPiBoltCompile(args: string[], installAgain: () => Promise<boolean>): Promise<number> {
@@ -2232,9 +2232,7 @@ export async function runPiBoltCompile(args: string[], installAgain: () => Promi
 		return 0;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(
-			chalk.red(`error: ${error instanceof CompileError ? message : `pi-bolt compile failed: ${message}`}`),
-		);
+		console.error(chalk.red(`error: ${error instanceof CompileError ? message : `upi compile failed: ${message}`}`));
 		return 1;
 	}
 }

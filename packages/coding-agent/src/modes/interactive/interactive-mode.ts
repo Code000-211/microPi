@@ -128,7 +128,7 @@ import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
 import { addMcpServerConfig, loadMcpConfig } from "../../extensions/mcp/config.ts";
-import { PIBOLT, PIBOLT_RELEASES_URL, piBoltUpdateCommand } from "../../pi-bolt.ts";
+import { MICROPI_RELEASES_URL, PIBOLT, piBoltUpdateCommand } from "../../upi.ts";
 import {
 	getChangelogPath,
 	getNewEntries,
@@ -4844,7 +4844,7 @@ export class InteractiveMode {
 		const updateInstruction = () =>
 			theme.fg("muted", `New ${PIBOLT ? "µPi " : ""}version ${release.version} is available. Run `) +
 			theme.fg("accent", PIBOLT ? piBoltUpdateCommand() : `${COMMAND_NAME} update`);
-		const changelogUrl = PIBOLT ? PIBOLT_RELEASES_URL : "https://pi.dev/changelog";
+		const changelogUrl = PIBOLT ? MICROPI_RELEASES_URL : "https://pi.dev/changelog";
 		const changelogLine = () => {
 			const changelogLink = getCapabilities().hyperlinks
 				? hyperlink(theme.fg("accent", changelogUrl), changelogUrl)

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Publishes install.sh, install.ps1 (Windows: `irm https://pi-bolt.opensec.in/install.ps1 | iex`) and site/ (the home page, the
+# Publishes install.sh, install.ps1 (Windows: `irm https://upi.opensec.in/install.ps1 | iex`) and site/ (the home page, the
 # crash-report page, the logo, the page's font, its video and poster, and the documentation in site/docs, built by
 # scripts/build-docs.py) to the gh-pages
-# branch, which GitHub Pages serves at https://pi-bolt.opensec.in.
+# branch, which GitHub Pages serves at https://upi.opensec.in.
 # Usage: scripts/publish-installer.sh [REMOTE]     (default remote: origin). Adds a commit to gh-pages; never rewrites it.
 source "$(dirname "$0")/lib/common.sh"
 need git

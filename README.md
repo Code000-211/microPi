@@ -69,18 +69,18 @@ No releases yet: µPi is built from source. Needs git, Python 3 and Node.js 22.1
 git clone https://github.com/Code000-211/microPi.git && cd microPi
 scripts/fetch-runtime.sh             # the AOT runtime from Pi-Bolt's latest signed release -> .work/runtime/bun
 scripts/prepare-pi.sh                # builds Pi from this repository
-scripts/build-pi.sh --kit .work/kit  # -> out/pi-bolt/pi, and the kit for compiling extensions in
-out/pi-bolt/pi --version
+scripts/build-pi.sh --kit .work/kit  # -> out/upi/pi, and the kit for compiling extensions in
+out/upi/pi --version
 ```
 
-The executable is still called `pi-bolt`: µPi builds on [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt), which
-compiles Pi ahead of time into one native executable, and keeps `pi-bolt compile` for extensions. Do not run
-`pi-bolt update`: it installs Pi-Bolt's latest release over µPi.
-To replace an installed Pi-Bolt, put `out/pi-bolt` where its installer put the build (on Linux x86-64
-`~/.pi-bolt/pi-bolt-linux-x64`; keep the old folder to go back), then compile your extensions in again:
+The executable is called `upi`: µPi builds on [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt), which
+compiles Pi ahead of time into one native executable, and keeps `upi compile` for extensions. Do not run
+`upi update`: it installs Pi-Bolt's latest release over µPi.
+To replace an installed Pi-Bolt, put `out/upi` where the µPi installation is (on Linux x86-64
+`~/.micropi/upi-linux-x64`; keep the old folder to go back), then compile your extensions in again:
 
 ```bash
-pi-bolt compile --kit .work/kit --runtime .work/runtime/bun
+upi compile --kit .work/kit --runtime .work/runtime/bun
 ```
 
 [docsearch](packages/docsearch) (`project_search`) is installed with `packages/docsearch/install.sh` before that compile.
@@ -375,7 +375,7 @@ Enter shows a job's whole output to scroll through, `x` stops it. While jobs run
 
 ### Working on another machine
 
-`/remote dev:~/Projects/Radiance` (or `pi-bolt --remote dev:~/Projects/Radiance`) moves `read`, `edit`, `write` and
+`/remote dev:~/Projects/Radiance` (or `upi --remote dev:~/Projects/Radiance`) moves `read`, `edit`, `write` and
 `bash` to that folder on another machine over ssh; `/remote off` moves them back, `/remote` says where they work. The
 session remembers it, so resuming it works there again, and the status line shows `⇄ dev:/home/dev/Projects/Radiance`.
 

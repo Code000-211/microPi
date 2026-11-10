@@ -1,5 +1,5 @@
 /**
- * µPi: extensions compiled into the executable by `pi-bolt compile` (src/pi-bolt-compile.ts).
+ * µPi: extensions compiled into the executable by `upi compile` (src/upi-compile.ts).
  *
  * Each stands in for an extension installed on this machine for as long as that extension is as it was when it was compiled
  * in. Pi finds, filters and orders its extensions as always; the one at a compiled-in path then gets the compiled factory
@@ -49,8 +49,8 @@ export interface CompiledExtension extends CompiledExtensionSource {
 }
 
 /**
- * The commands that start without the compiled-in extensions: those that report on or repair an installation (`pi-bolt
- * doctor`, `pi-bolt compile` in each of its forms, `pi-bolt update --rollback`). They run none of their code, whatever it does
+ * The commands that start without the compiled-in extensions: those that report on or repair an installation (`upi
+ * doctor`, `upi compile` in each of its forms, `upi update --rollback`). They run none of their code, whatever it does
  * (doctor lists the compiled-in ones without loading them).
  */
 export function startsWithoutCompiledExtensions(args: readonly string[]): boolean {
@@ -87,7 +87,7 @@ export function setCompiledExtensions(extensions: readonly CompiledExtension[]):
 	compiled = extensions.length > 0 ? new Map(extensions.map((extension) => [extension.entry, extension])) : undefined;
 }
 
-/** The extensions compiled into this executable by `pi-bolt compile`. */
+/** The extensions compiled into this executable by `upi compile`. */
 export function compiledExtensionList(): CompiledExtension[] {
 	return compiled ? [...compiled.values()] : [];
 }
@@ -175,7 +175,7 @@ export function compiledExtensionFor(
 }
 
 /**
- * What `pi-bolt compile --status` and `pi-bolt doctor` say of the extensions compiled in: one line each that is not used as
+ * What `upi compile --status` and `upi doctor` say of the extensions compiled in: one line each that is not used as
  * compiled in (changed or removed since), and, when compile.json records a compile but this build has none (the installer
  * replaced it, or a switch to or from the JIT build), how to compile them in again. `record`: compile.json's extensions.
  */
@@ -187,7 +187,7 @@ export function compiledStateLines(
 		const recorded = Array.isArray(record?.extensions) ? record.extensions.join(", ") : "";
 		return record
 			? [
-					`compile.json records extensions compiled in (${recorded || "none"}), but this build has none: the installer, or a switch to or from the JIT build, replaced the build they were compiled into. Run \`pi-bolt compile\` to compile them in again.`,
+					`compile.json records extensions compiled in (${recorded || "none"}), but this build has none: the installer, or a switch to or from the JIT build, replaced the build they were compiled into. Run \`upi compile\` to compile them in again.`,
 				]
 			: [];
 	}
@@ -196,7 +196,7 @@ export function compiledStateLines(
 		if (now === undefined) return [`${extension.name}: no longer installed (${extension.entry}): not loaded`];
 		if (now !== extension.fingerprint) {
 			return [
-				`${extension.name}: changed since it was compiled in, so it loads from its files: run \`pi-bolt compile\` to compile it in again`,
+				`${extension.name}: changed since it was compiled in, so it loads from its files: run \`upi compile\` to compile it in again`,
 			];
 		}
 		return [];

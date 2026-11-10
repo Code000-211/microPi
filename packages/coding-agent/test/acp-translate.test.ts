@@ -191,6 +191,26 @@ describe("JsonRpcConnection", () => {
 	});
 });
 
+describe("bashOutputTail", () => {
+	it("takes a terminal tail as the bash tool reports its output as it was written", () => {
+		expect(
+			bashOutputTail({
+				content: [{ type: "text", text: "cleaned" }],
+				details: { terminal: { text: "\x1b[31mred\x1b[0m\n", totalBytes: 16, truncated: false } },
+			}),
+		).toEqual({ text: "\x1b[31mred\x1b[0m\n", totalBytes: 16, truncated: false });
+	});
+
+	it("still reads a tail from a truncated partial result without a terminal tail", () => {
+		expect(
+			bashOutputTail({
+				content: [{ type: "text", text: "first" }],
+				details: { truncation: { truncated: true, totalBytes: 20, lastLinePartial: false, lastLine: "" } },
+			}),
+		).toEqual({ text: "\nfirst", totalBytes: 20, truncated: true });
+	});
+});
+
 describe("terminalOutputDelta", () => {
 	/** Command output as the bash tool reports it while the command runs: the end of it, with small limits. */
 	const command = () => {
@@ -230,6 +250,84 @@ describe("terminalOutputDelta", () => {
 			},
 		};
 	};
+
+	// As the bash tool reports it: the cleaned snapshot for the model, and the output as it was written (escape
+	// sequences included) for the terminal.
+	const cleanCommand = () => {
+		const output = new OutputAccumulator({
+			maxLines: 4,
+			maxBytes: 40,
+			clean: true,
+			keepRawTail: true,
+			tempFilePrefix: "pi-acp-test",
+		});
+		let full = "";
+		let sent: TerminalSent = TERMINAL_START;
+		let shown = "";
+		let cleaned = "";
+		return {
+			write(text: string) {
+				output.append(Buffer.from(text, "utf8"));
+				full += text;
+			},
+			/** What the terminal is sent for the bash tool's next report, which is what the model's text is built from. */
+			report(): string {
+				const snapshot = output.snapshot();
+				cleaned += snapshot.content;
+				const details = {
+					truncation: snapshot.truncation.truncated ? truncationDetails(snapshot.truncation) : undefined,
+					terminal: output.readRawTail(),
+				};
+				const delta = terminalOutputDelta(sent, bashOutputTail({ content: [], details }));
+				sent = delta.sent;
+				shown += delta.data;
+				return delta.data;
+			},
+			get full() {
+				return full;
+			},
+			get shown() {
+				return shown;
+			},
+			get cleaned() {
+				return cleaned;
+			},
+			close() {
+				output.closeTempFile();
+				const path = output.snapshot().fullOutputPath;
+				if (path) rmSync(path, { force: true });
+			},
+		};
+	};
+
+	it("sends a terminal the output as it was written, which the model still gets cleaned", () => {
+		const run = cleanCommand();
+		const chunks = ["first\n", "\x1b[31msecond\x1b[0m\n", "\x1b]8;;x\x1b\\", "li", "nk\x1b]8;;\x1b\\\n", "y\nlast"];
+		// An incomplete escape sequence goes by between two reports.
+		for (const [i, chunk] of chunks.entries()) {
+			run.write(chunk);
+			if (i !== 3) run.report();
+		}
+		run.report();
+		expect(run.shown).toBe(run.full);
+		expect(run.cleaned).not.toContain("\x1b");
+		run.close();
+	});
+
+	it("marks a terminal's skipped output in the raw tail too, and goes on from there", () => {
+		const run = cleanCommand();
+		run.write("start\n");
+		run.write("\x1b[1mbold\x1b[0m\n");
+		expect(run.report()).toBe("start\n\x1b[1mbold\x1b[0m\n");
+		run.write(Array.from({ length: 20 }, (_, i) => `line ${i}\n`).join(""));
+		const data = run.report();
+		// The bytes that went by between the two reports are marked; the tail stays the output as it was written.
+		expect(data.startsWith("[… output skipped …]")).toBe(true);
+		run.write("more");
+		expect(run.report()).toBe("more");
+		expect(run.shown).toContain("\x1b[1mbold\x1b[0m");
+		run.close();
+	});
 
 	it("sends only new output, through the bash tool's truncated tail", () => {
 		const run = command();
@@ -281,5 +379,19 @@ describe("terminalOutputDelta", () => {
 		expect(bashExitCode({ content: [], structuredContent: { exit_code: 3 } }, true)).toBe(3);
 		expect(bashExitCode({ content: [{ type: "text", text: "Command aborted" }] }, true)).toBeNull();
 		expect(bashExitCode({ content: [] }, false)).toBe(0);
+		// A command that moved to the background has no exit code: it is still running.
+		expect(
+			bashExitCode(
+				{
+					content: [
+						{
+							type: "text",
+							text: "started\n\nCommand still running at its timeout of 1 seconds: moved to the background as job bg7 (pid 42; stop it with: kill -- -42), not stopped.",
+						},
+					],
+				},
+				false,
+			),
+		).toBeNull();
 	});
 });

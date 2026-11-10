@@ -1,5 +1,5 @@
 import type { InlineExtension } from "../core/extensions/types.ts";
-import { PIBOLT } from "../pi-bolt.ts";
+import { PIBOLT } from "../upi.ts";
 import codemodeExtension from "./codemode/index.ts";
 import herdrExtension from "./herdr/index.ts";
 import { herdrFromEnvironment } from "./herdr/transport.ts";

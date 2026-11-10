@@ -1,4 +1,4 @@
-# install.ps1's Ed25519 (Test-Ed25519Signature), with its functions only (PIBOLT_INSTALLER_NO_MAIN): RFC 8032's test vectors
+# install.ps1's Ed25519 (Test-Ed25519Signature), with its functions only (MICROPI_INSTALLER_NO_MAIN): RFC 8032's test vectors
 # 1-3 verify; changed messages and signatures, an s that is not below L, encodings of R that are not canonical, points of small
 # order (the neutral point as the key "signs" any message in the check without them) and inputs of the wrong length do not.
 # Needs nothing but Windows PowerShell.
@@ -6,7 +6,7 @@
 # Usage: tests\installer\ed25519.ps1
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$env:PIBOLT_INSTALLER_NO_MAIN = '1'
+$env:MICROPI_INSTALLER_NO_MAIN = '1'
 . (Join-Path $root 'install.ps1')
 $script:status = 0
 

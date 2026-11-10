@@ -22,7 +22,7 @@ import { main } from "../src/main.ts";
 import { ConfigSelectorComponent } from "../src/modes/interactive/components/config-selector.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { handlePackageCommand } from "../src/package-manager-cli.ts";
-import { MICROPI_HAS_RELEASES } from "../src/pi-bolt.ts";
+import { MICROPI_HAS_RELEASES } from "../src/upi.ts";
 import { allowNetwork } from "./test-network-env.ts";
 
 describe("package commands", () => {

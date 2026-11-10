@@ -93,7 +93,7 @@ export function socketTransport(endpoint: string): HerdrTransport {
 				finish(false);
 				return;
 			}
-			const id = `pi-bolt:${process.pid}:${++requestCount}`;
+			const id = `upi:${process.pid}:${++requestCount}`;
 			const line = JSON.stringify({ id, ...request });
 			// The answer is one line with this id: Herdr took the request only when it carries a result, not an error.
 			let buffered = "";

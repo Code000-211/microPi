@@ -3,9 +3,9 @@
 # (bench/orderfile_session.py: Pi started, a headless prompt, a TUI session, against the local fake model). scripts/build-runtime.sh
 # lays those functions out first in the runtime's code (a linker order file), so that Pi touches fewer of its pages. The list is
 # of names: it holds from one build of the runtime to the next, and is made again when what Pi runs has changed much.
-# Usage: scripts/train-runtime-hints.sh [--pi BUILD]   BUILD: a µPi build made with the runtime in .work (default out/pi-bolt)
+# Usage: scripts/train-runtime-hints.sh [--pi BUILD]   BUILD: a µPi build made with the runtime in .work (default out/upi)
 source "$(dirname "$0")/lib/common.sh"
-BUILD="$PIBOLT_ROOT/out/pi-bolt"
+BUILD="$PIBOLT_ROOT/out/upi"
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--pi) BUILD="$(abspath "$2")"; shift ;;

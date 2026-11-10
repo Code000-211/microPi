@@ -37,10 +37,10 @@ import {
 	measurePieces,
 	originalOfCopy,
 	resolveCompilePackages,
-} from "../src/pi-bolt-compile.ts";
+} from "../src/upi-compile.ts";
 
 // (µPi applies piBolt.packages to `packages` only in a Pi-Bolt build.)
-vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
+vi.mock("../src/upi.ts", async (importOriginal) => ({
 	...(await importOriginal<object>()),
 	PIBOLT: { version: "1.0.0", variant: "arm64", jit: true },
 }));
@@ -204,7 +204,7 @@ describe("a compiled-in extension runs only when Pi loads it, and one that fails
 			{
 				path: entry,
 				warning:
-					"it failed compiled in (ENOENT: no such file or directory, open '/stage/package.json'), so it was loaded from its files: `pi-bolt compile` builds without it",
+					"it failed compiled in (ENOENT: no such file or directory, open '/stage/package.json'), so it was loaded from its files: `upi compile` builds without it",
 			},
 		]);
 		expect(extension.failed).toBe("ENOENT: no such file or directory, open '/stage/package.json'");
@@ -262,11 +262,11 @@ describe("a compiled-in extension runs only when Pi loads it, and one that fails
 });
 
 // After the installer runs again, or a switch to or from the JIT build, compile.json records a compile the build no longer has.
-describe("pi-bolt compile --status and doctor say what is not used as compiled in", () => {
+describe("upi compile --status and doctor say what is not used as compiled in", () => {
 	test("a build with none while compile.json records some, a changed one, a removed one", () => {
 		expect(compiledStateLines([], undefined)).toEqual([]);
 		expect(compiledStateLines([], { extensions: ["hello", "word-tools"] })).toEqual([
-			"compile.json records extensions compiled in (hello, word-tools), but this build has none: the installer, or a switch to or from the JIT build, replaced the build they were compiled into. Run `pi-bolt compile` to compile them in again.",
+			"compile.json records extensions compiled in (hello, word-tools), but this build has none: the installer, or a switch to or from the JIT build, replaced the build they were compiled into. Run `upi compile` to compile them in again.",
 		]);
 		const kept = join(dir, "kept.ts");
 		const changed = join(dir, "changed.ts");
@@ -282,21 +282,21 @@ describe("pi-bolt compile --status and doctor say what is not used as compiled i
 		touch(changed, 2_000_000);
 		rmSync(removed);
 		expect(compiledStateLines(extensions, { extensions: ["kept", "changed", "removed"] })).toEqual([
-			"changed: changed since it was compiled in, so it loads from its files: run `pi-bolt compile` to compile it in again",
+			"changed: changed since it was compiled in, so it loads from its files: run `upi compile` to compile it in again",
 			`removed: no longer installed (${removed}): not loaded`,
 		]);
 	});
 });
 
-describe("pi-bolt compile takes a release's files only with its signature", () => {
+describe("upi compile takes a release's files only with its signature", () => {
 	const { publicKey, privateKey } = generateKeyPairSync("ed25519");
 	const key = publicKey.export({ type: "spki", format: "pem" }).toString();
 	const kitSha = "a".repeat(64);
-	const sums = Buffer.from(`# pi-bolt 0.9.0\n${kitSha}  pi-bolt-kit-linux-x64.tar.gz\n`);
+	const sums = Buffer.from(`# upi 0.9.0\n${kitSha}  upi-kit-linux-x64.tar.gz\n`);
 
 	test("signed checksums of the version asked for give each file's SHA-256", () => {
 		const sha = checkReleaseSums(sums, sign(null, sums, privateKey), "0.9.0", key);
-		expect(sha.get("pi-bolt-kit-linux-x64.tar.gz")).toBe(kitSha);
+		expect(sha.get("upi-kit-linux-x64.tar.gz")).toBe(kitSha);
 	});
 
 	test("a signature by another key is refused", () => {
@@ -311,7 +311,7 @@ describe("pi-bolt compile takes a release's files only with its signature", () =
 	});
 
 	test("another release's checksums, signed all the same, are refused", () => {
-		expect(() => checkReleaseSums(sums, sign(null, sums, privateKey), "0.9.1", key)).toThrow("not Pi-Bolt 0.9.1's");
+		expect(() => checkReleaseSums(sums, sign(null, sums, privateKey), "0.9.1", key)).toThrow("not µPi 0.9.1's");
 	});
 
 	test("the release key is the default", () => {
@@ -319,7 +319,7 @@ describe("pi-bolt compile takes a release's files only with its signature", () =
 	});
 });
 
-describe("pi-bolt compile takes the packages µPi loads", () => {
+describe("upi compile takes the packages µPi loads", () => {
 	/** A package folder: its package.json and the extension files it names. */
 	function packageAt(path: string, name: string, version: string, files: string[]): string {
 		mkdirSync(path, { recursive: true });
@@ -338,11 +338,11 @@ describe("pi-bolt compile takes the packages µPi loads", () => {
 		packageAt(npm("pi-web-access"), "pi-web-access", "0.41.0", ["dist/index.js"]);
 		packageAt(npm("opensec-pi-fff"), "opensec-pi-fff", "0.11.0", ["src/index.ts"]);
 		packageAt(join(agentDir, "plugins", "pi-todo"), "pi-todo", "1.0.0", ["index.ts"]);
-		const bundle = packageAt(join(agentDir, "pi-bolt-bundles", "pi-bolt-web-access"), "pi-bolt-web-access", "1.0.0", [
+		const bundle = packageAt(join(agentDir, "upi-bundles", "upi-web-access"), "upi-web-access", "1.0.0", [
 			"extensions/a.ts",
 			"extensions/b.ts",
 		]);
-		mkdirSync(join(agentDir, "pi-bolt-bundles", "skills-only", "skills"), { recursive: true });
+		mkdirSync(join(agentDir, "upi-bundles", "skills-only", "skills"), { recursive: true });
 		writeFileSync(
 			join(agentDir, "settings.json"),
 			JSON.stringify({
@@ -352,10 +352,10 @@ describe("pi-bolt compile takes the packages µPi loads", () => {
 					packages: [
 						"npm:opensec-pi-fff@0.11.0",
 						"-plugins/pi-todo",
-						"pi-bolt-bundles/pi-bolt-web-access",
+						"upi-bundles/upi-web-access",
 						"-npm:pi-web-access",
-						"pi-bolt-bundles/skills-only",
-						"pi-bolt-bundles/not-there",
+						"upi-bundles/skills-only",
+						"upi-bundles/not-there",
 					],
 				},
 			}),
@@ -376,7 +376,7 @@ describe("pi-bolt compile takes the packages µPi loads", () => {
 				entries: [join(npm("opensec-pi-fff"), "src", "index.ts")],
 			},
 			{
-				source: "pi-bolt-bundles/pi-bolt-web-access",
+				source: "upi-bundles/upi-web-access",
 				kind: "folder",
 				root: bundle,
 				entries: [join(bundle, "extensions", "a.ts"), join(bundle, "extensions", "b.ts")],
@@ -384,8 +384,8 @@ describe("pi-bolt compile takes the packages µPi loads", () => {
 		]);
 		expect(resolved.removed).toEqual(["npm:pi-web-access", "plugins/pi-todo"]);
 		expect(resolved.passedOver).toEqual([
-			{ path: "pi-bolt-bundles/skills-only", reason: "no extensions in it" },
-			{ path: "pi-bolt-bundles/not-there", reason: "not found" },
+			{ path: "upi-bundles/skills-only", reason: "no extensions in it" },
+			{ path: "upi-bundles/not-there", reason: "not found" },
 		]);
 	});
 
@@ -419,7 +419,7 @@ describe("pi-bolt compile takes the packages µPi loads", () => {
 	});
 });
 
-describe("pi-bolt compile leaves out what compile.json records as excluded", () => {
+describe("upi compile leaves out what compile.json records as excluded", () => {
 	const record = { exclude: ["pi-web-access"] };
 	const found = [
 		{ name: "pi-web-access", aliases: ["pi-web-access", "npm:pi-web-access@0.41.0", "npm:pi-web-access"] },
@@ -491,7 +491,7 @@ describe("pi-bolt compile leaves out what compile.json records as excluded", () 
 	});
 });
 
-describe("pi-bolt compile says what it does with each extension and package", () => {
+describe("upi compile says what it does with each extension and package", () => {
 	const plugin = (name: string, origin: string) => ({
 		name,
 		entry: `/x/${name}.ts`,
@@ -509,7 +509,7 @@ describe("pi-bolt compile says what it does with each extension and package", ()
 		skipped: [{ path: "/agent/extensions/shared", reason: "empty folder" }],
 	};
 	const packages = {
-		passedOver: [{ path: "pi-bolt-bundles/skills-only", reason: "no extensions in it" }],
+		passedOver: [{ path: "upi-bundles/skills-only", reason: "no extensions in it" }],
 		removed: ["npm:pi-web-access"],
 	};
 
@@ -519,7 +519,7 @@ describe("pi-bolt compile says what it does with each extension and package", ()
 			"word-count (global): compiling",
 			"pi-web-access (package): excluded (compile.json)",
 			"notes (global): not in --only",
-			"pi-bolt-bundles/skills-only: passed over: no extensions in it",
+			"upi-bundles/skills-only: passed over: no extensions in it",
 			"/agent/extensions/shared: passed over: empty folder",
 			"npm:pi-web-access: excluded by piBolt.packages",
 		]);
@@ -530,7 +530,7 @@ describe("pi-bolt compile says what it does with each extension and package", ()
 	});
 });
 
-describe("pi-bolt compile says why a build stopped", () => {
+describe("upi compile says why a build stopped", () => {
 	// What the compiler printed for pi-web-access 0.41.0's bundled dist/ (#108), with progress lines around it.
 	const tooBig =
 		"AOT: a function of 413499 bytes of bytecode (the top-level code of a module) is bigger than " +
@@ -550,9 +550,9 @@ describe("pi-bolt compile says why a build stopped", () => {
 		expect(reason.split("\n")).toEqual([
 			"[0.12ms] bundle 2104 modules",
 			tooBig,
-			expect.stringContaining("pi-bolt compile --exclude <name>"),
+			expect.stringContaining("upi compile --exclude <name>"),
 		]);
-		expect(reason).toContain("BUN_JSC_maximumAOTCandidateBytecodeSize=<n> pi-bolt compile");
+		expect(reason).toContain("BUN_JSC_maximumAOTCandidateBytecodeSize=<n> upi compile");
 		expect(reason).not.toContain("methods are closed");
 	});
 
@@ -581,7 +581,7 @@ describe("pi-bolt compile says why a build stopped", () => {
 
 // Issue #129: a function too big to compile is one function of an extension, or the top-level code of a module: of one
 // extension's file (#142), or of the whole program in a build that does not split its code. The message says which.
-describe("pi-bolt compile says which extension a function too big to compile is of (#129)", () => {
+describe("upi compile says which extension a function too big to compile is of (#129)", () => {
 	test("the compiler's line gives the size, and whether it is the top-level code", () => {
 		expect(
 			functionTooBig(
@@ -812,14 +812,14 @@ describe("pi-bolt compile says which extension a function too big to compile is 
 			"That function is big's.",
 			"Leave it out.",
 		]);
-		expect(buildFailureReason(log)).toContain("compile.json keeps for `pi-bolt update`");
+		expect(buildFailureReason(log)).toContain("compile.json keeps for `upi update`");
 	});
 });
 
-// Issue #129: a raised limit was lost at the next `pi-bolt update`, which then installed the release without the extensions.
+// Issue #129: a raised limit was lost at the next `upi update`, which then installed the release without the extensions.
 // 3 of 56 published extensions have a function over the compiler's 262144 bytes (355 to 609 KB): with the limit raised they
 // built in about a minute at 2.7 GB. A compile raises it by itself up to 1 MB, on a machine with 8 GB.
-describe("pi-bolt compile raises the limit on the size of a function by itself, within bounds", () => {
+describe("upi compile raises the limit on the size of a function by itself, within bounds", () => {
 	test("up to 1 MB of bytecode, with 8 GB of memory", () => {
 		const gb = 2 ** 30;
 		expect(canRaiseLimit(609_173, 16 * gb)).toBe(true);
@@ -829,7 +829,7 @@ describe("pi-bolt compile raises the limit on the size of a function by itself, 
 	});
 });
 
-describe("pi-bolt compile keeps a raised limit on the size of a function (#129)", () => {
+describe("upi compile keeps a raised limit on the size of a function (#129)", () => {
 	test("the environment's limit, else the one compile.json records, else the compiler's own", () => {
 		const variable = "BUN_JSC_maximumAOTCandidateBytecodeSize";
 		expect(bytecodeSizeLimit({ [variable]: "400000" }, { maximumBytecodeSize: 300000 })).toBe(400000);
@@ -843,7 +843,7 @@ describe("pi-bolt compile keeps a raised limit on the size of a function (#129)"
 
 // Issue #160: @plannotator/pi-extension loads the Claude Agent SDK and the OpenCode SDK with import(), declares neither, and
 // works without them when loaded from its files. The bundler stopped the whole build at those import()s.
-describe("pi-bolt compile leaves an import() it cannot resolve to run time (#160)", () => {
+describe("upi compile leaves an import() it cannot resolve to run time (#160)", () => {
 	test("strings put into the generated code are escaped", () => {
 		expect(jsStringLiteral("a/b</script>\u2028")).toBe('"a\\u002fb\\u003c\\u002fscript\\u003e\\u2028"');
 		expect(new Function(`return ${jsStringLiteral('a/b</script>\u2028"\\')}`)()).toBe('a/b</script>\u2028"\\');
@@ -987,7 +987,7 @@ describe("pi-bolt compile leaves an import() it cannot resolve to run time (#160
 
 // One extension the bundler cannot build stopped the build of all of them, with a path in a deleted folder. Pi loads each on its
 // own: the one that does not resolve fails alone. It is left out of the build now, and loads from its files.
-describe("pi-bolt compile leaves out an extension the bundler cannot build", () => {
+describe("upi compile leaves out an extension the bundler cannot build", () => {
 	test("its line names it, what does not resolve, and its installed file", () => {
 		expect(
 			leftOutLine({
@@ -1106,7 +1106,7 @@ describe("pi-bolt compile leaves out an extension the bundler cannot build", () 
 
 // #174: pi-system-prompt imports "@mariozechner/pi-tui", a name Pi's loader gives its TUI module; the build could not resolve
 // it, said only the bundler's error, and `--exclude "@mariozechner/pi-tui"` (a package, not an extension) left out nothing.
-describe("pi-bolt compile and Pi's other names for its modules (#174)", () => {
+describe("upi compile and Pi's other names for its modules (#174)", () => {
 	const plan = {
 		plugins: [
 			{
@@ -1129,7 +1129,7 @@ describe("pi-bolt compile and Pi's other names for its modules (#174)", () => {
 		excluded: [{ name: "big-bundle", origin: "package", entry: "/x/b.js", by: "exclude" as const }],
 	};
 	const at = (file: string, line: number) =>
-		`    at /home/u/.pi-bolt/.compile-BTqjF3/kit/pi-bolt-kit-linux-x64/tree/packages/coding-agent/.pibolt-plugins/src/${file}:${line}:60`;
+		`    at /home/u/.micropi/.compile-BTqjF3/kit/upi-kit-linux-x64/tree/packages/coding-agent/.pibolt-plugins/src/${file}:${line}:60`;
 	// What the compiler printed for the issue's pi-system-prompt.
 	const stopped = [
 		'6 | import { matchesKey, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";',
@@ -1141,22 +1141,22 @@ describe("pi-bolt compile and Pi's other names for its modules (#174)", () => {
 
 	test("a build stopped in an extension names it, and the --exclude that leaves it out with those left out already", () => {
 		expect(bundlerErrorAdvice(stopped, plan, { exclude: ["big-bundle"] })).toEqual([
-			"That is in the extension pi-system-prompt (package-pi-system-prompt/extensions/system-prompt.ts:6). Leave it out with `pi-bolt compile --exclude big-bundle,pi-system-prompt`: it then loads from its files, as before it was compiled in.",
+			"That is in the extension pi-system-prompt (package-pi-system-prompt/extensions/system-prompt.ts:6). Leave it out with `upi compile --exclude big-bundle,pi-system-prompt`: it then loads from its files, as before it was compiled in.",
 		]);
 		const two = `${stopped}error: No matching export in "x.ts" for import "y"\n${at("global/word-count.ts", 2)}\n`;
 		expect(bundlerErrorAdvice(two, plan, {})).toEqual([
-			"Those are in the extensions pi-system-prompt, word-count (package-pi-system-prompt/extensions/system-prompt.ts:6, global/word-count.ts:2). Leave them out with `pi-bolt compile --exclude pi-system-prompt,word-count`: they then load from their files, as before they were compiled in.",
+			"Those are in the extensions pi-system-prompt, word-count (package-pi-system-prompt/extensions/system-prompt.ts:6, global/word-count.ts:2). Leave them out with `upi compile --exclude pi-system-prompt,word-count`: they then load from their files, as before they were compiled in.",
 		]);
 		// (With --only, the others of --only.)
 		expect(bundlerErrorAdvice(two, plan, { only: ["pi-system-prompt", "word-count", "notes"] })[0]).toContain(
-			"`pi-bolt compile --only notes`",
+			"`upi compile --only notes`",
 		);
 	});
 
 	test("a build stopped in a dependency, or outside the extensions, says so or nothing", () => {
 		const dependency = `error: Could not resolve: "missing"\n${at("node_modules/helper/index.js", 3)}\n`;
 		expect(bundlerErrorAdvice(dependency, plan, {})).toEqual([
-			"That is in a package the extensions depend on (node_modules/helper/index.js:3). Leave out the extensions that use it with `pi-bolt compile --exclude <name>`, by the names listed above.",
+			"That is in a package the extensions depend on (node_modules/helper/index.js:3). Leave out the extensions that use it with `upi compile --exclude <name>`, by the names listed above.",
 		]);
 		expect(bundlerErrorAdvice('error: Could not resolve: "./missing"\n    at plugins.ts:3:20\n', plan, {})).toEqual(
 			[],

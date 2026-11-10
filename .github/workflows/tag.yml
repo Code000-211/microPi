@@ -1,8 +1,8 @@
 name: tag
 
-# With the repository variable AUTO_RELEASE set to true: when ci passes on a push to pi-bolt whose VERSION has no
+# With the repository variable AUTO_RELEASE set to true: when ci passes on a push to upi whose VERSION has no
 # bolt-vX.Y.Z tag yet (a version bump, as scripts/bump-version.sh makes for a new Pi), tags that commit and runs the release
-# workflow, which hands its draft to publish (docs/RELEASING.md). Only pi-bolt's latest commit is tagged: a later push gets a
+# workflow, which hands its draft to publish (docs/RELEASING.md). Only upi's latest commit is tagged: a later push gets a
 # run of its own. (A push that changes only what ci ignores starts no ci run, so the commit before it is tagged then.) Nothing
 # is checked out here; the commit is read through the API.
 on:
@@ -41,10 +41,10 @@ jobs:
             later=$(gh api "repos/$GITHUB_REPOSITORY/compare/$SHA...$head" \
               --jq 'if .status == "ahead" and (.files | length) < 300 then .files[] | .filename, (.previous_filename // empty) else "-" end')
             if [ -z "$later" ] || printf '%s\n' "$later" | grep -Ev '\.md$|^(docs|bench/results|site)/' | grep -q .; then
-              echo "pi-bolt has moved on to $head: that push is tagged by its own run"
+              echo "upi has moved on to $head: that push is tagged by its own run"
               exit 0
             fi
-            echo "pi-bolt has moved on to $head, which changes only files ci ignores: $SHA is tagged"
+            echo "upi has moved on to $head, which changes only files ci ignores: $SHA is tagged"
           fi
           version=$(gh api "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$SHA" --jq .content | base64 -d | tr -d '[:space:]')
           printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "unexpected VERSION: $version"; exit 1; }

@@ -1,10 +1,10 @@
-# Records which of the runtime's functions Pi enters, in the order it first enters them, from sessions of a microPi build
+# Records which of the runtime's functions Pi enters, in the order it first enters them, from sessions of a µPi build
 # (bench\orderfile_session.py: Pi started, a headless prompt, a TUI session, against the local fake model). scripts\build-runtime.ps1
 # lays those functions out first in the runtime's code (a linker order file), so that Pi touches fewer of its pages. The list is of
 # names: it holds from one build of the runtime to the next, and is made again when what Pi runs has changed much. Windows'
 # scripts/train-runtime-hints.sh.
 # Usage: scripts\train-runtime-hints.ps1 [-Pi BUILD] [-BuildDir DIR]
-#   -Pi BUILD       a microPi build made with that runtime (default out\pi-bolt)
+#   -Pi BUILD       a µPi build made with that runtime (default out\upi)
 #   -BuildDir DIR   the runtime's build, in .work\bun (default build/pibolt-release)
 param(
 	[string]$Pi = '',
@@ -16,7 +16,7 @@ $Work = if ($env:PIBOLT_WORK) { $env:PIBOLT_WORK } else { Join-Path $Root '.work
 function Log($message) { Write-Host "==> $message" -ForegroundColor Cyan }
 function Die($message) { Write-Host "error: $message" -ForegroundColor Red; exit 1 }
 foreach ($tool in 'bun', 'py') { if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { Die "'$tool' is required but not installed" } }
-if (-not $Pi) { $Pi = Join-Path $Root 'out\pi-bolt' }
+if (-not $Pi) { $Pi = Join-Path $Root 'out\upi' }
 $Pi = [System.IO.Path]::GetFullPath($Pi)
 $BunSrc = Join-Path $Work 'bun'
 $Profile = Join-Path $BunSrc "$BuildDir\bun-profile.exe"

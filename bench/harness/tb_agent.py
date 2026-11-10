@@ -3,7 +3,7 @@ A Harbor agent that runs a µPi build on Terminal-Bench tasks (https://github.co
 
     PYTHONPATH=bench/harness harbor run -d terminal-bench/terminal-bench-2-1 -e docker \\
         --agent-import-path tb_agent:MicroPi -m melious/deepseek-v4.1-flash \\
-        --ak harness_dir=out/pi-bolt --ak extensions=<folder of docsearch> --ak models_json=~/.pi/agent/models.json
+        --ak harness_dir=out/upi --ak extensions=<folder of docsearch> --ak models_json=~/.pi/agent/models.json
 
 `harness_dir` (a build from scripts/build-pi.sh) is uploaded into the task's container, and each folder in `extensions`
 (comma-separated, each with an index.ts) next to it and loaded with `-e`; nothing else is (`-ne -ns -np -nc`), so the run

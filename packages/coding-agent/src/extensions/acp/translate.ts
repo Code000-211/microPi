@@ -6,6 +6,7 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
+import { MOVED_TO_BACKGROUND_NOTE } from "../../core/tools/bash.ts";
 import { resolveToCwd } from "../../core/tools/path-utils.ts";
 import { isRecord } from "../json-rpc.ts";
 import type {
@@ -201,7 +202,7 @@ export function resultText(result: unknown): string {
 
 /** Command output as the bash tool reports it while the command runs. */
 export interface OutputTail {
-	/** The output so far, or its end when `truncated` (which may leave out a trailing newline). */
+	/** The output so far, or when `truncated` part of it: its end (maybe without a trailing newline), or, for the raw tail, its last bytes with the start left out. */
 	text: string;
 	/** UTF-8 bytes of all the output so far. */
 	totalBytes: number;
@@ -210,8 +211,13 @@ export interface OutputTail {
 
 /** The output in a partial result of the bash tool. */
 export function bashOutputTail(partialResult: unknown): OutputTail {
-	const text = resultText(partialResult);
 	const details = isRecord(partialResult) ? partialResult.details : undefined;
+	const terminal = isRecord(details) ? details.terminal : undefined;
+	if (isRecord(terminal) && typeof terminal.text === "string" && typeof terminal.totalBytes === "number") {
+		// The output as the command wrote it, escape sequences included: a terminal is not given the cleaned text.
+		return { text: terminal.text, totalBytes: terminal.totalBytes, truncated: terminal.truncated === true };
+	}
+	const text = resultText(partialResult);
 	const truncation = isRecord(details) ? details.truncation : undefined;
 	if (isRecord(truncation) && truncation.truncated === true && typeof truncation.totalBytes === "number") {
 		// Whole lines, which a newline comes before: with it, a tail that has only new lines still shows where they start.
@@ -268,6 +274,9 @@ export function terminalOutputDelta(sent: TerminalSent, next: OutputTail): { dat
 export function bashExitCode(result: unknown, isError: boolean): number | null {
 	const structured = isRecord(result) ? result.structuredContent : undefined;
 	if (isRecord(structured) && typeof structured.exit_code === "number") return structured.exit_code;
+	if (!isError && resultText(result).includes(MOVED_TO_BACKGROUND_NOTE))
+		// The command went on in the background: it has no exit code yet, whatever its text says.
+		return null;
 	return isError ? null : 0;
 }
 

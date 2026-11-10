@@ -7,17 +7,17 @@
 #   --runtime-only  only the runtime's archive (.github/workflows/runtime.yml), no Pi and no SHA256SUMS
 # Archives (the names stay the same from release to release, so that releases/latest/download/<name> always works), of what
 # this machine builds:
-#   pi-bolt-linux-x64.tar.gz           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
-#   pi-bolt-linux-x64-baseline.tar.gz  JIT off, code for any x86-64 CPU
-#   pi-bolt-linux-x64-jit.tar.gz       JIT on, for code loaded at run time
-#   pi-bolt-runtime-linux-x64.tar.gz   the µPi Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
-#   pi-bolt-linux-arm64.tar.gz         on Linux ARM64: JIT off, code for any ARMv8.0 CPU
-#   pi-bolt-linux-arm64-jit.tar.gz     on Linux ARM64: JIT on
-#   pi-bolt-runtime-linux-arm64.tar.gz
-#   pi-bolt-darwin-arm64.tar.gz        on macOS: JIT off, for Apple silicon (M1 and later)
-#   pi-bolt-darwin-arm64-jit.tar.gz    on macOS: JIT on
-#   pi-bolt-runtime-darwin-arm64.tar.gz
-#   pi-bolt-kit-<platform>.tar.gz      the compile kit of this platform's builds, for `pi-bolt compile` (scripts/make-kit.mjs)
+#   upi-linux-x64.tar.gz           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
+#   upi-linux-x64-baseline.tar.gz  JIT off, code for any x86-64 CPU
+#   upi-linux-x64-jit.tar.gz       JIT on, for code loaded at run time
+#   upi-runtime-linux-x64.tar.gz   the µPi Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
+#   upi-linux-arm64.tar.gz         on Linux ARM64: JIT off, code for any ARMv8.0 CPU
+#   upi-linux-arm64-jit.tar.gz     on Linux ARM64: JIT on
+#   upi-runtime-linux-arm64.tar.gz
+#   upi-darwin-arm64.tar.gz        on macOS: JIT off, for Apple silicon (M1 and later)
+#   upi-darwin-arm64-jit.tar.gz    on macOS: JIT on
+#   upi-runtime-darwin-arm64.tar.gz
+#   upi-kit-<platform>.tar.gz      the compile kit of this platform's builds, for `upi compile` (scripts/make-kit.mjs)
 # The Pi archives also come as .tar.xz, about 40% smaller, which install.sh prefers where xz is installed.
 source "$(dirname "$0")/lib/common.sh"
 
@@ -37,13 +37,13 @@ VERSION="$(cat "$PIBOLT_ROOT/VERSION")"
 # The npm launcher downloads the release of its own version: the two have to agree.
 NPM_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$PIBOLT_ROOT/npm/package.json")"
 [ "$NPM_VERSION" = "$VERSION" ] || die "npm/package.json is $NPM_VERSION, VERSION is $VERSION"
-grep -q "^VERSION=$VERSION\$" "$PIBOLT_ROOT/npm/bin/pi-bolt" || die "npm/bin/pi-bolt does not download version $VERSION"
+grep -q "^VERSION=$VERSION\$" "$PIBOLT_ROOT/npm/bin/upi" || die "npm/bin/upi does not download version $VERSION"
 DIST="$PIBOLT_ROOT/dist/$VERSION"
 PI_ROOT="$(realpath "$PI_DIR")"
 case "$PIBOLT_PLATFORM" in
-linux-x64) TARGETS=("linux-x64:pi-bolt:" "linux-x64-baseline:pi-bolt-baseline:--cpu baseline" "linux-x64-jit:pi-bolt-jit:--jit on") ;;
-linux-arm64) TARGETS=("linux-arm64:pi-bolt:" "linux-arm64-jit:pi-bolt-jit:--jit on") ;;
-darwin-arm64) TARGETS=("darwin-arm64:pi-bolt:" "darwin-arm64-jit:pi-bolt-jit:--jit on") ;;
+linux-x64) TARGETS=("linux-x64:upi:" "linux-x64-baseline:upi-baseline:--cpu baseline" "linux-x64-jit:upi-jit:--jit on") ;;
+linux-arm64) TARGETS=("linux-arm64:upi:" "linux-arm64-jit:upi-jit:--jit on") ;;
+darwin-arm64) TARGETS=("darwin-arm64:upi:" "darwin-arm64-jit:upi-jit:--jit on") ;;
 *) die "no release is built on $PIBOLT_PLATFORM" ;;
 esac
 # Archives whose files belong to nobody in particular, and on macOS without AppleDouble (._*) files of extended attributes.
@@ -51,7 +51,7 @@ TAR=(tar --owner=0 --group=0 --numeric-owner)
 [ "$PIBOLT_OS" = darwin ] && TAR=(env COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --numeric-owner --no-xattrs --no-mac-metadata)
 
 # The compile kit comes with the first (the default) build: what it read, and how it was compiled.
-KIT="$PIBOLT_ROOT/out/pi-bolt-kit-$PIBOLT_PLATFORM"
+KIT="$PIBOLT_ROOT/out/upi-kit-$PIBOLT_PLATFORM"
 if [ -n "$BUILD" ]; then
 	kit=(--kit "$KIT")
 	for target in "${TARGETS[@]}"; do
@@ -77,34 +77,34 @@ for target in "${TARGETS[@]}"; do
 	build="$PIBOLT_ROOT/out/$out"
 	[ -x "$build/pi" ] || die "$build/pi not found: build it, or run without --no-build"
 	BUN_STATIC_HEAP_VERBOSE=1 "$build/pi" --version 2>&1 | grep -q "image registered: true" || die "$build/pi does not use its compiled code"
-	dir="$STAGE/pi-bolt-$name"
+	dir="$STAGE/upi-$name"
 	cp -R "$build" "$dir"
 	notices "$dir"
-	log "pi-bolt-$name.tar.gz (Pi $("$build/pi" --version))"
-	"${TAR[@]}" -C "$STAGE" -czf "$DIST/pi-bolt-$name.tar.gz" "pi-bolt-$name"
+	log "upi-$name.tar.gz (Pi $("$build/pi" --version))"
+	"${TAR[@]}" -C "$STAGE" -czf "$DIST/upi-$name.tar.gz" "upi-$name"
 	# (-T0 writes blocks, which xz -T0 can decompress in parallel.) On x86-64 with xz's x86 filter first, which makes the machine
 	# code's call targets relative and so more alike: 2% smaller, and every xz and liblzma since 2009 unpacks it. Not the ARM64
 	# filter: xz and libarchive older than 5.4 (2022; Ubuntu 22.04's, macOS's tar) cannot.
 	filters=(--lzma2=preset=9e); [ "$PIBOLT_ARCH" = x64 ] && filters=(--x86 "${filters[@]}")
-	"${TAR[@]}" -C "$STAGE" -cf - "pi-bolt-$name" | xz -T0 "${filters[@]}" >"$DIST/pi-bolt-$name.tar.xz"
+	"${TAR[@]}" -C "$STAGE" -cf - "upi-$name" | xz -T0 "${filters[@]}" >"$DIST/upi-$name.tar.xz"
 done
 
 if [ -z "$RUNTIME_ONLY" ]; then
 	[ -f "$KIT/kit.json" ] || die "$KIT not found: build, or run without --no-build"
-	log "pi-bolt-kit-$PIBOLT_PLATFORM.tar.gz"
-	"${TAR[@]}" -C "$(dirname "$KIT")" -czf "$DIST/pi-bolt-kit-$PIBOLT_PLATFORM.tar.gz" "$(basename "$KIT")"
+	log "upi-kit-$PIBOLT_PLATFORM.tar.gz"
+	"${TAR[@]}" -C "$(dirname "$KIT")" -czf "$DIST/upi-kit-$PIBOLT_PLATFORM.tar.gz" "$(basename "$KIT")"
 fi
 
 runtime="$(runtime_bun)"
-dir="$STAGE/pi-bolt-runtime-$PIBOLT_PLATFORM"
+dir="$STAGE/upi-runtime-$PIBOLT_PLATFORM"
 mkdir -p "$dir" && cp "$runtime" "$dir/bun" && notices "$dir"
-log "pi-bolt-runtime-$PIBOLT_PLATFORM.tar.gz (Bun $("$runtime" --version))"
-"${TAR[@]}" -C "$STAGE" -czf "$DIST/pi-bolt-runtime-$PIBOLT_PLATFORM.tar.gz" "pi-bolt-runtime-$PIBOLT_PLATFORM"
+log "upi-runtime-$PIBOLT_PLATFORM.tar.gz (Bun $("$runtime" --version))"
+"${TAR[@]}" -C "$STAGE" -czf "$DIST/upi-runtime-$PIBOLT_PLATFORM.tar.gz" "upi-runtime-$PIBOLT_PLATFORM"
 [ -z "$RUNTIME_ONLY" ] || exit 0
 
 # The extensions the installers offer, pinned; and checksums whose first line says which release they are (install.ps1 refuses
 # another version's: an older release, signed all the same, served as a newer one).
 cp "$PIBOLT_ROOT/extensions.txt" "$DIST/extensions.txt"
-(cd "$DIST" && { echo "# pi-bolt $VERSION"; sha256 -- *.tar.gz *.tar.xz extensions.txt; } >SHA256SUMS)
+(cd "$DIST" && { echo "# upi $VERSION"; sha256 -- *.tar.gz *.tar.xz extensions.txt; } >SHA256SUMS)
 log "release $VERSION in $DIST:"
 (cd "$DIST" && ls -lh -- * | awk '{print "    " $5 "  " $9}')

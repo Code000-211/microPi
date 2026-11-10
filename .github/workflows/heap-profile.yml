@@ -9,7 +9,7 @@ name: heap-profile
 # names where the build puts each function, which the engine decides.
 #
 # Run it from the branch with the new profile:
-#   gh workflow run heap-profile.yml -R opensec-git/Pi-Bolt --ref <branch>
+#   gh workflow run heap-profile.yml -R Code000-211/microPi --ref <branch>
 on:
   workflow_dispatch:
 
@@ -43,7 +43,7 @@ jobs:
             --pattern SHA256SUMS --pattern SHA256SUMS.sig --pattern RUNTIME_STAMP
           # The release's stamp counts only as its signed checksums give it, as in the release workflow.
           openssl pkeyutl -verify -pubin -inkey keys/release.pub -rawin -in .work/latest/SHA256SUMS -sigfile .work/latest/SHA256SUMS.sig
-          [ "$(head -n 1 .work/latest/SHA256SUMS)" = "# pi-bolt ${latest#bolt-v}" ] || { echo "the checksums are not $latest's"; exit 1; }
+          [ "$(head -n 1 .work/latest/SHA256SUMS)" = "# upi ${latest#bolt-v}" ] || { echo "the checksums are not $latest's"; exit 1; }
           (cd .work/latest && grep ' RUNTIME_STAMP$' SHA256SUMS | sha256sum -c --strict --quiet -)
           released=$(cat .work/latest/RUNTIME_STAMP)
           if [ "$released" != "$stamp" ]; then
@@ -93,16 +93,16 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force .work\rt, .work\runtime | Out-Null
           # The release's checksums, signed by the release key and saying they are that release's, say what it is.
-          gh release download $env:RUNTIME_FROM --repo $env:GITHUB_REPOSITORY --pattern pi-bolt-runtime-win32-x64.zip --pattern SHA256SUMS --pattern SHA256SUMS.sig --dir .work\rt
+          gh release download $env:RUNTIME_FROM --repo $env:GITHUB_REPOSITORY --pattern upi-runtime-win32-x64.zip --pattern SHA256SUMS --pattern SHA256SUMS.sig --dir .work\rt
           $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
           & $openssl pkeyutl -verify -pubin -inkey keys\release.pub -rawin -in .work\rt\SHA256SUMS -sigfile .work\rt\SHA256SUMS.sig
           if ($LASTEXITCODE -ne 0) { Write-Host 'the runtime release''s signature does not verify'; exit 1 }
           $lines = Get-Content -LiteralPath .work\rt\SHA256SUMS
-          if ($lines[0] -ne "# pi-bolt $($env:RUNTIME_FROM -replace '^bolt-v', '')") { Write-Host "the checksums are not $env:RUNTIME_FROM's"; exit 1 }
-          $sum = (Get-FileHash .work\rt\pi-bolt-runtime-win32-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($lines -notcontains "$sum  pi-bolt-runtime-win32-x64.zip") { Write-Host 'the runtime is not the one its release lists'; exit 1 }
-          Expand-Archive .work\rt\pi-bolt-runtime-win32-x64.zip -DestinationPath .work\rt -Force
-          Copy-Item .work\rt\pi-bolt-runtime-win32-x64\bun.exe .work\runtime\bun.exe
+          if ($lines[0] -ne "# upi $($env:RUNTIME_FROM -replace '^bolt-v', '')") { Write-Host "the checksums are not $env:RUNTIME_FROM's"; exit 1 }
+          $sum = (Get-FileHash .work\rt\upi-runtime-win32-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($lines -notcontains "$sum  upi-runtime-win32-x64.zip") { Write-Host 'the runtime is not the one its release lists'; exit 1 }
+          Expand-Archive .work\rt\upi-runtime-win32-x64.zip -DestinationPath .work\rt -Force
+          Copy-Item .work\rt\upi-runtime-win32-x64\bun.exe .work\runtime\bun.exe
           & .work\runtime\bun.exe --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
         env:
@@ -156,6 +156,6 @@ jobs:
             echo "### profiles/pi-$PI on \`$branch\`"
             echo
             echo '```bash'
-            echo "gh pr create -R $GITHUB_REPOSITORY --base pi-bolt --head $branch --title \"Windows heap order for Pi $PI\""
+            echo "gh pr create -R $GITHUB_REPOSITORY --base upi --head $branch --title \"Windows heap order for Pi $PI\""
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

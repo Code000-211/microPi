@@ -23,7 +23,7 @@ import {
 	sumsSignatureValid,
 	sumsVersion,
 	tgzEntry,
-} from "../src/pi-bolt-update-windows.ts";
+} from "../src/upi-update-windows.ts";
 
 let dir: string;
 
@@ -63,30 +63,28 @@ function tgz(files: Record<string, string | Buffer>): Buffer {
 describe("isInProfile", () => {
 	const env = { USERPROFILE: "C:\\Users\\ana", LOCALAPPDATA: "C:\\Users\\ana\\AppData\\Local" };
 	test("the default installation is in the profile, in any case", () => {
-		expect(isInProfile("C:\\Users\\ana\\.pi-bolt", env)).toBe(true);
-		expect(isInProfile("c:\\users\\ANA\\.pi-bolt", env)).toBe(true);
-		expect(isInProfile("C:\\Users\\ana\\AppData\\Local\\pi-bolt", env)).toBe(true);
+		expect(isInProfile("C:\\Users\\ana\\.micropi", env)).toBe(true);
+		expect(isInProfile("c:\\users\\ANA\\.micropi", env)).toBe(true);
+		expect(isInProfile("C:\\Users\\ana\\AppData\\Local\\upi", env)).toBe(true);
 	});
 	test("a folder elsewhere, or one whose name only starts like the profile, is not", () => {
-		expect(isInProfile("C:\\tools\\pi-bolt", env)).toBe(false);
-		expect(isInProfile("C:\\Users\\anabel\\.pi-bolt", env)).toBe(false);
+		expect(isInProfile("C:\\tools\\upi", env)).toBe(false);
+		expect(isInProfile("C:\\Users\\anabel\\.micropi", env)).toBe(false);
 		expect(isInProfile("C:\\Users\\ana", env)).toBe(false);
-		expect(isInProfile("C:\\Users\\ana\\.pi-bolt", {})).toBe(false);
+		expect(isInProfile("C:\\Users\\ana\\.micropi", {})).toBe(false);
 	});
 });
 
 describe("the signed checksums", () => {
-	const sums =
-		"# pi-bolt 0.9.7\nabc\n" +
-		`${"a".repeat(64)}  pi-bolt-win32-x64.zip\n${"B".repeat(64)} *pi-bolt-win32-x64-jit.zip\n`;
+	const sums = `# upi 0.9.7\nabc\n${"a".repeat(64)}  upi-win32-x64.zip\n${"B".repeat(64)} *upi-win32-x64-jit.zip\n`;
 	test("say which release they are, and the checksum of each file", () => {
 		expect(sumsVersion(sums)).toBe("0.9.7");
 		expect(sumsVersion(sums.replace(/\n/g, "\r\n"))).toBe("0.9.7");
 		expect(sumsVersion("a".repeat(64))).toBeUndefined();
-		expect(sumsEntry(sums, "pi-bolt-win32-x64.zip")).toBe("a".repeat(64));
-		expect(sumsEntry(sums, "pi-bolt-win32-x64-jit.zip")).toBe("b".repeat(64));
-		expect(sumsEntry(sums.replace(/\n/g, "\r\n"), "pi-bolt-win32-x64.zip")).toBe("a".repeat(64));
-		expect(sumsEntry(sums, "pi-bolt-win32-x64-baseline.zip")).toBeUndefined();
+		expect(sumsEntry(sums, "upi-win32-x64.zip")).toBe("a".repeat(64));
+		expect(sumsEntry(sums, "upi-win32-x64-jit.zip")).toBe("b".repeat(64));
+		expect(sumsEntry(sums.replace(/\n/g, "\r\n"), "upi-win32-x64.zip")).toBe("a".repeat(64));
+		expect(sumsEntry(sums, "upi-win32-x64-baseline.zip")).toBeUndefined();
 	});
 	test("are taken only with a signature from the key they are checked with", () => {
 		const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -104,11 +102,11 @@ describe("the signed checksums", () => {
 describe("tgzEntry", () => {
 	test("reads one file out of npm's .tgz", () => {
 		const zip = Buffer.from([0x50, 0x4b, 3, 4, 1, 2, 3]);
-		const archive = tgz({ "package/package.json": "{}", "package/pi-bolt-win32-x64.zip": zip });
-		expect(tgzEntry(archive, "package/pi-bolt-win32-x64.zip")?.equals(zip)).toBe(true);
+		const archive = tgz({ "package/package.json": "{}", "package/upi-win32-x64.zip": zip });
+		expect(tgzEntry(archive, "package/upi-win32-x64.zip")?.equals(zip)).toBe(true);
 		expect(tgzEntry(archive, "package/package.json")?.toString()).toBe("{}");
 		expect(tgzEntry(archive, "package/other.zip")).toBeUndefined();
-		expect(tgzEntry(Buffer.from("not a tarball"), "package/pi-bolt-win32-x64.zip")).toBeUndefined();
+		expect(tgzEntry(Buffer.from("not a tarball"), "package/upi-win32-x64.zip")).toBeUndefined();
 		expect(sha256(zip)).toMatch(/^[0-9a-f]{64}$/);
 	});
 });
@@ -116,18 +114,18 @@ describe("tgzEntry", () => {
 describe("installFiles", () => {
 	test("replaces the build's files, adds new ones, keeps the others, and leaves nothing renamed aside", () => {
 		const from = join(dir, "new"),
-			to = join(dir, "pi-bolt-win32-x64");
+			to = join(dir, "upi-win32-x64");
 		mkdirSync(join(from, "theme"), { recursive: true });
-		writeFileSync(join(from, "pi-bolt.exe"), "new exe");
+		writeFileSync(join(from, "upi.exe"), "new exe");
 		writeFileSync(join(from, "theme", "dark.json"), "new theme");
 		writeFileSync(join(from, "added.txt"), "added");
 		mkdirSync(join(to, "theme"), { recursive: true });
-		writeFileSync(join(to, "pi-bolt.exe"), "old exe");
+		writeFileSync(join(to, "upi.exe"), "old exe");
 		writeFileSync(join(to, "theme", "dark.json"), "old theme");
 		writeFileSync(join(to, "compiled.json"), "kept");
-		writeFileSync(join(to, "pi-bolt.exe.1.pibolt-old"), "left over by an earlier update");
+		writeFileSync(join(to, "upi.exe.1.pibolt-old"), "left over by an earlier update");
 		installFiles(from, to, 2);
-		expect(readFileSync(join(to, "pi-bolt.exe"), "utf8")).toBe("new exe");
+		expect(readFileSync(join(to, "upi.exe"), "utf8")).toBe("new exe");
 		expect(readFileSync(join(to, "theme", "dark.json"), "utf8")).toBe("new theme");
 		expect(readFileSync(join(to, "added.txt"), "utf8")).toBe("added");
 		expect(readFileSync(join(to, "compiled.json"), "utf8")).toBe("kept");
@@ -135,16 +133,16 @@ describe("installFiles", () => {
 	});
 	test("says which file it could not put in place", () => {
 		const from = join(dir, "new"),
-			to = join(dir, "pi-bolt-win32-x64");
+			to = join(dir, "upi-win32-x64");
 		mkdirSync(from, { recursive: true });
-		writeFileSync(join(from, "pi-bolt.exe"), "new exe");
+		writeFileSync(join(from, "upi.exe"), "new exe");
 		mkdirSync(to, { recursive: true });
-		writeFileSync(join(to, "pi-bolt.exe"), "old exe");
+		writeFileSync(join(to, "upi.exe"), "old exe");
 		// A folder nothing may be written to: the new file cannot be moved in, and the old one stays.
 		chmodSync(to, 0o555);
 		try {
-			expect(() => installFiles(from, to, 3)).toThrow(/could not put .*pi-bolt\.exe in place/);
-			expect(readFileSync(join(to, "pi-bolt.exe"), "utf8")).toBe("old exe");
+			expect(() => installFiles(from, to, 3)).toThrow(/could not put .*upi\.exe in place/);
+			expect(readFileSync(join(to, "upi.exe"), "utf8")).toBe("old exe");
 		} finally {
 			chmodSync(to, 0o755);
 		}
@@ -154,21 +152,21 @@ describe("installFiles", () => {
 describe("keepPrevious", () => {
 	const build = (folder: string, version: string) => {
 		mkdirSync(folder, { recursive: true });
-		writeFileSync(join(folder, "pi-bolt.exe"), `exe ${version}`);
-		writeFileSync(join(folder, "pi-bolt.txt"), `Pi-Bolt ${version} (Pi 1.3.0), win32-x64, JIT off\n`);
+		writeFileSync(join(folder, "upi.exe"), `exe ${version}`);
+		writeFileSync(join(folder, "upi.txt"), `µPi ${version} (Pi 1.3.0), win32-x64, JIT off\n`);
 	};
 	test("keeps the build an update replaces as <folder>.previous, without what was renamed aside", () => {
-		const current = join(dir, "pi-bolt-win32-x64"),
+		const current = join(dir, "upi-win32-x64"),
 			incoming = join(dir, "new");
 		build(current, "0.9.6");
-		writeFileSync(join(current, "pi-bolt.exe.5.pibolt-old"), "aside");
+		writeFileSync(join(current, "upi.exe.5.pibolt-old"), "aside");
 		build(incoming, "0.9.7");
 		keepPrevious(current, incoming);
-		expect(readFileSync(join(`${current}.previous`, "pi-bolt.exe"), "utf8")).toBe("exe 0.9.6");
-		expect(existsSync(join(`${current}.previous`, "pi-bolt.exe.5.pibolt-old"))).toBe(false);
+		expect(readFileSync(join(`${current}.previous`, "upi.exe"), "utf8")).toBe("exe 0.9.6");
+		expect(existsSync(join(`${current}.previous`, "upi.exe.5.pibolt-old"))).toBe(false);
 	});
 	test("not when the same build is installed again, nor when there is none", () => {
-		const current = join(dir, "pi-bolt-win32-x64"),
+		const current = join(dir, "upi-win32-x64"),
 			incoming = join(dir, "new");
 		build(current, "0.9.7");
 		build(incoming, "0.9.7");

@@ -29,7 +29,7 @@ const zlib = require("node:zlib");
 
 // The public key that releases are signed with (keys/release.pub in the repository, as in install.sh and install.ps1).
 const RELEASE_KEY = "MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI=";
-const REPO = "https://github.com/opensec-git/Pi-Bolt";
+const REPO = "https://github.com/Code000-211/microPi";
 const VARIANTS = ["x64", "x64-baseline", "x64-jit"];
 
 /** A reason not to install, said to the user as it is. */

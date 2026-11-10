@@ -244,7 +244,7 @@ jobs:
           python3 bench/e2e_screen.py --reference bun=out/pi-stable/pi --build upi=out/upi/pi
           python3 bench/e2e_fullscreen.py --build upi=out/upi/pi
 
-  # macOS, the slowest runner, does the same in two jobs side by side: Pi-Bolt's, engine and runtime tests in one, the comparison
+  # macOS, the slowest runner, does the same in two jobs side by side: µPi's, engine and runtime tests in one, the comparison
   # with stock Pi in the other (about 14 minutes one after the other, 7 of them the comparison). µPi on macOS Apple silicon
   # passes when both have.
   upi-macos-part:
@@ -318,12 +318,13 @@ jobs:
         id: latest
         shell: powershell
         run: |
+          # (Nonzero from curl means 'no latest release', not failure: the release workflow has not made one yet. Explicit
+          # `exit 0` in both branches, as the runner's trailing `exit $LASTEXITCODE` would otherwise fail on curl's 404.)
           & curl.exe -fsIL -o NUL "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/upi-runtime-win32-x64.zip"
-          if ($LASTEXITCODE -eq 0) { "available=true" >> $env:GITHUB_OUTPUT }
-          else {
-            Write-Host '::notice title=No latest release::µPi''s checks need the latest release; they are skipped while there is none.'
-            "available=false" >> $env:GITHUB_OUTPUT
-          }
+          if ($LASTEXITCODE -eq 0) { "available=true" >> $env:GITHUB_OUTPUT; exit 0 }
+          Write-Host '::notice title=No latest release::µPi''s checks need the latest release; they are skipped while there is none.'
+          "available=false" >> $env:GITHUB_OUTPUT
+          exit 0
       - name: Runtime of the latest release
         if: steps.latest.outputs.available == 'true'
         run: |

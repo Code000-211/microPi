@@ -8,7 +8,7 @@ name: runtime
 # a branch runtime/<name> builds its commit's runtimes as workflow artifacts only: all four, or the one the name is
 # (runtime/win32-x64).
 #
-#   gh workflow run runtime.yml -R opensec-git/Pi-Bolt -f tag=bolt-vX.Y.Z [-f ref=<the commit the release is tagged on>]
+#   gh workflow run runtime.yml -R Code000-211/microPi -f tag=bolt-vX.Y.Z [-f ref=<the commit the release is tagged on>]
 #
 # The runners are smaller than BUILDING.md asks for (4 cores and 16 GB; 3 cores and 7 GB on macOS): the build runs with swap
 # and fewer jobs, in about two to four hours. Each build job also runs tests/aot and tests/runtime on the runtime it made.

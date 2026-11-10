@@ -9,7 +9,7 @@ name: heap-profile
 # names where the build puts each function, which the engine decides.
 #
 # Run it from the branch with the new profile:
-#   gh workflow run heap-profile.yml -R opensec-git/Pi-Bolt --ref <branch>
+#   gh workflow run heap-profile.yml -R Code000-211/microPi --ref <branch>
 on:
   workflow_dispatch:
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# upi launcher (npm and bun packages). The first run installs the Pi-Bolt release that matches this package's version
+# upi launcher (npm and bun packages). The first run installs the µPi release that matches this package's version
 # into ~/.micropi/npm with the bundled installer (the same as install.sh: progress, checksum, checks). Every run then
 # replaces this script with the native executable (exec), so the launcher costs no startup time.
 set -eu
@@ -24,7 +24,7 @@ if [ ! -x "$DIR/pi" ]; then
 	here=$(dirname "$(readlink -f "$0")")
 	# (The first run installs nothing without a signature check: an opt-in to that, left in the environment, is not passed on.)
 	unset MICROPI_UNVERIFIED
-	# On stderr, so that what Pi-Bolt prints on stdout (upi -p ... > file) is all that is there.
+	# On stderr, so that what µPi prints on stdout (upi -p ... > file) is all that is there.
 	MICROPI_LAUNCHER=1 MICROPI_VERSION="bolt-v$VERSION" MICROPI_VARIANT="$VARIANT" MICROPI_INSTALL="$HOME_DIR/npm/$VERSION" \
 		sh "$here/../install.sh" 1>&2
 	printf '\n' >&2

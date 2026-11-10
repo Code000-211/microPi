@@ -77,10 +77,10 @@ for file in "${builds[@]}"; do
 	"name": "$pkg",
 	"version": "$VERSION",
 	"description": "The µPi $VERSION executable ($platform) for its installer. Install µPi with the upi package or $(if [ "$os" = win32 ]; then echo install.ps1; else echo install.sh; fi).",
-	"homepage": "https://github.com/opensec-git/Pi-Bolt",
+	"homepage": "https://github.com/Code000-211/microPi",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/opensec-git/Pi-Bolt.git"
+		"url": "git+https://github.com/Code000-211/microPi.git"
 	},
 	"license": "MIT",
 	"author": "OpenSec",
@@ -92,7 +92,7 @@ EOF
 	cat >"$dir/README.md" <<EOF
 # $pkg
 
-\`$file\` of the [Pi-Bolt $VERSION release](https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v$VERSION), the same
+\`$file\` of the [µPi $VERSION release](https://github.com/Code000-211/microPi/releases/tag/bolt-v$VERSION), the same
 bytes, for µPi's installer to download from the npm registry. Nothing to install from here: use
 
 $(if [ "$os" = win32 ]; then printf '```powershell\npowershell -c "irm https://upi.opensec.in/install.ps1 | iex"\n```'; else printf '```bash\ncurl -fsSL https://upi.opensec.in/install.sh | sh\n```'; fi)

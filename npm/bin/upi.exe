@@ -1,5 +1,5 @@
 # shellcheck shell=sh
-# upi: a placeholder, which the package's install script (install.cjs) replaces: on Windows with Pi-Bolt's native
+# upi: a placeholder, which the package's install script (install.cjs) replaces: on Windows with µPi's native
 # executable, which npm's upi.cmd and upi.ps1 then start directly; on Linux and macOS with the launcher bin/upi.
 # It has no #! line on purpose: npm makes its Windows commands before install scripts run, and from a #! line they would
 # start upi.exe with sh.
@@ -11,7 +11,7 @@ here=$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")
 case "$(uname -s 2>/dev/null)" in
 Linux | Darwin) exec sh "$here/upi" "$@" ;;
 esac
-echo "upi: Pi-Bolt's executable is not installed: the package's install script did not run" >&2
+echo "upi: µPi's executable is not installed: the package's install script did not run" >&2
 echo "(npm --ignore-scripts, or pnpm or Bun, which run install scripts only when they are allowed)." >&2
 echo "" >&2
 echo "Run the install script now:" >&2

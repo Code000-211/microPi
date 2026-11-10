@@ -10,13 +10,13 @@
 		"aot",
 		"bun"
 	],
-	"homepage": "https://github.com/opensec-git/Pi-Bolt",
+	"homepage": "https://github.com/Code000-211/microPi",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/opensec-git/Pi-Bolt.git",
+		"url": "git+https://github.com/Code000-211/microPi.git",
 		"directory": "npm"
 	},
-	"bugs": "https://github.com/opensec-git/Pi-Bolt/issues",
+	"bugs": "https://github.com/Code000-211/microPi/issues",
 	"license": "MIT",
 	"author": "OpenSec",
 	"bin": {

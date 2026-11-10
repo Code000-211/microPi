@@ -34,8 +34,8 @@
 
 # The public key that releases are signed with (keys/release.pub in the repository; scripts/sign-release.sh).
 $PiBoltReleaseKey = 'MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI='
-$PiBoltRepo = 'https://github.com/opensec-git/Pi-Bolt'
-$PiBoltApi = 'https://api.github.com/repos/opensec-git/Pi-Bolt'
+$PiBoltRepo = 'https://github.com/Code000-211/microPi'
+$PiBoltApi = 'https://api.github.com/repos/Code000-211/microPi'
 
 # --- Modules ---------------------------------------------------------------------------------------------------------------
 # PowerShell 7 passes its own module directories to everything it starts, and they come before this PowerShell's own. An
@@ -586,8 +586,8 @@ function Set-PiBoltUserPath([string]$value) {
 	$key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
 	try { $key.SetValue('Path', $value, [Microsoft.Win32.RegistryValueKind]::ExpandString) } finally { $key.Dispose() }
 	# Tell running programs (Explorer, new terminals) that the environment changed: setting a variable through .NET broadcasts it.
-	[Environment]::SetEnvironmentVariable('PIBOLT_INSTALLER_PATH_CHANGED', '1', 'User')
-	[Environment]::SetEnvironmentVariable('PIBOLT_INSTALLER_PATH_CHANGED', $null, 'User')
+	[Environment]::SetEnvironmentVariable('MICROPI_INSTALLER_PATH_CHANGED', '1', 'User')
+	[Environment]::SetEnvironmentVariable('MICROPI_INSTALLER_PATH_CHANGED', $null, 'User')
 }
 
 function Test-PiBoltOnPath([string]$dir, [string]$path) {

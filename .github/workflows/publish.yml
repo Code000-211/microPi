@@ -17,7 +17,7 @@ name: publish
 # npm job is skipped and the packages are published from the maintainer's machine.
 #
 # Run it from upi with the tag (the workflow and its checks are upi's, the files published are the tag's):
-#   gh workflow run publish.yml -R opensec-git/Pi-Bolt -f tag=bolt-vX.Y.Z
+#   gh workflow run publish.yml -R Code000-211/microPi -f tag=bolt-vX.Y.Z
 # A release is staged first with -f prerelease=true: a GitHub pre-release, which only the beta channel takes
 # (`upi update --channel beta`), with its builds on npm but not the upi package, and the site left as it is. Run it again
 # for the same tag without it to make the release the latest.

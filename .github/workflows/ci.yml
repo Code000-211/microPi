@@ -9,7 +9,7 @@ name: ci
 # engine itself is checked by scripts/check-patches.sh here, and built and tested before it is released (docs/RELEASING.md).
 on:
   push:
-    branches: [upi]
+    branches: [pi-bolt]
     # Documentation and benchmark data build nothing: the same files as the changes job below counts as documentation. (A
     # release commit changes VERSION too, so it is built. A pull request always starts this workflow, as its checks are
     # required: the changes job skips the work instead.) Other .md files are code: scripts/lib/training.md is what the
@@ -24,7 +24,7 @@ on:
       - "!site/**"
       - "!bench/results/**"
   pull_request:
-    branches: [upi]
+    branches: [pi-bolt]
   workflow_dispatch:
 
 permissions:

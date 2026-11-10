@@ -4,9 +4,9 @@ name: codeql
 # request and once a week. Results are in the repository's Security tab.
 on:
   push:
-    branches: [upi]
+    branches: [pi-bolt]
   pull_request:
-    branches: [upi]
+    branches: [pi-bolt]
   schedule:
     - cron: "41 5 * * 1"
 

@@ -9,7 +9,7 @@ on:
   workflow_run:
     workflows: [ci]
     types: [completed]
-    branches: [upi]
+    branches: [pi-bolt]
 
 permissions:
   contents: read
@@ -35,7 +35,7 @@ jobs:
       - name: Tag and release
         run: |
           printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "unexpected commit: $SHA"; exit 1; }
-          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/upi" --jq .sha)
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/pi-bolt" --jq .sha)
           if [ "$head" != "$SHA" ]; then
             # Tagged still when every later commit changes only what ci's paths-ignore lists (VERSION then is this commit's).
             later=$(gh api "repos/$GITHUB_REPOSITORY/compare/$SHA...$head" \
@@ -57,7 +57,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$object" >/dev/null
           echo "tagged $SHA as $tag"
           # (A tag created with this workflow's token starts no workflow by itself.)
-          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref upi -f tag="$tag"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref pi-bolt -f tag="$tag"
           echo "### $tag: tagged and released (the release workflow builds it, then publish signs and publishes it)" >> "$GITHUB_STEP_SUMMARY"
         env:
           GH_TOKEN: ${{ github.token }}

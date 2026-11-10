@@ -229,7 +229,7 @@ if ($Stable) {
 	try {
 		# Named µPi: PRODUCT_NAME, in messages and the window title, on stock Bun.
 		$stableBuild = "$PiboltVersion x64-stable jit-on" -replace ' ', ('\' + 'u0020')
-		& $Bun @CommonArgs --define "PIBOLT_BUILD=\`"$stableBuild\`"" @Entries --outfile (Join-Path $Out 'pi.exe') | Out-Null
+		& $Bun @CommonArgs --define "PIBOLT_BUILD=\`"$stableBuild\`"" --define "MICROPI_PI_VERSION=\`"$Version\`"" @Entries --outfile (Join-Path $Out 'pi.exe') | Out-Null
 		if ($LASTEXITCODE -ne 0) { Die 'bun build failed' }
 	} finally { Pop-Location; Remove-PluginStage }
 	Stage-Assets $Out
@@ -303,7 +303,7 @@ function Build-Pi($runtime, $outfile, $log) {
 	# --splitting, as scripts/build-pi.sh: what Pi imports with import() (the rest of Pi after `pi --version`, the interactive
 	# mode, the providers' APIs) is a chunk of its own, loaded when it is imported, so a start creates only the functions it loads
 	# (windows-2025: `pi --version` 17 -> 13 ms CPU and a fifth fewer page faults, `pi -p` 71 -> 66 ms).
-	& $runtime @CommonArgs '--compile-autoload-package-json' '--splitting' @OrderArgs --define "PIBOLT_BUILD=\`"$build\`"" '--compile-exec-argv=--smol' @Entries --outfile $outfile *> $log
+	& $runtime @CommonArgs '--compile-autoload-package-json' '--splitting' @OrderArgs --define "PIBOLT_BUILD=\`"$build\`"" --define "MICROPI_PI_VERSION=\`"$Version\`"" '--compile-exec-argv=--smol' @Entries --outfile $outfile *> $log
 	$status = $LASTEXITCODE
 	$ErrorActionPreference = 'Stop'
 	# (The writer's notes and warnings about the prebuilt heap are shown wherever they are in the log: a release build's log keeps

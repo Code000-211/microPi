@@ -255,7 +255,7 @@ jobs:
   draft:
     name: Attach to the draft of ${{ github.event.inputs.tag }}
     needs: [unix, windows, attest]
-    if: ${{ github.event.inputs.tag != '' && github.ref == 'refs/heads/upi' }}
+    if: ${{ github.event.inputs.tag != '' && github.ref == 'refs/heads/pi-bolt' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

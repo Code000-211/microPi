@@ -57,9 +57,9 @@ jobs:
     steps:
       - name: The run
         run: |
-          [ "$GITHUB_REF" = refs/heads/upi ] || { echo "run this workflow from upi"; exit 1; }
+          [ "$GITHUB_REF" = refs/heads/pi-bolt ] || { echo "run this workflow from pi-bolt"; exit 1; }
           printf '%s' "$TAG" | grep -Eq '^bolt-v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a release tag: $TAG"; exit 1; }
-      # upi as this run was started from it (github.sha), with its history and tags: the checks and the key are its own.
+      # pi-bolt as this run was started from it (github.sha), with its history and tags: the checks and the key are its own.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0

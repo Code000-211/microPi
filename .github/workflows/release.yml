@@ -137,12 +137,12 @@ jobs:
           '
           if [ -n "$FROM_DRAFT" ]; then
             dir=.work/draft
-            signers="runtime.yml@refs/heads/upi"
+            signers="runtime.yml@refs/heads/pi-bolt"
           else
             # (The check above verified this release's SHA256SUMS: its signature, and that it is $RUNTIME_FROM's.)
             dir=.work/previous
             gh release download "$RUNTIME_FROM" --repo "$GITHUB_REPOSITORY" --dir "$dir" --pattern 'upi-runtime-*'
-            signers="release.yml@refs/heads/upi release.yml@refs/tags/$RUNTIME_FROM runtime.yml@refs/heads/upi"
+            signers="release.yml@refs/heads/pi-bolt release.yml@refs/tags/$RUNTIME_FROM runtime.yml@refs/heads/pi-bolt"
           fi
           echo "### Runtime provenance" >> "$GITHUB_STEP_SUMMARY"
           failed=0
@@ -474,7 +474,7 @@ jobs:
           fi
           sum=$(sha256sum release/SHA256SUMS | cut -c1-64)
           if [ "$AUTO_RELEASE" = true ]; then
-            gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref upi -f tag="$TAG"
+            gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref pi-bolt -f tag="$TAG"
             {
               echo "### $TAG is a draft, handed to publish"
               echo

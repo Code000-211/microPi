@@ -3,7 +3,7 @@ name: release
 # A bolt-vX.Y.Z tag (pushed, or created by the tag workflow, which runs this one) builds the release on GitHub's runners: the
 # Linux x86-64 archives (x64, baseline, jit), the Linux ARM64 ones (arm64, jit), the macOS ones (arm64, jit) and the Windows ones
 # (x64, jit), each tested, then a
-# draft GitHub release with every archive, extensions.txt, SHA256SUMS and RUNTIME_STAMP. Nothing is signed or published here:
+# draft GitHub release with every archive, SHA256SUMS and RUNTIME_STAMP. Nothing is signed or published here:
 # with the repository variable AUTO_RELEASE set to true, the draft is handed to the publish workflow, which signs and publishes
 # it; otherwise publish is run by hand (docs/RELEASING.md).
 #
@@ -445,17 +445,15 @@ jobs:
         with:
           path: release
           merge-multiple: true
-      - name: SHA256SUMS, extensions.txt, RUNTIME_STAMP and the installers
+      - name: SHA256SUMS, RUNTIME_STAMP and the installers
         working-directory: release
         run: |
-          # The optional extensions the installers offer, pinned (without it they offer none).
-          cp ../extensions.txt .
           # The installers of the tagged commit, signed with the rest: `upi update` runs one only once it matches SHA256SUMS.
           cp ../install.sh ../install.ps1 .
           # (Signed with the rest: a later release reuses this release's runtimes only if its signed stamp says the same engine.)
           echo "$STAMP" > RUNTIME_STAMP
           # The first line says which release this is: install.ps1 and the npm package's Windows install refuse another's.
-          { echo "# upi $VERSION"; sha256sum -- *.tar.gz *.tar.xz *.zip extensions.txt RUNTIME_STAMP install.sh install.ps1; } > SHA256SUMS
+          { echo "# upi $VERSION"; sha256sum -- *.tar.gz *.tar.xz *.zip RUNTIME_STAMP install.sh install.ps1; } > SHA256SUMS
           # Exactly the files of a release (scripts/release-files.txt), each as listed.
           ../scripts/check-release-files.sh . "$VERSION"
           cat SHA256SUMS

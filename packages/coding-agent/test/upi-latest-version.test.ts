@@ -19,10 +19,10 @@ vi.mock("../src/upi.ts", async (importOriginal) => ({
 	PIBOLT: { version: "1.0.2", variant: "x64", jit: false },
 }));
 
-const LATEST = "https://github.com/opensec-git/Pi-Bolt/releases/latest";
-const FEED = "https://github.com/opensec-git/Pi-Bolt/releases.atom";
-const API_LATEST = "https://api.github.com/repos/opensec-git/Pi-Bolt/releases/latest";
-const API_RELEASES = "https://api.github.com/repos/opensec-git/Pi-Bolt/releases?per_page=30";
+const LATEST = "https://github.com/Code000-211/microPi/releases/latest";
+const FEED = "https://github.com/Code000-211/microPi/releases.atom";
+const API_LATEST = "https://api.github.com/repos/Code000-211/microPi/releases/latest";
+const API_RELEASES = "https://api.github.com/repos/Code000-211/microPi/releases?per_page=30";
 
 /** What api.github.com answers an address that has used up its 60 requests an hour. */
 function rateLimited(): Response {
@@ -39,13 +39,13 @@ function redirectTo(location: string): Response {
 const feed = (tags: string[]): string =>
 	`<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
-  <link type="text/html" rel="alternate" href="https://github.com/opensec-git/Pi-Bolt/releases"/>
+  <link type="text/html" rel="alternate" href="https://github.com/Code000-211/microPi/releases"/>
 ${tags
 	.map(
 		(tag) => `  <entry>
     <id>tag:github.com,2008:Repository/1402211512/${tag}</id>
-    <link rel="alternate" type="text/html" href="https://github.com/opensec-git/Pi-Bolt/releases/tag/${tag}"/>
-    <content type="html">&lt;a href=&quot;https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v9.9.9&quot;&gt;&lt;/a&gt;</content>
+    <link rel="alternate" type="text/html" href="https://github.com/Code000-211/microPi/releases/tag/${tag}"/>
+    <content type="html">&lt;a href=&quot;https://github.com/Code000-211/microPi/releases/tag/bolt-v9.9.9&quot;&gt;&lt;/a&gt;</content>
   </entry>`,
 	)
 	.join("\n")}
@@ -97,12 +97,12 @@ afterEach(() => {
 
 describe("the latest Pi-Bolt release", () => {
 	it("is read from a release page's address", () => {
-		expect(piBoltVersionOfReleaseUrl("https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.3")).toBe(
+		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.3")).toBe(
 			"1.0.3",
 		);
-		expect(piBoltVersionOfReleaseUrl("/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.3")).toBe("1.0.3");
-		expect(piBoltVersionOfReleaseUrl("https://github.com/opensec-git/Pi-Bolt/releases")).toBeUndefined();
-		expect(piBoltVersionOfReleaseUrl("https://github.com/opensec-git/Pi-Bolt/releases/tag/v1.4.0")).toBeUndefined();
+		expect(piBoltVersionOfReleaseUrl("/Code000-211/microPi/releases/tag/bolt-v1.0.3")).toBe("1.0.3");
+		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases")).toBeUndefined();
+		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases/tag/v1.4.0")).toBeUndefined();
 		expect(piBoltVersionOfReleaseUrl("https://github.com/login?return_to=x")).toBeUndefined();
 		expect(piBoltVersionOfReleaseUrl(null)).toBeUndefined();
 	});
@@ -110,7 +110,7 @@ describe("the latest Pi-Bolt release", () => {
 	it("is found where releases/latest redirects, without GitHub's API", async () => {
 		// #149: the API had answered 403 (its limit for an address without a token), and the update stopped there.
 		const fetchMock = serve({
-			[LATEST]: () => redirectTo("https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.3"),
+			[LATEST]: () => redirectTo("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.3"),
 			[API_LATEST]: rateLimited,
 		});
 		await expect(getLatestPiRelease("1.0.2", { retry: true })).resolves.toEqual({ version: "1.0.3" });
@@ -149,7 +149,7 @@ describe("the latest Pi-Bolt release", () => {
 	it.skipIf(!MICROPI_HAS_RELEASES)("upi update works while GitHub's API is limited", async () => {
 		// #149: "Error: Could not determine latest upi version." on 1.0.2, with the latest release 1.0.2.
 		serve({
-			[LATEST]: () => redirectTo("https://github.com/opensec-git/Pi-Bolt/releases/tag/bolt-v1.0.2"),
+			[LATEST]: () => redirectTo("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.2"),
 			[API_LATEST]: rateLimited,
 		});
 		const log = vi.spyOn(console, "log").mockImplementation(() => {});

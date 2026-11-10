@@ -43,8 +43,8 @@ MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI=
 ESC=$(printf '\033')
 CR=$(printf '\r')
 ETX=$(printf '\003')
-REPO="https://github.com/opensec-git/Pi-Bolt"
-API="https://api.github.com/repos/opensec-git/Pi-Bolt"
+REPO="https://github.com/Code000-211/microPi"
+API="https://api.github.com/repos/Code000-211/microPi"
 NPM_REGISTRY="${MICROPI_NPM_REGISTRY:-https://registry.npmjs.org}"
 
 main() {

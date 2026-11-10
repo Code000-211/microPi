@@ -23,7 +23,7 @@ $good = Join-Path $work 'good'
 New-Item -ItemType Directory -Force -Path $good | Out-Null
 # (Tried three times: GitHub's API answers a download with an occasional HTTP 500.)
 for ($attempt = 1; $attempt -le 3; $attempt++) {
-	& gh release download --repo opensec-git/µPi --dir $good --clobber --pattern SHA256SUMS --pattern SHA256SUMS.sig --pattern "$name.zip"
+	& gh release download --dir $good --clobber --pattern SHA256SUMS --pattern SHA256SUMS.sig --pattern "$name.zip"
 	if ($LASTEXITCODE -eq 0) { break }
 	if ($attempt -eq 3) { exit 1 }
 	Start-Sleep -Seconds 10

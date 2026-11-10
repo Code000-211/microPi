@@ -151,7 +151,7 @@ function makeRelease({ signer, sumsVersion = VERSION, zips = { x64: buildZip() }
 	return files;
 }
 
-const GITHUB = `https://github.com/opensec-git/Pi-Bolt/releases/download/bolt-v${VERSION}`;
+const GITHUB = `https://github.com/Code000-211/microPi/releases/download/bolt-v${VERSION}`;
 const REGISTRY = "https://registry.npmjs.org";
 const npmUrl = (variant = "x64") => `${REGISTRY}/@kushalkhemka/upi-win32-${variant}/-/upi-win32-${variant}-${VERSION}.tgz`;
 

@@ -16,7 +16,7 @@ while [ $# -gt 0 ]; do
 	shift
 done
 need curl
-REPO="https://github.com/opensec-git/Pi-Bolt"
+REPO="https://github.com/Code000-211/microPi"
 if [ "$TAG" = latest ]; then BASE="$REPO/releases/latest/download"; else BASE="$REPO/releases/download/$TAG"; fi
 BASE="${MICROPI_DOWNLOAD_BASE:-$BASE}"
 NAME=upi-runtime-$PIBOLT_PLATFORM.tar.gz

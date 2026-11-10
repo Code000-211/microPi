@@ -29,7 +29,8 @@ fail() { printf 'FAIL %s\n' "$1"; status=1; }
 mkdir -p "$WORK/good"
 # (Tried three times: GitHub's API answers a download with an occasional HTTP 500.)
 for attempt in 1 2 3; do
-	gh release download --repo opensec-git/µPi --dir "$WORK/good" --clobber --pattern SHA256SUMS --pattern SHA256SUMS.sig \
+	# (The origin this checkout is from, which in CI is the repository µPi's releases are published in.)
+	gh release download --dir "$WORK/good" --clobber --pattern SHA256SUMS --pattern SHA256SUMS.sig \
 		--pattern "$NAME.tar.gz" --pattern "$NAME.tar.xz" && break
 	[ "$attempt" = 3 ] && exit 1
 	sleep 10

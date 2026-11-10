@@ -34,7 +34,7 @@ import { gunzipSync } from "node:zlib";
 import chalk from "chalk";
 import { MICROPI_RELEASE_KEY } from "./upi.ts";
 
-const REPO = "https://github.com/opensec-git/Pi-Bolt";
+const REPO = "https://github.com/Code000-211/microPi";
 const ASIDE = /\.pibolt-(old|new)$/;
 
 /** Whether `dir` is under the user's profile (%USERPROFILE% or %LOCALAPPDATA%), as install.ps1's Test-PiBoltInProfile. */

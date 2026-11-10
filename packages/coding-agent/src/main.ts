@@ -683,7 +683,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		console.log(
 			PIBOLT
-				? `µPi ${VERSION} (Pi ${MICROPI_PI ?? PIBOLT.version}, ${process.platform}-${PIBOLT.variant}, JIT ${PIBOLT.jit ? "on" : "off"})`
+				? `µPi ${PIBOLT.version} (Pi ${MICROPI_PI ?? VERSION}, ${process.platform}-${PIBOLT.variant}, JIT ${PIBOLT.jit ? "on" : "off"})`
 				: VERSION,
 		);
 		process.exit(0);

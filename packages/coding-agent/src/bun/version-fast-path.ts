@@ -7,7 +7,7 @@ const args = process.argv.slice(2);
 if (args.length === 1 && (args[0] === "--version" || args[0] === "-v")) {
 	console.log(
 		PIBOLT
-			? `µPi ${VERSION} (Pi ${MICROPI_PI ?? PIBOLT.version}, ${process.platform}-${PIBOLT.variant}, JIT ${PIBOLT.jit ? "on" : "off"})`
+			? `µPi ${PIBOLT.version} (Pi ${MICROPI_PI ?? VERSION}, ${process.platform}-${PIBOLT.variant}, JIT ${PIBOLT.jit ? "on" : "off"})`
 			: VERSION,
 	);
 	process.exit(0);

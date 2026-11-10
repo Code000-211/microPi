@@ -94,7 +94,7 @@ export function piBoltInstallerProcess(installerFile?: string): { command: strin
  * update notice nor `upi update` (the program itself) uses them while this is false.
  */
 export const MICROPI_HAS_RELEASES = false;
-export const MICROPI_RELEASES_URL = "https://github.com/opensec-git/Pi-Bolt/releases";
+export const MICROPI_RELEASES_URL = "https://github.com/Code000-211/microPi/releases";
 /** The key releases' SHA256SUMS are signed with (keys/release.pub; the installers carry it too). */
 export const MICROPI_RELEASE_KEY = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI=
@@ -104,9 +104,9 @@ MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI=
 export const MICROPI_LATEST_RELEASE_URL = `${MICROPI_RELEASES_URL}/latest`;
 /** The releases, pre-releases among them, as an Atom feed; not counted against GitHub's API limit either. */
 export const MICROPI_RELEASES_FEED = `${MICROPI_RELEASES_URL}.atom`;
-export const MICROPI_LATEST_RELEASE_API = "https://api.github.com/repos/opensec-git/Pi-Bolt/releases/latest";
+export const MICROPI_LATEST_RELEASE_API = "https://api.github.com/repos/Code000-211/microPi/releases/latest";
 /** The releases, newest first, pre-releases among them (drafts are not shown to anyone without write access). */
-export const MICROPI_RELEASES_API = "https://api.github.com/repos/opensec-git/Pi-Bolt/releases?per_page=30";
+export const MICROPI_RELEASES_API = "https://api.github.com/repos/Code000-211/microPi/releases?per_page=30";
 
 /**
  * Which releases `upi update` takes: `stable`, the latest release; or `beta`, the newest one, pre-releases included (a

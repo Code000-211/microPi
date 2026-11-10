@@ -241,7 +241,7 @@ export async function download(url: string, what: string | undefined): Promise<B
 
 /** Where release `version`'s files are downloaded from. */
 export function releaseDownloadBase(version: string): string {
-	return `${REPO}/releases/download/bolt-v${version}`;
+	return `${REPO}/releases/download/upi-v${version}`;
 }
 
 /**

@@ -45,7 +45,7 @@ ${tags
 		(tag) => `  <entry>
     <id>tag:github.com,2008:Repository/1402211512/${tag}</id>
     <link rel="alternate" type="text/html" href="https://github.com/Code000-211/microPi/releases/tag/${tag}"/>
-    <content type="html">&lt;a href=&quot;https://github.com/Code000-211/microPi/releases/tag/bolt-v9.9.9&quot;&gt;&lt;/a&gt;</content>
+    <content type="html">&lt;a href=&quot;https://github.com/Code000-211/microPi/releases/tag/upi-v9.9.9&quot;&gt;&lt;/a&gt;</content>
   </entry>`,
 	)
 	.join("\n")}
@@ -97,10 +97,8 @@ afterEach(() => {
 
 describe("the latest Pi-Bolt release", () => {
 	it("is read from a release page's address", () => {
-		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.3")).toBe(
-			"1.0.3",
-		);
-		expect(piBoltVersionOfReleaseUrl("/Code000-211/microPi/releases/tag/bolt-v1.0.3")).toBe("1.0.3");
+		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases/tag/upi-v1.0.3")).toBe("1.0.3");
+		expect(piBoltVersionOfReleaseUrl("/Code000-211/microPi/releases/tag/upi-v1.0.3")).toBe("1.0.3");
 		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases")).toBeUndefined();
 		expect(piBoltVersionOfReleaseUrl("https://github.com/Code000-211/microPi/releases/tag/v1.4.0")).toBeUndefined();
 		expect(piBoltVersionOfReleaseUrl("https://github.com/login?return_to=x")).toBeUndefined();
@@ -110,7 +108,7 @@ describe("the latest Pi-Bolt release", () => {
 	it("is found where releases/latest redirects, without GitHub's API", async () => {
 		// #149: the API had answered 403 (its limit for an address without a token), and the update stopped there.
 		const fetchMock = serve({
-			[LATEST]: () => redirectTo("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.3"),
+			[LATEST]: () => redirectTo("https://github.com/Code000-211/microPi/releases/tag/upi-v1.0.3"),
 			[API_LATEST]: rateLimited,
 		});
 		await expect(getLatestPiRelease("1.0.2", { retry: true })).resolves.toEqual({ version: "1.0.3" });
@@ -121,7 +119,7 @@ describe("the latest Pi-Bolt release", () => {
 	it("is asked of the API when the redirect does not say", async () => {
 		const fetchMock = serve({
 			[LATEST]: () => new Response("Not Found", { status: 404 }),
-			[API_LATEST]: () => Response.json({ tag_name: "bolt-v1.0.3" }),
+			[API_LATEST]: () => Response.json({ tag_name: "upi-v1.0.3" }),
 		});
 		await expect(getLatestPiRelease("1.0.2")).resolves.toEqual({ version: "1.0.3" });
 		expect(requested(fetchMock)).toEqual([LATEST, API_LATEST]);
@@ -137,10 +135,10 @@ describe("the latest Pi-Bolt release", () => {
 	it("on the beta channel, is the newest release the feed lists when the API is limited", async () => {
 		vi.stubEnv("MICROPI_CHANNEL", "beta");
 		// (A link in a release's notes, escaped in the feed, is not a release.)
-		expect(newestPiBoltVersionInFeed(feed(["bolt-v1.0.2", "v1.4.0", "bolt-v1.0.10", "bolt-v1.0.9"]))).toBe("1.0.10");
+		expect(newestPiBoltVersionInFeed(feed(["upi-v1.0.2", "v1.4.0", "upi-v1.0.10", "upi-v1.0.9"]))).toBe("1.0.10");
 		const fetchMock = serve({
 			[API_RELEASES]: rateLimited,
-			[FEED]: () => new Response(feed(["bolt-v1.0.3", "bolt-v1.0.2"])),
+			[FEED]: () => new Response(feed(["upi-v1.0.3", "upi-v1.0.2"])),
 		});
 		await expect(getLatestPiRelease("1.0.2")).resolves.toEqual({ version: "1.0.3" });
 		expect(requested(fetchMock)).toEqual([API_RELEASES, FEED]);
@@ -149,7 +147,7 @@ describe("the latest Pi-Bolt release", () => {
 	it.skipIf(!MICROPI_HAS_RELEASES)("upi update works while GitHub's API is limited", async () => {
 		// #149: "Error: Could not determine latest upi version." on 1.0.2, with the latest release 1.0.2.
 		serve({
-			[LATEST]: () => redirectTo("https://github.com/Code000-211/microPi/releases/tag/bolt-v1.0.2"),
+			[LATEST]: () => redirectTo("https://github.com/Code000-211/microPi/releases/tag/upi-v1.0.2"),
 			[API_LATEST]: rateLimited,
 		});
 		const log = vi.spyOn(console, "log").mockImplementation(() => {});

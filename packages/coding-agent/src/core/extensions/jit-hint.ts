@@ -6,7 +6,7 @@
  * installs it:
  *
  *   Failed to load extension: bun:ffi requires the JIT. pi-foo needs µPi's JIT build (bun:ffi); switch with:
- *   curl -fsSL https://upi.opensec.in/install.sh | MICROPI_VARIANT=arm64-jit sh
+ *   curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | MICROPI_VARIANT=arm64-jit sh
  *
  * Nothing is looked at before such an error is shown (bun:ffi is not even loaded), so this costs nothing otherwise. In every
  * other build (stock Pi, the -jit build) messages are left as they are.

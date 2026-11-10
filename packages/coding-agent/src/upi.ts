@@ -1,5 +1,5 @@
 /**
- * µPi: Pi compiled ahead of time (https://github.com/opensec-git/Pi-Bolt).
+ * µPi: Pi compiled ahead of time (https://github.com/Code000-211/microPi).
  *
  * scripts/build-pi.sh defines PIBOLT_BUILD when it compiles this tree ("0.3.1 x64 jit-off e0f307e3d3f66944": the µPi
  * version, the CPU variant (x64, x64-baseline, x64-jit, arm64), whether the JIT is on, and the runtime stamp of the engine it
@@ -28,7 +28,9 @@ export const PIBOLT: PiBoltBuild | undefined = parsePiBoltBuild(
 export const MICROPI_PI: string | undefined = typeof MICROPI_PI_VERSION === "string" ? MICROPI_PI_VERSION : undefined;
 
 export const MICROPI_INSTALL_URL =
-	process.platform === "win32" ? "https://upi.opensec.in/install.ps1" : "https://upi.opensec.in/install.sh";
+	process.platform === "win32"
+		? "https://github.com/Code000-211/microPi/releases/latest/download/install.ps1"
+		: "https://github.com/Code000-211/microPi/releases/latest/download/install.sh";
 // TLS 1.2 before the first download: Windows PowerShell 5.1 on an older Windows 10 offers only TLS 1.0 by default, which the
 // site refuses, and the installer turns it on only once it is running. Only for the update's own process: the command shown to
 // users is the plain one (README), which Windows' antivirus does not mistake for a downloader.
@@ -90,7 +92,7 @@ export function piBoltInstallerProcess(installerFile?: string): { command: strin
 	};
 }
 /**
- * This µPi's releases (bolt-vX.Y.Z, made by release.yml): updating to one replaces µPi in place. False while there is no
+ * This µPi's releases (upi-vX.Y.Z, made by release.yml): updating to one replaces µPi in place. False while there is no
  * release yet: then the update notice stays off and `upi update --self` says to update from source instead.
  */
 export const MICROPI_HAS_RELEASES = false; // Set to true when the first release is published (releases/latest redirects to a tag).
@@ -100,7 +102,7 @@ export const MICROPI_RELEASE_KEY = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI=
 -----END PUBLIC KEY-----
 `;
-/** Redirects to the latest release's page (.../releases/tag/bolt-v1.0.2); not counted against GitHub's API limit. */
+/** Redirects to the latest release's page (.../releases/tag/upi-v1.0.2); not counted against GitHub's API limit. */
 export const MICROPI_LATEST_RELEASE_URL = `${MICROPI_RELEASES_URL}/latest`;
 /** The releases, pre-releases among them, as an Atom feed; not counted against GitHub's API limit either. */
 export const MICROPI_RELEASES_FEED = `${MICROPI_RELEASES_URL}.atom`;
@@ -148,10 +150,10 @@ export function parsePiBoltBuild(build: string | undefined): PiBoltBuild | undef
 	return { version, variant, jit: jit === "jit-on", ...(runtimeStamp ? { runtimeStamp } : {}) };
 }
 
-/** "0.3.1" from the release tag "bolt-v0.3.1"; undefined for anything else. */
+/** "0.3.1" from the release tag "upi-v0.3.1"; undefined for anything else. */
 export function piBoltVersionOfTag(tag: unknown): string | undefined {
 	if (typeof tag !== "string") return undefined;
-	const match = /^bolt-v(\d+\.\d+\.\d+)$/.exec(tag.trim());
+	const match = /^upi-v(\d+\.\d+\.\d+)$/.exec(tag.trim());
 	return match ? match[1] : undefined;
 }
 
@@ -197,14 +199,14 @@ function isScoopPath(path: string): boolean {
 /**
  * The tool a µPi that mise installed goes by, from the folder mise put it in, <data>/installs/<folder>/<version>: <data> is
  * ~/.local/share/mise (%LOCALAPPDATA%\mise on Windows) or $MISE_DATA_DIR, and <folder> is `upi` for the registry's
- * shorthand or `github-opensec-git-upi` for `github:opensec-git/Pi-Bolt`. Undefined if mise did not install it.
+ * shorthand or `github-Code000-211-microPi` for `github:Code000-211/microPi`. Undefined if mise did not install it.
  */
 export function piBoltMiseTool(path: string = realPathOf(process.execPath)): string | undefined {
 	let folder = /[\\/]mise[\\/]installs[\\/]([^\\/]+)[\\/]/.exec(path)?.[1];
 	const dataDir = process.env.MISE_DATA_DIR;
 	if (folder === undefined && dataDir) folder = pathInside(path, join(dataDir, "installs"))?.split("/")[0];
-	if (!folder || !/upi/i.test(folder)) return undefined;
-	return folder.startsWith("github-") ? "github:opensec-git/Pi-Bolt" : "upi";
+	if (!folder || !(/upi/i.test(folder) || /^github-Code000-211-microPi$/i.test(folder))) return undefined;
+	return folder.startsWith("github-") ? "github:Code000-211/microPi" : "upi";
 }
 
 /**
@@ -232,7 +234,7 @@ export interface PiBoltPackageManager {
 	name: string;
 	/** Its command: "brew". */
 	command: string;
-	/** What it installed µPi from: "the opensec-git/tap/upi formula". Or "the winget package". */
+	/** What it installed µPi from: "the Code000-211/tap/upi formula". Or "the winget package". */
 	source: string;
 	update: string;
 	uninstall: string;
@@ -249,7 +251,7 @@ export function piBoltPackageManager(
 			return {
 				name: "Homebrew",
 				command: "brew",
-				source: "the opensec-git/tap/upi formula",
+				source: "the Code000-211/tap/upi formula",
 				update: "brew upgrade upi",
 				uninstall: "brew uninstall upi",
 			};
@@ -258,7 +260,7 @@ export function piBoltPackageManager(
 			return {
 				name: "Scoop",
 				command: "scoop",
-				source: "the opensec-git/upi manifest",
+				source: "the Code000-211/upi manifest",
 				update: "scoop update upi",
 				uninstall: "scoop uninstall upi",
 				switchVersion: "scoop reset upi@<version>",
@@ -328,7 +330,7 @@ export function piBoltUpdateEnvironment(version: string): NodeJS.ProcessEnv {
 		MICROPI_NO_START: "1",
 		MICROPI_NO_PATH: "1",
 		MICROPI_VARIANT: PIBOLT?.variant ?? "x64",
-		MICROPI_VERSION: `bolt-v${version}`,
+		MICROPI_VERSION: `upi-v${version}`,
 		MICROPI_INSTALL: piBoltInstallDir() ?? process.env.MICROPI_INSTALL ?? join(homedir(), ".micropi"),
 	};
 }
@@ -359,10 +361,10 @@ export function piBoltJitSwitchCommand(
 	// Windows PowerShell 5.1 has no &&.)
 	const manager = piBoltPackageManager(method);
 	if (platform === "win32") {
-		const installer = `$env:MICROPI_VARIANT = "${variant}"; irm https://upi.opensec.in/install.ps1 | iex`;
+		const installer = `$env:MICROPI_VARIANT = "${variant}"; irm https://github.com/Code000-211/microPi/releases/latest/download/install.ps1 | iex`;
 		return manager ? `${manager.uninstall}; ${installer}` : installer;
 	}
-	const installer = `curl -fsSL https://upi.opensec.in/install.sh | MICROPI_VARIANT=${variant} sh`;
+	const installer = `curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | MICROPI_VARIANT=${variant} sh`;
 	return manager ? `${manager.uninstall} && ${installer}` : installer;
 }
 

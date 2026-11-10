@@ -51,7 +51,7 @@ describe("upi compile works offline once the release's files are cached (#6, #8)
 	const sums = Buffer.from(
 		`# upi 0.9.0\n${sha256(runtime)}  upi-runtime-linux-x64.tar.gz\n${sha256(kit)}  upi-kit-linux-x64.tar.gz\n`,
 	);
-	const base = "https://example.invalid/download/bolt-v0.9.0";
+	const base = "https://example.invalid/download/upi-v0.9.0";
 
 	let served: Map<string, Buffer>;
 	let requested: string[];

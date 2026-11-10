@@ -1944,7 +1944,7 @@ async function compile(options: CompileOptions, record: CompileSelection | undef
 			if (options.kit || options.runtime) throw new CompileError("--kit and --runtime go together");
 			const base =
 				process.env.MICROPI_DOWNLOAD_BASE?.replace(/\/+$/, "") ??
-				`${MICROPI_RELEASES_URL}/download/bolt-v${build.version}`;
+				`${MICROPI_RELEASES_URL}/download/upi-v${build.version}`;
 			// (The installation's cache, with --out too.)
 			const installDir = where?.installDir ?? piBoltInstallDir();
 			const archives = await releaseArchives(base, build.version, platform, join(installDir ?? work, "cache"));

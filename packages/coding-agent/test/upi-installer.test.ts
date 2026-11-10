@@ -142,11 +142,11 @@ describe.skipIf(process.platform === "win32")("runReleaseInstaller", () => {
 		const script = Buffer.from(`printf '%s\\n%s\\n' "$0" "$MICROPI_VERSION" > '${marker}'\nexit 3\n`);
 		const status = await runReleaseInstaller(
 			{ name: "install.sh", script },
-			{ ...process.env, MICROPI_VERSION: `bolt-v${VERSION}` },
+			{ ...process.env, MICROPI_VERSION: `upi-v${VERSION}` },
 		);
 		expect(status).toBe(3);
 		const [file, version] = readFileSync(marker, "utf8").trim().split("\n");
-		expect(version).toBe(`bolt-v${VERSION}`);
+		expect(version).toBe(`upi-v${VERSION}`);
 		expect(file.endsWith("/install.sh")).toBe(true);
 		expect(existsSync(dirname(file))).toBe(false);
 		// Nothing was downloaded: the script is the one given.
@@ -227,7 +227,7 @@ describe("piBoltUpdateEnvironment", () => {
 			expect(env.MICROPI_EXTENSIONS).toBe("no");
 			expect(env.NOT_MICROPI_VARIABLE).toBe("kept");
 			expect(env.PATH).toBe(process.env.PATH);
-			expect(env.MICROPI_VERSION).toBe(`bolt-v${VERSION}`);
+			expect(env.MICROPI_VERSION).toBe(`upi-v${VERSION}`);
 			expect(env.MICROPI_YES).toBe("1");
 		} finally {
 			for (const [name, value] of Object.entries(saved)) {

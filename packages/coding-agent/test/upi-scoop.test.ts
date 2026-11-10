@@ -29,7 +29,7 @@ function runningFrom(execPath: string): void {
 }
 
 /**
- * What the manifest (opensec-git/scoop-bucket's bucket/upi.json) installs: the archive's upi-win32-x64 folder, as
+ * What the manifest (Code000-211/scoop-bucket's bucket/upi.json) installs: the archive's upi-win32-x64 folder, as
  * <root>/apps/upi/<version>, with `current` linked to it (a junction on Windows); Scoop's shim starts current/upi.exe.
  */
 function scoopInstall(root: string): string {
@@ -80,7 +80,7 @@ describe("a µPi installed with Scoop", () => {
 		expect(piBoltInstallMethod()).toBe("installer");
 		expect(piBoltUpdateCommand("scoop")).toBe("scoop update upi");
 		expect(piBoltJitSwitchCommand("scoop", "win32", "x64-jit")).toBe(
-			'scoop uninstall upi; $env:MICROPI_VARIANT = "x64-jit"; irm https://upi.opensec.in/install.ps1 | iex',
+			'scoop uninstall upi; $env:MICROPI_VARIANT = "x64-jit"; irm https://github.com/Code000-211/microPi/releases/latest/download/install.ps1 | iex',
 		);
 	});
 
@@ -135,6 +135,6 @@ describe("a µPi installed with Scoop", () => {
 			return true;
 		});
 		expect(await runDoctor(["--offline"], { cwd: home, agentDir, extensionFactories: [] })).toBe(0);
-		expect(output).toMatch(/installed +Scoop \(the opensec-git\/upi manifest\), run from .*1\.0\.0/);
+		expect(output).toMatch(/installed +Scoop \(the Code000-211\/upi manifest\), run from .*1\.0\.0/);
 	});
 });

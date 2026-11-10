@@ -223,7 +223,7 @@ jobs:
           # Linux ARM64: also as Termux installs it, in an imitation of Android (the runner is thrown away after: it writes /data).
           if [ "$(uname -s)-$(uname -m)" = Linux-aarch64 ]; then
             sudo apt-get install -y -qq busybox-static >/dev/null
-            sudo env PATH="$PATH" PIBOLT_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/out/upi"
+            sudo env PATH="$PATH" MICROPI_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/out/upi"
           fi
       - name: Engine tests
         if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock'

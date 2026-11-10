@@ -230,7 +230,7 @@ remove anything private from it before you post it.
 
 ## Reporting a problem
 
-Please [open an issue](https://github.com/opensec-git/Pi-Bolt/issues/new) with:
+Please [open an issue](https://github.com/Code000-211/microPi/issues/new) with:
 
 - the output of `upi doctor` (the build, installation, extensions and packages, and the problems it finds; no keys or
   tokens, and your home folder shown as `~`);

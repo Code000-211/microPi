@@ -18,12 +18,16 @@
 Needs git, Node.js 22.19 or later with npm (to build Pi), Python 3, and rsync (for plugins).
 
 ```bash
-git clone https://github.com/opensec-git/Pi-Bolt.git && cd Pi-Bolt
+git clone https://github.com/Code000-211/microPi.git && cd microPi
 scripts/fetch-runtime.sh     # the µPi runtime from the latest release -> .work/runtime/bun
 scripts/prepare-pi.sh        # builds the Pi in this repository (µPi is a fork of Pi)
 scripts/build-pi.sh          # -> out/upi/pi
 out/upi/pi --version
 ```
+
+`scripts/install-from-source.sh` runs these steps and installs the build as the `upi` command where install.sh puts a
+release (`MICROPI_INSTALL`, default `~/.micropi`, with `MICROPI_BIN_DIR`, default `~/.local/bin`, linked); it hands other
+arguments to `build-pi.sh` (`--jit on`, `--cpu baseline`, ...). Its `--kit` is `.work/kit`, for `upi compile` afterwards.
 
 Apart from downloading the runtime and npm packages, the build is offline: Pi's model catalog
 (`packages/ai/src/providers/data`) is in the repository. `scripts/prepare-pi.sh --refresh-models` fetches it again from the

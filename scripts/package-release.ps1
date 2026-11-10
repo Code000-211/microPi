@@ -4,13 +4,15 @@
 # Usage: scripts\package-release.ps1 [-Pi DIR] [-NoBuild] [-RuntimeOnly] [-WithOpenSec]
 #   -Pi DIR     the built Pi tree (default: this repository)
 #   -NoBuild    package the builds already in out\upi and out\upi-jit instead of building them
-#   -RuntimeOnly  only the runtime's archive (.github/workflows/runtime.yml), no Pi and no SHA256SUMS
+#   -RuntimeOnly  only the runtime's archive (.github/workflows/runtime.yml), no Pi and no SHA256SUMS (building them needs Rust/cargo,
+#                 for the docsearch addon: the builds compile it in)
 #   -WithOpenSec  compile in OpenSec's extensions (plugins\opensec; `-builtin:<name>` in the extensions setting turns one off).
 #               Releases are built without: compiled in they cost every `-p` +66 ms
 #               (bench/results/2026-10-10-opensec-compiled). With it, retrain the profile with them first
 #               (scripts\train-heap.ps1 -Plugins plugins\opensec\plugins.ts).
 # Archives (the names stay the same from release to release, so that releases/latest/download/<name> always works):
-#   upi-win32-x64.zip           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
+#   upi-win32-x64.zip           JIT off, code for AVX2-class CPUs (falls back to bytecode on others); the built-in
+#                               docsearch (project_search) is compiled in
 #   upi-win32-x64-jit.zip       JIT on, for extensions that do heavy JavaScript work at run time (docs/PLUGINS.md)
 #   upi-runtime-win32-x64.zip   the microPi Bun runtime, to build Pi with plugins (docs/PLUGINS.md)
 # .zip, which install.ps1 unpacks with what Windows has. In the archive the executable is upi.exe: the installer puts its
@@ -51,11 +53,14 @@ if (-not $NoBuild -and -not $RuntimeOnly) {
 		} finally { Pop-Location }
 		$withPlugins.Plugins = Join-Path $opensec 'plugins.ts'
 	}
+	# The built-in plugins of the release, on every build (build-pi.ps1 -Builtins: the docsearch addon, project_search, built
+	# for win32-x64 with Rust/cargo; every platform's release has it).
+	$builtins = @{ Builtins = $true }
 	# (Exit code 3 is passed on: the two builds' prebuilt heaps differed, which the release workflow builds again for.)
-	& (Join-Path $Root 'scripts\build-pi.ps1') -Pi $Pi -Out $Out -VerifyDeterminism @withPlugins
+	& (Join-Path $Root 'scripts\build-pi.ps1') -Pi $Pi -Out $Out -VerifyDeterminism @builtins @withPlugins
 	if ($LASTEXITCODE -eq 3) { exit 3 }
 	if ($LASTEXITCODE -ne 0) { Die 'the build failed' }
-	& (Join-Path $Root 'scripts\build-pi.ps1') -Pi $Pi -Out $OutJit -Jit on -VerifyDeterminism @withPlugins
+	& (Join-Path $Root 'scripts\build-pi.ps1') -Pi $Pi -Out $OutJit -Jit on -VerifyDeterminism @builtins @withPlugins
 	if ($LASTEXITCODE -eq 3) { exit 3 }
 	if ($LASTEXITCODE -ne 0) { Die 'the JIT build failed' }
 }

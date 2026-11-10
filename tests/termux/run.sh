@@ -29,8 +29,8 @@ while [ $# -gt 0 ]; do
 done
 [ -x "$BUILD/pi" ] || { echo "no build at '$BUILD' (--build DIR)"; exit 2; }
 [ "$(uname -s)-$(uname -m)" = Linux-aarch64 ] || { echo "Linux ARM64 only"; exit 2; }
-[ "$(id -u)" = 0 ] && { [ -f /.dockerenv ] || [ "${PIBOLT_TERMUX_TEST:-}" = 1 ]; } ||
-	{ echo "run it as root in a throwaway container (or set PIBOLT_TERMUX_TEST=1): it writes /data and /system"; exit 2; }
+[ "$(id -u)" = 0 ] && { [ -f /.dockerenv ] || [ "${MICROPI_TERMUX_TEST:-}" = 1 ]; } ||
+	{ echo "run it as root in a throwaway container (or set MICROPI_TERMUX_TEST=1): it writes /data and /system"; exit 2; }
 
 status=0
 pass() { printf 'PASS %s\n' "$1"; }
@@ -90,14 +90,14 @@ for repo in "https://termux.net stable main|Google Play" "https://mirror.example
 	printf 'deb %s\n' "${repo%|*}" >"$PREFIX/etc/apt/sources.list"
 	want=${repo#*|}
 	what="without glibc-repo in Termux's repository, install.sh says so ($want)"
-	out=$(MICROPI_VERSION=bolt-v0.5.99 MICROPI_UNVERIFIED="$SUMS_SHA256" MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port" MICROPI_YES=1 MICROPI_EXTENSIONS=no MICROPI_NO_START=1 \
+	out=$(MICROPI_VERSION=upi-v0.5.99 MICROPI_UNVERIFIED="$SUMS_SHA256" MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port" MICROPI_YES=1 MICROPI_NO_START=1 \
 		/bin/sh "$ROOT/install.sh" </dev/null 2>&1)
 	if [ $? -ne 0 ] && grep -qF "$want" <<<"$out" && [ ! -e "$WORK/pkg-calls" ]; then pass "$what"; else fail "$what" "$out"; fi
 done
 rm -f "$PREFIX/bin/apt-get" "$PREFIX/bin/apt-cache" "$PREFIX/bin/pkg" "$PREFIX/etc/apt/sources.list"
 ln -sf /lib/ld-linux-aarch64.so.1 "$PREFIX/glibc/lib/ld-linux-aarch64.so.1"
 
-out=$(MICROPI_VERSION=bolt-v0.5.99 MICROPI_UNVERIFIED="$SUMS_SHA256" MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port" MICROPI_YES=1 MICROPI_EXTENSIONS=no MICROPI_NO_START=1 \
+out=$(MICROPI_VERSION=upi-v0.5.99 MICROPI_UNVERIFIED="$SUMS_SHA256" MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port" MICROPI_YES=1 MICROPI_NO_START=1 \
 	/bin/sh "$ROOT/install.sh" </dev/null 2>&1)
 if [ -x "$INSTALL/$NAME/pi-termux" ] && [ "$(readlink "$PREFIX/bin/upi")" = "$INSTALL/$NAME/pi-termux" ]; then
 	pass "install.sh installs it, upi in \$PREFIX/bin is the Termux launcher"

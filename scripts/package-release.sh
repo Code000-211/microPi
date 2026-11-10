@@ -6,7 +6,8 @@
 #   --no-build    package the builds already in out/ instead of building them
 #   --runtime-only  only the runtime's archive (.github/workflows/runtime.yml), no Pi and no SHA256SUMS
 # Archives (the names stay the same from release to release, so that releases/latest/download/<name> always works), of what
-# this machine builds:
+# this machine builds; every build has the release's built-in plugins in it (build-pi.sh --builtins: the docsearch addon,
+# project_search, built for this platform with Rust/cargo, and `upi compile` keeps it, for the kit carries it):
 #   upi-linux-x64.tar.gz           JIT off, code for AVX2-class CPUs (falls back to bytecode on others)
 #   upi-linux-x64-baseline.tar.gz  JIT off, code for any x86-64 CPU
 #   upi-linux-x64-jit.tar.gz       JIT on, for code loaded at run time
@@ -58,7 +59,7 @@ if [ -n "$BUILD" ]; then
 	for target in "${TARGETS[@]}"; do
 		IFS=: read -r _ out options <<<"$target"
 		# shellcheck disable=SC2086 # options is a list of words
-		"$PIBOLT_ROOT/scripts/build-pi.sh" --pi "$PI_DIR" --out "$PIBOLT_ROOT/out/$out" "${kit[@]}" $options
+		"$PIBOLT_ROOT/scripts/build-pi.sh" --pi "$PI_DIR" --out "$PIBOLT_ROOT/out/$out" --builtins "${kit[@]}" $options
 		kit=()
 	done
 fi

@@ -15,6 +15,8 @@ packages/ai/src/providers/*.catalog.generated.ts
 
 # Environment
 .env
+# Local gh CLI session state
+.local/
 
 # Editor files
 .vscode/
@@ -77,3 +79,6 @@ __pycache__/
 
 # Copied from install.sh when the npm package is packed
 npm/install.sh
+
+# gh runtime state
+.local/

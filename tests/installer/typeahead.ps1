@@ -121,7 +121,7 @@ public static class PiBoltTestConsole {
 	}
 }
 
-$work = Join-Path ([IO.Path]::GetTempPath()) "pibolt-typeahead-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$work = Join-Path ([IO.Path]::GetTempPath()) "upi-typeahead-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $script:status = 0
 function Write-Pass([string]$what) { Write-Host "PASS $what" }

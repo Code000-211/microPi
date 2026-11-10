@@ -12,7 +12,9 @@
 #   - an update keeps the build it replaces as <name>.previous (for upi update --rollback), and the same build installed
 #     again does not replace the one kept;
 #   - MICROPI_CHANNEL=beta is kept for the installation's updates (<install>/channel), and stable takes it away.
-# Needs curl, python3 and gh (or a GitHub token for gh), and OpenSSL 3 for the verified case.
+# Needs curl, python3 and OpenSSL 3 for the verified case; needs gh (or a GitHub token for gh) to download a published
+# release, unless MICROPI_TEST_RELEASE points at a folder with one (built by tests/installer/make-release.sh when none is
+# published yet), in which case its version is also given as MICROPI_VERSION to every install.
 #
 # Usage: tests/installer/run.sh
 set -euo pipefail
@@ -27,15 +29,24 @@ pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; status=1; }
 
 mkdir -p "$WORK/good"
-# (Tried three times: GitHub's API answers a download with an occasional HTTP 500.)
-for attempt in 1 2 3; do
-	# (The origin this checkout is from, which in CI is the repository µPi's releases are published in.)
-	gh release download --dir "$WORK/good" --clobber --pattern SHA256SUMS --pattern SHA256SUMS.sig \
-		--pattern "$NAME.tar.gz" --pattern "$NAME.tar.xz" && break
-	[ "$attempt" = 3 ] && exit 1
-	sleep 10
-done
+if [ -n "${MICROPI_TEST_RELEASE:-}" ]; then
+	cp "$MICROPI_TEST_RELEASE/SHA256SUMS" "$MICROPI_TEST_RELEASE/SHA256SUMS.sig" \
+		"$MICROPI_TEST_RELEASE/$NAME.tar.gz" "$MICROPI_TEST_RELEASE/$NAME.tar.xz" "$WORK/good/"
+	MICROPI_TEST_VERSION=$(head -n 1 "$WORK/good/SHA256SUMS" | sed 's/^# upi //')
+else
+	# (Tried three times: GitHub's API answers a download with an occasional HTTP 500.)
+	for attempt in 1 2 3; do
+		# (The origin this checkout is from, which in CI is the repository µPi's releases are published in.)
+		gh release download --dir "$WORK/good" --clobber --pattern SHA256SUMS --pattern SHA256SUMS.sig \
+			--pattern "$NAME.tar.gz" --pattern "$NAME.tar.xz" && break
+		[ "$attempt" = 3 ] && exit 1
+		sleep 10
+	done
+fi
 cp -R "$WORK/good" "$WORK/nosig" && rm "$WORK/nosig/SHA256SUMS.sig"
+# (A signed release is one from 0.6.0 on: its checksums are from that version, so that a missing signature is refused, not
+# taken for a release from before releases were signed.)
+{ echo "# upi 0.6.1"; tail -n +2 "$WORK/good/SHA256SUMS"; } >"$WORK/nosig/SHA256SUMS"
 cp -R "$WORK/good" "$WORK/htmlsig" && printf '<!DOCTYPE html><html><body>Not Found</body></html>\n' >"$WORK/htmlsig/SHA256SUMS.sig"
 # (As a release from before 0.6.0: no signature, and checksums that say that version.)
 cp -R "$WORK/nosig" "$WORK/unsigned" && { echo "# upi 0.5.99"; tail -n +2 "$WORK/good/SHA256SUMS"; } >"$WORK/unsigned/SHA256SUMS"
@@ -58,23 +69,25 @@ install() {
 	shift
 	rm -rf "${WORK:?}/home"
 	mkdir -p "$WORK/home"
-	env HOME="$WORK/home" SHELL=/bin/sh MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port/$case" MICROPI_EXTENSIONS=no MICROPI_NO_START=1 \
-		MICROPI_YES=1 MICROPI_INSTALL="$WORK/home/inst" MICROPI_BIN_DIR="$WORK/home/bin" "$@" sh "$ROOT/install.sh" </dev/null 2>&1 || true
+	env HOME="$WORK/home" SHELL=/bin/sh MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port/$case" MICROPI_NO_START=1 \
+		MICROPI_YES=1 MICROPI_INSTALL="$WORK/home/inst" MICROPI_BIN_DIR="$WORK/home/bin" \
+		${MICROPI_TEST_VERSION:+MICROPI_VERSION=upi-v$MICROPI_TEST_VERSION} "$@" sh "$ROOT/install.sh" </dev/null 2>&1 || true
 }
 installed() { [ -x "$WORK/home/inst/$NAME/pi" ]; }
 # install_again CASE [ENV...]: the same, over what the last run installed.
 install_again() {
 	local case=$1
 	shift
-	env HOME="$WORK/home" SHELL=/bin/sh MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port/$case" MICROPI_EXTENSIONS=no MICROPI_NO_START=1 \
-		MICROPI_YES=1 MICROPI_INSTALL="$WORK/home/inst" MICROPI_BIN_DIR="$WORK/home/bin" "$@" sh "$ROOT/install.sh" </dev/null 2>&1 || true
+	env HOME="$WORK/home" SHELL=/bin/sh MICROPI_DOWNLOAD_BASE="http://127.0.0.1:$port/$case" MICROPI_NO_START=1 \
+		MICROPI_YES=1 MICROPI_INSTALL="$WORK/home/inst" MICROPI_BIN_DIR="$WORK/home/bin" \
+		${MICROPI_TEST_VERSION:+MICROPI_VERSION=upi-v$MICROPI_TEST_VERSION} "$@" sh "$ROOT/install.sh" </dev/null 2>&1 || true
 }
 
 out=$(install good)
 if installed && grep -q "signature verified" <<<"$out"; then pass "the release installs, signature verified"; else
 	fail "the release installs, signature verified"; printf '%s\n' "$out"; fi
 
-out=$(install nosig)
+out=$(install nosig MICROPI_VERSION=upi-v0.6.1)
 if ! installed && grep -q "could not download the release's signature" <<<"$out"; then pass "no signature: not installed"; else
 	fail "no signature: not installed"; printf '%s\n' "$out"; fi
 
@@ -87,22 +100,24 @@ if ! installed && grep -q "signature does not verify" <<<"$out"; then pass "a pa
 	fail "a page of HTML for the signature: not installed"; printf '%s\n' "$out"; fi
 
 sums_sha=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi <"$WORK/unsigned/SHA256SUMS" | cut -c1-64)
-out=$(install unsigned MICROPI_VERSION=bolt-v0.5.99)
+out=$(install unsigned MICROPI_VERSION=upi-v0.5.99)
 if ! installed && grep -q "from before µPi signed its releases" <<<"$out" && grep -q "MICROPI_UNVERIFIED=$sums_sha" <<<"$out"; then
 	pass "a release from before signing: not installed, and the SHA-256 to give is said"; else
 	fail "a release from before signing: not installed, and the SHA-256 to give is said"; printf '%s\n' "$out"; fi
 # (An opt-in left in the environment, or one for another download, is not one for this download.)
 for value in 1 "$(printf '%064d' 0)"; do
-	out=$(install unsigned MICROPI_VERSION=bolt-v0.5.99 MICROPI_UNVERIFIED="$value")
+	out=$(install unsigned MICROPI_VERSION=upi-v0.5.99 MICROPI_UNVERIFIED="$value")
 	if ! installed && grep -q "not to this download's SHA-256" <<<"$out"; then pass "a release from before signing, MICROPI_UNVERIFIED=${value:0:8}...: not installed"; else
 		fail "a release from before signing, MICROPI_UNVERIFIED=${value:0:8}...: not installed"; printf '%s\n' "$out"; fi
 done
-out=$(install unsigned MICROPI_VERSION=bolt-v0.5.99 MICROPI_UNVERIFIED="$sums_sha")
+out=$(install unsigned MICROPI_VERSION=upi-v0.5.99 MICROPI_UNVERIFIED="$sums_sha")
 if installed && grep -q "WARNING:" <<<"$out"; then pass "a release from before signing, MICROPI_UNVERIFIED=<its SHA-256>: installed, with a warning"; else
 	fail "a release from before signing, MICROPI_UNVERIFIED=<its SHA-256>: installed, with a warning"; printf '%s\n' "$out"; fi
 
-# (GitHub out of reach through a proxy that is not there; the mirror is on this machine, which the proxy is not used for.)
-out=$(install good https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9)
+# (GitHub out of reach through a proxy that is not there; the mirror is on this machine, which the proxy is not used for.
+# Version not known: MICROPI_VERSION=latest undoes the default version MICROPI_TEST_RELEASE gives, so that not knowing
+# which release the mirror serves is the reason to refuse.)
+out=$(install good MICROPI_VERSION=latest https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9)
 if ! installed && grep -q "set MICROPI_VERSION to the release it serves" <<<"$out"; then
 	pass "a mirror, and the latest release not known: not installed"; else
 	fail "a mirror, and the latest release not known: not installed"; printf '%s\n' "$out"; fi
@@ -132,7 +147,7 @@ if grep -q "an older build" "$inst/$NAME.previous/upi.txt" 2>/dev/null; then
 	fail "the same build installed again leaves the previous one"; printf '%s\n' "$out"; fi
 
 version=$(head -n 1 "$WORK/good/SHA256SUMS" | sed 's/^# upi //')
-out=$(install_again good MICROPI_CHANNEL=beta MICROPI_VERSION="bolt-v$version")
+out=$(install_again good MICROPI_CHANNEL=beta MICROPI_VERSION="upi-v$version")
 if [ "$(cat "$inst/channel" 2>/dev/null)" = beta ]; then pass "MICROPI_CHANNEL=beta is kept for updates"; else
 	fail "MICROPI_CHANNEL=beta is kept for updates"; printf '%s\n' "$out"; fi
 out=$(install_again good MICROPI_CHANNEL=stable)

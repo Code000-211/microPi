@@ -379,5 +379,19 @@ describe("terminalOutputDelta", () => {
 		expect(bashExitCode({ content: [], structuredContent: { exit_code: 3 } }, true)).toBe(3);
 		expect(bashExitCode({ content: [{ type: "text", text: "Command aborted" }] }, true)).toBeNull();
 		expect(bashExitCode({ content: [] }, false)).toBe(0);
+		// A command that moved to the background has no exit code: it is still running.
+		expect(
+			bashExitCode(
+				{
+					content: [
+						{
+							type: "text",
+							text: "started\n\nCommand still running at its timeout of 1 seconds: moved to the background as job bg7 (pid 42; stop it with: kill -- -42), not stopped.",
+						},
+					],
+				},
+				false,
+			),
+		).toBeNull();
 	});
 });

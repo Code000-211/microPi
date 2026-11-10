@@ -151,6 +151,9 @@ function keepAsBackgroundJob(child: ChildProcess | undefined): number | undefine
 
 const MOVED_TO_BACKGROUND = Symbol("moved to the background");
 
+/** Words every result of the bash tool that moved its command to the background carries, whatever started the move. */
+export const MOVED_TO_BACKGROUND_NOTE = "moved to the background as job";
+
 function untilBackground<T>(running: Promise<T>, ms: number): Promise<T | typeof MOVED_TO_BACKGROUND> {
 	let timer: NodeJS.Timeout | undefined;
 	return Promise.race([
@@ -921,8 +924,8 @@ function moveToBackground(params: {
 	const status = background
 		? `Started in the background as job ${id}${stop}.`
 		: atTimeout
-			? `Command still running at its timeout of ${timeout} seconds: moved to the background as job ${id}${stop}, not stopped.`
-			: `Command still running after ${backgroundAfterMs / 1000} seconds: moved to the background as job ${id}${stop}.`;
+			? `Command still running at its timeout of ${timeout} seconds: ${MOVED_TO_BACKGROUND_NOTE} ${id}${stop}, not stopped.`
+			: `Command still running after ${backgroundAfterMs / 1000} seconds: ${MOVED_TO_BACKGROUND_NOTE} ${id}${stop}.`;
 	return {
 		content: [
 			{

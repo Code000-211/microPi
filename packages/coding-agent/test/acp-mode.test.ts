@@ -437,13 +437,16 @@ describe("ACP mode", () => {
 			_meta: { terminal_exit: { terminal_id: id, exit_code: 3 } },
 		});
 
-		// A command that does not finish has no exit code; the terminal says why it stopped.
+		// A command that does not finish has no exit code; the terminal says why it stopped. The command went on in the
+		// background at its timeout, and the terminal gets the words the tool's result carries about that.
 		const timedOut = await runCommand(zed, "timeout");
 		const timedOutData = timedOut.updates
 			.slice(0, -1)
 			.map((u) => (u._meta?.terminal_output as { data: string }).data)
 			.join("");
-		expect(timedOutData).toBe("started\nCommand timed out after 1 seconds\n");
+		expect(timedOutData).toMatch(
+			/^started\nCommand still running at its timeout of 1 seconds: moved to the background as job bg\d+ \(pid \d+; stop it with: kill -- -\d+\), not stopped\./,
+		);
 		expect(timedOut.updates.at(-1)?._meta).toEqual({
 			terminal_exit: { terminal_id: timedOut.call.toolCallId, exit_code: null },
 		});

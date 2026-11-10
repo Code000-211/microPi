@@ -6,6 +6,7 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
+import { MOVED_TO_BACKGROUND_NOTE } from "../../core/tools/bash.ts";
 import { resolveToCwd } from "../../core/tools/path-utils.ts";
 import { isRecord } from "../json-rpc.ts";
 import type {
@@ -273,6 +274,9 @@ export function terminalOutputDelta(sent: TerminalSent, next: OutputTail): { dat
 export function bashExitCode(result: unknown, isError: boolean): number | null {
 	const structured = isRecord(result) ? result.structuredContent : undefined;
 	if (isRecord(structured) && typeof structured.exit_code === "number") return structured.exit_code;
+	if (!isError && resultText(result).includes(MOVED_TO_BACKGROUND_NOTE))
+		// The command went on in the background: it has no exit code yet, whatever its text says.
+		return null;
 	return isError ? null : 0;
 }
 

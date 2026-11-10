@@ -463,7 +463,7 @@ jobs:
         run: |
           docker run --rm -e GITHUB_REPOSITORY -v "$PWD/install.sh:/install.sh:ro" debian:12-slim sh -ec '
             apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null
-            run() { env HOME=/root/t MICROPI_EXTENSIONS=no MICROPI_NO_START=1 MICROPI_YES=1 "$@" sh /install.sh </dev/null 2>&1; }
+            run() { env HOME=/root/t MICROPI_NO_START=1 MICROPI_YES=1 "$@" sh /install.sh </dev/null 2>&1; }
             run | tee /tmp/a; grep -q "signature verified" /tmp/a
             dpkg -r --force-depends openssl >/dev/null 2>&1
             run | tee /tmp/b; grep -q "signature verified" /tmp/b   # checked by the µPi installed before

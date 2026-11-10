@@ -582,7 +582,7 @@ sha256_of() {
 
 # A µPi executable installed here before, which checks the signature with its own crypto (BUN_BE_BUN=1 runs a script):
 # a build in its own folder (not one kept for a rollback, nor one left by an update that stopped).
-installed_pibolt() {
+installed_upi() {
 	for candidate in "$INSTALL/$NAME/pi-bin" "$INSTALL/$NAME/pi" "$INSTALL"/upi-"$PLATFORM"-*/pi-bin "$INSTALL"/upi-"$PLATFORM"-*/pi; do
 		case "${candidate#"$INSTALL"/}" in *.*/*) continue ;; esac
 		if [ -f "$candidate" ] && [ -x "$candidate" ]; then
@@ -643,7 +643,7 @@ verify_signature() {
 		SIGNED=1
 		return 0
 	fi
-	if exe=$(installed_pibolt); then
+	if exe=$(installed_upi); then
 		# (By its full path: it is run from the download's folder, below.)
 		case "$exe" in /*) ;; *) exe="$PWD/$exe" ;; esac
 		printf '%s\n' "$VERIFY_SCRIPT" >"$TMP/verify.js"

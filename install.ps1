@@ -33,7 +33,7 @@
 # A folder given in PIBOLT_INSTALL outside your profile is made yours, SYSTEM's and the Administrators' only.
 
 # The public key that releases are signed with (keys/release.pub in the repository; scripts/sign-release.sh).
-$PiBoltReleaseKey = 'MCowBQYDK2VwAyEAoLboJqtKaoISPqffk03vHZr+1sRBG3uIRIWeKOew+aY='
+$PiBoltReleaseKey = 'MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI='
 $PiBoltRepo = 'https://github.com/opensec-git/Pi-Bolt'
 $PiBoltApi = 'https://api.github.com/repos/opensec-git/Pi-Bolt'
 

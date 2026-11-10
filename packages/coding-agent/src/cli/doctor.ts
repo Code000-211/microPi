@@ -32,8 +32,8 @@ import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../core/tr
 import { isHerdrPiIntegration } from "../extensions/herdr/integration-file.ts";
 import { herdrFromEnvironment } from "../extensions/herdr/transport.ts";
 import {
+	MICROPI_RELEASE_KEY,
 	PIBOLT,
-	PIBOLT_RELEASE_KEY,
 	PIBOLT_RELEASES_URL,
 	type PiBoltPackageManagerId,
 	piBoltInstallDir,
@@ -315,7 +315,7 @@ export function verifyReleaseSums(
 	signature: Buffer,
 	version: string,
 	archives: readonly string[],
-	key: string = PIBOLT_RELEASE_KEY,
+	key: string = MICROPI_RELEASE_KEY,
 ): SignatureResult {
 	let valid = false;
 	try {

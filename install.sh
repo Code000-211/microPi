@@ -37,7 +37,7 @@
 # The public key that releases are signed with (keys/release.pub in the repository; scripts/sign-release.sh), from 0.6.0. A
 # release from before has no signature: it is installed only with PIBOLT_UNVERIFIED.
 RELEASE_KEY="-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAoLboJqtKaoISPqffk03vHZr+1sRBG3uIRIWeKOew+aY=
+MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI=
 -----END PUBLIC KEY-----"
 
 ESC=$(printf '\033')

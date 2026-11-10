@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Signs a release: SHA256SUMS.sig is the Ed25519 signature of SHA256SUMS, and SHA256SUMS.sshsig the same key's signature in
 # OpenSSH's format. The installer checks one of them with the public key it carries (openssl pkeyutl -verify with OpenSSL 3,
-# ssh-keygen -Y verify where there is none, as on macOS), so a download is known to be Pi-Bolt's and not only intact. The key pair is made once, by a
+# ssh-keygen -Y verify where there is none, as on macOS), so a download is known to be µPi's and not only intact. The key pair is made once, by a
 # maintainer, with:
 #   openssl genpkey -algorithm ed25519 -out signing-key.pem && openssl pkey -in signing-key.pem -pubout -out keys/release.pub
 # The publish workflow signs with the same key, a secret of the release environment; this script signs a draft by hand, before

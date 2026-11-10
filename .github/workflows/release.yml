@@ -1,24 +1,22 @@
 name: release
 
-# A bolt-vX.Y.Z tag (pushed, or created by the tag workflow, which runs this one) builds the release on GitHub's runners: the
-# Linux x86-64 archives (x64, baseline, jit), the Linux ARM64 ones (arm64, jit), the macOS ones (arm64, jit) and the Windows ones
-# (x64, jit), each tested, then a
-# draft GitHub release with every archive, SHA256SUMS and RUNTIME_STAMP. Nothing is signed or published here:
-# with the repository variable AUTO_RELEASE set to true, the draft is handed to the publish workflow, which signs and publishes
-# it; otherwise publish is run by hand (docs/RELEASING.md).
+# An upi-vX.Y.Z tag (pushed) builds the release on GitHub's runners: the Linux x86-64 archives (x64, baseline, jit), the
+# Linux ARM64 ones (arm64, jit), the macOS ones (arm64, jit) and the Windows ones (x64, jit), each tested, then a draft
+# GitHub release with every archive, SHA256SUMS and RUNTIME_STAMP. Nothing is signed or published here: publish is run by
+# hand on the draft (docs/RELEASING.md).
 #
 # The runtime: when the engine (patches/, sources.json, the runtime build scripts) is the latest release's, its runtime archives
 # are used again. When it changed, the runtime workflow builds them from upi and attaches them to the tag's draft release
-# before this runs (gh workflow run runtime.yml -f tag=bolt-vX.Y.Z). Either way the prepare job checks each runtime's build
+# before this runs (gh workflow run runtime.yml -f tag=upi-vX.Y.Z). Either way the prepare job checks each runtime's build
 # provenance attestation and stops the release when one does not verify (docs/RELEASING.md, "Provenance"). Each build job
 # attests the archives it makes.
 on:
   push:
-    tags: ["bolt-v*"]
+    tags: ["upi-v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "The bolt-vX.Y.Z tag to build (it must exist)"
+        description: "The upi-vX.Y.Z tag to build (it must exist)"
         required: true
       dry_run:
         description: "Build and test only: no draft release (works for a tag already released)"
@@ -59,7 +57,7 @@ jobs:
     steps:
       - name: The tag
         run: |
-          printf '%s' "$TAG" | grep -Eq '^bolt-v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a release tag: $TAG"; exit 1; }
+          printf '%s' "$TAG" | grep -Eq '^upi-v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a release tag: $TAG"; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ env.TAG }}
@@ -67,7 +65,7 @@ jobs:
       - id: check
         run: |
           version=$(cat VERSION)
-          test "bolt-v$version" = "$TAG" || { echo "VERSION is $version, the tag is $TAG"; exit 1; }
+          test "upi-v$version" = "$TAG" || { echo "VERSION is $version, the tag is $TAG"; exit 1; }
           test "$(python3 -c 'import json; print(json.load(open("npm/package.json"))["version"])')" = "$version"
           grep -q "^VERSION=$version\$" npm/bin/upi
           pi=$(python3 -c 'import json; print(json.load(open("sources.json"))["pi"]["tag"][1:])')
@@ -84,7 +82,7 @@ jobs:
                --pattern SHA256SUMS --pattern SHA256SUMS.sig --pattern RUNTIME_STAMP 2>/dev/null &&
              openssl pkeyutl -verify -pubin -inkey keys/release.pub -rawin -in .work/previous/SHA256SUMS \
                -sigfile .work/previous/SHA256SUMS.sig >/dev/null &&
-             [ "$(head -n 1 .work/previous/SHA256SUMS)" = "# upi ${previous#bolt-v}" ] &&
+             [ "$(head -n 1 .work/previous/SHA256SUMS)" = "# upi ${previous#upi-v}" ] &&
              (cd .work/previous && grep ' RUNTIME_STAMP$' SHA256SUMS | sha256sum -c --strict --quiet -); then
             released=$(cat .work/previous/RUNTIME_STAMP)
             [ "$released" != "$stamp" ] || runtime_from=$previous
@@ -106,7 +104,11 @@ jobs:
               echo "upi-runtime-${platform#*:}: $sum" | tee -a "$GITHUB_STEP_SUMMARY"
             done
           else
-            echo "::error title=Runtime needed::The engine changed since $previous (runtime stamp ${released:-not signed}, now $stamp). Build the runtimes with the runtime workflow from upi (gh workflow run runtime.yml -R $GITHUB_REPOSITORY -f tag=$TAG), which attaches them to a draft release of $TAG, and run this workflow again."
+            if [ -z "$previous" ]; then
+              echo "::error title=Runtime needed::There is no previous µPi release to reuse a runtime from. Build the runtimes first: gh workflow run runtime.yml -R $GITHUB_REPOSITORY -f tag=$TAG (they are attached to a draft release of $TAG), then run this workflow again."
+            else
+              echo "::error title=Runtime needed::The engine changed since $previous (runtime stamp ${released:-not signed}, now $stamp). Build the runtimes with the runtime workflow from upi (gh workflow run runtime.yml -R $GITHUB_REPOSITORY -f tag=$TAG), which attaches them to a draft release of $TAG, and run this workflow again."
+            fi
             exit 1
           fi
           { echo "version=$version"; echo "stamp=$stamp"; echo "runtime_from=$runtime_from"; } >> "$GITHUB_OUTPUT"
@@ -115,8 +117,7 @@ jobs:
       # Where each runtime the build jobs will use was built, as its build provenance attestation says (docs/RELEASING.md,
       # "Provenance"). One uploaded to the draft must be attested by the runtime workflow run from upi. One of the previous
       # release is the copy that release's build jobs packaged (package-release.sh archives the runtime again), attested by its
-      # run of this workflow: from upi (where the tag workflow starts it) or from its tag. A runtime without such an
-      # attestation stops the release, unless its SHA-256 is in the list below.
+      # run of this workflow: from upi or from its tag. A runtime without such an attestation stops the release.
       - name: Runtime provenance
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,17 +125,6 @@ jobs:
           # (Set only when the runtimes are the draft's, as in the build jobs.)
           FROM_DRAFT: ${{ steps.check.outputs.runtime_sha_linux }}
         run: |
-          # The exception: runtimes released before attestations existed, accepted without one, each with a warning. Only what
-          # a release can reuse is listed: 1.0.1's runtimes, whose bun executables are 1.0.0's, byte for byte those the runtime
-          # workflow built in run 39963518293 (branch runtime/v1.0.0b, commit ca41028c). A release reusing them attests its
-          # own copies, so the list can go once such a release is out (or the engine changes). A runtime is added here only in
-          # a reviewed commit, with where it was built.
-          unattested='
-          9978b1d5128799c09fcf09f7802e31ac0117c5ac3de73e56bdbaafec8f0d2eb3  upi-runtime-linux-x64.tar.gz
-          c9cc01452b1ea5194a8d53767b506c32dc16ac505ad254dfa3acb7e365b1056b  upi-runtime-linux-arm64.tar.gz
-          270d802270477e46ba80ee676a9fe371772b0f4eed2aaf92f37a92a6c4b132ab  upi-runtime-darwin-arm64.tar.gz
-          baafcdd97d363f4addf3ade6a9fdae41baeb1a4e08f16b90ee40df091ee486e4  upi-runtime-win32-x64.zip
-          '
           if [ -n "$FROM_DRAFT" ]; then
             dir=.work/draft
             signers="runtime.yml@refs/heads/pi-bolt"
@@ -165,10 +155,6 @@ jobs:
             done
             if [ -n "$verified" ]; then
               echo "- $name \`$sum\`: attested by ${verified%%@*} from ${verified#*@}" | tee -a "$GITHUB_STEP_SUMMARY"
-            elif printf '%s\n' "$unattested" | grep -qxF "$sum  $name"; then
-              echo "::group::gh attestation verify $name"; cat "$RUNNER_TEMP/attestation.log"; echo "::endgroup::"
-              echo "::warning title=Runtime without attestation::$name ($sum) has no attestation. It is accepted because release.yml lists it as released before attestations existed."
-              echo "- $name \`$sum\`: no attestation, accepted as listed (released before attestations existed)" >> "$GITHUB_STEP_SUMMARY"
             else
               cat "$RUNNER_TEMP/attestation.log"
               echo "::error title=Runtime not attested::$name ($sum, from $RUNTIME_FROM) has no attestation by ${signers// / or }."
@@ -232,6 +218,16 @@ jobs:
       - name: Tools (macOS)
         if: runner.os == 'macOS'
         run: brew install bash tmux xz
+      # Rust for docsearch: the addon is compiled by whoever installs it (packages/docsearch/install.sh), so each Unix runner
+      # checks that this tag's Rust package builds with the Cargo it would use.
+      - name: Rust (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          command -v rustup >/dev/null || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path && echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"; }
+      - name: Rust (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          command -v rustup >/dev/null || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path && echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"; }
       - name: Runtime
         run: |
           # (By whether prepare hashed a draft's runtime, not by RUNTIME_FROM: a dry run of the latest release has it as its own.)
@@ -251,6 +247,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: Pi
         run: scripts/prepare-pi.sh
+      - name: Rust for docsearch
+        run: |
+          cd packages/docsearch
+          # (The addon builds wherever the release built Pi's Unix archives and kits.)
+          PATH="$HOME/.cargo/bin:$PATH" cargo build --release -p docsearch-core -p docsearch-node
       - name: Build and package
         run: scripts/package-release.sh
       - name: Tests on every build, as unpacked from its archive
@@ -358,7 +359,7 @@ jobs:
             & $openssl pkeyutl -verify -pubin -inkey keys\release.pub -rawin -in .work\rt\SHA256SUMS -sigfile .work\rt\SHA256SUMS.sig
             if ($LASTEXITCODE -ne 0) { Write-Host 'the runtime release''s signature does not verify'; exit 1 }
             $lines = Get-Content -LiteralPath .work\rt\SHA256SUMS
-            if ($lines[0] -ne "# upi $($env:RUNTIME_FROM -replace '^bolt-v', '')") { Write-Host "the checksums are not $env:RUNTIME_FROM's"; exit 1 }
+            if ($lines[0] -ne "# upi $($env:RUNTIME_FROM -replace '^upi-v', '')") { Write-Host "the checksums are not $env:RUNTIME_FROM's"; exit 1 }
             $sum = (Get-FileHash .work\rt\upi-runtime-win32-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($lines -notcontains "$sum  upi-runtime-win32-x64.zip") { Write-Host 'the runtime is not the one its release lists'; exit 1 }
           }
@@ -432,7 +433,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
-      actions: write # (To run the publish workflow.)
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       STAMP: ${{ needs.prepare.outputs.stamp }}
@@ -473,15 +473,6 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "µPi $VERSION" --notes-file "docs/releases/$VERSION.md" release/*
           fi
           sum=$(sha256sum release/SHA256SUMS | cut -c1-64)
-          if [ "$AUTO_RELEASE" = true ]; then
-            gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref pi-bolt -f tag="$TAG"
-            {
-              echo "### $TAG is a draft, handed to publish"
-              echo
-              echo "SHA256SUMS: \`$sum\`"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
           {
             echo "### $TAG is a draft, ready to sign"
             echo
@@ -498,4 +489,3 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           GH_TOKEN: ${{ github.token }}
-          AUTO_RELEASE: ${{ vars.AUTO_RELEASE }}

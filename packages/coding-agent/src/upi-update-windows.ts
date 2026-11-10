@@ -279,20 +279,10 @@ export async function updatePiBoltWindows(version: string, installDir: string, v
 	const expected = sumsEntry(sums, archive);
 	if (!expected)
 		throw new Error(`this release has no build for this installation (${archive} is not in its SHA256SUMS)`);
-	// From npm (its package of this build is a .tgz with the release's .zip in it), else from GitHub, as install.ps1 does.
-	let zip: Buffer | undefined;
-	let from = "npm";
-	const registry = (process.env.MICROPI_NPM_REGISTRY || "https://registry.npmjs.org").replace(/\/+$/, "");
-	const tgz = await download(`${registry}/@kushalkhemka/${name}/-/${name}-${version}.tgz`, "downloading");
-	const fromNpm = tgz ? tgzEntry(tgz, `package/${archive}`) : undefined;
-	if (fromNpm && sha256(fromNpm) === expected) zip = fromNpm;
-	if (!zip) {
-		console.log(chalk.dim("  not available from npm; downloading from GitHub instead"));
-		from = "GitHub";
-		zip = await download(`${base}/${archive}`, "downloading");
-		if (!zip) throw new Error(`download failed: ${base}/${archive}`);
-		if (sha256(zip) !== expected) throw new Error("checksum mismatch: the download is corrupt or incomplete");
-	}
+	// From GitHub, as install.ps1's default does.
+	const zip = await download(`${base}/${archive}`, "downloading");
+	if (!zip) throw new Error(`download failed: ${base}/${archive}`);
+	if (sha256(zip) !== expected) throw new Error("checksum mismatch: the download is corrupt or incomplete");
 	const tmp = mkdtempSync(join(tmpdir(), "upi-update-"));
 	try {
 		const zipFile = join(tmp, archive);
@@ -312,7 +302,7 @@ export async function updatePiBoltWindows(version: string, installDir: string, v
 		keepPrevious(dir, build, (text) => console.log(chalk.dim(`  ${text}`)));
 		installFiles(build, dir);
 		console.log(
-			`  ${chalk.green("ok")} install complete ${chalk.dim(`(win32-${variant}, ${(statSync(zipFile).size / 1048576).toFixed(1)} MB from ${from}, signature verified)`)}`,
+			`  ${chalk.green("ok")} install complete ${chalk.dim(`(win32-${variant}, ${(statSync(zipFile).size / 1048576).toFixed(1)} MB from GitHub, signature verified)`)}`,
 		);
 	} finally {
 		rmSync(tmp, { recursive: true, force: true });

@@ -269,7 +269,7 @@ jobs:
           echo "µPi on macOS Apple silicon (tests, the same as stock Pi): $RESULT"
           [ "$RESULT" = success ]
         env:
-          RESULT: ${{ needs.micropi-macos-part.result }}
+          RESULT: ${{ needs.upi-macos-part.result }}
 
   # Windows, as the release builds and tests it (release.yml) but once, without the determinism check: µPi's tests and
   # Windows' self-test on the build with the JIT off and on, the engine and the runtime tests.

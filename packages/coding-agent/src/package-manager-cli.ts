@@ -883,8 +883,8 @@ async function runPiBoltSelfUpdate(
 	// What is there now says which version it is: an update that left the old one in place is not reported as done.
 	const installed = piBoltExecutableIn(piBoltUpdateEnvironment(version).MICROPI_INSTALL ?? "");
 	const check = spawnProcessSync(installed, ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-	// ("1.0.3 (Pi-Bolt 0.8.1, win32-x64, JIT off)": with the comma, 0.8.10 is not taken for 0.8.1.)
-	if (check.status !== 0 || !check.stdout.includes(`Pi-Bolt ${version},`)) {
+	// ("0.1.3 (Pi 0.8.1, win32-x64, JIT off)": with the comma, 0.8.10 is not taken for 0.8.1.)
+	if (check.status !== 0 || !check.stdout.includes(`µPi ${version} (`)) {
 		console.error(chalk.red(`The installer finished, but ${installed} is not µPi ${version}.`));
 		console.error(chalk.red(`You can run the installer yourself: ${PIBOLT_INSTALL_COMMAND}`));
 		return false;
@@ -932,7 +932,7 @@ async function runPiBoltWindowsUpdate(
 	}
 	const installed = piBoltExecutableIn(installDir);
 	const check = spawnProcessSync(installed, ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-	if (check.status !== 0 || !check.stdout.includes(`Pi-Bolt ${version},`)) {
+	if (check.status !== 0 || !check.stdout.includes(`µPi ${version} (`)) {
 		console.error(chalk.red(`The update finished, but ${installed} is not µPi ${version}.`));
 		console.error(chalk.red(`You can run the installer yourself: ${PIBOLT_INSTALL_COMMAND}`));
 		return false;

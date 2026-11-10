@@ -1030,7 +1030,7 @@ offer_extensions() {
 	choice="${MICROPI_EXTENSIONS:-}"
 	case "$choice" in
 	"" | yes | no) ;;
-	*) printf '  %sPIBOLT_EXTENSIONS must be yes or no: no extensions installed%s\n' "$dim" "$reset"; return 0 ;;
+	*) printf '  %sMICROPI_EXTENSIONS must be yes or no: no extensions installed%s\n' "$dim" "$reset"; return 0 ;;
 	esac
 	if [ -z "$choice" ] && ! has_tty; then return 0; fi
 	[ "$choice" != no ] || return 0

@@ -63,7 +63,26 @@ the report. See [bench/harness](bench/harness).
 
 ## Install
 
-No releases yet: µPi is built from source. Needs git, Python 3 and Node.js 22.19 or later. Tested on Linux x86-64.
+One command in your shell. On Linux x86-64 or ARM64, and macOS on Apple silicon:
+
+```bash
+curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | sh
+```
+
+On Windows x64:
+
+```powershell
+powershell -c "irm https://github.com/Code000-211/microPi/releases/latest/download/install.ps1 | iex"
+```
+
+The installer downloads a release, checks every file against its signed `SHA256SUMS`, installs the executable to
+`~/.micropi` (Windows: `%USERPROFILE%\.micropi`) and links the `upi` command into `~/.local/bin` (Windows: your user
+`PATH`). Pin a version with `MICROPI_VERSION=upi-vX.Y.Z` (default: the latest release); reinstall, update or uninstall
+by running the installer again. Windows keeps only one variant on the `PATH`.
+
+## Build from source
+
+Needs git, Python 3, Node.js 22.19 or later and rsync; tested on Linux x86-64.
 
 ```bash
 git clone https://github.com/Code000-211/microPi.git && cd microPi
@@ -73,13 +92,19 @@ scripts/build-pi.sh --kit .work/kit  # -> out/upi/pi, and the kit for compiling 
 out/upi/pi --version
 ```
 
-While µPi has no release yet, `fetch-runtime.sh` takes the runtime from Pi-Bolt's latest release instead, checked with
-`keys/pibolt-release.pub`; `--from micropi | pibolt` picks a source, a `bolt-vX.Y.Z` version fetches from Pi-Bolt directly.
+`fetch-runtime.sh` takes the runtime from µPi's latest release, falling back to Pi-Bolt's latest release while there is
+none, checked with `keys/pibolt-release.pub`; `--from micropi | pibolt` picks a source, and a `bolt-vX.Y.Z` version
+fetches that release of Pi-Bolt directly. Details: [BUILDING.md](docs/BUILDING.md).
 
-The executable is called `upi`: µPi builds on [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt), which
-compiles Pi ahead of time into one native executable, and keeps `upi compile` for extensions. Do not run
-`upi update`: it installs Pi-Bolt's latest release over µPi.
-To replace an installed Pi-Bolt, put `out/upi` where the µPi installation is (on Linux x86-64
+## Pi and µPi side by side
+
+µPi builds on [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt), which compiles the Pi coding agent ahead of time into
+one native executable; µPi is its fork, tuned for fewer turns, and keeps `upi compile` for extensions (`build-pi.sh
+--kit`, [PLUGINS.md](docs/PLUGINS.md)). It installs next to a Pi-Bolt installation — `~/.micropi` and the `upi`
+command, not Pi-Bolt's own — and reads the same `~/.pi` settings, skills and extensions, so your Pi setup keeps working.
+When an extension is meant for µPi's own packages, it resolves them from `github:Code000-211/microPi`
+(or its install tree), so the same extension file works for both.
+To replace an installed Pi-Bolt with a build of your own, put `out/upi` where the µPi installation is (on Linux x86-64
 `~/.micropi/upi-linux-x64`; keep the old folder to go back), then compile your extensions in again:
 
 ```bash

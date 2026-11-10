@@ -217,14 +217,20 @@ jobs:
         run: scripts/check-macos-floor.sh out/upi out/upi-jit
       - name: µPi's tests
         if: steps.runtime.outputs.available == 'true'
+        env:
+          TESTS_LOG: tests.log
         run: |
-          tests/pi/run.sh "$PWD/out/upi/pi"
-          tests/pi/run.sh "$PWD/out/upi-jit/pi"
+          rc=0
+          tests/pi/run.sh "$PWD/out/upi/pi" 2>&1 | tee "$TESTS_LOG"; [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+          tests/pi/run.sh "$PWD/out/upi-jit/pi" 2>&1 | tee -a "$TESTS_LOG"; [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+          if [ "$rc" -ne 0 ]; then cat "$TESTS_LOG" >> "$GITHUB_STEP_SUMMARY"; fi
           # Linux ARM64: also as Termux installs it, in an imitation of Android (the runner is thrown away after: it writes /data).
           if [ "$(uname -s)-$(uname -m)" = Linux-aarch64 ]; then
             sudo apt-get install -y -qq busybox-static >/dev/null
-            sudo env PATH="$PATH" PIBOLT_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/out/upi"
+            sudo env PATH="$PATH" PIBOLT_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/out/upi" 2>&1 | tee -a "$TESTS_LOG"; [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+            if [ "$rc" -ne 0 ]; then cat "$TESTS_LOG" >> "$GITHUB_STEP_SUMMARY"; fi
           fi
+          exit $rc
       - name: Engine tests
         if: steps.runtime.outputs.available == 'true'
         run: tests/aot/run.sh
@@ -377,16 +383,19 @@ jobs:
           if ($version -notmatch "\u00B5Pi $([regex]::Escape((Get-Content VERSION).Trim()))") { Write-Host 'not this version'; exit 1 }
       - name: µPi's tests
         if: steps.latest.outputs.available == 'true'
+        env:
+          TESTS_LOG: tests.log
         run: |
-          $failed = 0
+          $rc = 0
           foreach ($build in 'upi', 'upi-jit') {
             $exe = (Resolve-Path "out\$build\pi.exe").Path
-            & tests\pi\run.ps1 $exe
-            if ($LASTEXITCODE -ne 0) { $failed = 1 }
-            & scripts\windows-selftest.ps1 -Pi $exe
-            if ($LASTEXITCODE -ne 0) { $failed = 1 }
+            & tests\pi\run.ps1 $exe | Tee-Object -FilePath $env:TESTS_LOG -Append
+            if ($LASTEXITCODE -ne 0) { $rc = 1 }
+            & scripts\windows-selftest.ps1 -Pi $exe | Tee-Object -FilePath $env:TESTS_LOG -Append
+            if ($LASTEXITCODE -ne 0) { $rc = 1 }
           }
-          exit $failed
+          if ($rc -ne 0) { Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value (Get-Content -LiteralPath $env:TESTS_LOG -Raw) }
+          exit $rc
       - name: Update finds the latest release
         # (µPi's own release only: while the runtime comes from Pi-Bolt's (there is no µPi release), upi update has no
         # release of µPi to find.)

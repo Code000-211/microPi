@@ -92,10 +92,11 @@ export function piBoltInstallerProcess(installerFile?: string): { command: strin
 	};
 }
 /**
- * This µPi's releases (upi-vX.Y.Z, made by release.yml): updating to one replaces µPi in place. False while there is no
- * release yet: then the update notice stays off and `upi update --self` says to update from source instead.
+ * This µPi's releases (upi-vX.Y.Z, made by release.yml): updating to one replaces µPi in place. Set to true when the first
+ * one is published (releases/latest redirects to a tag). A build that has it false has no release to take: the update notice
+ * stays off and `upi update --self` says to update from source instead.
  */
-export const MICROPI_HAS_RELEASES = false; // Set to true when the first release is published (releases/latest redirects to a tag).
+export const MICROPI_HAS_RELEASES = true;
 export const MICROPI_RELEASES_URL = "https://github.com/Code000-211/microPi/releases";
 /** The key releases' SHA256SUMS are signed with (keys/release.pub; the installers carry it too). */
 export const MICROPI_RELEASE_KEY = `-----BEGIN PUBLIC KEY-----

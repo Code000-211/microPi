@@ -1,6 +1,7 @@
 #!/bin/sh
-# Builds the addon and installs the extension to ~/.pi/agent/extensions/docsearch.
-# Afterwards: upi compile --only klar-ui,docsearch   (compiles it into the executable)
+# Builds the addon and installs the extension to ~/.pi/agent/extensions/docsearch. For development: a release has
+# project_search compiled in already (build-pi.sh --builtins), and an installed copy would merely replace it here.
+# Afterwards: upi compile   (compiles what is installed here into the executable)
 set -e
 cd "$(dirname "$0")"
 case "$(uname -s)" in

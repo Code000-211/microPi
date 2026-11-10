@@ -163,4 +163,9 @@ bedrock "Bedrock loads behind a proxy (the proxy refuses)" AWS_ENDPOINT_URL_BEDR
 
 # µPi's grep and find tools, in-process: on by default, and not with FFF loaded.
 python3 search-tools.py "$PI" || status=1
+# The built-in docsearch (build-pi.sh --builtins), when the build has it: project_search is offered with nothing installed,
+# and works (`upi compile`'s build is covered by tests/pi/compile.py, which runs this file's checks on it too).
+if grep -q '^built-in: docsearch' "$(cd "$(dirname "$PI")" && pwd -P)/upi.txt" 2>/dev/null; then
+	python3 docsearch.py "$PI" || status=1
+fi
 exit $status

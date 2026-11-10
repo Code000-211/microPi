@@ -247,6 +247,8 @@ export default function (pi: ExtensionAPI) {
 	// PI_DOCSEARCH=off leaves the extension out entirely (no tool, no recall), to measure without it.
 	if (process.env.PI_DOCSEARCH === "off" || !DocIndex) return;
 	let index: any;
+	/** The interval that watches the first build (session_shutdown stops it): a tick on a dead session's ctx throws. */
+	let poll: ReturnType<typeof setInterval> | undefined;
 	/** The current index's first build is there: searches need not wait for it. */
 	let ready = false;
 	let base = "";
@@ -285,12 +287,14 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("docsearch", undefined);
 			return;
 		}
-		// The build runs on a thread; show the count once it is there.
+		// The build runs on a thread; show the count once it is there. In a `-p` run the session can end before the build
+		// does, and the ctx is stale after it: the poll stops on session_shutdown.
 		let tries = 0;
-		const poll = setInterval(() => {
+		poll = setInterval(() => {
 			const s = index?.stats();
 			if (!s || s.ready || ++tries > 100) {
 				clearInterval(poll);
+				poll = undefined;
 				ctx.ui.setStatus("docsearch", s?.ready ? `index ${s.files}` : undefined);
 			}
 		}, 100);
@@ -348,6 +352,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => start(ctx));
 	pi.on("session_shutdown", async () => {
+		if (poll) clearInterval(poll);
+		poll = undefined;
 		index = undefined;
 	});
 

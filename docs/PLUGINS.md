@@ -91,6 +91,11 @@ upi compile --off                       # the release's executable again
 applied, as `upi list` shows them, npm packages, git checkouts and local folders alike (`--no-packages` leaves those out).
 It needs no checkout of this repository and no tools.
 
+**The release's built-ins.** A µPi release has docsearch (project_search) compiled in, as a named built-in extension
+(`-builtin:docsearch` turns it off, an installed copy with the same tools replaces it). A compile keeps it: the compile
+kit carries the built-in along, and the build your extensions go into has it besides them. `upi compile --status` shows
+it (`built-in: docsearch`).
+
 **Network.** The first compile of a version downloads that release's runtime and compile kit (37 MB on macOS, 51-52 MB on Linux)
 from GitHub, checks them against the release's signed `SHA256SUMS` as the installer does, and keeps them in `~/.micropi/cache`
 with the `SHA256SUMS` and its signature. Later compiles of that version, `--out` ones included, check the cached files against

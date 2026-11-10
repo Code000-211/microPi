@@ -50,9 +50,12 @@ embeddings (docs Hit@10 88% → 97%, but ~22 ms per search on the CPU).
 
 Needs Rust (stable) and µPi's `upi compile`.
 
+A release has project_search compiled in already: `upi compile` (with or without other extensions) keeps it, the
+kit carrying the built-in along. To develop the extension itself, `install.sh` installs it into the agent directory:
+
 ```sh
 packages/docsearch/install.sh                 # builds the addon, copies it and the extension to ~/.pi/agent/extensions/docsearch
-upi compile --only klar-ui,docsearch      # compiles it into the executable (list the extensions you compile in)
+upi compile                               # compiles what is installed here into the executable (the installed copy replaces the release's built-in)
 ```
 
 `install.sh` builds for the platform it runs on (Linux, macOS, Windows in Git Bash; x64 or arm64), copies the addon as
@@ -60,7 +63,7 @@ upi compile --only klar-ui,docsearch      # compiles it into the executable (lis
 compiles for Windows (`cargo check --target x86_64-pc-windows-gnu`), but the addon has not been built or run there. On
 Windows an index file mapped by another process cannot be replaced, so a process whose save fails keeps its build in
 memory. `install.sh` honours `PI_CODING_AGENT_DIR`. The addon is loaded by a literal `require`, so `upi compile` embeds
-it in the executable. `PI_DOCSEARCH=off` leaves the extension out of a run (no tool, no recall), to measure without it.
+it in the executable; `-builtin:docsearch` in the `extensions` setting turns the release's built-in off. `PI_DOCSEARCH=off` leaves the extension out of a run (no tool, no recall), to measure without it.
 
 ## Settings
 

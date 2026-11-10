@@ -224,6 +224,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq tmux xz-utils
+          # Rust (cargo), for the docsearch addon the release compiles into the executable (scripts/build-docsearch.mjs).
+          command -v cargo >/dev/null || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path && echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"; }
           # The x64 build's code uses what the building CPU has (AVX2, LZCNT, BMI1: what JSC's x86 back end can use). (The arm64
           # build's is for any ARMv8.0 CPU.)
           if [ "$(uname -m)" = x86_64 ]; then
@@ -231,7 +233,10 @@ jobs:
           fi
       - name: Tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install bash tmux xz
+        run: |
+          brew install bash tmux xz
+          # Rust (cargo), for the docsearch addon the release compiles into the executable (scripts/build-docsearch.mjs).
+          command -v cargo >/dev/null || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path && echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"; }
       - name: Runtime
         run: |
           # (By whether prepare hashed a draft's runtime, not by RUNTIME_FROM: a dry run of the latest release has it as its own.)
@@ -343,6 +348,12 @@ jobs:
             Add-Content -Encoding utf8 $env:GITHUB_PATH $shim
           }
           python --version
+          # Rust (cargo), for the docsearch addon the release compiles into the executable (scripts/build-docsearch.mjs).
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe -OutFile "$env:RUNNER_TEMP\rustup-init.exe"
+            & "$env:RUNNER_TEMP\rustup-init.exe" -y --profile minimal --no-modify-path
+            Add-Content -Encoding utf8 $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
+          }
       - name: Runtime
         run: |
           New-Item -ItemType Directory -Force .work\rt, .work\runtime | Out-Null

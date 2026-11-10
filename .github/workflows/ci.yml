@@ -426,7 +426,7 @@ jobs:
         id: latest
         shell: bash
         run: |
-          if curl -fsIL -o /dev/null "${GITHUB_REPOSITORY}/releases/latest/download/SHA256SUMS"; then
+          if curl -fsIL -o /dev/null "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/SHA256SUMS"; then
             echo "available=true" >>"$GITHUB_OUTPUT"
           else
             echo "::notice title=No latest release::The installers' checks need the latest release (its files); they are skipped while there is none."

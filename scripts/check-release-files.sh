@@ -4,7 +4,7 @@
 #   another version);
 # - every other line is a file in DIR with that checksum, and they are exactly the files scripts/release-files.txt names, no more
 #   and none missing (RUNTIME_STAMP among them, so that the runtime a later release reuses is the signed one; install.sh and
-#   install.ps1 too, which `upi update` runs only once they match the signed SHA256SUMS).
+#   install.ps1 too, which `upi update` runs only once they match the signed SHA256SUMS);
 # Usage: scripts/check-release-files.sh DIR VERSION
 set -euo pipefail
 manifest="$(cd "$(dirname "$0")" && pwd)/release-files.txt"

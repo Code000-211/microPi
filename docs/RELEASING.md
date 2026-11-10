@@ -6,7 +6,7 @@ Six workflows, all on GitHub's own runners (Ubuntu 24.04 x86-64 and ARM64, Windo
 |---|---|---|
 | `ci` | every push to `upi`, every pull request | lint and types (the workflows too, with actionlint), Pi's tests, µPi built and tested on Linux x86-64, Linux ARM64, macOS (Apple silicon: its tests and its comparison with stock Pi side by side) and Windows x64, the installer's checks, whether the engine patches apply. A pull request that changes only documentation builds and tests nothing |
 | `tag` | `ci` passed on a push to `upi` | when `VERSION` has no `bolt-vX.Y.Z` tag yet, tags that commit and runs `release` |
-| `release` | a `bolt-vX.Y.Z` tag | checks the runtimes' attestations, builds the 20 archives on Linux (x86-64 and ARM64), macOS and Windows, tests each as unpacked from its archive, attests each, makes a **draft** release with `SHA256SUMS`, `extensions.txt` and `RUNTIME_STAMP`, and runs `publish` |
+| `release` | a `bolt-vX.Y.Z` tag | checks the runtimes' attestations, builds the 20 archives on Linux (x86-64 and ARM64), macOS and Windows, tests each as unpacked from its archive, attests each, makes a **draft** release with `SHA256SUMS` and `RUNTIME_STAMP`, and runs `publish` |
 | `publish` | after `release`, or by hand | signs `SHA256SUMS`, checks the signature and the checksums, publishes the release, puts `install.sh`, `install.ps1` and the site on `gh-pages`, publishes npm, and updates the Homebrew formula |
 | `runtime` | by hand, when the engine changed | builds the four runtimes, each on its platform's runner, attests them, and attaches them to the tag's draft ([below](#when-the-engine-changed)) |
 | `upstream` | daily | opens an issue when Pi has a new release, with the files where merging it conflicts |
@@ -81,22 +81,17 @@ the engine or the build. On Windows, the same for older CPUs is Intel SDE (`-snb
 - The compile kits `upi-kit-linux-x64.tar.gz`, `upi-kit-linux-arm64.tar.gz` and `upi-kit-darwin-arm64.tar.gz`: the
   files of Pi each platform's default build read, its compile command and the training profile (`scripts/make-kit.mjs`, made
   by `scripts/build-pi.sh --kit` in `package-release.sh`). `upi compile` builds with them and the runtimes.
-- `extensions.txt`: the optional extensions the installers offer (OpenSec's `opensec-pi-subagents`, `opensec-pi-todo` and `opensec-pi-fff`), each
-  with its version and npm integrity. The installers install those versions and only if the registry's tarball has that
-  integrity; a release without the file pins none, and they offer nothing. Update it in the repository when either has a new
-  release.
 - `RUNTIME_STAMP`: what engine the runtimes were built from (below).
 - `install.sh` and `install.ps1`, as they are in the tagged commit. `upi update` runs the release's own installer, and only
   once `SHA256SUMS` verifies with the release key built into the executable and lists the installer's checksum. A release up to
   1.0.1 does not list its installers: updating to one runs the installer the site serves, with a notice.
-- `SHA256SUMS`: its first line is `# upi X.Y.Z`, then one line for each archive, `extensions.txt`, `RUNTIME_STAMP`,
+- `SHA256SUMS`: its first line is `# upi X.Y.Z`, then one line for each archive, `RUNTIME_STAMP`,
   `install.sh` and `install.ps1`.
   `install.ps1` and the npm package's Windows install refuse checksums whose first line is not their version: an older release,
   signed all the same, served as a newer one.
 - `SHA256SUMS.sig` ([Signing](#signing)).
 
-`scripts/release-files.txt` names the files of a release. `release` and `publish` check that `SHA256SUMS` lists exactly those,
-each as it is, and that `extensions.txt` pins at least one extension and has no line the installers could not read
+`scripts/release-files.txt` names the files of a release. `release` and `publish` check that `SHA256SUMS` lists exactly those, each as it is
 (`scripts/check-release-files.sh`). A new platform or variant is added to that list.
 
 ## When the engine changed

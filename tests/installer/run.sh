@@ -44,6 +44,9 @@ else
 	done
 fi
 cp -R "$WORK/good" "$WORK/nosig" && rm "$WORK/nosig/SHA256SUMS.sig"
+# (A signed release is one from 0.6.0 on: its checksums are from that version, so that a missing signature is refused, not
+# taken for a release from before releases were signed.)
+{ echo "# upi 0.6.1"; tail -n +2 "$WORK/good/SHA256SUMS"; } >"$WORK/nosig/SHA256SUMS"
 cp -R "$WORK/good" "$WORK/htmlsig" && printf '<!DOCTYPE html><html><body>Not Found</body></html>\n' >"$WORK/htmlsig/SHA256SUMS.sig"
 # (As a release from before 0.6.0: no signature, and checksums that say that version.)
 cp -R "$WORK/nosig" "$WORK/unsigned" && { echo "# upi 0.5.99"; tail -n +2 "$WORK/good/SHA256SUMS"; } >"$WORK/unsigned/SHA256SUMS"
@@ -84,7 +87,7 @@ out=$(install good)
 if installed && grep -q "signature verified" <<<"$out"; then pass "the release installs, signature verified"; else
 	fail "the release installs, signature verified"; printf '%s\n' "$out"; fi
 
-out=$(install nosig)
+out=$(install nosig MICROPI_VERSION=upi-v0.6.1)
 if ! installed && grep -q "could not download the release's signature" <<<"$out"; then pass "no signature: not installed"; else
 	fail "no signature: not installed"; printf '%s\n' "$out"; fi
 

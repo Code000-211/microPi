@@ -102,9 +102,8 @@ log "upi-runtime-$PIBOLT_PLATFORM.tar.gz (Bun $("$runtime" --version))"
 "${TAR[@]}" -C "$STAGE" -czf "$DIST/upi-runtime-$PIBOLT_PLATFORM.tar.gz" "upi-runtime-$PIBOLT_PLATFORM"
 [ -z "$RUNTIME_ONLY" ] || exit 0
 
-# The extensions the installers offer, pinned; and checksums whose first line says which release they are (install.ps1 refuses
+# Checksums whose first line says which release they are (install.ps1 refuses
 # another version's: an older release, signed all the same, served as a newer one).
-cp "$PIBOLT_ROOT/extensions.txt" "$DIST/extensions.txt"
-(cd "$DIST" && { echo "# upi $VERSION"; sha256 -- *.tar.gz *.tar.xz extensions.txt; } >SHA256SUMS)
+(cd "$DIST" && { echo "# upi $VERSION"; sha256 -- *.tar.gz *.tar.xz; } >SHA256SUMS)
 log "release $VERSION in $DIST:"
 (cd "$DIST" && ls -lh -- * | awk '{print "    " $5 "  " $9}')

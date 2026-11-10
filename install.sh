@@ -545,7 +545,7 @@ fetch_signature() {
 }
 
 # The release key in OpenSSH's form, for SHA256SUMS.sshsig (node scripts/lib/sshsig.mjs pubkey keys/release.pub).
-RELEASE_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKC26CarSmqCEj6n35NN7x2a/tbEQRt7iESFnijnsPmm"
+RELEASE_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO71pQ9OWueQ/BuY8484EOSe2QzXr+64X9CKDT/LsJoy"
 
 # Whether ssh-keygen can verify signatures (-Y, OpenSSH 8.1 and later).
 ssh_keygen_verifies() {

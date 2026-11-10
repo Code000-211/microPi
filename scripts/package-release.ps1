@@ -37,7 +37,7 @@ $Pi = (Resolve-Path $Pi).Path
 $Out = Join-Path $Root 'out\upi'
 $OutJit = Join-Path $Root 'out\upi-jit'
 if (-not $NoBuild -and -not $RuntimeOnly) {
-	# With -WithOpenSec, OpenSec's extensions compiled in (plugins\opensec: the versions extensions.txt pins, by their lockfile's
+	# With -WithOpenSec, OpenSec's extensions compiled in (plugins\opensec, by their lockfile's
 	# integrity).
 	$withPlugins = @{}
 	if ($WithOpenSec) {
@@ -131,13 +131,10 @@ try {
 }
 if ($RuntimeOnly) { exit 0 }
 
-# The extensions the installers offer, pinned (extensions.txt), with LF line ends as everywhere else.
-[IO.File]::WriteAllText((Join-Path $Dist 'extensions.txt'), ((Get-Content (Join-Path $Root 'extensions.txt')) -join "`n") + "`n")
-
 # sha256sum's format (two spaces, then the name), with LF line ends, after a first line that says which release it is (the
 # installers refuse checksums of another version: an older release, signed all the same, served as a newer one). The release's
 # SHA256SUMS is made over every platform's archives together, and signed on the owner's machine (docs/RELEASING.md).
-$lines = @("# upi $Version") + (Get-ChildItem $Dist -File | Where-Object { $_.Name -like '*.zip' -or $_.Name -eq 'extensions.txt' } | Sort-Object Name | ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant())  $($_.Name)" })
+$lines = @("# upi $Version") + (Get-ChildItem $Dist -File | Where-Object { $_.Name -like '*.zip' } | Sort-Object Name | ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant())  $($_.Name)" })
 [IO.File]::WriteAllText((Join-Path $Dist 'SHA256SUMS'), (($lines -join "`n") + "`n"))
 Log "release $Version (Windows) in ${Dist}:"
 Get-ChildItem $Dist | ForEach-Object { '    {0,8:N1} MB  {1}' -f ($_.Length / 1MB), $_.Name }

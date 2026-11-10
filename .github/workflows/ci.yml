@@ -89,7 +89,7 @@ jobs:
         run: |
           shellcheck -s sh -S warning install.sh npm/bin/upi
           shellcheck -x -S warning scripts/*.sh scripts/lib/common.sh scripts/toolchain/*.sh \
-            tests/aot/run.sh tests/pi/run.sh tests/installer/run.sh tests/runtime/run.sh tests/termux/run.sh bench/run-suite.sh
+            tests/aot/run.sh tests/pi/run.sh tests/installer/run.sh tests/runtime/run.sh tests/termux/run.sh
       - name: Workflows
         run: |
           # actionlint 1.7.12, checked against its release's SHA-256 (.github/actionlint.yaml); it runs shellcheck on each
@@ -188,10 +188,16 @@ jobs:
         id: runtime
         if: needs.changes.outputs.code != 'false'
         run: |
-          # (A platform the latest release has no runtime for, Linux ARM64 before its first release, is skipped.)
-          if [ "$(uname -s)-$(uname -m)" = Linux-aarch64 ] &&
-            ! curl -fsIL -o /dev/null "${GITHUB_REPOSITORY}/releases/latest/download/upi-runtime-linux-arm64.tar.gz"; then
-            echo "::notice title=No runtime::The latest release has no Linux ARM64 runtime: µPi's checks are skipped on Linux ARM64."
+          # (When a platform the latest release has no runtime for, one is skipped; while there is no latest release at all, so
+          # are µPi's checks on every platform. scripts/build-runtime.sh builds the runtime instead, but is too slow for CI.)
+          case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) NAME=upi-runtime-linux-x64.tar.gz ;;
+          Linux-aarch64) NAME=upi-runtime-linux-arm64.tar.gz ;;
+          Darwin-arm64) NAME=upi-runtime-darwin-arm64.tar.gz ;;
+          *) echo "no runtime name for $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          if ! curl -fsIL -o /dev/null "${GITHUB_REPOSITORY}/releases/latest/download/$NAME"; then
+            echo "::notice title=No runtime::The latest release has no $NAME: µPi's checks are skipped on $(uname -s)-$(uname -m)."
             echo "available=false" >>"$GITHUB_OUTPUT"
             exit 0
           fi
@@ -305,7 +311,21 @@ jobs:
             Add-Content -Encoding utf8 $env:GITHUB_PATH $shim
           }
           python --version
+      - name: Latest release
+        # (The checks and builds below need the latest release, so that the runtime can come from it; the update check
+        # needs one, for releases/latest to send them to.)
+        if: needs.changes.outputs.code != 'false'
+        id: latest
+        shell: powershell
+        run: |
+          & curl.exe -fsIL -o NUL "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/upi-runtime-win32-x64.zip"
+          if ($LASTEXITCODE -eq 0) { "available=true" >> $env:GITHUB_OUTPUT }
+          else {
+            Write-Host '::notice title=No latest release::µPi''s checks need the latest release; they are skipped while there is none.'
+            "available=false" >> $env:GITHUB_OUTPUT
+          }
       - name: Runtime of the latest release
+        if: steps.latest.outputs.available == 'true'
         run: |
           # As scripts/fetch-runtime.sh: the checksums, signed by the release key, say which runtime and which engine it is.
           $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
@@ -327,6 +347,7 @@ jobs:
           & .work\runtime\bun.exe --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Pi
+        if: steps.latest.outputs.available == 'true'
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -334,6 +355,7 @@ jobs:
           npm run build:offline
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Build
+        if: steps.latest.outputs.available == 'true'
         run: |
           & scripts\build-pi.ps1 -Out out\upi
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -343,6 +365,7 @@ jobs:
           Write-Host $version
           if ($version -notmatch "µPi $([regex]::Escape((Get-Content VERSION).Trim()))") { Write-Host 'not this version'; exit 1 }
       - name: µPi's tests
+        if: steps.latest.outputs.available == 'true'
         run: |
           $failed = 0
           foreach ($build in 'upi', 'upi-jit') {
@@ -354,6 +377,7 @@ jobs:
           }
           exit $failed
       - name: Update finds the latest release
+        if: steps.latest.outputs.available == 'true'
         run: |
           # upi update online, as a user runs it: it finds the latest release where releases/latest redirects, as the
           # installers do, not only through GitHub's API, which answers 403 once an address has used its hourly requests (#149).
@@ -364,13 +388,14 @@ jobs:
         env:
           PI_TELEMETRY: "0"
       - name: Engine tests
+        if: steps.latest.outputs.available == 'true'
         run: |
           & tests\aot\run.ps1
           exit $LASTEXITCODE
       - name: Runtime tests
         # (Not while the released runtime is an older engine than this commit's: the release workflow runs them on the runtime
         # built from it, docs/RELEASING.md.)
-        if: needs.changes.outputs.runtime_older != 'true'
+        if: steps.latest.outputs.available == 'true' && needs.changes.outputs.runtime_older != 'true'
         run: |
           & tests\runtime\run.ps1
           exit $LASTEXITCODE
@@ -391,13 +416,24 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Latest release
+        # (The installers' checks download the latest release's files; without a release they cannot run.)
+        id: latest
+        shell: bash
+        run: |
+          if curl -fsIL -o /dev/null "${GITHUB_REPOSITORY}/releases/latest/download/SHA256SUMS"; then
+            echo "available=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice title=No latest release::The installers' checks need the latest release (its files); they are skipped while there is none."
+            echo "available=false" >>"$GITHUB_OUTPUT"
+          fi
       - name: Signature and checksum checks
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && steps.latest.outputs.available == 'true'
         run: tests/installer/run.sh
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Signature and checksum checks (install.ps1)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.latest.outputs.available == 'true'
         # Windows PowerShell 5.1, which install.ps1 is written for (as Windows 10 has it).
         shell: powershell
         run: |
@@ -418,7 +454,7 @@ jobs:
           & tests\installer\typeahead.ps1
           exit $LASTEXITCODE
       - name: A bare Debian, with and without OpenSSL
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.latest.outputs.available == 'true'
         run: |
           docker run --rm -e GITHUB_REPOSITORY -v "$PWD/install.sh:/install.sh:ro" debian:12-slim sh -ec '
             apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null

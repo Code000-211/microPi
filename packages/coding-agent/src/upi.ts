@@ -311,7 +311,7 @@ const PIBOLT_UPDATE_PASSED_ON = new Set([
 
 /**
  * The environment that makes the installer replace this installation with release `version`, keeping its variant and place.
- * The version is the one the update was decided on (not "latest" again). Of the installers' own variables (PIBOLT_*), only
+ * The version is the one the update was decided on (not "latest" again). Of the installers' own variables (MICROPI_*), only
  * those above are passed on: none that changes where the release comes from (a mirror, the source), whether its signature is
  * checked (MICROPI_UNVERIFIED, MICROPI_ALLOW_UNSIGNED), or what the installer does (the npm launcher's mode, functions only), and
  * none an installer may read in the future. PATH is left as the user set it: the installer would otherwise add this folder

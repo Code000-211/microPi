@@ -401,7 +401,9 @@ jobs:
             $exe = (Resolve-Path (Join-Path $dir 'upi.exe')).Path
             $version = (& $exe --version | Out-String)
             Write-Host $version
-            if ($version -notmatch "µPi $([regex]::Escape($env:VERSION))") { Write-Host "$exe is not µPi $env:VERSION"; $failed = 1 }
+            # (µ as an escape, and the console's code page first: PowerShell 5.1 reads these scripts as ANSI, not UTF-8.)
+            [Console]::OutputEncoding = [Text.Encoding]::UTF8
+            if ($version -notmatch "\u00B5Pi $([regex]::Escape($env:VERSION))") { Write-Host "$exe is not µPi $env:VERSION"; $failed = 1 }
             & tests\pi\run.ps1 $exe
             if ($LASTEXITCODE -ne 0) { $failed = 1 }
             & scripts\windows-selftest.ps1 -Pi $exe

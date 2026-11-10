@@ -363,7 +363,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $version = (& out\upi\pi.exe --version | Out-String)
           Write-Host $version
-          if ($version -notmatch "µPi $([regex]::Escape((Get-Content VERSION).Trim()))") { Write-Host 'not this version'; exit 1 }
+          # (The pattern writes the micro sign as an escape: GitHub gives this step's script to Windows PowerShell 5.1 as UTF-8
+          # without a BOM, which it reads as ANSI, and a literal µ there would not match the output. The console's code page is
+          # set first, so the executable's UTF-8 output is decoded as it is.)
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          if ($version -notmatch "\u00B5Pi $([regex]::Escape((Get-Content VERSION).Trim()))") { Write-Host 'not this version'; exit 1 }
       - name: µPi's tests
         if: steps.latest.outputs.available == 'true'
         run: |

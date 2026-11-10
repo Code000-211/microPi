@@ -90,10 +90,10 @@ export function piBoltInstallerProcess(installerFile?: string): { command: strin
 	};
 }
 /**
- * µPi has no releases of its own. The releases below are Pi-Bolt's: updating to one would replace µPi, so neither the
- * update notice nor `upi update` (the program itself) uses them while this is false.
+ * This µPi's releases (bolt-vX.Y.Z, made by release.yml): updating to one replaces µPi in place. False while there is no
+ * release yet: then the update notice stays off and `upi update --self` says to update from source instead.
  */
-export const MICROPI_HAS_RELEASES = false;
+export const MICROPI_HAS_RELEASES = true;
 export const MICROPI_RELEASES_URL = "https://github.com/Code000-211/microPi/releases";
 /** The key releases' SHA256SUMS are signed with (keys/release.pub; the installers carry it too). */
 export const MICROPI_RELEASE_KEY = `-----BEGIN PUBLIC KEY-----

@@ -25,6 +25,10 @@ scripts/build-pi.sh          # -> out/upi/pi
 out/upi/pi --version
 ```
 
+`scripts/install-from-source.sh` runs these steps and installs the build as the `upi` command where install.sh puts a
+release (`MICROPI_INSTALL`, default `~/.micropi`, with `MICROPI_BIN_DIR`, default `~/.local/bin`, linked); it hands other
+arguments to `build-pi.sh` (`--jit on`, `--cpu baseline`, ...). Its `--kit` is `.work/kit`, for `upi compile` afterwards.
+
 Apart from downloading the runtime and npm packages, the build is offline: Pi's model catalog
 (`packages/ai/src/providers/data`) is in the repository. `scripts/prepare-pi.sh --refresh-models` fetches it again from the
 model providers; every provider has to answer, so it is for updating the catalog (commit what changes), not for building.

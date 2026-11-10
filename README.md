@@ -94,7 +94,9 @@ out/upi/pi --version
 
 `fetch-runtime.sh` takes the runtime from µPi's latest release, falling back to Pi-Bolt's latest release while there is
 none, checked with `keys/pibolt-release.pub`; `--from micropi | pibolt` picks a source, and a `bolt-vX.Y.Z` version
-fetches that release of Pi-Bolt directly. Details: [BUILDING.md](docs/BUILDING.md).
+fetches that release of Pi-Bolt directly. `install-from-source.sh` installs the build as the `upi` command where
+install.sh puts a release (`~/.micropi`, the command linked into `~/.local/bin`, the replaced build kept as
+`upi-<platform>-<variant>.previous`). Details: [BUILDING.md](docs/BUILDING.md).
 
 ## Pi and µPi side by side
 

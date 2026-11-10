@@ -43,7 +43,7 @@ jobs:
             --pattern SHA256SUMS --pattern SHA256SUMS.sig --pattern RUNTIME_STAMP
           # The release's stamp counts only as its signed checksums give it, as in the release workflow.
           openssl pkeyutl -verify -pubin -inkey keys/release.pub -rawin -in .work/latest/SHA256SUMS -sigfile .work/latest/SHA256SUMS.sig
-          [ "$(head -n 1 .work/latest/SHA256SUMS)" = "# upi ${latest#bolt-v}" ] || { echo "the checksums are not $latest's"; exit 1; }
+          [ "$(head -n 1 .work/latest/SHA256SUMS)" = "# upi ${latest#upi-v}" ] || { echo "the checksums are not $latest's"; exit 1; }
           (cd .work/latest && grep ' RUNTIME_STAMP$' SHA256SUMS | sha256sum -c --strict --quiet -)
           released=$(cat .work/latest/RUNTIME_STAMP)
           if [ "$released" != "$stamp" ]; then
@@ -98,7 +98,7 @@ jobs:
           & $openssl pkeyutl -verify -pubin -inkey keys\release.pub -rawin -in .work\rt\SHA256SUMS -sigfile .work\rt\SHA256SUMS.sig
           if ($LASTEXITCODE -ne 0) { Write-Host 'the runtime release''s signature does not verify'; exit 1 }
           $lines = Get-Content -LiteralPath .work\rt\SHA256SUMS
-          if ($lines[0] -ne "# upi $($env:RUNTIME_FROM -replace '^bolt-v', '')") { Write-Host "the checksums are not $env:RUNTIME_FROM's"; exit 1 }
+          if ($lines[0] -ne "# upi $($env:RUNTIME_FROM -replace '^upi-v', '')") { Write-Host "the checksums are not $env:RUNTIME_FROM's"; exit 1 }
           $sum = (Get-FileHash .work\rt\upi-runtime-win32-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($lines -notcontains "$sum  upi-runtime-win32-x64.zip") { Write-Host 'the runtime is not the one its release lists'; exit 1 }
           Expand-Archive .work\rt\upi-runtime-win32-x64.zip -DestinationPath .work\rt -Force

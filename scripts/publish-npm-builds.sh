@@ -92,7 +92,7 @@ EOF
 	cat >"$dir/README.md" <<EOF
 # $pkg
 
-\`$file\` of the [µPi $VERSION release](https://github.com/Code000-211/microPi/releases/tag/bolt-v$VERSION), the same
+\`$file\` of the [µPi $VERSION release](https://github.com/Code000-211/microPi/releases/tag/upi-v$VERSION), the same
 bytes, for µPi's installer to download from the npm registry. Nothing to install from here: use
 
 $(if [ "$os" = win32 ]; then printf '```powershell\npowershell -c "irm https://upi.opensec.in/install.ps1 | iex"\n```'; else printf '```bash\ncurl -fsSL https://upi.opensec.in/install.sh | sh\n```'; fi)

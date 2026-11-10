@@ -2,9 +2,9 @@ name: runtime
 
 # Builds the µPi runtime (patched WebKit and Bun: scripts/build-runtime.sh, scripts\build-runtime.ps1) of every platform on
 # GitHub's runners, each on its own: Linux x86-64 and ARM64, macOS on Apple silicon, Windows x64. It is what a release needs when
-# the engine changed (docs/RELEASING.md, "When the engine changed"): run it from upi with the release's tag, and it attaches
+# the engine changed (docs/RELEASING.md, "When the engine changed"): run it from pi-bolt with the release's tag, and it attaches
 # upi-runtime-<platform>.tar.gz (Windows: .zip) to that tag's draft release, which the release workflow then uses once it has
-# checked their attestations (the attest job below: only a run from upi counts for a release). A push to
+# checked their attestations (the attest job below: only a run from pi-bolt counts for a release). A push to
 # a branch runtime/<name> builds its commit's runtimes as workflow artifacts only: all four, or the one the name is
 # (runtime/win32-x64).
 #

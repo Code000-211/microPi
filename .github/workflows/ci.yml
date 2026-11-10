@@ -5,7 +5,8 @@ name: ci
 # on Windows), and whether the engine patches still apply.
 #
 # The runtime (patched WebKit and Bun) takes about an hour and 40 GB of disk to build, more than GitHub's runners give, so
-# µPi is built here with the latest release's runtime (scripts/fetch-runtime.sh checks its signature). A change to the
+# µPi is built here with the latest release's runtime (scripts/fetch-runtime.sh checks its signature; while µPi has no
+# release, that comes from Pi-Bolt's latest release instead, checked with Pi-Bolt's key). A change to the
 # engine itself is checked by scripts/check-patches.sh here, and built and tested before it is released (docs/RELEASING.md).
 on:
   push:
@@ -188,8 +189,9 @@ jobs:
         id: runtime
         if: needs.changes.outputs.code != 'false'
         run: |
-          # (When a platform the latest release has no runtime for, one is skipped; while there is no latest release at all, so
-          # are µPi's checks on every platform. scripts/build-runtime.sh builds the runtime instead, but is too slow for CI.)
+          # (A µPi release may have no runtime for a platform, or there may be no µPi release yet: scripts/fetch-runtime.sh then
+          # takes the runtime from Pi-Bolt's latest release instead, verified with Pi-Bolt's key. So the µPi checks are skipped
+          # only if that fetch fails too. scripts/build-runtime.sh builds the runtime instead, but is too slow for CI.)
           case "$(uname -s)-$(uname -m)" in
           Linux-x86_64) NAME=upi-runtime-linux-x64.tar.gz ;;
           Linux-aarch64) NAME=upi-runtime-linux-arm64.tar.gz ;;
@@ -197,9 +199,7 @@ jobs:
           *) echo "no runtime name for $(uname -s)-$(uname -m)"; exit 1 ;;
           esac
           if ! curl -fsIL -o /dev/null "${GITHUB_REPOSITORY}/releases/latest/download/$NAME"; then
-            echo "::notice title=No runtime::The latest release has no $NAME: µPi's checks are skipped on $(uname -s)-$(uname -m)."
-            echo "available=false" >>"$GITHUB_OUTPUT"
-            exit 0
+            echo "::notice title=No µPi runtime::µPi's latest release has no $NAME (or there is no release yet): the runtime comes from Pi-Bolt's latest release."
           fi
           scripts/fetch-runtime.sh
           echo "available=true" >>"$GITHUB_OUTPUT"
@@ -312,8 +312,8 @@ jobs:
           }
           python --version
       - name: Latest release
-        # (The checks and builds below need the latest release, so that the runtime can come from it; the update check
-        # needs one, for releases/latest to send them to.)
+        # (The checks and builds below need a release, so that the runtime can come from it: µPi's latest release, or Pi-Bolt's
+        # while µPi has none (fetch-runtime.sh's fallback); the update check needs one, for releases/latest to send them to.)
         if: needs.changes.outputs.code != 'false'
         id: latest
         shell: powershell
@@ -321,32 +321,56 @@ jobs:
           # (Nonzero from curl means 'no latest release', not failure: the release workflow has not made one yet. Explicit
           # `exit 0` in both branches, as the runner's trailing `exit $LASTEXITCODE` would otherwise fail on curl's 404.)
           & curl.exe -fsIL -o NUL "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/upi-runtime-win32-x64.zip"
-          if ($LASTEXITCODE -eq 0) { "available=true" >> $env:GITHUB_OUTPUT; exit 0 }
-          Write-Host '::notice title=No latest release::µPi''s checks need the latest release; they are skipped while there is none.'
+          if ($LASTEXITCODE -eq 0) {
+            "available=true" >> $env:GITHUB_OUTPUT
+            "source=micropi" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          & curl.exe -fsIL -o NUL "https://github.com/opensec-git/Pi-Bolt/releases/latest/download/pi-bolt-runtime-win32-x64.zip"
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host '::notice title=No µPi release::µPi''s latest release has no runtime for Windows (or there is no release yet): the runtime comes from Pi-Bolt''s latest release.'
+            "available=true" >> $env:GITHUB_OUTPUT
+            "source=pibolt" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          Write-Host '::notice title=No latest release::Neither µPi''s nor Pi-Bolt''s releases have a Windows runtime; the checks are skipped while there is none.'
           "available=false" >> $env:GITHUB_OUTPUT
           exit 0
       - name: Runtime of the latest release
         if: steps.latest.outputs.available == 'true'
         run: |
           # As scripts/fetch-runtime.sh: the checksums, signed by the release key, say which runtime and which engine it is.
-          $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
-          New-Item -ItemType Directory -Force .work\rt, .work\runtime | Out-Null
-          foreach ($name in 'upi-runtime-win32-x64.zip', 'SHA256SUMS', 'SHA256SUMS.sig', 'RUNTIME_STAMP') {
-            & curl.exe -fsSL -o ".work\rt\$name" "$base/$name"
-            if ($LASTEXITCODE -ne 0) { Write-Host "could not download $name"; exit 1 }
+          # Which release that is, the previous step's source says: µPi's, or Pi-Bolt's while µPi has none, each with its key
+          # and its archive's name.
+          if ($env:SOURCE -eq 'pibolt') {
+            $base = "https://github.com/opensec-git/Pi-Bolt/releases/latest/download"
+            $key = "keys\pibolt-release.pub"
+            $name = "pi-bolt-runtime-win32-x64.zip"
+          } else {
+            $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+            $key = "keys\release.pub"
+            $name = "upi-runtime-win32-x64.zip"
           }
-          & 'C:\Program Files\Git\usr\bin\openssl.exe' pkeyutl -verify -pubin -inkey keys\release.pub -rawin -in .work\rt\SHA256SUMS -sigfile .work\rt\SHA256SUMS.sig
+          Write-Host "runtime source: $base"
+          New-Item -ItemType Directory -Force .work\rt, .work\runtime | Out-Null
+          foreach ($file in $name, 'SHA256SUMS', 'SHA256SUMS.sig', 'RUNTIME_STAMP') {
+            & curl.exe -fsSL -o ".work\rt\$file" "$base/$file"
+            if ($LASTEXITCODE -ne 0) { Write-Host "could not download $file"; exit 1 }
+          }
+          & 'C:\Program Files\Git\usr\bin\openssl.exe' pkeyutl -verify -pubin -inkey $key -rawin -in .work\rt\SHA256SUMS -sigfile .work\rt\SHA256SUMS.sig
           if ($LASTEXITCODE -ne 0) { Write-Host 'the release''s signature does not verify'; exit 1 }
           $lines = Get-Content -LiteralPath .work\rt\SHA256SUMS
-          foreach ($name in 'upi-runtime-win32-x64.zip', 'RUNTIME_STAMP') {
-            $sum = (Get-FileHash ".work\rt\$name" -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($lines -notcontains "$sum  $name") { Write-Host "$name is not the one the release lists"; exit 1 }
+          foreach ($file in $name, 'RUNTIME_STAMP') {
+            $sum = (Get-FileHash ".work\rt\$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($lines -notcontains "$sum  $file") { Write-Host "$file is not the one the release lists"; exit 1 }
           }
-          Expand-Archive .work\rt\upi-runtime-win32-x64.zip -DestinationPath .work\rt -Force
-          Copy-Item .work\rt\upi-runtime-win32-x64\bun.exe .work\runtime\bun.exe
+          Expand-Archive .work\rt\$name -DestinationPath .work\rt -Force
+          Copy-Item ".work\rt\$([IO.Path]::GetFileNameWithoutExtension($name))\bun.exe" .work\runtime\bun.exe
           Copy-Item .work\rt\RUNTIME_STAMP .work\runtime\RUNTIME_STAMP
           & .work\runtime\bun.exe --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
+        env:
+          SOURCE: ${{ steps.latest.outputs.source }}
       - name: Pi
         if: steps.latest.outputs.available == 'true'
         run: |
@@ -382,7 +406,9 @@ jobs:
           }
           exit $failed
       - name: Update finds the latest release
-        if: steps.latest.outputs.available == 'true'
+        # (µPi's own release only: while the runtime comes from Pi-Bolt's (there is no µPi release), upi update has no
+        # release of µPi to find.)
+        if: steps.latest.outputs.source == 'micropi'
         run: |
           # upi update online, as a user runs it: it finds the latest release where releases/latest redirects, as the
           # installers do, not only through GitHub's API, which answers 403 once an address has used its hourly requests (#149).

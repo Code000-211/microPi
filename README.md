@@ -67,11 +67,14 @@ No releases yet: µPi is built from source. Needs git, Python 3 and Node.js 22.1
 
 ```bash
 git clone https://github.com/Code000-211/microPi.git && cd microPi
-scripts/fetch-runtime.sh             # the AOT runtime from Pi-Bolt's latest signed release -> .work/runtime/bun
+scripts/fetch-runtime.sh             # the AOT runtime from µPi's latest signed release -> .work/runtime/bun
 scripts/prepare-pi.sh                # builds Pi from this repository
 scripts/build-pi.sh --kit .work/kit  # -> out/upi/pi, and the kit for compiling extensions in
 out/upi/pi --version
 ```
+
+While µPi has no release yet, `fetch-runtime.sh` takes the runtime from Pi-Bolt's latest release instead, checked with
+`keys/pibolt-release.pub`; `--from micropi | pibolt` picks a source, a `bolt-vX.Y.Z` version fetches from Pi-Bolt directly.
 
 The executable is called `upi`: µPi builds on [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt), which
 compiles Pi ahead of time into one native executable, and keeps `upi compile` for extensions. Do not run

@@ -274,10 +274,8 @@ jobs:
             sudo apt-get install -y -qq busybox-static >/dev/null
             sudo env PATH="$PATH" MICROPI_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/.work/unpacked/upi-linux-arm64"
           fi
-          scripts/build-pi.sh --stable --out out/pi-stable
-          python3 bench/e2e_tools.py --reference bun=out/pi-stable/pi --build upi=.work/unpacked/upi-${{ matrix.platform }}/pi
-          python3 bench/e2e_screen.py --reference bun=out/pi-stable/pi --build upi=.work/unpacked/upi-${{ matrix.platform }}/pi
-          python3 bench/e2e_fullscreen.py --build upi=.work/unpacked/upi-${{ matrix.platform }}/pi
+          # Termux test above is the last ARM64 extra; µPi slimmed the bench e2e scripts away (commit 7c4d28e6d):
+          # their release steps are gone with them.
       # A build provenance attestation of every archive, the runtime's included (which a later release reusing it checks):
       # docs/RELEASING.md, "Provenance". Made in dry runs too.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

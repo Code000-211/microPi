@@ -259,8 +259,15 @@ export default function (pi: ExtensionAPI) {
 	let leftOut = false;
 
 	const show = (p: string) => {
-		if (base && (p === base || p.startsWith(`${base}/`))) return relative(base, p) || ".";
-		return p.startsWith(`${homedir()}/`) ? `~/${relative(homedir(), p)}` : p;
+		// Model-facing paths: forward slashes on every platform (the scan hands out \-separated paths on Windows -
+		// both in the walked file list and in base), made relative to the project when the path is in it. path.relative
+		// writes \ again on Windows when it cuts, so it is normalized too. On POSIX this compares and shortens
+		// unchanged.
+		const s = p.replaceAll("\\", "/");
+		const b = base.replaceAll("\\", "/");
+		if (b && (s === b || s.startsWith(`${b}/`))) return relative(b, s).replaceAll("\\", "/") || ".";
+		const home = homedir().replaceAll("\\", "/");
+		return s.startsWith(`${home}/`) ? `~/${relative(home, s).replaceAll("\\", "/")}` : s;
 	};
 
 	function start(ctx: ExtensionContext) {

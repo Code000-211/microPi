@@ -202,17 +202,25 @@ progress (errors come at once).
 | C/C++/HIP | clangd-tidy (about 10x clang-tidy) | `.clang-tidy` and `compile_commands.json` | 0.2 s a file |
 
 **HIP for AMD RDNA4 (gfx12)**: what the compiler accepts but the GPU does not. When a HIP unit is built for a `gfx12`
-target (its `--offload-arch` in `compile_commands.json`, else `HIP_OFFLOAD_ARCH`) and
+target (an `--offload-arch` or `-mcpu` of its entries in `compile_commands.json`, else `HIP_OFFLOAD_ARCH`) and
 [radisa](https://github.com/Code000-211/radiance-rdna4-isa-suite) is found (`PI_RADISA`, or `tools/rdna4-isa-suite`
-above the file), the unit is compiled for gfx1201 and its machine code checked against AMD's machine-readable RDNA4 ISA:
-a register used before the `s_wait_*` its load needs (above all after a memory instruction in inline asm, which the
-compiler does not wait for), WMMA and VOPD hazards, use after VGPR deallocation. These come as errors at the source
-line, with the wait to insert; spills, scratch arrays and memory instructions in inline asm come as lint findings.
-AMDGPU `.s` files are checked the same way. The unit is optimised as a whole each time, but only kernels whose optimised
-code changed are compiled and checked again; the others come from radisa's cache. On libr4d with clang 20: 12 s for the
-first check of `r4d_attn_paged_h256_gqa12` (38 kernels), 4.6 s after an edit that changes few kernels (the whole compile
-took 18 s); for `r4d_gemm_iqr` (704 kernels) 86 s instead of more than 10 minutes. A large unit can still report after the
-run ended (`PI_CHECKS_WAIT`) or exceed the checks' 300 s limit on its first check. `PI_CHECKS` names it `rdna4-isa`.
+above the file), the unit is compiled for gfx1201 and its machine code checked against AMD's machine-readable RDNA4 ISA.
+Errors, at the source line: a register used before the `s_wait_*` its load needs (above all after a memory instruction
+in inline asm, which the compiler does not wait for), an LDS store still outstanding at a barrier, WMMA and
+`v_cmpx`/`v_permlane` hazards on any path through the kernel, VOPD pairs the hardware does not accept, use after VGPR
+deallocation; in functions the kernels call as well. Lint findings: spills, scratch arrays, a register read that
+nothing wrote, a register inline asm writes without naming it as clobbered, and whatever radisa could not check
+(`not checked: ...`), so that a unit it only half analysed does not look clean. AMDGPU `.s` files are checked the same
+way, with assembler errors at their line. A project's `.radisa.json`, its baseline and `radisa: ignore[RULE] reason`
+comments apply as they do on the command line. Use the compiler the code is built with: for one older than LLVM 20,
+which inserts no `s_wait_alu`, the two rules that ask for it are left out, and one lint finding says so.
+
+The unit is optimised as a whole each time, but only kernels whose optimised code changed are compiled and checked
+again; the others come from radisa's cache. With ROCm's clang 24 on a Radeon AI PRO R9700 host, a first check of the
+114 libr4d units took 17 s a unit on average; `r4d_gemm_iqr` (704 kernels) took 32 minutes, far beyond the checks'
+300 s limit. radisa keeps the kernels it finished when the limit stops it, so each check of such a unit gets further
+and a later one reports; `PI_RADISA_TIMEOUT` (seconds) raises the limit for this checker alone. A check can still
+report after the run ended (`PI_CHECKS_WAIT`). `PI_CHECKS` names it `rdna4-isa`.
 
 On Moebius (443 Rust files), a type error the model wrote was reported 3 s after the edit, before the run ended, and
 fixed; rust-analyzer, which Pi used before, reported nothing within 84 s and took 3.2 GB. `PI_CHECKS=off` turns the

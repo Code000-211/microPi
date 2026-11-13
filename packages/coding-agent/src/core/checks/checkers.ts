@@ -13,7 +13,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -523,8 +523,10 @@ function offloadArchs(db: string): Map<string, string[]> {
 	}>;
 	for (const e of entries) {
 		const text = e.arguments?.join(" ") ?? e.command ?? "";
-		const found = [...text.matchAll(/(?:--offload-arch|--cuda-gpu-arch)[= ](gfx\w+)/g)].map((m) => m[1]!);
-		archs.set(resolve(e.directory ?? dirname(db), e.file), found);
+		const found = [...text.matchAll(/(?:--offload-arch|--cuda-gpu-arch|-mcpu)[= ](gfx\w+)/g)].map((m) => m[1]!);
+		// A file built for two targets has two entries: one of them for gfx12 is enough.
+		const file = resolve(e.directory ?? dirname(db), e.file);
+		archs.set(file, [...(archs.get(file) ?? []), ...found]);
 	}
 	archCache.set(db, { mtimeMs, archs });
 	return archs;
@@ -563,31 +565,113 @@ interface RadisaFinding {
 
 interface RadisaReport {
 	findings: RadisaFinding[];
-	kernels: Array<{ name: string; findings: RadisaFinding[] }>;
+	kernels: Array<{ name: string; callee?: boolean; findings: RadisaFinding[] }>;
+	/** How the unit was compiled; `compiler` is the device compiler's own version line. */
+	incremental?: { compiler?: string } | null;
 }
 
 /**
- * Rules that are not the agent's to fix: LLVM emits VOPD pairs with an X/Y anti-dependency on purpose, and compile errors
- * come from the C/C++/HIP check already.
+ * Rules that are not the agent's to fix: compile errors come from the C/C++/HIP check already, and LLVM emits VOPD pairs
+ * with an X/Y anti-dependency on purpose (a note in radisa now, a warning in checkouts before November 2026).
  */
 const RADISA_IGNORED = new Set(["VOPD_ANTIDEP", "COMPILE", "COMPILER_DIAGNOSTICS"]);
 
-/** radisa's errors as errors and its warnings as lint findings; notes and info are left out. */
+/**
+ * The SGPR hazard rules. LLVM inserts the `s_wait_alu` they ask for from version 20 on (AMDGPUWaitSGPRHazards); the
+ * code of an older compiler has none, so every carry chain it emits is reported, and no edit of the source removes that.
+ */
+const RADISA_NEEDS_LLVM_20 = new Set(["MISSING_ALU_WAIT", "ALU_WAIT_TTMP"]);
+
+/** The major version in a compiler's version line (`AMD clang version 24.0.0git ...`), when it names one. */
+function clangMajor(versionLine: string | undefined): number | undefined {
+	const m = /clang version (\d+)/.exec(versionLine ?? "");
+	return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * radisa's errors as errors; its warnings, and what it could not check (severity `incomplete`: bytes that do not
+ * decode, a branch it could not follow), as lint findings; notes are left out.
+ *
+ * A finding is compared with the check before by its message, so what moves with an unrelated edit is taken out of
+ * it: pcs, and the line of the instruction it names in the same file (`ds_load_b32 (k.hip:14)`), which becomes its
+ * distance from the finding (`1 line above`).
+ */
 export function radisaDiagnostics(report: RadisaReport, file: string): Diagnostic[] {
 	const out: Diagnostic[] = [];
-	const add = (f: RadisaFinding, kernel?: string) => {
-		const severity = f.severity === "error" ? "error" : f.severity === "review" ? "warning" : undefined;
-		if (!severity || RADISA_IGNORED.has(f.rule)) return;
-		// A pc moves with every change of the code; only the source position says where.
+	const assembly = extension(file) === "s";
+	const major = clangMajor(report.incremental?.compiler);
+	const oldCompiler = !assembly && major !== undefined && major < 20;
+	let leftOut = false;
+	const add = (f: RadisaFinding, kernel?: { name: string; callee?: boolean }) => {
+		if (RADISA_IGNORED.has(f.rule)) return;
+		if (oldCompiler && RADISA_NEEDS_LLVM_20.has(f.rule)) {
+			leftOut = true;
+			return;
+		}
+		let severity: DiagnosticSeverity | undefined =
+			f.severity === "error"
+				? "error"
+				: f.severity === "review" || f.severity === "incomplete"
+					? "warning"
+					: undefined;
+		if (!severity) return;
 		let message = f.message.replace(/\s*\(pc 0x[0-9a-f]+\)/g, "");
+		let loc = f.loc;
+		if (f.rule === "ASSEMBLER") {
+			// llvm-mc's own line, `path:line:col: error: text`, then the source line and a caret.
+			const m = /^(.+?):(\d+):(\d+): error: (.*)$/m.exec(message);
+			if (assembly && m) {
+				loc = { file: m[1]!, line: Number(m[2]), column: Number(m[3]) };
+				message = m[4]!;
+			} else if (!assembly) {
+				// The compiler's own output did not assemble: nothing in the source to fix.
+				severity = "warning";
+				message = message.split("\n")[0]!;
+			}
+		}
+		const at = loc ? (isAbsolute(loc.file) ? loc.file : resolve(dirname(file), loc.file)) : file;
+		if (loc) {
+			const name = at.slice(Math.max(at.lastIndexOf("/"), at.lastIndexOf("\\")) + 1);
+			const line = loc.line;
+			message = message.replace(/\(([^\s():]+):(\d+)\)/g, (whole, base: string, n: string) => {
+				if (base !== name) return whole;
+				const d = Number(n) - line;
+				return d === 0
+					? "(same line)"
+					: `(${Math.abs(d)} line${Math.abs(d) === 1 ? "" : "s"} ${d < 0 ? "above" : "below"})`;
+			});
+		}
+		if (f.severity === "incomplete") message = `not checked: ${message}`;
 		if (f.instruction) message += ` [${f.instruction}]`;
-		if (!f.loc && kernel) message = `in kernel ${kernel}: ${message}`;
-		out.push(diag(f.loc?.file ?? file, f.loc?.line ?? 1, f.loc?.column ?? 1, message, f.rule, severity));
+		if (!loc && kernel) message = `in ${kernel.callee ? "function" : "kernel"} ${kernel.name}: ${message}`;
+		out.push(diag(at, loc?.line ?? 1, loc?.column ?? 1, message, f.rule, severity));
 	};
 	for (const f of report.findings) add(f);
-	for (const k of report.kernels) for (const f of k.findings) add(f, k.name);
+	for (const k of report.kernels) for (const f of k.findings) add(f, k);
+	if (leftOut) {
+		// One finding with a text that does not change, so it is reported once and not with every edit.
+		out.push(
+			diag(
+				file,
+				1,
+				1,
+				`radisa's s_wait_alu checks are left out: the device compiler is LLVM ${major}, which inserts no s_wait_alu ` +
+					"(LLVM 20 and later do), so they would report every carry chain it emits. Check with the compiler the " +
+					"code is built with (ROCm's clang) to have them.",
+				"RADISA_OLD_COMPILER",
+				"warning",
+			),
+		);
+	}
 	return out;
 }
+
+/**
+ * How long one radisa run may take (`PI_RADISA_TIMEOUT`, seconds; else as every check). A unit with hundreds of kernels
+ * takes longer than that the first time (`r4d_gemm_iqr`, 704 kernels: 32 minutes with ROCm's clang 24). radisa keeps
+ * the kernels it finished when it is stopped, so each check of such a unit gets further and a later one reports.
+ */
+const RADISA_TIMEOUT_MS = (Number(process.env.PI_RADISA_TIMEOUT) || RUN_TIMEOUT_MS / 1000) * 1000;
 
 const rdna4: Checker = {
 	name: "rdna4-isa",
@@ -601,34 +685,40 @@ const rdna4: Checker = {
 	},
 	async run(unit, signal) {
 		const suite = radisaSuite(unit.cwd);
-		if (!suite) return [];
-		const out = join(
-			tmpdir(),
-			"pi-checks",
-			`${createHash("sha1").update(unit.file!).digest("hex").slice(0, 16)}.radisa.json`,
-		);
-		mkdirSync(dirname(out), { recursive: true });
-		const db = extension(unit.file!) === "s" ? undefined : compileDb(unit.cwd);
-		// -I keeps the edited project's modules and PYTHON* settings out; radisa is imported from the suite alone.
-		const argv = [
-			"python3",
-			"-I",
-			"-c",
-			"import sys; sys.path.insert(0, sys.argv.pop(1)); from radisa.cli import main; sys.exit(main(sys.argv[1:]))",
-			suite,
-			"check",
-			unit.file!,
-			"--json",
-			out,
-		];
-		if (db) argv.push("--compile-commands", db);
-		const ran = await run(argv, unit.cwd, signal);
-		// 0 clean, 1 findings, 3 could not analyse: only a report says which findings there are.
-		if (ran.code !== 0 && ran.code !== 1) return [];
+		if (!suite) throw new Error("radisa is gone");
+		// A folder of this run alone: two sessions checking the same file must not read each other's report, and a
+		// report left by an earlier run must not be taken for this one's.
+		const work = mkdtempSync(join(tmpdir(), "pi-radisa-"));
 		try {
+			const out = join(work, "report.json");
+			const db = extension(unit.file!) === "s" ? undefined : compileDb(unit.cwd);
+			// -I keeps the edited project's modules and PYTHON* settings out; radisa is imported from the suite alone.
+			const argv = [
+				"python3",
+				"-I",
+				"-c",
+				"import sys; sys.path.insert(0, sys.argv.pop(1)); from radisa.cli import main; sys.exit(main(sys.argv[1:]))",
+				suite,
+				"check",
+				unit.file!,
+				"--json",
+				out,
+			];
+			if (db) argv.push("--compile-commands", db);
+			const ran = await run(argv, unit.cwd, signal, undefined, RADISA_TIMEOUT_MS);
+			// 2: radisa did not start the check (a .radisa.json it cannot read, a baseline that is missing).
+			if (ran.code === 2) {
+				const why = ran.stderr.trim().split("\n").pop() ?? "";
+				return [diag(unit.file!, 1, 1, `radisa did not check this file: ${why}`, "RADISA_USAGE", "warning")];
+			}
+			// 0 clean, 1 errors, 3 parts not checked: each with a report. Anything else (killed, a crash) has no findings
+			// to compare, and throwing keeps the findings of the check before as they are.
+			if (ran.code !== 0 && ran.code !== 1 && ran.code !== 3) {
+				throw new Error(`radisa ended with ${ran.code}: ${ran.stderr.trim().split("\n").pop() ?? ""}`);
+			}
 			return radisaDiagnostics(JSON.parse(readFileSync(out, "utf-8")) as RadisaReport, unit.file!);
-		} catch {
-			return [];
+		} finally {
+			rmSync(work, { recursive: true, force: true });
 		}
 	},
 };

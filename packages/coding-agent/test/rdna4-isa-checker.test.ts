@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -17,6 +17,8 @@ describe("rdna4-isa checker", () => {
 		delete process.env.PI_RADISA;
 		delete process.env.HIP_OFFLOAD_ARCH;
 		delete process.env.HCC_AMDGPU_TARGET;
+		delete process.env.RADISA_COMPILE_COMMANDS;
+		delete process.env.PI_RADISA_JOBS;
 	});
 
 	afterEach(() => {
@@ -67,7 +69,7 @@ describe("rdna4-isa checker", () => {
 		const diagnostics = radisaDiagnostics(
 			{
 				findings: [
-					{ rule: "COMPILE", severity: "error", message: "device compile failed" },
+					{ rule: "COMPILER_DIAGNOSTICS", severity: "info", message: "1 warning" },
 					{ rule: "HIP_INLINE_ASM_MEMORY", severity: "review", message: "asm load", loc: { file, line: 14 } },
 					{ rule: "HIP_NO_LAUNCH_BOUNDS", severity: "info", message: "no bounds", loc: { file, line: 3 } },
 				],
@@ -226,6 +228,57 @@ describe("rdna4-isa checker", () => {
 		expect(hip[0]).toMatchObject({ file: "/p/k.hip", line: 1, severity: "warning" });
 	});
 
+	it("says that a unit which did not compile for gfx1201 was not checked", () => {
+		const message =
+			"gfx1201 device compile failed:\n/p/k.hip:3:10: fatal error: 'r4d_common.h' file not found\n    3 | #include \"r4d_common.h\"";
+		expect(
+			radisaDiagnostics({ findings: [{ rule: "COMPILE", severity: "error", message }], kernels: [] }, "/p/k.hip"),
+		).toEqual([
+			{
+				file: "/p/k.hip",
+				line: 1,
+				column: 1,
+				severity: "warning",
+				message: "not checked: the unit did not compile for gfx1201 ('r4d_common.h' file not found)",
+				code: "COMPILE",
+			},
+		]);
+	});
+
+	it("finds the compile commands of a build outside the source tree through RADISA_COMPILE_COMMANDS", () => {
+		if (!onPath("python3")) return;
+		const path = project("k.hip", "gfx1201");
+		// The build folder is not above the file: nothing names the target, and HIP_OFFLOAD_ARCH says another.
+		const outside = mkdtempSync(join(tmpdir(), "pi-rdna4-build-"));
+		try {
+			writeFileSync(
+				join(outside, "compile_commands.json"),
+				JSON.stringify([
+					{ directory: dir, file: "k.hip", command: "clang++ -x hip --offload-arch=gfx1201 -c k.hip" },
+				]),
+			);
+			rmSync(join(dir, "build"), { recursive: true });
+			process.env.HIP_OFFLOAD_ARCH = "gfx1151";
+			expect(rdna4.unit(path)).toBeUndefined();
+			process.env.RADISA_COMPILE_COMMANDS = join(outside, "compile_commands.json");
+			expect(rdna4.unit(path)?.key).toBe(`rdna4-isa:${path}`);
+		} finally {
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	it("finds compile commands in a build folder of another usual name", () => {
+		if (!onPath("python3")) return;
+		const path = project("k.hip", "gfx1151");
+		rmSync(join(dir, "build"), { recursive: true });
+		mkdirSync(join(dir, "cmake-build-release"));
+		writeFileSync(
+			join(dir, "cmake-build-release", "compile_commands.json"),
+			JSON.stringify([{ directory: dir, file: "k.hip", command: "clang++ -x hip --offload-arch=gfx1201 -c k.hip" }]),
+		);
+		expect(rdna4.unit(path)?.key).toBe(`rdna4-isa:${path}`);
+	});
+
 	describe("running radisa", () => {
 		/** A suite whose `radisa check` writes `report` (when given) and ends with `code`. */
 		function fakeSuite(code: number, report?: object, stderr = ""): string {
@@ -313,6 +366,41 @@ describe("rdna4-isa checker", () => {
 		);
 		expect(rdna4.unit(path)?.key).toBe(`rdna4-isa:${path}`);
 	});
+
+	// The HIP path with radisa itself: a build folder outside the source tree whose flags include -g0 (as libr4d's do),
+	// which once put every finding at line 1. Runs when PI_RADISA names the suite and clang++ compiles for gfx1201.
+	it.runIf(suite && onPath("python3") && onPath("clang++") && onPath("llvm-mc"))(
+		"reports an inline-asm load used before its wait at its source line, with the build's flags",
+		async () => {
+			process.env.PI_RADISA = suite;
+			const path = join(dir, "k.hip");
+			copyFileSync(join(suite!, "fixtures", "check", "inline_asm_lds.hip"), path);
+			const build = mkdtempSync(join(tmpdir(), "pi-rdna4-build-"));
+			try {
+				writeFileSync(
+					join(build, "compile_commands.json"),
+					JSON.stringify([
+						{
+							directory: dir,
+							file: "k.hip",
+							command: `clang++ -x hip --offload-arch=gfx1201 -nogpulib -nogpuinc -O3 -g0 -c k.hip -o ${join(build, "k.o")}`,
+						},
+					]),
+				);
+				process.env.RADISA_COMPILE_COMMANDS = join(build, "compile_commands.json");
+				process.env.RADISA_CACHE = join(build, "cache");
+				const found = await rdna4.run(rdna4.unit(path)!, new AbortController().signal);
+				const wait = found.filter((d) => d.code === "MISSING_WAIT");
+				expect(wait).toHaveLength(1);
+				expect(wait[0]).toMatchObject({ file: path, line: 15, severity: "error" });
+				expect(wait[0]!.message).toContain("(1 line above)");
+				expect(found.filter((d) => d.code === "COMPILE")).toEqual([]);
+			} finally {
+				rmSync(build, { recursive: true, force: true });
+			}
+		},
+		120_000,
+	);
 
 	// Runs radisa itself when PI_RADISA names a checkout of the suite and llvm-mc is installed.
 	it.runIf(suite && onPath("python3") && onPath("llvm-mc"))(

@@ -499,17 +499,18 @@ function radisaSuite(dir: string): string | undefined {
 }
 
 /**
- * The compile_commands.json for a file: `RADISA_COMPILE_COMMANDS` when it names one (as radisa's own edit hook reads it;
- * for a build folder outside the source tree, which nothing above the file leads to), else the nearest above the file,
- * in the folder itself or in a build folder of the usual names.
+ * The compile_commands.json for a file: `RADISA_COMPILE_COMMANDS` when it names one that lists the file (as radisa's own
+ * edit hook reads it; for a build folder outside the source tree, which nothing above the file leads to), else the
+ * nearest above the file, in the folder itself or in a build folder of the usual names. A file the variable's database
+ * does not list (a scratch copy, another project) is not checked against it: radisa would only say it is not there.
  */
-function compileDb(dir: string): string | undefined {
+function compileDb(file: string): string | undefined {
 	const env = process.env.RADISA_COMPILE_COMMANDS;
-	if (env && existsSync(env)) return resolve(env);
+	if (env && existsSync(env) && offloadArchs(resolve(env)).has(resolve(file))) return resolve(env);
 	const names = ["", "build", "out", "cmake-build-release", "cmake-build-debug"].map((sub) =>
 		join(sub, "compile_commands.json"),
 	);
-	const found = findUp(dir, names);
+	const found = findUp(dirname(file), names);
 	return found ? join(found, names.find((name) => existsSync(join(found, name)))!) : undefined;
 }
 
@@ -694,7 +695,7 @@ const rdna4: Checker = {
 		const python3 = onPath("python3");
 		const suite = radisaSuite(dirname(path));
 		if (!python3 || !suite) return undefined;
-		if (extension(path) !== "s" && !buildsForGfx12(path, compileDb(dirname(path)))) return undefined;
+		if (extension(path) !== "s" && !buildsForGfx12(path, compileDb(path))) return undefined;
 		return { key: `rdna4-isa:${path}`, checker: rdna4, cwd: dirname(path), file: path };
 	},
 	async run(unit, signal) {
@@ -705,7 +706,7 @@ const rdna4: Checker = {
 		const work = mkdtempSync(join(tmpdir(), "pi-radisa-"));
 		try {
 			const out = join(work, "report.json");
-			const db = extension(unit.file!) === "s" ? undefined : compileDb(unit.cwd);
+			const db = extension(unit.file!) === "s" ? undefined : compileDb(unit.file!);
 			// -I keeps the edited project's modules and PYTHON* settings out; radisa is imported from the suite alone.
 			const argv = [
 				"python3",

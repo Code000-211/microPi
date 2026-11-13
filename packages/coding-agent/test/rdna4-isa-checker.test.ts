@@ -267,6 +267,25 @@ describe("rdna4-isa checker", () => {
 		}
 	});
 
+	it("keeps the compile commands next to a file that RADISA_COMPILE_COMMANDS does not list", () => {
+		if (!onPath("python3")) return;
+		// The file's own build makes it for gfx1151, so it is not this check's; the other build does not list it.
+		const path = project("k.hip", "gfx1151");
+		const outside = mkdtempSync(join(tmpdir(), "pi-rdna4-build-"));
+		try {
+			writeFileSync(
+				join(outside, "compile_commands.json"),
+				JSON.stringify([
+					{ directory: outside, file: "other.hip", command: "clang++ -x hip --offload-arch=gfx1201 -c other.hip" },
+				]),
+			);
+			process.env.RADISA_COMPILE_COMMANDS = join(outside, "compile_commands.json");
+			expect(rdna4.unit(path)).toBeUndefined();
+		} finally {
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
 	it("finds compile commands in a build folder of another usual name", () => {
 		if (!onPath("python3")) return;
 		const path = project("k.hip", "gfx1151");

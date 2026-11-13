@@ -1,12 +1,12 @@
-// `pi-bolt update` runs the release's installer only once the release key vouches for it (pi-bolt-installer.ts).
+// `upi update` runs the release's installer only once the release key vouches for it (upi-installer.ts).
 import { createHash, generateKeyPairSync, type KeyObject, sign } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { piBoltInstallerProcess, piBoltUpdateEnvironment } from "../src/pi-bolt.ts";
-import { fetchReleaseInstaller, runReleaseInstaller } from "../src/pi-bolt-installer.ts";
-import { releaseDownloadBase } from "../src/pi-bolt-update-windows.ts";
+import { piBoltInstallerProcess, piBoltUpdateEnvironment } from "../src/upi.ts";
+import { fetchReleaseInstaller, runReleaseInstaller } from "../src/upi-installer.ts";
+import { releaseDownloadBase } from "../src/upi-update-windows.ts";
 
 const VERSION = "1.0.2";
 const BASE = releaseDownloadBase(VERSION);
@@ -23,7 +23,7 @@ function sha(data: Buffer): string {
 /** SHA256SUMS of a release, listing `files`. */
 function sumsOf(version: string, files: Record<string, Buffer>): Buffer {
 	const lines = Object.entries(files).map(([name, data]) => `${sha(data)}  ${name}`);
-	return Buffer.from(`# pi-bolt ${version}\n${lines.join("\n")}\n`);
+	return Buffer.from(`# upi ${version}\n${lines.join("\n")}\n`);
 }
 
 let served: Map<string, Buffer>;
@@ -65,7 +65,7 @@ describe("fetchReleaseInstaller", () => {
 		const { pem, privateKey } = keyPair();
 		serveRelease({
 			privateKey,
-			listed: { "pi-bolt-linux-x64.tar.xz": archive, "install.sh": script },
+			listed: { "upi-linux-x64.tar.xz": archive, "install.sh": script },
 			installer: script,
 		});
 		const installer = await fetchReleaseInstaller(VERSION, "install.sh", pem);
@@ -101,13 +101,13 @@ describe("fetchReleaseInstaller", () => {
 		await expect(fetchReleaseInstaller(VERSION, "install.sh", pem)).rejects.toThrow("has no signature");
 		serveRelease({ privateKey, listed: { "install.sh": script }, installer: script, version: "1.0.1" });
 		await expect(fetchReleaseInstaller(VERSION, "install.sh", pem)).rejects.toThrow(
-			`the download is Pi-Bolt 1.0.1, not ${VERSION}`,
+			`the download is µPi 1.0.1, not ${VERSION}`,
 		);
 	});
 
 	test("a release that does not list its installer (up to 1.0.1) gives none, without downloading it", async () => {
 		const { pem, privateKey } = keyPair();
-		serveRelease({ privateKey, listed: { "pi-bolt-linux-x64.tar.xz": archive }, installer: script });
+		serveRelease({ privateKey, listed: { "upi-linux-x64.tar.xz": archive }, installer: script });
 		const installer = await fetchReleaseInstaller(VERSION, "install.sh", pem);
 		expect(installer).toEqual({ name: "install.sh" });
 		expect(requested).not.toContain(`${BASE}/install.sh`);
@@ -131,7 +131,7 @@ describe("fetchReleaseInstaller", () => {
 describe.skipIf(process.platform === "win32")("runReleaseInstaller", () => {
 	let dir: string;
 	beforeEach(() => {
-		dir = mkdtempSync(join(tmpdir(), "pi-bolt-installer-test-"));
+		dir = mkdtempSync(join(tmpdir(), "upi-installer-test-"));
 	});
 	afterEach(() => {
 		rmSync(dir, { recursive: true, force: true });
@@ -139,14 +139,14 @@ describe.skipIf(process.platform === "win32")("runReleaseInstaller", () => {
 
 	test("runs the verified bytes from a private file, removed after", async () => {
 		const marker = join(dir, "ran");
-		const script = Buffer.from(`printf '%s\\n%s\\n' "$0" "$PIBOLT_VERSION" > '${marker}'\nexit 3\n`);
+		const script = Buffer.from(`printf '%s\\n%s\\n' "$0" "$MICROPI_VERSION" > '${marker}'\nexit 3\n`);
 		const status = await runReleaseInstaller(
 			{ name: "install.sh", script },
-			{ ...process.env, PIBOLT_VERSION: `bolt-v${VERSION}` },
+			{ ...process.env, MICROPI_VERSION: `upi-v${VERSION}` },
 		);
 		expect(status).toBe(3);
 		const [file, version] = readFileSync(marker, "utf8").trim().split("\n");
-		expect(version).toBe(`bolt-v${VERSION}`);
+		expect(version).toBe(`upi-v${VERSION}`);
 		expect(file.endsWith("/install.sh")).toBe(true);
 		expect(existsSync(dirname(file))).toBe(false);
 		// Nothing was downloaded: the script is the one given.
@@ -162,9 +162,9 @@ describe("piBoltInstallerProcess with a verified installer", () => {
 
 	test("runs that file, and downloads nothing", () => {
 		Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-		expect(piBoltInstallerProcess("/tmp/pi-bolt-installer-x/install.sh")).toEqual({
+		expect(piBoltInstallerProcess("/tmp/upi-installer-x/install.sh")).toEqual({
 			command: "sh",
-			args: ["/tmp/pi-bolt-installer-x/install.sh"],
+			args: ["/tmp/upi-installer-x/install.sh"],
 		});
 		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
 		// (The command's path is built with this platform's path module: only the PowerShell it runs is checked here.)
@@ -177,15 +177,15 @@ describe("piBoltInstallerProcess with a verified installer", () => {
 });
 
 describe("piBoltUpdateEnvironment", () => {
-	test("does not pass PIBOLT_UNVERIFIED to the installer", () => {
-		const saved = process.env.PIBOLT_UNVERIFIED;
-		process.env.PIBOLT_UNVERIFIED = "1";
+	test("does not pass MICROPI_UNVERIFIED to the installer", () => {
+		const saved = process.env.MICROPI_UNVERIFIED;
+		process.env.MICROPI_UNVERIFIED = "1";
 		try {
-			expect(piBoltUpdateEnvironment(VERSION).PIBOLT_UNVERIFIED).toBeUndefined();
-			expect("PIBOLT_UNVERIFIED" in piBoltUpdateEnvironment(VERSION)).toBe(false);
+			expect(piBoltUpdateEnvironment(VERSION).MICROPI_UNVERIFIED).toBeUndefined();
+			expect("MICROPI_UNVERIFIED" in piBoltUpdateEnvironment(VERSION)).toBe(false);
 		} finally {
-			if (saved === undefined) delete process.env.PIBOLT_UNVERIFIED;
-			else process.env.PIBOLT_UNVERIFIED = saved;
+			if (saved === undefined) delete process.env.MICROPI_UNVERIFIED;
+			else process.env.MICROPI_UNVERIFIED = saved;
 		}
 	});
 
@@ -193,42 +193,42 @@ describe("piBoltUpdateEnvironment", () => {
 	// installer reads.
 	test("passes on only the installers' variables it names, and everything else", () => {
 		const set: Record<string, string> = {
-			PIBOLT_ALLOW_UNSIGNED: "1",
-			PIBOLT_UNVERIFIED: "0".repeat(64),
-			PIBOLT_DOWNLOAD_BASE: "http://mirror.test",
-			PIBOLT_SOURCE: "github",
-			PIBOLT_LAUNCHER: "1",
-			PIBOLT_INSTALLER_NO_MAIN: "1",
-			PIBOLT_SOMETHING_LATER: "1",
-			PIBOLT_CHANNEL: "beta",
-			PIBOLT_NPM_REGISTRY: "https://registry.test",
-			PIBOLT_CONNECTIONS: "2",
-			PIBOLT_EXTENSIONS: "no",
-			NOT_PIBOLT_VARIABLE: "kept",
+			MICROPI_ALLOW_UNSIGNED: "1",
+			MICROPI_UNVERIFIED: "0".repeat(64),
+			MICROPI_DOWNLOAD_BASE: "http://mirror.test",
+			MICROPI_SOURCE: "github",
+			MICROPI_LAUNCHER: "1",
+			MICROPI_INSTALLER_NO_MAIN: "1",
+			MICROPI_SOMETHING_LATER: "1",
+			MICROPI_CHANNEL: "beta",
+			MICROPI_NPM_REGISTRY: "https://registry.test",
+			MICROPI_CONNECTIONS: "2",
+			MICROPI_EXTENSIONS: "no",
+			NOT_MICROPI_VARIABLE: "kept",
 		};
 		const saved = Object.fromEntries(Object.keys(set).map((name) => [name, process.env[name]]));
 		Object.assign(process.env, set);
 		try {
 			const env = piBoltUpdateEnvironment(VERSION);
 			for (const name of [
-				"PIBOLT_ALLOW_UNSIGNED",
-				"PIBOLT_UNVERIFIED",
-				"PIBOLT_DOWNLOAD_BASE",
-				"PIBOLT_SOURCE",
-				"PIBOLT_LAUNCHER",
-				"PIBOLT_INSTALLER_NO_MAIN",
-				"PIBOLT_SOMETHING_LATER",
+				"MICROPI_ALLOW_UNSIGNED",
+				"MICROPI_UNVERIFIED",
+				"MICROPI_DOWNLOAD_BASE",
+				"MICROPI_SOURCE",
+				"MICROPI_LAUNCHER",
+				"MICROPI_INSTALLER_NO_MAIN",
+				"MICROPI_SOMETHING_LATER",
 			]) {
 				expect(name in env, name).toBe(false);
 			}
-			expect(env.PIBOLT_CHANNEL).toBe("beta");
-			expect(env.PIBOLT_NPM_REGISTRY).toBe("https://registry.test");
-			expect(env.PIBOLT_CONNECTIONS).toBe("2");
-			expect(env.PIBOLT_EXTENSIONS).toBe("no");
-			expect(env.NOT_PIBOLT_VARIABLE).toBe("kept");
+			expect(env.MICROPI_CHANNEL).toBe("beta");
+			expect(env.MICROPI_NPM_REGISTRY).toBe("https://registry.test");
+			expect(env.MICROPI_CONNECTIONS).toBe("2");
+			expect(env.MICROPI_EXTENSIONS).toBe("no");
+			expect(env.NOT_MICROPI_VARIABLE).toBe("kept");
 			expect(env.PATH).toBe(process.env.PATH);
-			expect(env.PIBOLT_VERSION).toBe(`bolt-v${VERSION}`);
-			expect(env.PIBOLT_YES).toBe("1");
+			expect(env.MICROPI_VERSION).toBe(`upi-v${VERSION}`);
+			expect(env.MICROPI_YES).toBe("1");
 		} finally {
 			for (const [name, value] of Object.entries(saved)) {
 				if (value === undefined) delete process.env[name];

@@ -1,11 +1,11 @@
 name: Bug report
-description: Pi-Bolt does something stock Pi does not, or fails to install, update, compile or start.
+description: µPi does something stock Pi does not, or fails to install, update, compile or start.
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        Before you file: update (`pi-bolt update`), search existing issues, and try stock Pi (`npx @earendil-works/pi-coding-agent`).
+        Before you file: update (`upi update`), search existing issues, and try stock Pi (`npx @earendil-works/pi-coding-agent`).
         A security problem? Don't file it here: report it privately (see SECURITY.md).
   - type: textarea
     id: what
@@ -18,9 +18,9 @@ body:
     id: steps
     attributes:
       label: Steps to reproduce
-      description: The smallest steps that show it, starting from `pi-bolt` in a folder.
+      description: The smallest steps that show it, starting from `upi` in a folder.
       placeholder: |
-        1. pi-bolt in a folder with ...
+        1. upi in a folder with ...
         2. ask ...
         3. see ...
     validations:
@@ -34,7 +34,7 @@ body:
         - Startup or crash
         - Screen, keys or terminal
         - Tools (bash, read, edit, grep, find)
-        - Extensions or pi-bolt compile
+        - Extensions or upi compile
         - Model or provider
         - Speed or memory
         - Other
@@ -43,8 +43,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: pi-bolt --version
-      placeholder: "1.4.0 (Pi-Bolt 1.0.4, darwin-arm64, JIT off)"
+      label: upi --version
+      placeholder: "1.4.0 (µPi 1.0.4, darwin-arm64, JIT off)"
     validations:
       required: true
   - type: input
@@ -74,11 +74,11 @@ body:
     id: plain-pi
     attributes:
       label: Does stock Pi (on Node or Bun) do the same?
-      options: ["No, only Pi-Bolt", "Yes, stock Pi too", "Not tried"]
+      options: ["No, only µPi", "Yes, stock Pi too", "Not tried"]
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: Logs or `pi-bolt doctor` output (optional)
+      label: Logs or `upi doctor` output (optional)
       render: text

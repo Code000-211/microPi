@@ -128,7 +128,7 @@ import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
 import { addMcpServerConfig, loadMcpConfig } from "../../extensions/mcp/config.ts";
-import { PIBOLT, PIBOLT_RELEASES_URL, piBoltUpdateCommand } from "../../pi-bolt.ts";
+import { MICROPI_RELEASES_URL, PIBOLT, piBoltUpdateCommand } from "../../upi.ts";
 import {
 	getChangelogPath,
 	getNewEntries,
@@ -906,7 +906,7 @@ export class InteractiveMode {
 		if (this.settingsManager.getCollapseChangelog()) {
 			const versionMatch = this.changelogMarkdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
 			const latestVersion = versionMatch ? versionMatch[1] : this.version;
-			// (A Pi-Bolt build shows Pi's changelog: the version is Pi's, not Pi-Bolt's.)
+			// (A µPi build shows Pi's changelog: the version is Pi's, not µPi's.)
 			const condensedText = `Updated to ${PIBOLT ? "Pi " : "v"}${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
 			this.chatContainer.addChild(new Text(condensedText, 1, 0));
 		} else {
@@ -4842,9 +4842,9 @@ export class InteractiveMode {
 
 	showNewVersionNotification(release: LatestPiRelease): void {
 		const updateInstruction = () =>
-			theme.fg("muted", `New ${PIBOLT ? "Pi-Bolt " : ""}version ${release.version} is available. Run `) +
+			theme.fg("muted", `New ${PIBOLT ? "µPi " : ""}version ${release.version} is available. Run `) +
 			theme.fg("accent", PIBOLT ? piBoltUpdateCommand() : `${COMMAND_NAME} update`);
-		const changelogUrl = PIBOLT ? PIBOLT_RELEASES_URL : "https://pi.dev/changelog";
+		const changelogUrl = PIBOLT ? MICROPI_RELEASES_URL : "https://pi.dev/changelog";
 		const changelogLine = () => {
 			const changelogLink = getCapabilities().hyperlinks
 				? hyperlink(theme.fg("accent", changelogUrl), changelogUrl)

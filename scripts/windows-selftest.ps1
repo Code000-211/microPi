@@ -1,16 +1,16 @@
-# A self-test of a Pi-Bolt executable on this Windows machine (Windows 10 1809 or later, or Windows 11; x64), for machines the
+# A self-test of a microPi executable on this Windows machine (Windows 10 1809 or later, or Windows 11; x64), for machines the
 # release was not built or tested on. Self-contained: no Python, no repository, no network (a small fake model on 127.0.0.1
 # answers Pi; no provider is called). Run it with Windows PowerShell:
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File windows-selftest.ps1 [-Pi C:\path\to\pi-bolt.exe]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File windows-selftest.ps1 [-Pi C:\path\to\upi.exe]
 #
-# Default: the pi-bolt on PATH. It prints PASS/FAIL for each check and writes the same, with what the machine is, to
+# Default: the upi on PATH. It prints PASS/FAIL for each check and writes the same, with what the machine is, to
 # pibolt-selftest.txt in the current folder: send that file back. It changes nothing on the machine; its temporary files are in
 # %TEMP% and removed at the end.
 param([string]$Pi = '')
 $ErrorActionPreference = 'Continue'
-if (-not $Pi) { $Pi = (Get-Command pi-bolt -ErrorAction SilentlyContinue).Source }
-if (-not $Pi -or -not (Test-Path -LiteralPath $Pi)) { Write-Host 'error: no pi-bolt.exe (pass -Pi C:\path\to\pi-bolt.exe)'; exit 1 }
+if (-not $Pi) { $Pi = (Get-Command upi -ErrorAction SilentlyContinue).Source }
+if (-not $Pi -or -not (Test-Path -LiteralPath $Pi)) { Write-Host 'error: no upi.exe (pass -Pi C:\path\to\upi.exe)'; exit 1 }
 $Pi = (Resolve-Path -LiteralPath $Pi).Path
 $report = Join-Path (Get-Location) 'pibolt-selftest.txt'
 $lines = New-Object System.Collections.Generic.List[string]
@@ -27,7 +27,7 @@ Add-Type -Namespace PiBoltSelfTest -Name Cpu -MemberDefinition '[DllImport("kern
 Say "machine: $($os.Caption) $($os.Version) (build $($os.BuildNumber)), $env:PROCESSOR_ARCHITECTURE"
 Say "cpu: $cpu; AVX2 reported: $([PiBoltSelfTest.Cpu]::IsProcessorFeaturePresent(40))"
 Say "powershell: $($PSVersionTable.PSVersion); .NET: $([Environment]::Version)"
-Say "pi-bolt: $Pi"
+Say "upi: $Pi"
 
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "pibolt-selftest-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 $agent = Join-Path $tmp 'agent'; $work = Join-Path $tmp 'work'
@@ -119,7 +119,7 @@ function Hex($code) { if ($code -is [int]) { '0x{0:x8}' -f $code } else { $code 
 try {
 	# --- The checks -------------------------------------------------------------------------------------------------------
 	$v = Invoke-Pi @('--version')
-	Result 'starts and says its version' ($v.Code -eq 0 -and $v.Out -match 'Pi-Bolt') "exit $(Hex $v.Code) $($v.Out.Trim()) $($v.Err.Trim())"
+	Result 'starts and says its version' ($v.Code -eq 0 -and $v.Out -match 'µPi|Pi [0-9]') "exit $(Hex $v.Code) $($v.Out.Trim()) $($v.Err.Trim())"
 	Say "  version: $($v.Out.Trim())"
 	$aot = if ($v.Err -match 'image of \d+ bytes mapped') { 'yes' } elseif ($v.Err -match 'not used \(([^)]*)\)') { "no ($($Matches[1]))" } else { 'not said' }
 	Say "  compiled code used: $aot"
@@ -127,7 +127,7 @@ try {
 	Say "  --version: $(($times | Sort-Object)[2]) ms (median of 5, with this script's overhead)"
 
 	$r = Invoke-Pi @('--no-session', '--model', 'fake/fake-model', '-p', 'hello')
-	Result 'answers a prompt (pi-bolt -p, with the local fake model)' ($r.Code -eq 0 -and $r.Out -match 'SELFTEST-OK') "exit $(Hex $r.Code) $($r.Err.Trim() | Select-Object -First 1)"
+	Result 'answers a prompt (upi -p, with the local fake model)' ($r.Code -eq 0 -and $r.Out -match 'SELFTEST-OK') "exit $(Hex $r.Code) $($r.Err.Trim() | Select-Object -First 1)"
 	$r = Invoke-Pi @('--no-session', '--model', 'fake/fake-model', '-p', 'SELFTEST-READ the note')
 	Result 'runs a tool (read) and answers after it' ($r.Code -eq 0 -and $r.Out -match 'SELFTEST-OK after the tool') "exit $(Hex $r.Code) $($r.Err.Trim())"
 

@@ -17,7 +17,7 @@ Defender's check of a new process cost can be told from what a build costs. The 
 
 Example:
   bench/benchmark.py --runs 15 --cpus 8-15 \\
-      --build pi-bolt=./out/pi/pi \\
+      --build upi=./out/pi/pi \\
       --build bun="./out/pi-stable/pi" \\
       --build node="node ./pi/packages/coding-agent/dist/cli.js"
 """

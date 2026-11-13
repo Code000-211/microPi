@@ -9,9 +9,9 @@
 # a stock-Bun build of Pi in the same userland, or the main build on this CPU.
 #
 # Usage: tests/compat/run.sh [--builds DIR] [--stable PI] [--only userlands|cpus]
-#   --builds DIR   where the unpacked release archives are (pi-bolt-linux-x64/, -baseline/, -jit/; on ARM64
-#                  pi-bolt-linux-arm64/, -jit/). Default: out/, with the names build-pi.sh gives them (pi-bolt, pi-bolt-baseline,
-#                  pi-bolt-jit)
+#   --builds DIR   where the unpacked release archives are (upi-linux-x64/, -baseline/, -jit/; on ARM64
+#                  upi-linux-arm64/, -jit/). Default: out/, with the names build-pi.sh gives them (upi, upi-baseline,
+#                  upi-jit)
 #   --stable PI    the stock-Bun build (scripts/build-pi.sh --stable). Default: out/pi-stable/pi
 # Needs: bwrap and curl for the userlands (unprivileged user namespaces), qemu-x86_64-static (on ARM64 qemu-aarch64-static) for
 # the CPUs. What is missing is skipped, and said.
@@ -31,9 +31,9 @@ while [ $# -gt 0 ]; do
 done
 # (On ARM64 the main build is for any ARMv8.0 CPU: there is no baseline build.)
 if [ -n "$BUILDS" ]; then
-	MAIN="$BUILDS/pi-bolt-$PIBOLT_PLATFORM"; BASELINE="$BUILDS/pi-bolt-linux-x64-baseline"; JIT="$BUILDS/pi-bolt-$PIBOLT_PLATFORM-jit"
+	MAIN="$BUILDS/upi-$PIBOLT_PLATFORM"; BASELINE="$BUILDS/upi-linux-x64-baseline"; JIT="$BUILDS/upi-$PIBOLT_PLATFORM-jit"
 else
-	MAIN="$PIBOLT_ROOT/out/pi-bolt"; BASELINE="$PIBOLT_ROOT/out/pi-bolt-baseline"; JIT="$PIBOLT_ROOT/out/pi-bolt-jit"
+	MAIN="$PIBOLT_ROOT/out/upi"; BASELINE="$PIBOLT_ROOT/out/upi-baseline"; JIT="$PIBOLT_ROOT/out/upi-jit"
 fi
 [ "$PIBOLT_ARCH" = x64 ] || BASELINE=""
 [ -x "$MAIN/pi" ] || die "no build at $MAIN (scripts/package-release.sh, or --builds)"

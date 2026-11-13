@@ -1,9 +1,9 @@
 """
-A Harbor agent that runs a Pi-Lightspeed build on Terminal-Bench tasks (https://github.com/harbor-framework/terminal-bench-2-1).
+A Harbor agent that runs a µPi build on Terminal-Bench tasks (https://github.com/harbor-framework/terminal-bench-2-1).
 
     PYTHONPATH=bench/harness harbor run -d terminal-bench/terminal-bench-2-1 -e docker \\
-        --agent-import-path tb_agent:PiLightspeed -m melious/deepseek-v4.1-flash \\
-        --ak harness_dir=out/pi-bolt --ak extensions=<folder of docsearch> --ak models_json=~/.pi/agent/models.json
+        --agent-import-path tb_agent:MicroPi -m melious/deepseek-v4.1-flash \\
+        --ak harness_dir=out/upi --ak extensions=<folder of docsearch> --ak models_json=~/.pi/agent/models.json
 
 `harness_dir` (a build from scripts/build-pi.sh) is uploaded into the task's container, and each folder in `extensions`
 (comma-separated, each with an index.ts) next to it and loaded with `-e`; nothing else is (`-ne -ns -np -nc`), so the run
@@ -28,7 +28,7 @@ EXTENSIONS_DIR = "/opt/pi-extensions"
 AGENT_DIR = "/opt/pi-agent"
 
 
-class PiLightspeed(BaseInstalledAgent):
+class MicroPi(BaseInstalledAgent):
     def __init__(
         self,
         *args,
@@ -39,14 +39,14 @@ class PiLightspeed(BaseInstalledAgent):
     ):
         super().__init__(*args, **kwargs)
         if not harness_dir:
-            raise ValueError("PiLightspeed needs --ak harness_dir=<folder of the Pi build>")
+            raise ValueError("MicroPi needs --ak harness_dir=<folder of the Pi build>")
         self._harness_dir = Path(harness_dir).expanduser()
         self._extensions = [Path(p).expanduser() for p in extensions.split(",") if p]
         self._models_json = Path(models_json).expanduser()
 
     @staticmethod
     def name() -> str:
-        return "pi-lightspeed"
+        return "micropi"
 
     def version(self) -> str | None:
         return None

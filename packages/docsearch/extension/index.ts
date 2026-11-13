@@ -14,7 +14,7 @@
  * Settings: ~/.pi/agent/docsearch.json
  *   { "project": true, "roots": ["~/notes"], "autoRecall": true }
  *
- * Install: packages/docsearch/install.sh, then `pi-bolt compile` (see packages/docsearch/README.md).
+ * Install: packages/docsearch/install.sh, then `upi compile` (see packages/docsearch/README.md).
  */
 
 import { spawnSync } from "node:child_process";
@@ -25,7 +25,7 @@ import { Type } from "typebox";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
-// A literal path, so that `pi-bolt compile` embeds the addon in the executable; install.sh puts in the platform it
+// A literal path, so that `upi compile` embeds the addon in the executable; install.sh puts in the platform it
 // builds on (docsearch.darwin-arm64.node, docsearch.win32-x64.node, ...). One that does not load here (built against a
 // newer C library than this system's, say) leaves the extension out instead of stopping Pi.
 let DocIndex: any;
@@ -247,6 +247,8 @@ export default function (pi: ExtensionAPI) {
 	// PI_DOCSEARCH=off leaves the extension out entirely (no tool, no recall), to measure without it.
 	if (process.env.PI_DOCSEARCH === "off" || !DocIndex) return;
 	let index: any;
+	/** The interval that watches the first build (session_shutdown stops it): a tick on a dead session's ctx throws. */
+	let poll: ReturnType<typeof setInterval> | undefined;
 	/** The current index's first build is there: searches need not wait for it. */
 	let ready = false;
 	let base = "";
@@ -257,8 +259,15 @@ export default function (pi: ExtensionAPI) {
 	let leftOut = false;
 
 	const show = (p: string) => {
-		if (base && (p === base || p.startsWith(`${base}/`))) return relative(base, p) || ".";
-		return p.startsWith(`${homedir()}/`) ? `~/${relative(homedir(), p)}` : p;
+		// Model-facing paths: forward slashes on every platform (the scan hands out \-separated paths on Windows -
+		// both in the walked file list and in base), made relative to the project when the path is in it. path.relative
+		// writes \ again on Windows when it cuts, so it is normalized too. On POSIX this compares and shortens
+		// unchanged.
+		const s = p.replaceAll("\\", "/");
+		const b = base.replaceAll("\\", "/");
+		if (b && (s === b || s.startsWith(`${b}/`))) return relative(b, s).replaceAll("\\", "/") || ".";
+		const home = homedir().replaceAll("\\", "/");
+		return s.startsWith(`${home}/`) ? `~/${relative(home, s).replaceAll("\\", "/")}` : s;
 	};
 
 	function start(ctx: ExtensionContext) {
@@ -285,12 +294,14 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("docsearch", undefined);
 			return;
 		}
-		// The build runs on a thread; show the count once it is there.
+		// The build runs on a thread; show the count once it is there. In a `-p` run the session can end before the build
+		// does, and the ctx is stale after it: the poll stops on session_shutdown.
 		let tries = 0;
-		const poll = setInterval(() => {
+		poll = setInterval(() => {
 			const s = index?.stats();
 			if (!s || s.ready || ++tries > 100) {
 				clearInterval(poll);
+				poll = undefined;
 				ctx.ui.setStatus("docsearch", s?.ready ? `index ${s.files}` : undefined);
 			}
 		}, 100);
@@ -348,6 +359,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => start(ctx));
 	pi.on("session_shutdown", async () => {
+		if (poll) clearInterval(poll);
+		poll = undefined;
 		index = undefined;
 	});
 

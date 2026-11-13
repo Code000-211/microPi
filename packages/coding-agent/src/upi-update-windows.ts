@@ -1,17 +1,17 @@
 /**
- * `pi-bolt update` on Windows, without PowerShell.
+ * `upi update` on Windows, without PowerShell.
  *
  * Updates used to start the installer as `powershell -Command "irm https://.../install.ps1 | iex"`. A program that starts
  * PowerShell to download a script and run it with iex is what a malware "download cradle" does, and behavior-based antivirus
- * stops it as such: Kaspersky's System Watcher reports PDM:Trojan.Win32.Generic for pi-bolt.exe during `pi-bolt update`
- * (#82). So Pi-Bolt updates itself here, doing what install.ps1 does for an update (PIBOLT_YES, PIBOLT_NO_PATH: no questions,
+ * stops it as such: Kaspersky's System Watcher reports PDM:Trojan.Win32.Generic for upi.exe during `upi update`
+ * (#82). So µPi updates itself here, doing what install.ps1 does for an update (MICROPI_YES, MICROPI_NO_PATH: no questions,
  * no PATH, no extensions): the signed SHA256SUMS, the release's .zip from npm or else GitHub, checked against them, unpacked
- * by Windows' own tar.exe, the build it replaces kept as <folder>.previous for `pi-bolt update --rollback`, and the new files
+ * by Windows' own tar.exe, the build it replaces kept as <folder>.previous for `upi update --rollback`, and the new files
  * renamed into place the way install.ps1 does it, the executable last.
  *
  * An installation outside the user's profile still goes through the installer: install.ps1 checks and sets who may change
  * such a folder (Windows ACLs), which is not done here. That is the release's own install.ps1, checked against the same signed
- * SHA256SUMS before it runs (pi-bolt-installer.ts).
+ * SHA256SUMS before it runs (upi-installer.ts).
  */
 import { spawnSync } from "node:child_process";
 import { createHash, createPublicKey, verify } from "node:crypto";
@@ -32,9 +32,9 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { gunzipSync } from "node:zlib";
 import chalk from "chalk";
-import { PIBOLT_RELEASE_KEY } from "./pi-bolt.ts";
+import { MICROPI_RELEASE_KEY } from "./upi.ts";
 
-const REPO = "https://github.com/opensec-git/Pi-Bolt";
+const REPO = "https://github.com/Code000-211/microPi";
 const ASIDE = /\.pibolt-(old|new)$/;
 
 /** Whether `dir` is under the user's profile (%USERPROFILE% or %LOCALAPPDATA%), as install.ps1's Test-PiBoltInProfile. */
@@ -49,7 +49,7 @@ export function isInProfile(dir: string, env: NodeJS.ProcessEnv = process.env): 
 export function sumsSignatureValid(
 	sums: Buffer,
 	signature: Buffer,
-	publicKeyPem: string = PIBOLT_RELEASE_KEY,
+	publicKeyPem: string = MICROPI_RELEASE_KEY,
 ): boolean {
 	try {
 		return verify(null, sums, createPublicKey(publicKeyPem), signature);
@@ -58,9 +58,9 @@ export function sumsSignatureValid(
 	}
 }
 
-/** The release SHA256SUMS says it is ("# pi-bolt 0.9.6" on its first line), or undefined. */
+/** The release SHA256SUMS says it is ("# upi 0.9.6" on its first line), or undefined. */
 export function sumsVersion(sums: string): string | undefined {
-	return /^# pi-bolt (\d+\.\d+\.\d+)\r?$/.exec(sums.split("\n", 1)[0] ?? "")?.[1];
+	return /^# upi (\d+\.\d+\.\d+)\r?$/.exec(sums.split("\n", 1)[0] ?? "")?.[1];
 }
 
 /** The SHA-256 SHA256SUMS lists for `name` (lowercase hex), or undefined. */
@@ -141,10 +141,10 @@ function moveFile(from: string, to: string): void {
 }
 
 /**
- * Moves the new build in `from` into place over the one in `to`, as install.ps1's Install-PiBoltFiles: a running Pi-Bolt keeps
+ * Moves the new build in `from` into place over the one in `to`, as install.ps1's Install-PiBoltFiles: a running µPi keeps
  * its executable and DLLs open, and Windows lets those be renamed but not replaced or deleted. Each new file is first moved
  * next to its target, then the old one renamed aside, then the new one renamed into place (if that fails, the old one is put
- * back); pi-bolt.exe last, so that until it is in place the one that runs is the old one. What was renamed aside is deleted
+ * back); upi.exe last, so that until it is in place the one that runs is the old one. What was renamed aside is deleted
  * now if it can be, or by the next install.
  */
 export function installFiles(from: string, to: string, stamp: number = Date.now()): void {
@@ -153,7 +153,7 @@ export function installFiles(from: string, to: string, stamp: number = Date.now(
 	}
 	mkdirSync(to, { recursive: true });
 	const files = filesIn(from).sort(
-		(a, b) => Number(/(^|[\\/])pi-bolt\.exe$/i.test(a)) - Number(/(^|[\\/])pi-bolt\.exe$/i.test(b)),
+		(a, b) => Number(/(^|[\\/])upi\.exe$/i.test(a)) - Number(/(^|[\\/])upi\.exe$/i.test(b)),
 	);
 	for (const file of files) {
 		const target = join(to, file);
@@ -177,21 +177,21 @@ export function installFiles(from: string, to: string, stamp: number = Date.now(
 		} catch (error) {
 			rmSync(staged, { force: true });
 			throw new Error(
-				`could not put ${target} in place (${(error as Error).message}). Close Pi-Bolt and anything that has its files open, then run \`pi-bolt update\` again.`,
+				`could not put ${target} in place (${(error as Error).message}). Close µPi and anything that has its files open, then run \`upi update\` again.`,
 			);
 		}
 	}
 }
 
 /**
- * Keeps the build in `dir` as <dir>.previous for `pi-bolt update --rollback`, unless the incoming build is the same one (the same
- * pi-bolt.txt). Copied, since the running Pi-Bolt keeps its folder from being renamed. A note, not an error, if it cannot be.
+ * Keeps the build in `dir` as <dir>.previous for `upi update --rollback`, unless the incoming build is the same one (the same
+ * upi.txt). Copied, since the running µPi keeps its folder from being renamed. A note, not an error, if it cannot be.
  */
 export function keepPrevious(dir: string, incoming: string, note: (text: string) => void = () => {}): void {
-	if (!existsSync(join(dir, "pi-bolt.exe"))) return;
+	if (!existsSync(join(dir, "upi.exe"))) return;
 	const read = (folder: string) => {
 		try {
-			return readFileSync(join(folder, "pi-bolt.txt"), "utf8");
+			return readFileSync(join(folder, "upi.txt"), "utf8");
 		} catch {
 			return undefined;
 		}
@@ -204,7 +204,7 @@ export function keepPrevious(dir: string, incoming: string, note: (text: string)
 		cpSync(dir, previous, { recursive: true, filter: (source) => !ASIDE.test(source) });
 	} catch (error) {
 		note(
-			`the build this replaces was not kept (${(error as Error).message}): pi-bolt update --rollback has none to go back to`,
+			`the build this replaces was not kept (${(error as Error).message}): upi update --rollback has none to go back to`,
 		);
 	}
 }
@@ -213,7 +213,7 @@ export function keepPrevious(dir: string, incoming: string, note: (text: string)
 export async function download(url: string, what: string | undefined): Promise<Buffer | undefined> {
 	let response: Response;
 	try {
-		response = await fetch(url, { headers: { "user-agent": "pi-bolt-updater" }, redirect: "follow" });
+		response = await fetch(url, { headers: { "user-agent": "upi-updater" }, redirect: "follow" });
 	} catch {
 		return undefined;
 	}
@@ -241,14 +241,14 @@ export async function download(url: string, what: string | undefined): Promise<B
 
 /** Where release `version`'s files are downloaded from. */
 export function releaseDownloadBase(version: string): string {
-	return `${REPO}/releases/download/bolt-v${version}`;
+	return `${REPO}/releases/download/upi-v${version}`;
 }
 
 /**
  * Release `version`'s SHA256SUMS, once its signature (SHA256SUMS.sig) verifies with the release key and its first line names
  * that version. Throws otherwise: nothing else is looked at in a release whose checksums are not Pi-Bolt's.
  */
-export async function fetchSignedSums(version: string, publicKeyPem: string = PIBOLT_RELEASE_KEY): Promise<string> {
+export async function fetchSignedSums(version: string, publicKeyPem: string = MICROPI_RELEASE_KEY): Promise<string> {
 	const base = releaseDownloadBase(version);
 	const sumsBytes = await download(`${base}/SHA256SUMS`, undefined);
 	if (!sumsBytes) throw new Error(`download failed: ${base}/SHA256SUMS`);
@@ -258,22 +258,20 @@ export async function fetchSignedSums(version: string, publicKeyPem: string = PI
 			"the release has no signature (SHA256SUMS.sig), and every release since 0.6.0 is signed. Nothing was installed.",
 		);
 	if (!sumsSignatureValid(sumsBytes, signature, publicKeyPem)) {
-		throw new Error("the release's signature does not verify: the download is not Pi-Bolt's. Nothing was installed.");
+		throw new Error("the release's signature does not verify: the download is not µPi's. Nothing was installed.");
 	}
 	// The first line says which release the signed files are: an older release (signed all the same) is not taken for a newer one.
 	const sums = sumsBytes.toString("utf8");
 	const signedVersion = sumsVersion(sums);
 	if (signedVersion !== version) {
-		throw new Error(
-			`the download is Pi-Bolt ${signedVersion ?? "(unknown)"}, not ${version}. Nothing was installed.`,
-		);
+		throw new Error(`the download is µPi ${signedVersion ?? "(unknown)"}, not ${version}. Nothing was installed.`);
 	}
 	return sums;
 }
 
 /** Updates the installation in `installDir` (its `variant` folder) to release `version`. Throws with what went wrong. */
 export async function updatePiBoltWindows(version: string, installDir: string, variant: string): Promise<void> {
-	const name = `pi-bolt-win32-${variant}`;
+	const name = `upi-win32-${variant}`;
 	const archive = `${name}.zip`;
 	const dir = join(installDir, name);
 	const base = releaseDownloadBase(version);
@@ -281,21 +279,11 @@ export async function updatePiBoltWindows(version: string, installDir: string, v
 	const expected = sumsEntry(sums, archive);
 	if (!expected)
 		throw new Error(`this release has no build for this installation (${archive} is not in its SHA256SUMS)`);
-	// From npm (its package of this build is a .tgz with the release's .zip in it), else from GitHub, as install.ps1 does.
-	let zip: Buffer | undefined;
-	let from = "npm";
-	const registry = (process.env.PIBOLT_NPM_REGISTRY || "https://registry.npmjs.org").replace(/\/+$/, "");
-	const tgz = await download(`${registry}/@kushalkhemka/${name}/-/${name}-${version}.tgz`, "downloading");
-	const fromNpm = tgz ? tgzEntry(tgz, `package/${archive}`) : undefined;
-	if (fromNpm && sha256(fromNpm) === expected) zip = fromNpm;
-	if (!zip) {
-		console.log(chalk.dim("  not available from npm; downloading from GitHub instead"));
-		from = "GitHub";
-		zip = await download(`${base}/${archive}`, "downloading");
-		if (!zip) throw new Error(`download failed: ${base}/${archive}`);
-		if (sha256(zip) !== expected) throw new Error("checksum mismatch: the download is corrupt or incomplete");
-	}
-	const tmp = mkdtempSync(join(tmpdir(), "pi-bolt-update-"));
+	// From GitHub, as install.ps1's default does.
+	const zip = await download(`${base}/${archive}`, "downloading");
+	if (!zip) throw new Error(`download failed: ${base}/${archive}`);
+	if (sha256(zip) !== expected) throw new Error("checksum mismatch: the download is corrupt or incomplete");
+	const tmp = mkdtempSync(join(tmpdir(), "upi-update-"));
 	try {
 		const zipFile = join(tmp, archive);
 		writeFileSync(zipFile, zip);
@@ -307,18 +295,18 @@ export async function updatePiBoltWindows(version: string, installDir: string, v
 		if (extracted.status !== 0)
 			throw new Error(`could not unpack ${archive}: ${(extracted.stderr || String(extracted.error ?? "")).trim()}`);
 		const build = join(unpacked, name);
-		const exe = join(build, "pi-bolt.exe");
-		if (!existsSync(exe)) throw new Error(`${archive} does not have ${name}\\pi-bolt.exe`);
+		const exe = join(build, "upi.exe");
+		if (!existsSync(exe)) throw new Error(`${archive} does not have ${name}\\upi.exe`);
 		if (spawnSync(exe, ["--version"], { stdio: "ignore" }).status !== 0)
 			throw new Error("the downloaded executable does not run on this system");
 		keepPrevious(dir, build, (text) => console.log(chalk.dim(`  ${text}`)));
 		installFiles(build, dir);
 		console.log(
-			`  ${chalk.green("ok")} install complete ${chalk.dim(`(win32-${variant}, ${(statSync(zipFile).size / 1048576).toFixed(1)} MB from ${from}, signature verified)`)}`,
+			`  ${chalk.green("ok")} install complete ${chalk.dim(`(win32-${variant}, ${(statSync(zipFile).size / 1048576).toFixed(1)} MB from GitHub, signature verified)`)}`,
 		);
 	} finally {
 		rmSync(tmp, { recursive: true, force: true });
 	}
-	// Pi-Bolt keeps the packages only it runs out of Pi's list as it starts: once now, as install.ps1 does after an install.
-	spawnSync(join(dir, "pi-bolt.exe"), ["list"], { cwd: dir, stdio: "ignore" });
+	// µPi keeps the packages only it runs out of Pi's list as it starts: once now, as install.ps1 does after an install.
+	spawnSync(join(dir, "upi.exe"), ["list"], { cwd: dir, stdio: "ignore" });
 }

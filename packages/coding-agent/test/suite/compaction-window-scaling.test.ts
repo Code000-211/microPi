@@ -166,7 +166,7 @@ describe("compaction scaled with the context window", () => {
 
 	// A 128K session with default settings must compact at the same point and send exactly the
 	// requests it sent before the defaults scaled with the context window. The fixture was captured
-	// from pi-bolt before that change.
+	// from upi before that change.
 	it("leaves 128K default compaction unchanged", async () => {
 		const harness = await harnessWith({});
 		expect(harness.getModel().contextWindow).toBe(128_000);

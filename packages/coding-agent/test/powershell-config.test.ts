@@ -12,7 +12,7 @@ vi.mock("node:fs", async (importOriginal) => ({
 	accessSync: accessSyncMock,
 }));
 
-// Pi-Bolt looks shells up in PATH's directories itself (not with `where`, which also searches the working directory): a PATH
+// µPi looks shells up in PATH's directories itself (not with `where`, which also searches the working directory): a PATH
 // entry counts when the existence check passes for the file in it.
 vi.mock("../src/utils/windows-path.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof WindowsPath>()),

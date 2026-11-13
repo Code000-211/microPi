@@ -1,4 +1,4 @@
-# Builds the Pi-Bolt runtime on Windows: Bun on the patched WebKit (JavaScriptCore with the ahead-of-time compiler), release
+# Builds the microPi runtime on Windows: Bun on the patched WebKit (JavaScriptCore with the ahead-of-time compiler), release
 # flags. Windows' scripts/build-runtime.sh.
 # Usage: scripts\build-runtime.ps1 [-Lto on|off] [-Jobs N] [-BuildDir DIR]
 #   -Lto off    no link-time optimization: a faster build that needs less memory, for working on the engine

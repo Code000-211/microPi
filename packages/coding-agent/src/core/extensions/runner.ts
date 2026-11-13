@@ -12,7 +12,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
-import { PIBOLT } from "../../pi-bolt.ts";
+import { PIBOLT } from "../../upi.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
@@ -608,7 +608,7 @@ export class ExtensionRunner {
 				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts)),
 			editor: (title, prefill) => this.withUIPrompt("editor", title, () => ui.editor(title, prefill)),
 			custom: (factory, options) => this.withUIPrompt("custom", undefined, () => ui.custom(factory, options)),
-			// Pi-Bolt without the JIT: an extension's own notice of "bun:ffi requires the JIT" says which extension needs the JIT
+			// µPi without the JIT: an extension's own notice of "bun:ffi requires the JIT" says which extension needs the JIT
 			// build (core/extensions/jit-hint.ts). The extension is the one whose code called notify().
 			...(PIBOLT && !PIBOLT.jit
 				? {

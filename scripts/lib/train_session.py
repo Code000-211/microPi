@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Training sessions for a Pi executable built with the Pi-Bolt runtime (no AOT yet).
+"""Training sessions for a Pi executable built with the µPi runtime (no AOT yet).
 
 The first starts the TUI, runs prompts that read files, renders markdown and code, and quits, while the runtime records which
 functions run, in which order (BUN_BYTECODE_ORDER_OUT), and which regular expressions the program builds at run time

@@ -17,6 +17,8 @@ export interface OutputAccumulatorOptions {
 	/** When the output is truncated, also keep its first lines, up to `headLines` and `headBytes`, before the tail. */
 	headLines?: number;
 	headBytes?: number;
+	/** Also keep the end of the output as it was written, escape sequences included (readRawTail), for a client that shows a terminal. */
+	keepRawTail?: boolean;
 }
 
 export interface OutputSnapshot {
@@ -27,6 +29,13 @@ export interface OutputSnapshot {
 	fullOutputPath?: string;
 	/** Lines of the head before the omission line, when the output is truncated and a head is kept. */
 	headLines?: number;
+}
+
+/** The output as it was written, escape sequences included, or its end when truncated: what a terminal shows. */
+export interface RawTail {
+	text: string;
+	totalBytes: number;
+	truncated: boolean;
 }
 
 export interface FullOutput {
@@ -62,6 +71,7 @@ export class OutputAccumulator {
 	private readonly tempFilePrefix: string;
 	private readonly decoder = new TextDecoder();
 	private readonly clean: boolean;
+	private readonly keepRawTail: boolean;
 	private readonly headLineLimit: number;
 	private readonly headByteLimit: number;
 	/** clean: an unfinished escape sequence at the end of the last chunk, and the line not yet ended. */
@@ -72,6 +82,10 @@ export class OutputAccumulator {
 	private headLineCount = 0;
 	private headFull = false;
 	private pendingHead = "";
+
+	/** The end of the output as it was written, escape sequences included, while `keepRawTail`. */
+	private rawTailText = "";
+	private rawTailTotalBytes = 0;
 
 	private rawChunks: Buffer[] = [];
 	private tailText = "";
@@ -98,6 +112,7 @@ export class OutputAccumulator {
 		this.maxRollingBytes = Math.max(this.maxBytes * 2, 1);
 		this.tempFilePrefix = options.tempFilePrefix ?? "pi-output";
 		this.clean = options.clean ?? false;
+		this.keepRawTail = options.keepRawTail ?? false;
 		this.headLineLimit = options.headLines ?? 0;
 		this.headByteLimit = options.headBytes ?? 0;
 		this.headFull = this.headLineLimit <= 0 || this.headByteLimit <= 0;
@@ -108,7 +123,9 @@ export class OutputAccumulator {
 			throw new Error("Cannot append to a finished output accumulator");
 		}
 		if (this.clean) {
-			this.appendCleaned(this.decoder.decode(data, { stream: true }), false);
+			const text = this.decoder.decode(data, { stream: true });
+			this.appendRawTail(text);
+			this.appendCleaned(text, false);
 			return;
 		}
 
@@ -123,7 +140,9 @@ export class OutputAccumulator {
 		}
 		this.finished = true;
 		if (this.clean) {
-			this.appendCleaned(this.decoder.decode(), true);
+			const text = this.decoder.decode();
+			this.appendRawTail(text);
+			this.appendCleaned(text, true);
 		} else {
 			this.appendDecodedText(this.decoder.decode());
 		}
@@ -297,6 +316,16 @@ export class OutputAccumulator {
 		return { content: tail.content, truncated: true };
 	}
 
+	/** The output as it was written so far, escape sequences included, or nothing when `keepRawTail` is off or nothing came in: for a client that shows a terminal, which cannot be given the cleaned text. */
+	readRawTail(): RawTail | undefined {
+		if (this.rawTailTotalBytes === 0) return undefined;
+		return {
+			text: this.rawTailText,
+			totalBytes: this.rawTailTotalBytes,
+			truncated: byteLength(this.rawTailText) < this.rawTailTotalBytes,
+		};
+	}
+
 	getLastLineBytes(): number {
 		return this.currentLineBytes;
 	}
@@ -374,6 +403,23 @@ export class OutputAccumulator {
 		this.tailStartsAtLineBoundary = start === 0 ? this.tailStartsAtLineBoundary : buffer[start - 1] === 0x0a;
 		this.tailText = buffer.subarray(start).toString("utf-8");
 		this.tailBytes = byteLength(this.tailText);
+	}
+
+	/** Feeds the raw tail: the whole decoded chunk (a partial escape sequence the cleaned path holds back is in it as it arrives). */
+	private appendRawTail(text: string): void {
+		if (!this.keepRawTail || text.length === 0) return;
+		this.rawTailText += text;
+		this.rawTailTotalBytes += byteLength(text);
+		if (byteLength(this.rawTailText) > this.maxRollingBytes) this.trimRawTail();
+	}
+
+	/** Keeps the raw tail within `maxRollingBytes`, cutting at a character boundary. */
+	private trimRawTail(): void {
+		const buffer = Buffer.from(this.rawTailText, "utf-8");
+		let start = buffer.length - this.maxRollingBytes;
+		if (start <= 0) return;
+		while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start++;
+		this.rawTailText = buffer.subarray(start).toString("utf-8");
 	}
 
 	private getSnapshotText(): string {

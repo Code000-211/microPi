@@ -1,8 +1,8 @@
-"""Shared pieces of the Pi-Bolt benchmark and test tools.
+"""Shared pieces of the µPi benchmark and test tools.
 
 A *build* is a name and the command that starts Pi, given as ``name=command`` on the command line, e.g.::
 
-    --build pi-bolt=./dist/pi/pi --build bun=~/.bun/bin/bun ./pi/dist/bun/cli.js --build node="node ./pi/dist/cli.js"
+    --build upi=./dist/pi/pi --build bun=~/.bun/bin/bun ./pi/dist/bun/cli.js --build node="node ./pi/dist/cli.js"
 
 Every run gets its own fake model server (fake_model.py) on a free port and a throwaway Pi home that points at it, so runs are
 isolated from the user's Pi configuration and from each other.
@@ -252,7 +252,7 @@ last_exit_counters: dict = {}
 
 class PeakOwnSampler:
     """Linux: the largest private memory a running process reached, the counterpart of macOS's peak footprint. ru_maxrss also
-    counts the clean pages of the files it maps (Pi-Bolt's executable maps its 114 MB static heap and compiled code; a Go
+    counts the clean pages of the files it maps (µPi's executable maps its 114 MB static heap and compiled code; a Go
     binary maps its own text), which the kernel can drop and share. RssAnon (in /proc/<pid>/status) is the process's own
     resident memory: its heaps, and file pages it has written to. Linux keeps no peak of it, so a thread samples it every
     `interval` seconds from start() until the process is gone or stop(): a spike shorter than that can be missed.

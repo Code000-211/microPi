@@ -39,7 +39,7 @@ import ignore from "ignore";
 import { minimatch } from "minimatch";
 import { gt, maxSatisfying, rcompare, satisfies, valid, validRange } from "semver";
 import { CONFIG_DIR_NAME, isBunBinary } from "../config.ts";
-import { PIBOLT } from "../pi-bolt.ts";
+import { PIBOLT } from "../upi.ts";
 import { findExecutableOnPath, spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
 import { type GitSource, parseGitUrl } from "../utils/git.ts";
 import {
@@ -140,7 +140,7 @@ export interface ConfiguredPackage {
 
 export interface PackageMutationOptions {
 	local?: boolean;
-	/** Select raw Pi-Bolt declarations instead of shared packages. Does not isolate installed files. */
+	/** Select raw µPi declarations instead of shared packages. Does not isolate installed files. */
 	piBolt?: boolean;
 }
 
@@ -977,10 +977,10 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	/**
-	 * Plain install and remove (without --pi-bolt) in Pi-Bolt change the shared list and drop Pi-Bolt's entries for the same
-	 * package in that settings file: a replacement, an addition or an exclusion. Pi-Bolt then loads exactly what the shared
-	 * list declares, so `remove X` cannot leave Pi-Bolt loading X and `install X@2` cannot leave it on X@1 or without X.
-	 * Returns whether Pi-Bolt's list changed.
+	 * Plain install and remove (without --upi) in µPi change the shared list and drop µPi's entries for the same
+	 * package in that settings file: a replacement, an addition or an exclusion. µPi then loads exactly what the shared
+	 * list declares, so `remove X` cannot leave µPi loading X and `install X@2` cannot leave it on X@1 or without X.
+	 * Returns whether µPi's list changed.
 	 */
 	private clearPiBoltOverride(
 		source: string,
@@ -1192,7 +1192,7 @@ export class DefaultPackageManager implements PackageManager {
 		const scope: SourceScope = options?.local ? "project" : "user";
 		this.assertProjectTrustedForScope(scope);
 		await this.withProgress("remove", source, `Removing ${source}...`, async () => {
-			// Both runtimes share installed files: --pi-bolt keeps the files the shared list still declares. A plain remove
+			// Both runtimes share installed files: --upi keeps the files the shared list still declares. A plain remove
 			// drops the package from both lists of this settings file (clearPiBoltOverride), so no declaration keeps them.
 			// Settings that cannot be read abort before anything is deleted.
 			if (PIBOLT !== undefined) {
@@ -1933,7 +1933,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private assertPackageMutationOptions(options?: PackageMutationOptions): void {
-		if (options?.piBolt && PIBOLT === undefined) throw new Error("--pi-bolt requires a Pi-Bolt build");
+		if (options?.piBolt && PIBOLT === undefined) throw new Error("--upi requires a µPi build");
 	}
 
 	private assertProjectTrustedForScope(scope: SourceScope): void {

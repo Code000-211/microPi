@@ -1,7 +1,7 @@
 /**
- * How Pi-Bolt's reports reach Herdr: through Herdr's socket, or by running the `herdr` executable that owns the pane
+ * How µPi's reports reach Herdr: through Herdr's socket, or by running the `herdr` executable that owns the pane
  * (HERDR_BIN_PATH). Herdr's "Add Herdr support to your agent" names the executable as the portable way, Windows included;
- * the socket costs no process per report. Pi-Bolt uses the executable on Windows and the socket elsewhere.
+ * the socket costs no process per report. µPi uses the executable on Windows and the socket elsewhere.
  */
 
 import { spawn } from "node:child_process";
@@ -25,7 +25,7 @@ export type HerdrRequest =
 	| { method: "pane.release_agent"; params: { pane_id: string; source: string; agent: string; seq: number } };
 
 /**
- * Send one request; true when Herdr took it. Never throws; waits at most `timeoutMs`, also when Pi-Bolt is quitting (the
+ * Send one request; true when Herdr took it. Never throws; waits at most `timeoutMs`, also when µPi is quitting (the
  * release on quit must get through), and never longer.
  */
 export type HerdrTransport = (request: HerdrRequest, timeoutMs: number) => Promise<boolean>;
@@ -93,7 +93,7 @@ export function socketTransport(endpoint: string): HerdrTransport {
 				finish(false);
 				return;
 			}
-			const id = `pi-bolt:${process.pid}:${++requestCount}`;
+			const id = `upi:${process.pid}:${++requestCount}`;
 			const line = JSON.stringify({ id, ...request });
 			// The answer is one line with this id: Herdr took the request only when it carries a result, not an error.
 			let buffered = "";

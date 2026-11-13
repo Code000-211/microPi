@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MICROPI_HAS_RELEASES } from "../src/upi.ts";
 import {
 	checkForNewPiVersion,
 	comparePackageVersions,
@@ -13,6 +14,8 @@ const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
 
 beforeEach(() => {
 	allowNetwork();
+	// These are tests of the automatic check, which the harness's PI_SKIP_VERSION_CHECK would turn off.
+	delete process.env.PI_SKIP_VERSION_CHECK;
 });
 
 afterEach(() => {
@@ -34,7 +37,7 @@ describe("version checks", () => {
 		expect(isNewerPackageVersion("0.70.6", "0.70.5")).toBe(true);
 	});
 
-	it("returns only newer versions", async () => {
+	it.skipIf(!MICROPI_HAS_RELEASES)("returns only newer versions", async () => {
 		const fetchMock = vi.fn(async () => Response.json({ version: "1.2.3" }));
 		vi.stubGlobal("fetch", fetchMock);
 
@@ -70,7 +73,7 @@ describe("version checks", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(3);
 	});
 
-	it("keeps automatic version checks to one request", async () => {
+	it.skipIf(!MICROPI_HAS_RELEASES)("keeps automatic version checks to one request", async () => {
 		const fetchMock = vi.fn().mockRejectedValue(new Error("fetch failed"));
 		vi.stubGlobal("fetch", fetchMock);
 

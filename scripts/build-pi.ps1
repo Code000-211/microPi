@@ -2,7 +2,7 @@
 #
 # Usage: scripts\build-pi.ps1 [options]
 #   -Pi DIR           a built Pi tree (npm ci --ignore-scripts; npm run build:offline, with the model catalog the repository has). Default: this repository, which is a fork of Pi
-#   -Out DIR          where to put the executable and its assets. Default: out\pi-bolt
+#   -Out DIR          where to put the executable and its assets. Default: out\upi
 #   -Jit on|off       run with the JIT on (code that is not compiled ahead of time gets JIT-compiled) or off (the default)
 #   -Cpu native|baseline
 #                     native: code for this CPU's instruction set (AVX2 class); baseline: any x86-64 CPU Bun runs on
@@ -20,6 +20,9 @@
 #                     the agent directory to read. Default: ~\.pi\agent (needs -PluginsFromInstalled)
 #   -PluginsNoPackages
 #                     leave out the packages `pi install` installed (needs -PluginsFromInstalled)
+#   -Builtins         compile in the release's built-in plugins (docsearch: project_search): the addon is built for this
+#                     platform and the manifest generated (scripts\build-docsearch.mjs, needs Rust/cargo). The kit, if any,
+#                     carries it, so that `upi compile` keeps it besides the extensions installed on the machine
 #   -PluginWorker PATH[,PATH...]
 #                     a worker script a plugin starts, relative to the manifest's folder (several: separated by commas)
 #   -KeepBytecode     keep the bytecode in the prebuilt heap
@@ -30,7 +33,7 @@
 #                     or a table hashed by address, would differ (scripts\lib\compare-static-heaps.py)
 #   -FunctionCellsOut FILE
 #                     write where each function's executables are in the prebuilt heap, by name (for scripts\train-heap.ps1)
-# Environment: PIBOLT_BUN (the Pi-Bolt runtime; default .work\runtime\bun.exe); PIBOLT_BUILD_LOG (a file for what the compiler
+# Environment: PIBOLT_BUN (the microPi runtime; default .work\runtime\bun.exe); PIBOLT_BUILD_LOG (a file for what the compiler
 #              prints)
 param(
 	[string]$Pi = '',
@@ -39,6 +42,7 @@ param(
 	[ValidateSet('native', 'baseline')][string]$Cpu = 'native',
 	[string]$Profile = '',
 	[string]$Plugins = '',
+	[switch]$Builtins,
 	[switch]$PluginsFromInstalled,
 	[string]$PluginsOnly = '',
 	[string]$PluginsExclude = '',
@@ -85,7 +89,7 @@ foreach ($package in Get-ChildItem (Split-Path $Agent) -Directory) {
 $PiboltVersion = (Get-Content (Join-Path $Root 'VERSION') -Raw).Trim()
 $Platform = 'win32-x64'
 $CpuVariant = 'x64'; if ($Cpu -eq 'baseline') { $CpuVariant = 'x64-baseline' }; if ($Jit -eq 'on') { $CpuVariant = 'x64-jit' }
-if (-not $Out) { $Out = Join-Path $Root 'out\pi-bolt' }
+if (-not $Out) { $Out = Join-Path $Root 'out\upi' }
 $Out = [System.IO.Path]::GetFullPath($Out)
 if (-not $Profile) { $Profile = Join-Path $Root "profiles\pi-$Version" }
 
@@ -94,44 +98,73 @@ if (-not $Profile) { $Profile = Join-Path $Root "profiles\pi-$Version" }
 # (@earendil-works/pi-*, typebox) resolve to Pi's own modules, as they do when Pi loads an extension at run time; a copy of one
 # inside the plugin would be a second Pi (duplicate classes and registries), so those are left out, and so is .git. Returns the
 # entry, relative to the agent dir.
-function Stage-Plugins($manifest) {
+function Stage-Plugins($manifest, $builtins) {
 	$script:Stage = Join-Path $Agent '.pibolt-plugins'
-	$src = Split-Path $manifest
 	if (Test-Path -LiteralPath $Stage) { Remove-Item -LiteralPath $Stage -Recurse -Force }
 	$script:Staged = $true
-	New-Item -ItemType Directory -Force (Join-Path $Stage 'src') | Out-Null
+	New-Item -ItemType Directory -Force (Join-Path $Stage 'src'), (Join-Path $Stage 'builtins') | Out-Null
 	# (robocopy, which copies the long paths node_modules has. rsync's patterns match at any depth: here they are the folders they
 	# match, by full path. The staging folder too, for a manifest whose folder holds the Pi tree.)
 	$exclude = @($Stage)
-	foreach ($modules in @(Get-ChildItem -LiteralPath $src -Recurse -Directory -Force -Filter node_modules)) {
-		$scope = Join-Path $modules.FullName '@earendil-works'
-		if (Test-Path -LiteralPath $scope) { $exclude += @(Get-ChildItem -LiteralPath $scope -Force -Filter 'pi-*' | ForEach-Object { $_.FullName }) }
-		if (Test-Path -LiteralPath (Join-Path $modules.FullName 'typebox')) { $exclude += Join-Path $modules.FullName 'typebox' }
+	$folders = @()
+	if ($manifest) { $folders += Split-Path $manifest }
+	if ($builtins) { $folders += Split-Path $builtins }
+	foreach ($folder in $folders) {
+		foreach ($modules in @(Get-ChildItem -LiteralPath $folder -Recurse -Directory -Force -Filter node_modules)) {
+			$scope = Join-Path $modules.FullName '@earendil-works'
+			if (Test-Path -LiteralPath $scope) { $exclude += @(Get-ChildItem -LiteralPath $scope -Force -Filter 'pi-*' | ForEach-Object { $_.FullName }) }
+			if (Test-Path -LiteralPath (Join-Path $modules.FullName 'typebox')) { $exclude += Join-Path $modules.FullName 'typebox' }
+		}
 	}
-	& robocopy $src (Join-Path $Stage 'src') /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP /XD .git @exclude /XF .git | Out-Null
-	if ($LASTEXITCODE -ge 8) { Die "-Plugins: could not copy $src to $Stage\src (robocopy exit $LASTEXITCODE)" }
+	if ($builtins) {
+		# The built-ins staged in a folder of their own: `upi compile` resets src\ and keeps builtins\ (upi-compile.ts).
+		& robocopy (Split-Path $builtins) (Join-Path $Stage 'builtins') /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP /XD .git @exclude /XF .git | Out-Null
+		if ($LASTEXITCODE -ge 8) { Die "-Builtins: could not copy $(Split-Path $builtins) to $Stage\builtins (robocopy exit $LASTEXITCODE)" }
+	}
+	if ($manifest) {
+		& robocopy (Split-Path $manifest) (Join-Path $Stage 'src') /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP /XD .git @exclude /XF .git | Out-Null
+		if ($LASTEXITCODE -ge 8) { Die "-Plugins: could not copy $(Split-Path $manifest) to $Stage\src (robocopy exit $LASTEXITCODE)" }
+	}
 	Stage-Tsconfig
+	# The factories the entry loads: the manifest's plugins, with the builtins' (staged in builtins\) added when there are
+	# any. (No manifest: the builtins are the plugins.)
+	$pluginsLine = if ($manifest) { "const { default: plugins } = await import(`"./src/$(Split-Path $manifest -Leaf)`");" } else { '' }
+	$builtinsLine = ''
+	$factories = 'plugins'
+	if ($builtins) {
+		$builtinsLine = "const { default: builtins } = await import(`"./builtins/$(Split-Path $builtins -Leaf)`");"
+		if ($manifest) { $factories = 'plugins, ...builtins' } else {
+			# (No manifest: the import must define `plugins`, the name the factories below use - as stage_plugins in
+			# scripts/lib/common.sh writes it. upi-v0.1.0's Windows release crashed at its start with
+			# "ReferenceError: plugins is not defined" when this line was the copied builtins import instead.)
+			$pluginsLine = "const { default: plugins } = await import(`"./builtins/$(Split-Path $builtins -Leaf)`");"
+			$builtinsLine = ''
+		}
+	}
 	$lines = @(
-		"// Generated by Pi-Bolt: Pi's Bun entry (packages/coding-agent/src/bun/cli.ts), with extensions compiled in."
+		"// Generated by microPi: Pi's Bun entry (packages/coding-agent/src/bun/cli.ts), with extensions compiled in."
 		'import "../dist/bun/sandbox-env-setup.js";'
-		'// (pi-bolt --version answered before the rest of Pi, and the plugins, are loaded: as Pi''s own entry does.)'
+		'// (upi --version answered before the rest of Pi, and the plugins, are loaded: as Pi''s own entry does.)'
 		'import "../dist/bun/version-fast-path.js";'
 		'import "../dist/bun/runtime-setup.js";'
 		'import { setupCli } from "../dist/cli/setup.js";'
 		'import { main } from "../dist/main.js";'
 		''
-		'// Loaded with import(), as pi-bolt-compile.ts''s ENTRY explains: imported with this module, the plugins'' top-level code'
+		'// Loaded with import(), as upi-compile.ts''s ENTRY explains: imported with this module, the plugins'' top-level code'
 		'// would join Pi''s in one function, which the compiler refuses past 256 KB of bytecode (#129); required, a plugin with an'
 		'// `await` at its top level would stop the bundler (#142). Split (--splitting), the manifest and the modules only it'
 		'// imports are a file of their own. They still run in the order the manifest imports them, at the same point of the start.'
 		'// (Not split, as with -Stable: each module is a function of its own, and a plugin that waits at its top level runs after'
 		'// the plugins beside it that do not.)'
-		"const { default: plugins } = await import(`"./src/$(Split-Path $manifest -Leaf)`");"
+		$pluginsLine
+		$builtinsLine
 		''
 		'// A named plugin is a built-in extension (`builtin:<name>`): it can be turned off (`-builtin:<name>` in the `extensions` setting,'
 		'// or the config screen), and an extension of the same tools loaded at run time replaces it (replaceable) instead of conflicting.'
 		'// The manifest decides where it says (builtin or replaceable set); an unnamed factory stays an inline extension.'
-		'const extensionFactories = plugins.map((plugin) =>'
+		# (A flat(): a manifest's default is an array of factories, and the builtins' is beside it or instead of it -
+		# as stage_plugins in scripts/lib/common.sh writes it.)
+		"const extensionFactories = [$factories].flat().map((plugin) =>"
 		'	typeof plugin === "function" || plugin.builtin !== undefined'
 		'		? plugin'
 		'		: { ...plugin, builtin: true, replaceable: plugin.replaceable ?? true },'
@@ -177,6 +210,15 @@ if ($PluginsFromInstalled) {
 	$Plugins = (& node (Join-Path $Root 'scripts\gen-plugin-manifest.mjs') @genArgs | Select-Object -Last 1)
 	if ($LASTEXITCODE -ne 0 -or -not $Plugins) { Die 'no plugin manifest was generated' }
 }
+# The release's built-in plugins (docsearch: project_search): their manifest with the addon built for this platform, staged
+# into the Pi tree below.
+if ($Builtins) {
+	if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die 'node is required for -Builtins' }
+	Log 'building the docsearch addon:'
+	$BuiltinsManifest = (& node (Join-Path $Root 'scripts\build-docsearch.mjs') '--out' (Join-Path $Work 'plugins\builtins') | Select-Object -Last 1)
+	if ($LASTEXITCODE -ne 0 -or -not $BuiltinsManifest) { Die 'no builtins manifest was generated' }
+	$BuiltinsManifest = (Resolve-Path -LiteralPath $BuiltinsManifest).Path
+}
 # (-PluginWorker a,b through powershell -File arrives as one string.)
 $PluginWorker = @($PluginWorker | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 if ($Plugins) {
@@ -187,7 +229,7 @@ foreach ($worker in $PluginWorker) {
 	if (-not $Plugins) { Die '-PluginWorker needs -Plugins' }
 	if (-not (Test-Path -LiteralPath (Join-Path (Split-Path $Plugins) $worker) -PathType Leaf)) { Die "-PluginWorker: $(Join-Path (Split-Path $Plugins) $worker) not found" }
 }
-if ($Plugins) { $Entry = Stage-Plugins $Plugins }
+if ($Plugins -or $Builtins) { $Entry = Stage-Plugins $Plugins $BuiltinsManifest }
 $Entries = @($Entry, './src/utils/image-resize-worker.ts')
 if (Test-Path (Join-Path $Agent 'src\extensions\codemode\worker.ts')) { $Entries += './src/extensions/codemode/worker.ts' }
 # Workers a plugin starts (new Worker(new URL("./worker.ts", import.meta.url))) are entry points of their own, by the path a
@@ -201,7 +243,7 @@ function Stage-Assets($dir) {
 	Copy-Item -Recurse -Force (Join-Path $Agent 'docs'), (Join-Path $Agent 'examples') $dir
 	# Not the documentation's pictures (2.5 MB of PNG): the model reads the text, and a terminal shows none of them.
 	Remove-Item -Recurse -Force (Join-Path $dir 'docs\images') -ErrorAction SilentlyContinue
-	# With Pi-Bolt's own that `pi-bolt doctor` points at (#63).
+	# With microPi's own that `upi doctor` points at (#63).
 	Copy-Item (Join-Path $Root 'docs\PLUGINS.md'), (Join-Path $Root 'docs\ACP.md'), (Join-Path $Root 'docs\TROUBLESHOOTING.md') (Join-Path $dir 'docs')
 	New-Item -ItemType Directory -Force "$dir\theme", "$dir\assets", "$dir\export-html\vendor", "$dir\native\win32\prebuilds" | Out-Null
 	Copy-Item "$Agent\src\modes\interactive\theme\*.json" "$dir\theme"
@@ -227,9 +269,9 @@ if ($Stable) {
 	Log "Pi $Version with stock Bun $(& $Bun --version) (bytecode, no AOT) -> $Out"
 	Push-Location $Agent
 	try {
-		# Named Pi-Bolt as the builds it is compared with are (PRODUCT_NAME, in messages and the window title), on stock Bun.
+		# Named µPi: PRODUCT_NAME, in messages and the window title, on stock Bun.
 		$stableBuild = "$PiboltVersion x64-stable jit-on" -replace ' ', ('\' + 'u0020')
-		& $Bun @CommonArgs --define "PIBOLT_BUILD=\`"$stableBuild\`"" @Entries --outfile (Join-Path $Out 'pi.exe') | Out-Null
+		& $Bun @CommonArgs --define "PIBOLT_BUILD=\`"$stableBuild\`"" --define "MICROPI_PI_VERSION=\`"$Version\`"" @Entries --outfile (Join-Path $Out 'pi.exe') | Out-Null
 		if ($LASTEXITCODE -ne 0) { Die 'bun build failed' }
 	} finally { Pop-Location; Remove-PluginStage }
 	Stage-Assets $Out
@@ -238,8 +280,8 @@ if ($Stable) {
 }
 
 $Bun = if ($env:PIBOLT_BUN) { $env:PIBOLT_BUN } else { Join-Path $Work 'runtime\bun.exe' }
-if (-not (Test-Path $Bun)) { Die "no Pi-Bolt runtime at ${Bun}: build it (scripts\build-runtime.ps1), or set PIBOLT_BUN" }
-# Which runtime this is, for pi-bolt.txt (and from it the benchmarks' environment.txt), so that two builds made with different
+if (-not (Test-Path $Bun)) { Die "no microPi runtime at ${Bun}: build it (scripts\build-runtime.ps1), or set PIBOLT_BUN" }
+# Which runtime this is, for upi.txt (and from it the benchmarks' environment.txt), so that two builds made with different
 # runtimes say so: its version, hash, whether it has Control Flow Guard (the PE header's GUARD_CF), and the build of it in
 # .work\bun\build it is a copy of, with that build's LTO setting. A build of the runtime newer than this one is warned about.
 function Get-RuntimeStamp($exe) {
@@ -292,7 +334,7 @@ foreach ($k in $vars.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable(
 function Build-Pi($runtime, $outfile, $log) {
 	# A JSON string. (Windows PowerShell passes a native command's argument's double quotes as they are, which the program's runtime
 	# then takes away, and splits an argument with quotes at its spaces: the quotes are written \" and the spaces as JSON escapes.)
-	# (With which engine the runtime is, scripts/runtime-stamp.sh, for `pi-bolt doctor`: PIBOLT_RUNTIME_STAMP, from the release
+	# (With which engine the runtime is, scripts/runtime-stamp.sh, for `upi doctor`: PIBOLT_RUNTIME_STAMP, from the release
 	# workflow, else a RUNTIME_STAMP beside the runtime.)
 	$stamp = if ($env:PIBOLT_RUNTIME_STAMP) { $env:PIBOLT_RUNTIME_STAMP } else { Get-Content -LiteralPath (Join-Path (Split-Path $runtime) 'RUNTIME_STAMP') -ErrorAction SilentlyContinue | Select-Object -First 1 }
 	$build = "$PiboltVersion $CpuVariant jit-$Jit$(if ($stamp -match '^[0-9a-f]{16}$') { " $stamp" })" -replace ' ', ('\' + 'u0020')
@@ -303,7 +345,7 @@ function Build-Pi($runtime, $outfile, $log) {
 	# --splitting, as scripts/build-pi.sh: what Pi imports with import() (the rest of Pi after `pi --version`, the interactive
 	# mode, the providers' APIs) is a chunk of its own, loaded when it is imported, so a start creates only the functions it loads
 	# (windows-2025: `pi --version` 17 -> 13 ms CPU and a fifth fewer page faults, `pi -p` 71 -> 66 ms).
-	& $runtime @CommonArgs '--compile-autoload-package-json' '--splitting' @OrderArgs --define "PIBOLT_BUILD=\`"$build\`"" '--compile-exec-argv=--smol' @Entries --outfile $outfile *> $log
+	& $runtime @CommonArgs '--compile-autoload-package-json' '--splitting' @OrderArgs --define "PIBOLT_BUILD=\`"$build\`"" --define "MICROPI_PI_VERSION=\`"$Version\`"" '--compile-exec-argv=--smol' @Entries --outfile $outfile *> $log
 	$status = $LASTEXITCODE
 	$ErrorActionPreference = 'Stop'
 	# (The writer's notes and warnings about the prebuilt heap are shown wherever they are in the log: a release build's log keeps
@@ -351,7 +393,7 @@ if ($VerifyDeterminism) {
 	Log 'the prebuilt heap is the same from both builds'
 }
 Stage-Assets $Out
-$about = @("Pi-Bolt $PiboltVersion (Pi $Version), win32-$CpuVariant, JIT $Jit, built $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'))", $RuntimeStamp)
+$about = @("µPi $PiboltVersion (Pi $Version), win32-$CpuVariant, JIT $Jit, built $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'))", $RuntimeStamp)
 # The packages compiled in, by the manifest folder's package.json (`name version`, comma-separated): the installer does not offer
 # to install from npm what the executable has already.
 if ($Plugins) {
@@ -362,7 +404,8 @@ if ($Plugins) {
 	} else { Split-Path $Plugins -Leaf }
 	$about += "plugins: $compiledIn"
 }
-$about | Set-Content -Encoding ascii (Join-Path $Out 'pi-bolt.txt')
+if ($Builtins) { $about += 'built-in: docsearch (project_search)' }
+$about | Set-Content -Encoding ascii (Join-Path $Out 'upi.txt')
 
 $env:BUN_STATIC_HEAP_VERBOSE = '1'
 $ErrorActionPreference = 'Continue' # (stderr is where it says it)

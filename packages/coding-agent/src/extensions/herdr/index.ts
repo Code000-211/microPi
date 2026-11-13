@@ -1,10 +1,10 @@
 /**
- * Herdr (https://herdr.dev) support for Pi-Bolt: in a Herdr pane, report the agent's state (idle, working, blocked) and the
- * command that reopens its session, so Herdr shows `pi-bolt` in its sidebar, notifies when it finishes or needs the user, and
+ * Herdr (https://herdr.dev) support for µPi: in a Herdr pane, report the agent's state (idle, working, blocked) and the
+ * command that reopens its session, so Herdr shows `upi` in its sidebar, notifies when it finishes or needs the user, and
  * brings the same session back in the same pane after a Herdr server restart.
  *
  * Herdr's own Pi integration (`herdr integration install pi`, ~/.pi/agent/extensions/herdr-agent-state.ts) reports as `pi` and
- * restores with `pi --session`, which is not Pi-Bolt, so Pi-Bolt does not load that file (integration-file.ts) and
+ * restores with `pi --session`, which is not µPi, so µPi does not load that file (integration-file.ts) and
  * reports for itself, as Herdr's "Add Herdr support to your agent" describes: its own source and agent name, its own resume
  * command. Outside Herdr (HERDR_ENV and HERDR_PANE_ID unset) it does nothing. Reports go over Herdr's socket, or on
  * Windows through the `herdr` executable (transport.ts). Disable it with
@@ -19,8 +19,8 @@ import { COMMAND_NAME } from "../../config.ts";
 import type { ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
 import { type HerdrRequest, type HerdrTransport, herdrFromEnvironment } from "./transport.ts";
 
-const SOURCE = "pi-bolt";
-const AGENT = "pi-bolt";
+const SOURCE = "upi";
+const AGENT = "upi";
 
 type AgentState = "working" | "blocked" | "idle";
 
@@ -47,7 +47,7 @@ async function send(transport: HerdrTransport, request: () => HerdrRequest | und
 }
 
 /**
- * The command Herdr runs to reopen this session after a server restart: `pi-bolt --session <file>`. Herdr refuses a
+ * The command Herdr runs to reopen this session after a server restart: `upi --session <file>`. Herdr refuses a
  * report whose command has an apostrophe or a control character in it or is over 8 KiB, so such a session gets no command
  * (its state still reaches Herdr).
  */
@@ -77,7 +77,7 @@ export function createHerdrExtension(
 		if (!herdr) return;
 		const { transport, paneId } = herdr;
 
-		// Herdr ignores a report whose number is not above the last one from this source, across restarts of Pi-Bolt too.
+		// Herdr ignores a report whose number is not above the last one from this source, across restarts of µPi too.
 		let seq = Date.now() * 1000;
 		const nextSeq = () => ++seq;
 

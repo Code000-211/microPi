@@ -272,12 +272,12 @@ export function sanitizeBinaryOutput(str: string): string {
 const trackedDetachedChildPids = new Set<number>();
 
 /**
- * Windows, in a runtime with Bun's FFI, which needs the JIT (Pi-Bolt's -jit build, Pi on Bun): a job object for each shell a
+ * Windows, in a runtime with Bun's FFI, which needs the JIT (µPi's -jit build, Pi on Bun): a job object for each shell a
  * tool starts, so that stopping the command (Escape, its timeout, Pi exiting) ends everything it started. `taskkill /T` alone
  * walks the tree by parent process, and misses a process whose parent has exited (Git Bash's `sleep 25; echo x`, `cd web &&
  * npm run dev`: a dev server left holding its port), or one started while it walks. The job is only ended when the command is
  * stopped; one that finishes leaves what it started in the background as before (no kill-on-close). Not available (the
- * default Pi-Bolt build, Node, or a call that fails): taskkill, and Git Bash's own processes by their group's variable
+ * default µPi build, Node, or a call that fails): taskkill, and Git Bash's own processes by their group's variable
  * (killMsysGroup). A native program whose native parent has exited before the stop (a server a launcher started and left)
  * is reached by neither there, and keeps running.
  */

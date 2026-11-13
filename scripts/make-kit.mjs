@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Writes the compile kit: what `pi-bolt compile` needs, besides the runtime, to build the executable a release has with
+ * Writes the compile kit: what `upi compile` needs, besides the runtime, to build the executable a release has with
  * extensions compiled in, on a machine with no copy of this repository. scripts/build-pi.sh --kit runs it after a build.
  *
  * The kit is a folder:
@@ -17,6 +17,11 @@
  *
  * Usage: bun scripts/make-kit.mjs --bun BUN --pi DIR --agent DIR --record FILE --profile DIR --platform P --version V --out DIR
  *   --record FILE  JSON: { env, args, entries } of the build (build-pi.sh writes it)
+ *   --builtins LIST
+ *                  the release's built-in plugins (build-pi.sh --builtins, staged in .pibolt-plugins/builtins/), so that
+ *                  `upi compile` keeps them besides the extensions installed on the machine. LIST: comma-separated pairs
+ *                  PATH=NAME, PATH relative to the agent dir (entry point, import()), NAME for the executable's upi.txt
+ *                  (all pairs in LIST)
  */
 
 import { spawnSync } from "node:child_process";
@@ -64,7 +69,11 @@ function parseArgs(argv) {
 	for (const name of ["bun", "pi", "agent", "record", "profile", "platform", "version", "out"]) {
 		if (!options[name]) die(`--${name} is required`);
 	}
-	return options;
+	return { ...options, builtins: (options.builtins ?? "").split(",").filter(Boolean).map((pair) => {
+		const at = pair.indexOf("=");
+		if (at <= 0) die(`--builtins: ${pair} is not PATH=NAME`);
+		return { manifest: pair.slice(0, at), names: [pair.slice(at + 1)] };
+	}) };
 }
 
 /** The module path an "exports" target names for the bundler (conditions bun, import, default, in that order). */
@@ -252,13 +261,21 @@ mkdirSync(profileDir, { recursive: true });
 if (existsSync(profile)) cpSync(profile, profileDir, { recursive: true });
 cpSync(join(HERE, "..", "packages", "coding-agent", "src", "gen-plugin-manifest.mjs"), join(out, "gen-plugin-manifest.mjs"));
 
-// The compile command, with the profile's paths as @KIT@/profile/... (where `pi-bolt compile` unpacks the kit).
+// The compile command, with the profile's paths as @KIT@/profile/... (where `upi compile` unpacks the kit).
 const kitPath = (value) => value.split(profile).join("@KIT@/profile");
 const piVersion = JSON.parse(readFileSync(join(agent, "package.json"), "utf8")).version;
+// The built-in plugins the kit carries (upi-compile.ts keeps them in the staging of a compile build): the files the bundler
+// and the import closure took must have brought them in already.
+for (const builtin of options.builtins) {
+	if (!files.has(relative(root, resolve(agent, builtin.manifest)).split(sep).join("/")))
+		die(`--builtins: ${builtin.manifest} is not in the kit (the release build did not bundle it)`);
+}
+
 const kit = {
 	piBolt: options.version,
 	pi: piVersion,
 	platform: options.platform,
+	...(options.builtins.length > 0 ? { builtins: options.builtins } : {}),
 	agent: `tree/${relative(root, agent).split(sep).join("/")}`,
 	entries: record.entries,
 	args: record.args.map(kitPath),

@@ -5,7 +5,7 @@
 #
 #   DOCSEARCH_EVAL_DATA  folder holding the frozen snapshots the test sets point into (see README.md):
 #                        corpus/ (radiance's Markdown and text files) and code/ (its source files);
-#                        ts/ (Pi-Bolt's TypeScript, see README.md) is measured when it is there.
+#                        ts/ (µPi's TypeScript, see README.md) is measured when it is there.
 #                        Each run's ranks are kept there as ranks-NAME-<set>.tsv.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)

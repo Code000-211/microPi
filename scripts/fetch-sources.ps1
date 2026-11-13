@@ -1,4 +1,4 @@
-# Clones oven-sh/WebKit and oven-sh/bun at the commits in sources.json and applies Pi-Bolt's patches on top: Windows'
+# Clones oven-sh/WebKit and oven-sh/bun at the commits in sources.json and applies microPi's patches on top: Windows'
 # scripts/fetch-sources.sh. Sources go to $env:PIBOLT_WORK (default .work\) as webkit\ and bun\.
 #
 # WebKit is fetched without file contents and checked out sparsely (Source, Tools, WebKitLibraries, JSTests, icu, scripts,
@@ -59,7 +59,7 @@ function Fetch($name, [string[]]$sparse) {
 	git -C $dir checkout -q --detach $s.commit
 	if ($LASTEXITCODE -ne 0) { throw "${name}: checkout failed" }
 	Log "${name}: applying $(Split-Path -Leaf $s.patches)"
-	git -C $dir -c user.name=pi-bolt -c user.email=pi-bolt@localhost am -q (Join-Path $Root $s.patches)
+	git -C $dir -c user.name=upi -c user.email=upi@localhost am -q (Join-Path $Root $s.patches)
 	if ($LASTEXITCODE -ne 0) { throw "${name}: the patch did not apply" }
 }
 

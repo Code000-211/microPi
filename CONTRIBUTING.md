@@ -1,9 +1,9 @@
 # Contributing
 
-Thanks for helping make Pi-Bolt better. Bug reports, benchmarks on other hardware and fixes are all welcome.
+Thanks for helping make µPi better. Bug reports, benchmarks on other hardware and fixes are all welcome.
 
-Pi-Bolt is a fork of [Pi](https://github.com/earendil-works/pi). If something also happens with stock Pi, it belongs upstream.
-This repository takes what Pi-Bolt adds: the engine patches, the installers and updater, `pi-bolt compile`, the tools Pi-Bolt
+µPi is a fork of [Pi](https://github.com/earendil-works/pi). If something also happens with stock Pi, it belongs upstream.
+This repository takes what µPi adds: the engine patches, the installers and updater, `upi compile`, the tools µPi
 replaces, scripts, benchmarks and docs.
 
 Security problems: never in a public issue. See [SECURITY.md](SECURITY.md). Everyone taking part follows the
@@ -11,12 +11,12 @@ Security problems: never in a public issue. See [SECURITY.md](SECURITY.md). Ever
 
 ## Opening an issue
 
-1. Update first (`pi-bolt update`) and search [existing issues](https://github.com/opensec-git/Pi-Bolt/issues).
+1. Update first (`upi update`) and search [existing issues](https://github.com/opensec-git/Pi-Bolt/issues).
 2. Check whether stock Pi does the same (`npx @earendil-works/pi-coding-agent`). If it does, report it to Pi instead.
 3. Open a [bug report](https://github.com/opensec-git/Pi-Bolt/issues/new?template=bug.yml) or a
    [feature request](https://github.com/opensec-git/Pi-Bolt/issues/new?template=feature.yml) and fill in the form:
    - what you did, what you expected, what happened, with error messages as text;
-   - `pi-bolt --version`, your OS and how you installed;
+   - `upi --version`, your OS and how you installed;
    - the smallest steps that reproduce it.
 
 Questions and ideas that aren't bugs go to [Discussions](https://github.com/opensec-git/Pi-Bolt/discussions).
@@ -47,7 +47,7 @@ need to rebase unless asked.
 
 | Area | Where | Check with |
 |---|---|---|
-| Pi's code as Pi-Bolt changes it | `packages/` | `npm run check`, `./test.sh` |
+| Pi's code as µPi changes it | `packages/` | `npm run check`, `./test.sh` |
 | Build scripts, tools | `scripts/`, `bench/` | `shellcheck -x scripts/*.sh`, and a build |
 | The engine (JavaScriptCore AOT compiler, runtime) | `.work/webkit`, then regenerate `patches/webkit.patch` | `tests/aot/run.sh` |
 | The executable format | `.work/bun`, then regenerate `patches/bun.patch` | the same |

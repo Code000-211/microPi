@@ -25,5 +25,5 @@ packages/agent/docs/**/*.diff -whitespace
 *.woff binary
 *.woff2 binary
 
-# Pi-Bolt: patch series are applied with git am, byte for byte
+# µPi: patch series are applied with git am, byte for byte
 patches/**/*.patch -text

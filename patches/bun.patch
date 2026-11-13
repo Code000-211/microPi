@@ -7383,13 +7383,13 @@ index 91e2ee80..f4246de1 100644
      }
  
 +    /// An executable that runs code compiled ahead of time (Pi-Bolt) is not a Bun that Bun's team can decode a trace of: its
-+    /// crashes go to Pi-Bolt, with the trace in the same encoding, which Pi-Bolt decodes against its own symbols.
-+    const PI_BOLT_REPORT_BASE_URL: &str = "https://pi-bolt.opensec.in/crash";
-+    const PI_BOLT_CRASH_MESSAGE: &[u8] = b"Pi-Bolt has crashed. This is a bug in Pi-Bolt, not in your code.\n\n\
-+        Please report it at https://github.com/opensec-git/Pi-Bolt/issues/new\n\
++    /// crashes go to µPi, with the trace in the same encoding, which µPi decodes against its own symbols.
++    const PI_BOLT_REPORT_BASE_URL: &str = "https://upi.opensec.in/crash";
++    const PI_BOLT_CRASH_MESSAGE: &[u8] = b"\xc2\xb5Pi has crashed. This is a bug in \xc2\xb5Pi, not in your code.\n\n\
++        Please report it at https://github.com/Code000-211/microPi/issues/new\n\
 +        with the link below and what you were doing:\n\n";
-+    const PI_BOLT_OOM_MESSAGE: &[u8] = b"Pi-Bolt has run out of memory.\n\n\
-+        Please report it at https://github.com/opensec-git/Pi-Bolt/issues/new\n\
++    const PI_BOLT_OOM_MESSAGE: &[u8] = b"\xc2\xb5Pi has run out of memory.\n\n\
++        Please report it at https://github.com/Code000-211/microPi/issues/new\n\
 +        with the link below and what you were doing:\n\n";
 +
 +    // A Pi-Bolt executable: one that carries code compiled ahead of time, whether it uses it or not (on a CPU it was not

@@ -1,21 +1,21 @@
 "use strict";
-// The pi-bolt package's install script (postinstall): puts the `pi-bolt` command in place. package.json's "bin" is
-// bin/pi-bolt.exe on every platform, a placeholder until this runs (npm links commands before it runs install scripts).
+// The upi package's install script (postinstall): puts the `upi` command in place. package.json's "bin" is
+// bin/upi.exe on every platform, a placeholder until this runs (npm links commands before it runs install scripts).
 //
 // On Windows it installs the native executable: the release build of this package's version, checked as install.ps1 checks
 // it (the Ed25519 signature of the release's SHA256SUMS, the version they say, the build's SHA-256), and unpacked into bin\
-// over the placeholder, so that npm's pi-bolt.cmd and pi-bolt.ps1 start pi-bolt.exe itself, with no Node.js in between.
-// The build comes from the npm package @kushalkhemka/pi-bolt-win32-<variant> of the same version (the release's .zip, byte for byte),
+// over the placeholder, so that npm's upi.cmd and upi.ps1 start upi.exe itself, with no Node.js in between.
+// The build comes from the npm package @kushalkhemka/upi-win32-<variant> of the same version (the release's .zip, byte for byte),
 // or from the GitHub release if that fails; the checksums and their signature always come from the release.
-// On Linux and macOS it puts the launcher (bin/pi-bolt) over the placeholder, and the first run downloads the build, as
+// On Linux and macOS it puts the launcher (bin/upi) over the placeholder, and the first run downloads the build, as
 // before.
 //
 // Plain Node.js (18 or later), no dependencies. On Windows it reads, as install.ps1 does:
-//   PIBOLT_VARIANT        x64 (the default), x64-baseline (picked when the CPU has no AVX2 and the release has it) or x64-jit
-//   PIBOLT_SOURCE         auto (npm, then GitHub; the default), npm or github
-//   PIBOLT_NPM_REGISTRY   the npm registry or mirror to download the build from (default: https://registry.npmjs.org)
-//   PIBOLT_DOWNLOAD_BASE  a mirror of the release to download everything from instead (its SHA256SUMS.sig too)
-//   PIBOLT_ALLOW_UNSIGNED  the SHA-256 of a release's SHA256SUMS, to install that download although it has no signature (a
+//   MICROPI_VARIANT        x64 (the default), x64-baseline (picked when the CPU has no AVX2 and the release has it) or x64-jit
+//   MICROPI_SOURCE         auto (npm, then GitHub; the default), npm or github
+//   MICROPI_NPM_REGISTRY   the npm registry or mirror to download the build from (default: https://registry.npmjs.org)
+//   MICROPI_DOWNLOAD_BASE  a mirror of the release to download everything from instead (its SHA256SUMS.sig too)
+//   MICROPI_ALLOW_UNSIGNED  the SHA-256 of a release's SHA256SUMS, to install that download although it has no signature (a
 //                         build of one's own). It matches those checksums only: a value left in the environment does nothing
 //                         for another download.
 const crypto = require("node:crypto");
@@ -28,8 +28,8 @@ const { pipeline } = require("node:stream/promises");
 const zlib = require("node:zlib");
 
 // The public key that releases are signed with (keys/release.pub in the repository, as in install.sh and install.ps1).
-const RELEASE_KEY = "MCowBQYDK2VwAyEAoLboJqtKaoISPqffk03vHZr+1sRBG3uIRIWeKOew+aY=";
-const REPO = "https://github.com/opensec-git/Pi-Bolt";
+const RELEASE_KEY = "MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI=";
+const REPO = "https://github.com/Code000-211/microPi";
 const VARIANTS = ["x64", "x64-baseline", "x64-jit"];
 
 /** A reason not to install, said to the user as it is. */
@@ -51,7 +51,7 @@ function checksumOf(sums, name) {
 /**
  * Checks the release's SHA256SUMS before anything else in the release is looked at: its signature by the release key, and
  * that its first line says it is `version` (otherwise an older release, signed all the same, could be served as this one).
- * A release without a signature is refused, unless `allowUnsigned` (PIBOLT_ALLOW_UNSIGNED: a build of one's own) is the
+ * A release without a signature is refused, unless `allowUnsigned` (MICROPI_ALLOW_UNSIGNED: a build of one's own) is the
  * SHA-256 of these checksums, as install.ps1 does; the caller then warns that only the checksum was verified. Returns whether
  * the signature was verified, and the checksums as text.
  */
@@ -72,20 +72,20 @@ function checkSums({ sums, signature, version, key = RELEASE_KEY, allowUnsigned 
 				fail(`this Node.js cannot check Ed25519 signatures (${error.message}). Nothing was installed: use Node.js 18 or later.`);
 			}
 		}
-		if (!verified) fail("the release's signature does not verify: the download is not Pi-Bolt's. Nothing was installed.");
+		if (!verified) fail("the release's signature does not verify: the download is not µPi's. Nothing was installed.");
 		signed = true;
 	} else {
 		const hash = crypto.createHash("sha256").update(sums).digest("hex");
 		if ((allowUnsigned || "").trim().toLowerCase() !== hash) {
-			const stale = allowUnsigned ? " (PIBOLT_ALLOW_UNSIGNED is set, but not to this download's SHA-256: it applies to one download only)" : "";
-			fail(`the release has no signature (SHA256SUMS.sig), and every Windows release is signed. Nothing was installed${stale}. Only for a build of your own: install it again with PIBOLT_ALLOW_UNSIGNED=${hash}, the SHA-256 of its SHA256SUMS.`);
+			const stale = allowUnsigned ? " (MICROPI_ALLOW_UNSIGNED is set, but not to this download's SHA-256: it applies to one download only)" : "";
+			fail(`the release has no signature (SHA256SUMS.sig), and every Windows release is signed. Nothing was installed${stale}. Only for a build of your own: install it again with MICROPI_ALLOW_UNSIGNED=${hash}, the SHA-256 of its SHA256SUMS.`);
 		}
 	}
 	const text = sums.toString("utf8");
-	const match = /^# pi-bolt (\d+\.\d+\.\d+)\r?$/.exec(text.split("\n", 1)[0]);
+	const match = /^# upi (\d+\.\d+\.\d+)\r?$/.exec(text.split("\n", 1)[0]);
 	if (!match) fail("the release's SHA256SUMS does not say which version it is. Nothing was installed.");
 	if (match[1] !== version) {
-		fail(`the download is Pi-Bolt ${match[1]}, not ${version} as asked for (an older release served as a newer one?). Nothing was installed.`);
+		fail(`the download is µPi ${match[1]}, not ${version} as asked for (an older release served as a newer one?). Nothing was installed.`);
 	}
 	return { signed, text };
 }
@@ -99,7 +99,7 @@ const CHUNK = 1 << 20;
 async function request(fetchImpl, url) {
 	try {
 		const response = await fetchImpl(url, {
-			headers: { "user-agent": "pi-bolt-installer" },
+			headers: { "user-agent": "upi-installer" },
 			redirect: "follow",
 			signal: AbortSignal.timeout(TIMEOUT),
 		});
@@ -166,7 +166,7 @@ function tarSize(block) {
 }
 
 /**
- * Copies the file `wanted` ("package/pi-bolt-win32-x64.zip") of an npm package (a .tgz) to `out`, as it reads it; false if
+ * Copies the file `wanted` ("package/upi-win32-x64.zip") of an npm package (a .tgz) to `out`, as it reads it; false if
  * the package has no such file. (ustar, with the pax and GNU records for long names that npm's tar may write.)
  */
 async function extractFromTgz(tgz, wanted, out) {
@@ -347,7 +347,7 @@ async function extractZip(zipFile, top, dest) {
 	}
 }
 
-/** `url` without the slashes it ends with, if any ("http://mirror.test/pi-bolt//" -> "http://mirror.test/pi-bolt"). */
+/** `url` without the slashes it ends with, if any ("http://mirror.test/upi//" -> "http://mirror.test/upi"). */
 function withoutTrailingSlashes(url) {
 	let end = url.length;
 	while (end > 0 && url[end - 1] === "/") end--;
@@ -359,13 +359,13 @@ function withoutTrailingSlashes(url) {
 function windowsProblems(env, release = os.release()) {
 	const problems = [];
 	const arch = env.PROCESSOR_ARCHITEW6432 || env.PROCESSOR_ARCHITECTURE || process.arch;
-	if (!/^(AMD64|ARM64|x64|arm64)$/.test(arch)) problems.push(`Pi-Bolt runs on x86-64 (this is ${arch}).`);
+	if (!/^(AMD64|ARM64|x64|arm64)$/.test(arch)) problems.push(`µPi runs on x86-64 (this is ${arch}).`);
 	// ConPTY, and the console's virtual terminal sequences, which Pi's interface needs: Windows 10 1809 (build 17763).
 	const build = Number(release.split(".")[2]) || 0;
-	if (build < 17763) problems.push(`Pi-Bolt needs Windows 10 version 1809 or later (this is build ${build}).`);
+	if (build < 17763) problems.push(`µPi needs Windows 10 version 1809 or later (this is build ${build}).`);
 	// Windows on ARM runs x64 code from Windows 11 on; Windows 10 on ARM emulates 32-bit x86 only.
 	if (/^(ARM64|arm64)$/.test(arch) && build >= 17763 && build < 22000) {
-		problems.push(`On ARM, Pi-Bolt needs Windows 11, whose x64 emulation runs it (this is Windows 10, build ${build}).`);
+		problems.push(`On ARM, µPi needs Windows 11, whose x64 emulation runs it (this is Windows 10, build ${build}).`);
 	}
 	return problems;
 }
@@ -410,9 +410,9 @@ function removeOld(dir) {
 }
 
 /**
- * Moves the files of the tree `from` into `to`. A running Pi-Bolt keeps its executable open, and Windows lets that be renamed
+ * Moves the files of the tree `from` into `to`. A running µPi keeps its executable open, and Windows lets that be renamed
  * but not replaced: each file that is there is renamed out of the way first, and deleted now if it can be (or by the next
- * installation). pi-bolt.exe goes last, so that the command is the new executable only once everything it needs is there.
+ * installation). upi.exe goes last, so that the command is the new executable only once everything it needs is there.
  */
 function moveFiles(from, to, stamp, last) {
 	fs.mkdirSync(to, { recursive: true });
@@ -469,12 +469,12 @@ async function installWindows({
 	const problems = windowsProblems(env, release);
 	if (problems.length) fail(problems.join(" "));
 	if (typeof fetchImpl !== "function") fail("this Node.js has no fetch: use Node.js 18 or later");
-	const source = env.PIBOLT_SOURCE || "auto";
-	if (!["auto", "npm", "github"].includes(source)) fail("PIBOLT_SOURCE must be auto, npm or github");
-	let variant = env.PIBOLT_VARIANT || "";
-	if (variant && !VARIANTS.includes(variant)) fail("PIBOLT_VARIANT must be x64, x64-baseline or x64-jit");
-	const mirror = withoutTrailingSlashes(env.PIBOLT_DOWNLOAD_BASE || "");
-	if (source === "npm" && mirror) fail("PIBOLT_SOURCE=npm needs the release from GitHub (no PIBOLT_DOWNLOAD_BASE)");
+	const source = env.MICROPI_SOURCE || "auto";
+	if (!["auto", "npm", "github"].includes(source)) fail("MICROPI_SOURCE must be auto, npm or github");
+	let variant = env.MICROPI_VARIANT || "";
+	if (variant && !VARIANTS.includes(variant)) fail("MICROPI_VARIANT must be x64, x64-baseline or x64-jit");
+	const mirror = withoutTrailingSlashes(env.MICROPI_DOWNLOAD_BASE || "");
+	if (source === "npm" && mirror) fail("MICROPI_SOURCE=npm needs the release from GitHub (no MICROPI_DOWNLOAD_BASE)");
 	const base = mirror || `${REPO}/releases/download/bolt-v${version}`;
 	const bin = path.join(pkgDir, "bin");
 	const stage = fs.mkdtempSync(path.join(pkgDir, ".install-"));
@@ -482,22 +482,22 @@ async function installWindows({
 		const sums = await fetchBytes(fetchImpl, `${base}/SHA256SUMS`);
 		if (!sums) fail(`download failed: ${base}/SHA256SUMS`);
 		const signature = await fetchBytes(fetchImpl, `${base}/SHA256SUMS.sig`);
-		// (A mirror copies the signature too; only a build of one's own, PIBOLT_ALLOW_UNSIGNED=1, has none.)
-		const { signed, text } = checkSums({ sums, signature, version, key, allowUnsigned: env.PIBOLT_ALLOW_UNSIGNED });
+		// (A mirror copies the signature too; only a build of one's own, MICROPI_ALLOW_UNSIGNED=1, has none.)
+		const { signed, text } = checkSums({ sums, signature, version, key, allowUnsigned: env.MICROPI_ALLOW_UNSIGNED });
 		if (!variant) {
 			variant = "x64";
-			if (checksumOf(text, "pi-bolt-win32-x64-baseline.zip") && !avx2()) variant = "x64-baseline";
+			if (checksumOf(text, "upi-win32-x64-baseline.zip") && !avx2()) variant = "x64-baseline";
 		}
-		const name = `pi-bolt-win32-${variant}`;
+		const name = `upi-win32-${variant}`;
 		const archive = `${name}.zip`;
 		const want = checksumOf(text, archive);
 		if (!want) fail(`this release has no Windows build ${variant} (${archive} is not in its SHA256SUMS)`);
 		const zip = path.join(stage, archive);
 		let from = "";
 		if (source !== "github" && !mirror) {
-			// The npm package @kushalkhemka/pi-bolt-win32-<variant> of the same version: a .tgz with the release's .zip in it.
+			// The npm package @kushalkhemka/upi-win32-<variant> of the same version: a .tgz with the release's .zip in it.
 			// (Releases before 0.8.5 have none: they come from GitHub.)
-			const registry = withoutTrailingSlashes(env.PIBOLT_NPM_REGISTRY || "https://registry.npmjs.org");
+			const registry = withoutTrailingSlashes(env.MICROPI_NPM_REGISTRY || "https://registry.npmjs.org");
 			const tgz = path.join(stage, "npm.tgz");
 			if (
 				(await download(fetchImpl, `${registry}/@kushalkhemka/${name}/-/${name}-${version}.tgz`, tgz)) &&
@@ -508,8 +508,8 @@ async function installWindows({
 			}
 			fs.rmSync(tgz, { force: true });
 			if (!from) {
-				if (source === "npm") fail(`npm does not have Pi-Bolt ${version}, or its download does not match the release's checksum. Nothing was installed.`);
-				log("pi-bolt: not available from npm; downloading from GitHub instead");
+				if (source === "npm") fail(`npm does not have µPi ${version}, or its download does not match the release's checksum. Nothing was installed.`);
+				log("upi: not available from npm; downloading from GitHub instead");
 			}
 		}
 		if (!from) {
@@ -520,15 +520,15 @@ async function installWindows({
 		const unpacked = path.join(stage, "unpacked");
 		await extractZip(zip, name, unpacked);
 		const tree = path.join(unpacked, name);
-		const exe = path.join(tree, "pi-bolt.exe");
-		if (!fs.existsSync(exe)) fail(`${archive} does not have ${name}\\pi-bolt.exe`);
+		const exe = path.join(tree, "upi.exe");
+		if (!fs.existsSync(exe)) fail(`${archive} does not have ${name}\\upi.exe`);
 		if (!runs(exe)) fail("the downloaded executable does not run on this system. Nothing was installed.");
 		removeOld(bin);
-		moveFiles(tree, bin, Date.now(), "pi-bolt.exe");
+		moveFiles(tree, bin, Date.now(), "upi.exe");
 		const size = (fs.statSync(zip).size / 1048576).toFixed(1);
-		log(`pi-bolt: installed Pi-Bolt ${version} (win32-${variant}, ${size} MB from ${from}${signed ? ", signature verified" : ""})`);
+		log(`upi: installed µPi ${version} (win32-${variant}, ${size} MB from ${from}${signed ? ", signature verified" : ""})`);
 		if (!signed) {
-			log(`pi-bolt: WARNING: ${from} has no signature for this release (SHA256SUMS.sig). It was installed because PIBOLT_ALLOW_UNSIGNED is the SHA-256 of its SHA256SUMS: that checksum is all that shows what it is.`);
+			log(`upi: WARNING: ${from} has no signature for this release (SHA256SUMS.sig). It was installed because MICROPI_ALLOW_UNSIGNED is the SHA-256 of its SHA256SUMS: that checksum is all that shows what it is.`);
 		}
 		return { variant, from, signed };
 	} finally {
@@ -538,18 +538,18 @@ async function installWindows({
 
 // --- Linux and macOS ----------------------------------------------------------------------------------------------------
 
-/** Puts the launcher (bin/pi-bolt, with its #!/bin/sh) over the placeholder, executable. */
+/** Puts the launcher (bin/upi, with its #!/bin/sh) over the placeholder, executable. */
 function installPosix({ pkgDir }) {
-	const launcher = fs.readFileSync(path.join(pkgDir, "bin", "pi-bolt"));
-	if (!launcher.toString("latin1", 0, 10).startsWith("#!/bin/sh")) fail("bin/pi-bolt is not the launcher");
-	const target = path.join(pkgDir, "bin", "pi-bolt.exe");
+	const launcher = fs.readFileSync(path.join(pkgDir, "bin", "upi"));
+	if (!launcher.toString("latin1", 0, 10).startsWith("#!/bin/sh")) fail("bin/upi is not the launcher");
+	const target = path.join(pkgDir, "bin", "upi.exe");
 	const part = `${target}.${process.pid}.part`;
 	fs.writeFileSync(part, launcher, { mode: 0o755 });
 	fs.chmodSync(part, 0o755);
 	fs.renameSync(part, target);
 }
 
-/** Whether `pkgDir` is npm/ in Pi-Bolt's repository (`npm install` or `npm link` there), whose placeholder stays as it is. */
+/** Whether `pkgDir` is npm/ in µPi's repository (`npm install` or `npm link` there), whose placeholder stays as it is. */
 function isSourceTree(pkgDir) {
 	return path.basename(pkgDir) === "npm" && ["VERSION", "install.ps1", "install.sh"].every((file) => fs.existsSync(path.join(pkgDir, "..", file)));
 }
@@ -565,7 +565,7 @@ function proxyOf(env) {
 async function main() {
 	const pkgDir = __dirname;
 	if (isSourceTree(pkgDir)) {
-		console.error("pi-bolt: this is Pi-Bolt's repository, not an installed package: bin/pi-bolt.exe stays the placeholder");
+		console.error("upi: this is µPi's repository, not an installed package: bin/upi.exe stays the placeholder");
 		return;
 	}
 	if (process.platform !== "win32") {
@@ -605,13 +605,13 @@ module.exports = {
 if (require.main === module) {
 	main().catch((error) => {
 		const message = error instanceof InstallError ? error.message : error && error.stack ? error.stack : String(error);
-		console.error(`pi-bolt: error: ${message}`);
+		console.error(`upi: error: ${message}`);
 		const proxy = proxyOf(process.env);
 		if (proxy && /download failed/.test(message)) {
-			console.error(`pi-bolt: downloads went through the proxy ${proxy.replace(/\/\/[^@/]*@/, "//")}; a Node.js older than 22.21 or 24.5 cannot use one (NODE_USE_ENV_PROXY)`);
+			console.error(`upi: downloads went through the proxy ${proxy.replace(/\/\/[^@/]*@/, "//")}; a Node.js older than 22.21 or 24.5 cannot use one (NODE_USE_ENV_PROXY)`);
 		}
 		if (process.platform === "win32") {
-			console.error('pi-bolt: Pi-Bolt was not installed. Try again, or install it with: powershell -c "irm https://pi-bolt.opensec.in/install.ps1 | iex"');
+			console.error('upi: µPi was not installed. Try again, or install it with: powershell -c "irm https://upi.opensec.in/install.ps1 | iex"');
 		}
 		process.exitCode = 1;
 	});

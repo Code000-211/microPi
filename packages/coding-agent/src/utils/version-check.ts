@@ -1,13 +1,14 @@
 import { compare, valid } from "semver";
 import {
+	MICROPI_HAS_RELEASES,
+	MICROPI_LATEST_RELEASE_API,
+	MICROPI_LATEST_RELEASE_URL,
+	MICROPI_RELEASES_API,
+	MICROPI_RELEASES_FEED,
 	PIBOLT,
-	PIBOLT_LATEST_RELEASE_API,
-	PIBOLT_LATEST_RELEASE_URL,
-	PIBOLT_RELEASES_API,
-	PIBOLT_RELEASES_FEED,
 	piBoltChannel,
 	piBoltVersionOfTag,
-} from "../pi-bolt.ts";
+} from "../upi.ts";
 import { fetchWithRetry } from "./management-http.ts";
 import { getPiUserAgent } from "./pi-user-agent.ts";
 
@@ -116,11 +117,11 @@ export function newestPiBoltVersion(releases: unknown): string | undefined {
 	);
 }
 
-/** The version of a release page's address (".../releases/tag/bolt-v1.0.2" -> "1.0.2"), or undefined for any other. */
+/** The version of a release page's address (".../releases/tag/upi-v1.0.2" -> "1.0.2"), or undefined for any other. */
 export function piBoltVersionOfReleaseUrl(url: string | null | undefined): string | undefined {
 	if (!url) return undefined;
 	try {
-		const tag = /\/releases\/tag\/([^/]+)$/.exec(new URL(url, PIBOLT_LATEST_RELEASE_URL).pathname)?.[1];
+		const tag = /\/releases\/tag\/([^/]+)$/.exec(new URL(url, MICROPI_LATEST_RELEASE_URL).pathname)?.[1];
 		return tag ? piBoltVersionOfTag(decodeURIComponent(tag)) : undefined;
 	} catch {
 		return undefined;
@@ -163,7 +164,7 @@ async function getLatestPiBoltRelease(
 	const signal = AbortSignal.timeout(options.timeoutMs ?? DEFAULT_VERSION_CHECK_TIMEOUT_MS);
 	const retry = { maxRetries: options.retry ? 2 : 0 };
 	const latestRedirect = async (): Promise<string | undefined> => {
-		const response = await fetchWithRetry(PIBOLT_LATEST_RELEASE_URL, { headers, redirect: "manual", signal }, retry);
+		const response = await fetchWithRetry(MICROPI_LATEST_RELEASE_URL, { headers, redirect: "manual", signal }, retry);
 		try {
 			await response.body?.cancel();
 		} catch {
@@ -186,7 +187,7 @@ async function getLatestPiBoltRelease(
 		return version;
 	};
 	const feed = async (): Promise<string | undefined> => {
-		const response = await fetchWithRetry(PIBOLT_RELEASES_FEED, { headers, signal }, retry);
+		const response = await fetchWithRetry(MICROPI_RELEASES_FEED, { headers, signal }, retry);
 		if (!response.ok) throw new Error(describeResponse(response));
 		const version = newestPiBoltVersionInFeed(await response.text());
 		if (!version) throw new Error("no Pi-Bolt release in the feed");
@@ -195,15 +196,15 @@ async function getLatestPiBoltRelease(
 	const sources: Array<[string, () => Promise<string | undefined>]> =
 		piBoltChannel() === "beta"
 			? [
-					[PIBOLT_RELEASES_API, () => api(PIBOLT_RELEASES_API, newestPiBoltVersion)],
-					[PIBOLT_RELEASES_FEED, feed],
+					[MICROPI_RELEASES_API, () => api(MICROPI_RELEASES_API, newestPiBoltVersion)],
+					[MICROPI_RELEASES_FEED, feed],
 				]
 			: [
-					[PIBOLT_LATEST_RELEASE_URL, latestRedirect],
+					[MICROPI_LATEST_RELEASE_URL, latestRedirect],
 					[
-						PIBOLT_LATEST_RELEASE_API,
+						MICROPI_LATEST_RELEASE_API,
 						() =>
-							api(PIBOLT_LATEST_RELEASE_API, (data) =>
+							api(MICROPI_LATEST_RELEASE_API, (data) =>
 								piBoltVersionOfTag((data as { tag_name?: unknown } | null)?.tag_name),
 							),
 					],
@@ -228,7 +229,7 @@ export async function getLatestPiVersion(
 }
 
 export async function checkForNewPiVersion(currentVersion: string): Promise<LatestPiRelease | undefined> {
-	if (process.env.PI_SKIP_VERSION_CHECK) return undefined;
+	if (!MICROPI_HAS_RELEASES || process.env.PI_SKIP_VERSION_CHECK) return undefined;
 	if (PIBOLT) currentVersion = PIBOLT.version;
 
 	try {

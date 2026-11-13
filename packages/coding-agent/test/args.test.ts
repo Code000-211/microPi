@@ -591,7 +591,7 @@ describe("parseArgs", () => {
 
 describe("missingExtensionPaths", () => {
 	test("reports a local path that does not exist", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-bolt-ext-"));
+		const dir = mkdtempSync(join(tmpdir(), "upi-ext-"));
 		try {
 			const missing = join(dir, "nope.ts");
 			expect(missingExtensionPaths([missing])).toEqual([missing]);
@@ -601,7 +601,7 @@ describe("missingExtensionPaths", () => {
 	});
 
 	test("leaves an existing file, builtin names and package sources alone", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-bolt-ext-"));
+		const dir = mkdtempSync(join(tmpdir(), "upi-ext-"));
 		try {
 			const present = join(dir, "ext.ts");
 			writeFileSync(present, "export default function () {}\n");

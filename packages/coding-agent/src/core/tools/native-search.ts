@@ -1,5 +1,5 @@
 /**
- * Pi-Bolt: the search behind the grep and find tools, in-process (grep.ts and find.ts use it in Pi-Bolt builds; Pi runs
+ * µPi: the search behind the grep and find tools, in-process (grep.ts and find.ts use it in µPi builds; Pi runs
  * ripgrep and fd, which it downloads when they are not installed). Compiled ahead of time with the rest of Pi, it starts no
  * process and needs nothing installed.
  *

@@ -17,7 +17,7 @@ interface NativeImagePipeline {
 
 export type NativeImageConstructor = new (input: Uint8Array, options: { autoOrient: boolean }) => NativeImagePipeline;
 
-/** `Bun.Image` when the runtime has it (Bun, including Pi-Bolt's runtime), else undefined (Node). */
+/** `Bun.Image` when the runtime has it (Bun, including µPi's runtime), else undefined (Node). */
 export function getNativeImage(): NativeImageConstructor | undefined {
 	const image = (globalThis as { Bun?: { Image?: unknown } }).Bun?.Image;
 	return typeof image === "function" ? (image as NativeImageConstructor) : undefined;
@@ -51,7 +51,7 @@ function orient(pipeline: NativeImagePipeline, orientation: number): NativeImage
 /**
  * Resize with the runtime's native image code (libspng, libjpeg-turbo and libwebp decoders, SIMD
  * Lanczos3 resize, libspng and libjpeg-turbo encoders) instead of photon's WebAssembly, which the
- * JIT-off Pi-Bolt runtime interprets: a 2442x1438 screenshot takes about 0.5 s of CPU instead of
+ * JIT-off µPi runtime interprets: a 2442x1438 screenshot takes about 0.5 s of CPU instead of
  * about 15 s. It runs on Bun's own worker threads, so the event loop stays free.
  *
  * Same output rules as the photon path (same target sizes, candidate order and size limit), but

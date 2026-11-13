@@ -15,7 +15,7 @@ import {
 } from "../config.ts";
 import type { ExtensionFlag } from "../core/extensions/types.ts";
 import { getToolListError, type TuiMode } from "../core/settings-manager.ts";
-import { PIBOLT } from "../pi-bolt.ts";
+import { PIBOLT } from "../upi.ts";
 import { isLocalPath } from "../utils/paths.ts";
 
 export type Mode = "text" | "json" | "rpc" | "acp" | "mcp";

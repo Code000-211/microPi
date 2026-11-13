@@ -1,45 +1,43 @@
-# Pi-Bolt installer for Windows (x64).
+# µPi installer for Windows (x64).
 #
-#   irm https://pi-bolt.opensec.in/install.ps1 | iex                       (in PowerShell)
-#   powershell -c "irm https://pi-bolt.opensec.in/install.ps1 | iex"      (in Command Prompt)
+#   irm https://upi.opensec.in/install.ps1 | iex                       (in PowerShell)
+#   powershell -c "irm https://upi.opensec.in/install.ps1 | iex"      (in Command Prompt)
 #
 # Downloads a release, verifies its SHA-256 checksum and the Ed25519 signature of the checksums, installs it to
-# %USERPROFILE%\.pi-bolt and puts `pi-bolt` on your PATH (it asks first). Run it again to reinstall, update or uninstall. The
-# executable comes from the npm registry (a CDN, fast in most places) and falls back to GitHub; the checksums and their signature
-# always come from the GitHub release, so a download from npm is checked against them. Nothing here needs administrator rights,
-# and nothing changes a security setting: the installation is the user's own folder and the user's own PATH.
+# %USERPROFILE%\.micropi and puts `upi` on your PATH (it asks first). Run it again to reinstall, update or uninstall. The
+# executable comes from the GitHub release by default (a CDN mirror of it is on npm, for MICROPI_SOURCE=npm); the checksums and
+# their signature always come from the GitHub release, so a download from npm is checked against them. Nothing here needs
+# administrator rights, and nothing changes a security setting: the installation is the user's own folder and the user's own PATH.
 #
 # Environment:
-#   PIBOLT_VERSION   a release tag such as bolt-v0.8.0 (default: the latest release)
-#   PIBOLT_CHANNEL   stable (the latest release; the default) or beta (the newest release, pre-releases included), for this
-#                    installation and its updates (`pi-bolt update --channel` changes it)
-#   PIBOLT_VARIANT   x64 (default), x64-baseline (any x86-64 CPU; picked when the CPU has no AVX2 and the release has one) or
+#   MICROPI_VERSION   a release tag such as upi-v0.8.0 (default: the latest release)
+#   MICROPI_CHANNEL   stable (the latest release; the default) or beta (the newest release, pre-releases included), for this
+#                    installation and its updates (`upi update --channel` changes it)
+#   MICROPI_VARIANT   x64 (default), x64-baseline (any x86-64 CPU; picked when the CPU has no AVX2 and the release has one) or
 #                    x64-jit
-#   PIBOLT_INSTALL   where to install (default: %USERPROFILE%\.pi-bolt)
-#   PIBOLT_NO_PATH=1 leave PATH as it is: do not add the installation, nor take another variant off (pi-bolt update sets it)
-#   PIBOLT_YES=1     do not ask: take the default action and do not offer to start Pi-Bolt
-#   PIBOLT_LAUNCHER=1  used by the npm package's first run: download only, no menu, PATH or prompts
-#   PIBOLT_SOURCE    where to download the executable from: auto (npm, then GitHub; the default), npm or github
-#   PIBOLT_NPM_REGISTRY  the npm registry or mirror to use (default: https://registry.npmjs.org)
-#   PIBOLT_EXTENSIONS  yes or no: whether to install OpenSec's optional extensions (opensec-pi-subagents, opensec-pi-todo, opensec-pi-fff)
-#                    without asking. Without it the installer asks when it can; a run that cannot ask, or PIBOLT_YES=1,
-#                    installs none.
-#   PIBOLT_DOWNLOAD_BASE  a mirror of a release to download everything from (its SHA256SUMS.sig too)
-#   PIBOLT_ALLOW_UNSIGNED  the SHA-256 of a release's SHA256SUMS (the installer shows it), to install that download although it
+#   MICROPI_INSTALL   where to install (default: %USERPROFILE%\.micropi)
+#   MICROPI_NO_PATH=1 leave PATH as it is: do not add the installation, nor take another variant off (upi update sets it)
+#   MICROPI_YES=1     do not ask: take the default action and do not offer to start µPi
+#   MICROPI_LAUNCHER=1  used by the npm package's first run: download only, no menu, PATH or prompts
+#   MICROPI_SOURCE    where to download the executable from: auto (GitHub; the default), npm (the npm package of the build, a
+#                    mirror of the release) or github
+#   MICROPI_NPM_REGISTRY  the npm registry or mirror to use with MICROPI_SOURCE=npm (default: https://registry.npmjs.org)
+#   MICROPI_DOWNLOAD_BASE  a mirror of a release to download everything from (its SHA256SUMS.sig too)
+#   MICROPI_ALLOW_UNSIGNED  the SHA-256 of a release's SHA256SUMS (the installer shows it), to install that download although it
 #                    has no signature (a build of your own); never needed otherwise. It matches those checksums only, so a
 #                    value left in the environment does nothing for another download. A signature that does not verify always
 #                    stops the install.
 #
-# A folder given in PIBOLT_INSTALL outside your profile is made yours, SYSTEM's and the Administrators' only.
+# A folder given in MICROPI_INSTALL outside your profile is made yours, SYSTEM's and the Administrators' only.
 
 # The public key that releases are signed with (keys/release.pub in the repository; scripts/sign-release.sh).
-$PiBoltReleaseKey = 'MCowBQYDK2VwAyEAoLboJqtKaoISPqffk03vHZr+1sRBG3uIRIWeKOew+aY='
-$PiBoltRepo = 'https://github.com/opensec-git/Pi-Bolt'
-$PiBoltApi = 'https://api.github.com/repos/opensec-git/Pi-Bolt'
+$PiBoltReleaseKey = 'MCowBQYDK2VwAyEA7vWlD05a55D8G5jzjzgQ5J7ZDNev7rhf0IoNP8uwmjI='
+$PiBoltRepo = 'https://github.com/Code000-211/microPi'
+$PiBoltApi = 'https://api.github.com/repos/Code000-211/microPi'
 
 # --- Modules ---------------------------------------------------------------------------------------------------------------
 # PowerShell 7 passes its own module directories to everything it starts, and they come before this PowerShell's own. An
-# installation started from a PowerShell 7 prompt (which is how `pi-bolt update` starts this script when Pi-Bolt itself runs in
+# installation started from a PowerShell 7 prompt (which is how `upi update` starts this script when µPi itself runs in
 # one, and how a user's own prompt runs it) then resolves names this script needs — Get-FileHash, Get-Acl and Set-Acl, from
 # Microsoft.PowerShell.Utility and Microsoft.PowerShell.Security — to PowerShell 7's copies of those modules, whose cmdlets are
 # built for .NET and do not load in it: Windows PowerShell reports "The term 'Get-FileHash' is not recognized" and the
@@ -50,7 +48,7 @@ $env:PSModulePath = "$PSHOME\Modules;$env:PSModulePath"
 
 # --- Ed25519 ----------------------------------------------------------------------------------------------------------
 # Signature verification (RFC 8032, section 5.1.7) with System.Numerics.BigInteger: Windows has no Ed25519 of its own (neither
-# .NET Framework nor .NET has one, and there is no openssl), and the signature is what says that a download is Pi-Bolt's. About
+# .NET Framework nor .NET has one, and there is no openssl), and the signature is what says that a download is µPi's. About
 # a second, once. (PowerShell's names are not case-sensitive, and a comma binds tighter than %: hence some of the names and
 # parentheses below.)
 
@@ -161,7 +159,7 @@ function Format-MB([double]$bytes) { '{0:N1}' -f ($bytes / 1MB) }
 
 function Show-PiBoltProgress([string]$text) {
 	if ([Console]::IsOutputRedirected) { return }
-	Write-PiBolt "`r$esc[K  $amber>$reset ${bold}Installing Pi-Bolt$reset $dim$text$reset"
+	Write-PiBolt "`r$esc[K  $amber>$reset ${bold}Installing µPi$reset $dim$text$reset"
 }
 
 function Clear-PiBoltProgress { if (-not [Console]::IsOutputRedirected) { Write-PiBolt "`r$esc[K" } }
@@ -170,17 +168,17 @@ function Clear-PiBoltProgress { if (-not [Console]::IsOutputRedirected) { Write-
 function Stop-PiBolt([string]$message) {
 	Clear-PiBoltProgress
 	[Console]::Error.WriteLine("${red}error:$reset $message")
-	throw [System.OperationCanceledException]::new('Pi-Bolt installer')
+	throw [System.OperationCanceledException]::new('µPi installer')
 }
 
 # --- Steps ------------------------------------------------------------------------------------------------------------
 
 # Whether the user let the download whose SHA256SUMS has the SHA-256 $hash be installed without a signature:
-# PIBOLT_ALLOW_UNSIGNED is that SHA-256, which no other download has (a value kept in the environment does not let another
-# release in). Never in the npm package's first run (PIBOLT_LAUNCHER).
+# MICROPI_ALLOW_UNSIGNED is that SHA-256, which no other download has (a value kept in the environment does not let another
+# release in). Never in the npm package's first run (MICROPI_LAUNCHER).
 function Test-PiBoltUnsignedAllowed([string]$hash) {
-	$allowed = $env:PIBOLT_ALLOW_UNSIGNED
-	$env:PIBOLT_LAUNCHER -ne '1' -and $allowed -and $allowed.Trim().ToLowerInvariant() -eq $hash
+	$allowed = $env:MICROPI_ALLOW_UNSIGNED
+	$env:MICROPI_LAUNCHER -ne '1' -and $allowed -and $allowed.Trim().ToLowerInvariant() -eq $hash
 }
 
 function Test-PiBoltPrerequisites {
@@ -188,17 +186,17 @@ function Test-PiBoltPrerequisites {
 	if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
 		$problems += "PowerShell is in $($ExecutionContext.SessionState.LanguageMode) mode here, in which the installer cannot check the download's signature. Download the release from $PiBoltRepo/releases and check it yourself."
 	}
-	if (-not [Environment]::Is64BitOperatingSystem) { $problems += 'Pi-Bolt runs on 64-bit Windows only.' }
+	if (-not [Environment]::Is64BitOperatingSystem) { $problems += 'µPi runs on 64-bit Windows only.' }
 	$arch = $env:PROCESSOR_ARCHITEW6432; if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
-	if ($arch -ne 'AMD64' -and $arch -ne 'ARM64') { $problems += "Pi-Bolt runs on x86-64 (this is $arch)." }
+	if ($arch -ne 'AMD64' -and $arch -ne 'ARM64') { $problems += "µPi runs on x86-64 (this is $arch)." }
 	# ConPTY, and the console's virtual terminal sequences, which Pi's interface needs: Windows 10 1809 (build 17763).
 	$build = [Environment]::OSVersion.Version.Build
-	if ($build -lt 17763) { $problems += "Pi-Bolt needs Windows 10 version 1809 or later (this is build $build)." }
+	if ($build -lt 17763) { $problems += "µPi needs Windows 10 version 1809 or later (this is build $build)." }
 	# Windows on ARM runs x64 code from Windows 11 on; Windows 10 on ARM emulates 32-bit x86 only.
-	if ($arch -eq 'ARM64' -and $build -lt 22000) { $problems += "On ARM, Pi-Bolt needs Windows 11, whose x64 emulation runs it (this is Windows 10, build $build)." }
+	if ($arch -eq 'ARM64' -and $build -lt 22000) { $problems += "On ARM, µPi needs Windows 11, whose x64 emulation runs it (this is Windows 10, build $build)." }
 	foreach ($p in $problems) { [Console]::Error.WriteLine("${red}error:$reset $p") }
-	if ($problems) { throw [System.OperationCanceledException]::new('Pi-Bolt installer') }
-	if ($arch -eq 'ARM64') { Write-Host "  ${dim}note: this is Windows on ARM; Pi-Bolt is x64 code and runs under its emulation$reset" }
+	if ($problems) { throw [System.OperationCanceledException]::new('µPi installer') }
+	if ($arch -eq 'ARM64') { Write-Host "  ${dim}note: this is Windows on ARM; µPi is x64 code and runs under its emulation$reset" }
 }
 
 # Whether the CPU has AVX2 (what the x64 build's compiled code is for; without it, that build runs its bytecode instead).
@@ -222,7 +220,7 @@ function New-PiBoltClient {
 	$handler = [System.Net.Http.HttpClientHandler]::new()
 	$client = [System.Net.Http.HttpClient]::new($handler)
 	$client.Timeout = [TimeSpan]::FromMinutes(30)
-	$client.DefaultRequestHeaders.UserAgent.ParseAdd('pi-bolt-installer')
+	$client.DefaultRequestHeaders.UserAgent.ParseAdd('upi-installer')
 	$client
 }
 
@@ -334,12 +332,12 @@ function Test-PiBoltChecksum([string]$sums, [string]$name, [string]$file) {
 }
 
 function Get-PiBoltInstalledVersion([string]$dir) {
-	$file = Join-Path $dir 'pi-bolt.txt'
-	if ((Test-Path -LiteralPath $file) -and ((Get-Content -LiteralPath $file -TotalCount 1) -match '^Pi-Bolt ([0-9.]+) ')) { return $Matches[1] }
+	$file = Join-Path $dir 'upi.txt'
+	if ((Test-Path -LiteralPath $file) -and ((Get-Content -LiteralPath $file -TotalCount 1) -match 'µPi ([0-9.]+) ')) { return $Matches[1] }
 	''
 }
 
-# Moves the new build into place over the old one. A running Pi-Bolt (`pi-bolt update`) keeps its executable and DLLs open, and
+# Moves the new build into place over the old one. A running µPi (`upi update`) keeps its executable and DLLs open, and
 # Windows lets those be renamed but not replaced or deleted: each file that is there is renamed out of the way first, and what was
 # renamed is deleted now if it can be, or by the next installation.
 function Install-PiBoltFiles([string]$from, [string]$to) {
@@ -349,12 +347,12 @@ function Install-PiBoltFiles([string]$from, [string]$to) {
 	}
 	New-Item -ItemType Directory -Force -Path $to | Out-Null
 	$stamp = [DateTime]::UtcNow.Ticks
-	# pi-bolt.exe last: until it is in place, the one that runs is the old one. (If a move fails part of the way, the files moved
+	# upi.exe last: until it is in place, the one that runs is the old one. (If a move fails part of the way, the files moved
 	# before it are the new ones; the installer says so and stops, and running it again puts the rest in place.) Each new file is
 	# first moved next to its target (from %TEMP%, perhaps another drive: a copy, which can fail on a full disk), and only then is
 	# the old one renamed aside and the new one renamed into place, in the same folder; if that last step fails, the old one is
 	# put back. A file is never missing because a copy failed.
-	$files = @(Get-ChildItem -LiteralPath $from -Recurse -File | Sort-Object { $_.Name -ieq 'pi-bolt.exe' })
+	$files = @(Get-ChildItem -LiteralPath $from -Recurse -File | Sort-Object { $_.Name -ieq 'upi.exe' })
 	foreach ($file in $files) {
 		$relative = $file.FullName.Substring($from.Length).TrimStart('\')
 		$target = Join-Path $to $relative
@@ -373,14 +371,14 @@ function Install-PiBoltFiles([string]$from, [string]$to) {
 			Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue
 		} catch {
 			Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
-			Stop-PiBolt "could not put $target in place ($($_.Exception.Message)). Close Pi-Bolt and anything that has its files open, then run the installer again."
+			Stop-PiBolt "could not put $target in place ($($_.Exception.Message)). Close µPi and anything that has its files open, then run the installer again."
 		}
 	}
 }
 
-# A folder Pi-Bolt is installed in outside the user's profile (PIBOLT_INSTALL=C:\tools\pi-bolt) inherits its parent's
+# A folder µPi is installed in outside the user's profile (MICROPI_INSTALL=C:\tools\upi) inherits its parent's
 # permissions, and a folder made in C:\ lets every user change what is in it: anyone on the machine could then replace
-# pi-bolt.exe, which is on this user's PATH. Such a folder is made the user's, SYSTEM's and the Administrators' only.
+# upi.exe, which is on this user's PATH. Such a folder is made the user's, SYSTEM's and the Administrators' only.
 function Test-PiBoltInProfile([string]$dir) {
 	foreach ($root in $env:USERPROFILE, $env:LOCALAPPDATA) {
 		if ($root -and $dir.StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
@@ -397,9 +395,9 @@ function Protect-PiBoltFolder([string]$dir) {
 	foreach ($sid in Get-PiBoltFolderOwners) {
 		$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
 	}
-	# (Not a note: a folder that others may still change is one they could put another pi-bolt.exe in.)
+	# (Not a note: a folder that others may still change is one they could put another upi.exe in.)
 	try { Set-Acl -LiteralPath $dir -AclObject $acl -ErrorAction Stop }
-	catch { Stop-PiBolt "could not limit who can change $dir ($($_.Exception.Message)). Install in a folder of your own (PIBOLT_INSTALL), such as the default under your profile." }
+	catch { Stop-PiBolt "could not limit who can change $dir ($($_.Exception.Message)). Install in a folder of your own (MICROPI_INSTALL), such as the default under your profile." }
 }
 # A folder outside the profile that is there already must be this user's, SYSTEM's or the Administrators': another user who made
 # it first (C:\ lets anyone make folders) would still own it, and could give themselves back the right to change it.
@@ -408,12 +406,12 @@ function Assert-PiBoltFolderOwner([string]$dir) {
 	$owner = (Get-Acl -LiteralPath $dir).GetOwner([Security.Principal.SecurityIdentifier])
 	if ((Get-PiBoltFolderOwners | ForEach-Object Value) -notcontains $owner.Value) {
 		$name = try { $owner.Translate([Security.Principal.NTAccount]).Value } catch { $owner.Value }
-		Stop-PiBolt "$dir belongs to $name, not to you: whoever owns it can change what is installed there. Choose another folder (PIBOLT_INSTALL)."
+		Stop-PiBolt "$dir belongs to $name, not to you: whoever owns it can change what is installed there. Choose another folder (MICROPI_INSTALL)."
 	}
 }
 
 # The folders above it too, up to the drive: whoever may rename or delete one of them (every user may, in a folder a user made
-# in C:\, which inherits that) can put a folder of their own, with their pi-bolt.exe, where this user's PATH points. The folders
+# in C:\, which inherits that) can put a folder of their own, with their upi.exe, where this user's PATH points. The folders
 # the installer makes itself are made the user's (Get-PiBoltFirstNewFolder). (S-1-15-*: app capabilities, not users.)
 function Assert-PiBoltFolderParents([string]$dir) {
 	if (Test-PiBoltInProfile $dir) { return }
@@ -437,7 +435,7 @@ function Assert-PiBoltFolderParents([string]$dir) {
 				}
 			} catch { $why = "its permissions cannot be read ($($_.Exception.Message))" }
 			if ($why) {
-				Stop-PiBolt "$dir is in $parent, and $why`: another user could then put their own pi-bolt.exe where your PATH points. Install under your profile (the default), or in a folder whose parents only you and the administrators can change. Nothing was installed."
+				Stop-PiBolt "$dir is in $parent, and $why`: another user could then put their own upi.exe where your PATH points. Install under your profile (the default), or in a folder whose parents only you and the administrators can change. Nothing was installed."
 			}
 		}
 		$parent = Split-Path -Parent $parent
@@ -452,7 +450,7 @@ function Get-PiBoltFirstNewFolder([string]$dir) {
 
 function Install-PiBoltRelease($state) {
 	$name = $state.Name
-	$tmp = Join-Path ([IO.Path]::GetTempPath()) "pi-bolt-$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+	$tmp = Join-Path ([IO.Path]::GetTempPath()) "upi-$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
 	New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 	try {
 		$client = New-PiBoltClient
@@ -463,48 +461,38 @@ function Install-PiBoltRelease($state) {
 		if (-not ((Get-Content -LiteralPath $sums) -match " [ *]?$([regex]::Escape($archive))$")) {
 			Stop-PiBolt "this release has no Windows build ($archive is not in its SHA256SUMS)"
 		}
-		# The signature first: nothing else is looked at in a release whose checksums are not Pi-Bolt's.
+		# The signature first: nothing else is looked at in a release whose checksums are not µPi's.
 		$signed = $false
 		$sigFile = Join-Path $tmp 'SHA256SUMS.sig'
 		if (Get-PiBoltFile $client "$($state.Base)/SHA256SUMS.sig" $sigFile '') {
 			Show-PiBoltProgress 'verifying the signature'
 			$der = [Convert]::FromBase64String($PiBoltReleaseKey)
 			if (-not (Test-Ed25519Signature ([byte[]]$der[12..43]) ([IO.File]::ReadAllBytes($sums)) ([IO.File]::ReadAllBytes($sigFile)))) {
-				Stop-PiBolt "the release's signature does not verify: the download is not Pi-Bolt's. Nothing was installed."
+				Stop-PiBolt "the release's signature does not verify: the download is not µPi's. Nothing was installed."
 			}
 			$signed = $true
 		} else {
-			# (A mirror, PIBOLT_DOWNLOAD_BASE, copies the signature too: it is not a reason to do without it.)
+			# (A mirror, MICROPI_DOWNLOAD_BASE, copies the signature too: it is not a reason to do without it.)
 			$sumsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sums).Hash.ToLowerInvariant()
 			if (-not (Test-PiBoltUnsignedAllowed $sumsHash)) {
-				$stale = if ($env:PIBOLT_ALLOW_UNSIGNED) { ' (PIBOLT_ALLOW_UNSIGNED is set, but not to this download''s SHA-256: it applies to one download only)' } else { '' }
-				Stop-PiBolt "the release has no signature (SHA256SUMS.sig), and every Windows release is signed. Nothing was installed$stale. Only for a build of your own: run the installer again with PIBOLT_ALLOW_UNSIGNED=$sumsHash, the SHA-256 of its SHA256SUMS."
+				$stale = if ($env:MICROPI_ALLOW_UNSIGNED) { ' (MICROPI_ALLOW_UNSIGNED is set, but not to this download''s SHA-256: it applies to one download only)' } else { '' }
+				Stop-PiBolt "the release has no signature (SHA256SUMS.sig), and every Windows release is signed. Nothing was installed$stale. Only for a build of your own: run the installer again with MICROPI_ALLOW_UNSIGNED=$sumsHash, the SHA-256 of its SHA256SUMS."
 			}
 		}
 		# The signature covers the files, and the first line says which release they are: without it, an older release (signed all the
 		# same) could be served as a newer one.
 		$first = Get-Content -LiteralPath $sums -TotalCount 1
-		if ($first -notmatch '^# pi-bolt (\d+\.\d+\.\d+)$') { Stop-PiBolt 'the release''s SHA256SUMS does not say which version it is. Nothing was installed.' }
+		if ($first -notmatch '^# upi (\d+\.\d+\.\d+)$') { Stop-PiBolt 'the release''s SHA256SUMS does not say which version it is. Nothing was installed.' }
 		if ($state.Version -and $Matches[1] -ne $state.Version) {
-			Stop-PiBolt "the download is Pi-Bolt $($Matches[1]), not $($state.Version) as asked for (an older release served as a newer one?). Nothing was installed."
+			Stop-PiBolt "the download is µPi $($Matches[1]), not $($state.Version) as asked for (an older release served as a newer one?). Nothing was installed."
 		}
 		$state.Version = $Matches[1]; $state.Shown = $Matches[1]
-		# The optional extensions this release pins (extensions.txt, covered by the signed checksums).
-		$state.Extensions = @()
-		$pins = Join-Path $tmp 'extensions.txt'
-		if ((Get-PiBoltFile $client "$($state.Base)/extensions.txt" $pins '') -and (Test-PiBoltChecksum $sums 'extensions.txt' $pins)) {
-			foreach ($line in Get-Content -LiteralPath $pins) {
-				if ($line -match '^([a-z0-9][a-z0-9._-]*) (\d+\.\d+\.\d+) (sha512-[A-Za-z0-9+/]+=*)$') {
-					$state.Extensions += @{ Package = $Matches[1]; Version = $Matches[2]; Integrity = $Matches[3] }
-				}
-			}
-		}
 		$file = Join-Path $tmp $archive
 		$from = ''
-		if ($state.Source -ne 'github' -and -not $env:PIBOLT_DOWNLOAD_BASE) {
-			# The npm package @kushalkhemka/pi-bolt-win32-x64 (of the same version) is a .tgz with the release's .zip in it. (Releases
-			# before 0.8.5 have none: they come from GitHub.)
-			$registry = if ($env:PIBOLT_NPM_REGISTRY) { $env:PIBOLT_NPM_REGISTRY.TrimEnd('/') } else { 'https://registry.npmjs.org' }
+		if ($state.Source -eq 'npm' -and -not $env:MICROPI_DOWNLOAD_BASE) {
+			# The npm package @kushalkhemka/upi-win32-x64 (of the same version) is a .tgz with the release's .zip in it. (Releases
+			# before 0.8.5 have none: they come from GitHub.) The default is GitHub; npm is only asked for with MICROPI_SOURCE=npm.
+			$registry = if ($env:MICROPI_NPM_REGISTRY) { $env:MICROPI_NPM_REGISTRY.TrimEnd('/') } else { 'https://registry.npmjs.org' }
 			$tgz = Join-Path $tmp 'npm.tgz'
 			if ((Get-PiBoltFile $client "$registry/@kushalkhemka/$name/-/$name-$($state.Version).tgz" $tgz 'downloading')) {
 				if (Get-PiBoltTarEntry $tgz "package/$archive" $file) {
@@ -512,30 +500,26 @@ function Install-PiBoltRelease($state) {
 					if (Test-PiBoltChecksum $sums $archive $file) { $from = 'npm' }
 				}
 			}
-			if (-not $from) {
-				if ($state.Source -eq 'npm') { Stop-PiBolt "npm does not have Pi-Bolt $($state.Version), or its download does not match the release's checksum" }
-				Clear-PiBoltProgress
-				Write-Host "  ${dim}not available from npm; downloading from GitHub instead$reset"
-			}
+			if (-not $from) { Stop-PiBolt "npm does not have µPi $($state.Version), or its download does not match the release's checksum" }
 		} elseif ($state.Source -eq 'npm') {
-			Stop-PiBolt 'PIBOLT_SOURCE=npm needs the release from GitHub (no PIBOLT_DOWNLOAD_BASE)'
+			Stop-PiBolt 'MICROPI_SOURCE=npm needs the release from GitHub (no MICROPI_DOWNLOAD_BASE)'
 		}
 		if (-not $from) {
 			if (-not (Get-PiBoltFile $client "$($state.Base)/$archive" $file 'downloading')) { Stop-PiBolt "download failed: $($state.Base)/$archive" }
 			Show-PiBoltProgress 'verifying the checksum'
 			if (-not (Test-PiBoltChecksum $sums $archive $file)) { Stop-PiBolt 'checksum mismatch: the download is corrupt or incomplete' }
-			$from = if ($env:PIBOLT_DOWNLOAD_BASE) { $env:PIBOLT_DOWNLOAD_BASE } else { 'GitHub' }
+			$from = if ($env:MICROPI_DOWNLOAD_BASE) { $env:MICROPI_DOWNLOAD_BASE } else { 'GitHub' }
 		}
 		Show-PiBoltProgress 'extracting'
 		Add-Type -AssemblyName System.IO.Compression.FileSystem
 		$unpacked = Join-Path $tmp 'unpacked'
 		[System.IO.Compression.ZipFile]::ExtractToDirectory($file, $unpacked)
-		$exe = Join-Path $unpacked "$name\pi-bolt.exe"
-		if (-not (Test-Path -LiteralPath $exe)) { Stop-PiBolt "$archive does not have $name\pi-bolt.exe" }
+		$exe = Join-Path $unpacked "$name\upi.exe"
+		if (-not (Test-Path -LiteralPath $exe)) { Stop-PiBolt "$archive does not have $name\upi.exe" }
 		Show-PiBoltProgress 'checking the executable'
 		$null = & $exe --version 2>&1
 		if ($LASTEXITCODE -ne 0) { Stop-PiBolt 'the downloaded executable does not run on this system' }
-		# (The highest folder the installer makes too, such as C:\tools for C:\tools\pi-bolt: whoever may change that may rename
+		# (The highest folder the installer makes too, such as C:\tools for C:\tools\upi: whoever may change that may rename
 		# the ones in it.)
 		Assert-PiBoltFolderOwner $state.Install
 		Assert-PiBoltFolderOwner $state.Dir
@@ -544,11 +528,11 @@ function Install-PiBoltRelease($state) {
 		New-Item -ItemType Directory -Force -Path $state.Dir | Out-Null
 		if ($made) { Protect-PiBoltFolder $made }
 		Protect-PiBoltFolder $state.Dir
-		# The build this replaces is kept as <folder>.previous, for `pi-bolt update --rollback`: copied, since a running Pi-Bolt
-		# (`pi-bolt update`) keeps its folder from being renamed. The same build installed again (the same pi-bolt.txt) is not.
-		$current = Join-Path $state.Dir 'pi-bolt.txt'
-		$incoming = Join-Path (Join-Path $unpacked $name) 'pi-bolt.txt'
-		if ($env:PIBOLT_LAUNCHER -ne '1' -and (Test-Path -LiteralPath (Join-Path $state.Dir 'pi-bolt.exe')) -and
+		# The build this replaces is kept as <folder>.previous, for `upi update --rollback`: copied, since a running µPi
+		# (`upi update`) keeps its folder from being renamed. The same build installed again (the same upi.txt) is not.
+		$current = Join-Path $state.Dir 'upi.txt'
+		$incoming = Join-Path (Join-Path $unpacked $name) 'upi.txt'
+		if ($env:MICROPI_LAUNCHER -ne '1' -and (Test-Path -LiteralPath (Join-Path $state.Dir 'upi.exe')) -and
 			-not ((Test-Path -LiteralPath $current) -and (Get-Content -LiteralPath $current -Raw) -eq (Get-Content -LiteralPath $incoming -Raw))) {
 			$previous = "$($state.Dir).previous"
 			Show-PiBoltProgress 'keeping the build it replaces'
@@ -560,14 +544,14 @@ function Install-PiBoltRelease($state) {
 				Protect-PiBoltFolder $previous
 			} catch {
 				Clear-PiBoltProgress
-				Write-Host "  ${dim}the build this replaces was not kept ($($_.Exception.Message)): pi-bolt update --rollback has none to go back to$reset"
+				Write-Host "  ${dim}the build this replaces was not kept ($($_.Exception.Message)): upi update --rollback has none to go back to$reset"
 			}
 		}
 		Install-PiBoltFiles (Join-Path $unpacked $name) $state.Dir
 		Clear-PiBoltProgress
 		$size = (Get-Item -LiteralPath $file).Length
 		Write-Host ("  $green" + 'ok' + "$reset install complete $dim($($state.Platform)-$($state.Variant), $(Format-MB $size) MB from $from$(if ($signed) { ', signature verified' }))$reset")
-		if (-not $signed) { [Console]::Error.WriteLine("  $bold${red}WARNING:$reset $from has no signature for this release (SHA256SUMS.sig). It was installed because PIBOLT_ALLOW_UNSIGNED is the SHA-256 of its SHA256SUMS: that checksum is all that shows what it is.") }
+		if (-not $signed) { [Console]::Error.WriteLine("  $bold${red}WARNING:$reset $from has no signature for this release (SHA256SUMS.sig). It was installed because MICROPI_ALLOW_UNSIGNED is the SHA-256 of its SHA256SUMS: that checksum is all that shows what it is.") }
 	} finally {
 		Clear-PiBoltProgress
 		Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -586,8 +570,8 @@ function Set-PiBoltUserPath([string]$value) {
 	$key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
 	try { $key.SetValue('Path', $value, [Microsoft.Win32.RegistryValueKind]::ExpandString) } finally { $key.Dispose() }
 	# Tell running programs (Explorer, new terminals) that the environment changed: setting a variable through .NET broadcasts it.
-	[Environment]::SetEnvironmentVariable('PIBOLT_INSTALLER_PATH_CHANGED', '1', 'User')
-	[Environment]::SetEnvironmentVariable('PIBOLT_INSTALLER_PATH_CHANGED', $null, 'User')
+	[Environment]::SetEnvironmentVariable('MICROPI_INSTALLER_PATH_CHANGED', '1', 'User')
+	[Environment]::SetEnvironmentVariable('MICROPI_INSTALLER_PATH_CHANGED', $null, 'User')
 }
 
 function Test-PiBoltOnPath([string]$dir, [string]$path) {
@@ -598,29 +582,29 @@ function Test-PiBoltOnPath([string]$dir, [string]$path) {
 }
 
 function Add-PiBoltToPath([string]$dir, [bool]$existed = $false) {
-	# Another variant of this installation on PATH (pi-bolt-win32-x64 when this is -x64-jit, say) would be found first, and the
+	# Another variant of this installation on PATH (upi-win32-x64 when this is -x64-jit, say) would be found first, and the
 	# build just installed would not be the one that runs: it comes off, unless PATH is left as it is.
 	$root = Split-Path $dir
-	foreach ($other in Get-ChildItem -LiteralPath $root -Directory -Filter 'pi-bolt-win32-*' -ErrorAction SilentlyContinue) {
-		if ($env:PIBOLT_NO_PATH -ne '1' -and $other.FullName.TrimEnd('\') -ine $dir.TrimEnd('\') -and (Test-PiBoltOnPath $other.FullName (Get-PiBoltUserPath))) {
+	foreach ($other in Get-ChildItem -LiteralPath $root -Directory -Filter 'upi-win32-*' -ErrorAction SilentlyContinue) {
+		if ($env:MICROPI_NO_PATH -ne '1' -and $other.FullName.TrimEnd('\') -ine $dir.TrimEnd('\') -and (Test-PiBoltOnPath $other.FullName (Get-PiBoltUserPath))) {
 			Remove-PiBoltFromPath $other.FullName
 			Write-Host "  ${dim}took $($other.FullName) off your PATH: $dir is the one installed now$reset"
 		}
 	}
 	$userPath = Get-PiBoltUserPath
 	if (-not (Test-PiBoltOnPath $dir $userPath)) {
-		if ($env:PIBOLT_NO_PATH -eq '1') {
-			Write-Host "`n$dir is not on your PATH (PIBOLT_NO_PATH=1). Run Pi-Bolt as:`n`n  & '$dir\pi-bolt.exe'"
+		if ($env:MICROPI_NO_PATH -eq '1') {
+			Write-Host "`n$dir is not on your PATH (MICROPI_NO_PATH=1). Run µPi as:`n`n  & '$dir\upi.exe'"
 			return
 		}
 		if (Test-PiBoltCanAsk) {
 			$answer = Read-PiBoltAnswer "`nAdd $dir to your PATH (for your user account)? [Y/n] "
 			if ($answer -match '^(n|no)$') {
-				Write-Host "Not added. Run Pi-Bolt as:`n`n  & '$dir\pi-bolt.exe'"
+				Write-Host "Not added. Run µPi as:`n`n  & '$dir\upi.exe'"
 				return
 			}
 		} elseif ($existed) {
-			# Unasked, over an installation that is there (`pi-bolt update`): a folder that is not on PATH was left off it, by
+			# Unasked, over an installation that is there (`upi update`): a folder that is not on PATH was left off it, by
 			# the user's answer or their own choice, and stays off.
 			return
 		}
@@ -640,7 +624,7 @@ function Remove-PiBoltFromPath([string]$dir) {
 
 # --- Questions --------------------------------------------------------------------------------------------------------
 
-function Test-PiBoltCanAsk { $env:PIBOLT_YES -ne '1' -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected }
+function Test-PiBoltCanAsk { $env:MICROPI_YES -ne '1' -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected }
 
 function Read-PiBoltKey {
 	try { return [string][Console]::ReadKey($true).KeyChar } catch { return '' }
@@ -662,26 +646,26 @@ function Read-PiBoltAnswer([string]$prompt) {
 }
 
 function Select-PiBoltAction($state) {
-	$existing = Test-Path -LiteralPath (Join-Path $state.Dir 'pi-bolt.exe')
+	$existing = Test-Path -LiteralPath (Join-Path $state.Dir 'upi.exe')
 	$default = if ($existing) { 'reinstall' } else { 'install' }
 	$installed = if ($existing) { Get-PiBoltInstalledVersion $state.Dir } else { '' }
 	$state.Installed = $installed
 	$state.Existed = $existing
 	if ($existing) {
-		if ($installed -and $installed -ne $state.Shown) { Write-Host "${bold}Pi-Bolt $installed is installed at:$reset`n`n  $($state.Dir)`n" }
-		else { Write-Host "${bold}Pi-Bolt is already installed at:$reset`n`n  $($state.Dir)`n" }
+		if ($installed -and $installed -ne $state.Shown) { Write-Host "${bold}µPi $installed is installed at:$reset`n`n  $($state.Dir)`n" }
+		else { Write-Host "${bold}µPi is already installed at:$reset`n`n  $($state.Dir)`n" }
 	}
 	$cpu = switch ($state.Variant) { 'x64' { 'for CPUs with AVX2' } 'x64-baseline' { 'for any x86-64 CPU' } default { 'with the JIT on' } }
 	Write-Host "${bold}Installation:$reset`n"
-	Write-Host "  ${amber}Pi-Bolt $($state.Shown)$reset, $($state.Platform)-$($state.Variant) build $cpu"
+	Write-Host "  ${amber}µPi $($state.Shown)$reset, $($state.Platform)-$($state.Variant) build $cpu"
 	Write-Host "  ${dim}installs to$reset  $($state.Dir)`n"
 	Write-Host "${bold}Choose an action:$reset`n"
 	if ($existing) {
-		$action = if ($installed -and $installed -ne $state.Shown) { "Update to Pi-Bolt $($state.Shown)" } else { 'Reinstall Pi-Bolt' }
+		$action = if ($installed -and $installed -ne $state.Shown) { "Update to µPi $($state.Shown)" } else { 'Reinstall µPi' }
 		Write-Host "  ${cyan}y   $reset $green$action$reset $dim(default)$reset"
-		Write-Host "  ${cyan}u   $reset ${red}Uninstall Pi-Bolt$reset"
+		Write-Host "  ${cyan}u   $reset ${red}Uninstall µPi$reset"
 	} else {
-		Write-Host "  ${cyan}y   $reset ${green}Install Pi-Bolt$reset $dim(default)$reset"
+		Write-Host "  ${cyan}y   $reset ${green}Install µPi$reset $dim(default)$reset"
 	}
 	Write-Host "  ${cyan}n   $reset ${dim}Do nothing$reset"
 	$choice = $default
@@ -695,208 +679,79 @@ function Select-PiBoltAction($state) {
 		}
 	}
 	switch ($choice) {
-		'install' { Write-Host "`nWill install Pi-Bolt.`n" }
-		'reinstall' { Write-Host "`nWill reinstall Pi-Bolt.`n" }
-		'uninstall' { Write-Host "`nWill uninstall Pi-Bolt." }
+		'install' { Write-Host "`nWill install µPi.`n" }
+		'reinstall' { Write-Host "`nWill reinstall µPi.`n" }
+		'uninstall' { Write-Host "`nWill uninstall µPi." }
 		'none' { Write-Host "`nChose to do nothing. Exiting." }
 	}
 	$choice
-}
-
-# Whether the registry has the pinned version of an extension as pinned: its record says the pinned integrity, and its tarball has
-# it. (The package manager then installs that version, and checks the tarball against the same record.)
-function Test-PiBoltExtension([string]$registry, $extension) {
-	try {
-		$client = New-PiBoltClient
-		$record = $client.GetStringAsync("$registry/$($extension.Package)/$($extension.Version)").GetAwaiter().GetResult() | ConvertFrom-Json
-		if ($record.dist.integrity -cne $extension.Integrity) { return $false }
-		$tarball = $client.GetByteArrayAsync($record.dist.tarball).GetAwaiter().GetResult()
-		$digest = [Convert]::ToBase64String([System.Security.Cryptography.SHA512]::Create().ComputeHash($tarball))
-		return "sha512-$digest" -ceq $extension.Integrity
-	} catch {
-		return $false
-	}
-}
-
-# Whether what the package manager installed of an extension has the pinned integrity, by its lockfile (npm's, bun's or pnpm's,
-# in the folder Pi installs npm packages to; `pi-bolt list` says where): 'same', 'different', or 'unknown' (no lockfile).
-# `pi-bolt list`, run in Pi-Bolt's own folder: in a project with resources that need trust (the folder the installer was started
-# in), `list` loads the extensions to settle it, the one just installed among them, before its pin has been compared.
-function Get-PiBoltPackageList([string]$exe) {
-	Push-Location -LiteralPath (Split-Path $exe)
-	try { @(& $exe list 2>$null) } finally { Pop-Location }
-}
-
-function Test-PiBoltInstalledExtension([string]$exe, $extension) {
-	$lines = Get-PiBoltPackageList $exe
-	for ($i = 0; $i -lt $lines.Count - 1; $i++) {
-		if ($lines[$i] -match "^\s+npm:$([regex]::Escape($extension.Package))(@\S*)?\s*$") {
-			$root = Split-Path (Split-Path $lines[$i + 1].Trim()) # <root>\node_modules\<package>
-			foreach ($lock in 'package-lock.json', 'bun.lock', 'pnpm-lock.yaml') {
-				$path = Join-Path $root $lock
-				if (Test-Path -LiteralPath $path) {
-					if ([IO.File]::ReadAllText($path).Contains($extension.Integrity)) { return 'same' } else { return 'different' }
-				}
-			}
-			return 'unknown'
-		}
-	}
-	'unknown'
-}
-
-# OpenSec's optional extensions (see install.sh, which offers the same), at the versions the release pins.
-function Install-PiBoltExtensions($state) {
-	$choice = $env:PIBOLT_EXTENSIONS
-	if ($choice -and $choice -ne 'yes' -and $choice -ne 'no') { Write-Host "  ${dim}PIBOLT_EXTENSIONS must be yes or no: no extensions installed$reset"; return }
-	if (-not $choice -and -not (Test-PiBoltCanAsk)) { return }
-	if ($choice -eq 'no') { return }
-	$exe = Join-Path $state.Dir 'pi-bolt.exe'
-	$sources = (Get-PiBoltPackageList $exe) -join "`n"
-	$extensions = @(
-		@{ Package = 'opensec-pi-subagents'; What = 'run specialized agents in separate sessions'; Kind = 'subagents' },
-		@{ Package = 'opensec-pi-todo'; What = 'a todo list for the model, shown above the editor'; Kind = 'rpiv-todo|pi-todo' },
-		@{ Package = 'opensec-pi-fff'; What = 'fast file and content search (find, grep, @-mentions)'; Kind = 'pi-fff' })
-	# Only the versions the release pins, and only with the integrity it says they have.
-	foreach ($e in $extensions) {
-		$pin = $state.Extensions | Where-Object { $_.Package -eq $e.Package } | Select-Object -First 1
-		if ($pin) { $e.Version = $pin.Version; $e.Integrity = $pin.Integrity }
-	}
-	$extensions = @($extensions | Where-Object { $_.Version })
-	# What the executable has compiled in already (pi-bolt.txt's `plugins:` line, scripts\build-pi.ps1): not offered again. (It can be
-	# turned off with `-builtin:<name>` in the extensions setting; installed from npm, a copy replaces the compiled one.)
-	$about = Join-Path $state.Dir 'pi-bolt.txt'
-	$compiledIn = if (Test-Path -LiteralPath $about) { (Get-Content -LiteralPath $about | Where-Object { $_ -like 'plugins: *' } | Select-Object -First 1) } else { $null }
-	if ($compiledIn) {
-		$extensions = @($extensions | Where-Object { $compiledIn -notmatch "(^plugins: |, )$([regex]::Escape($_.Package)) " })
-		if (-not $extensions) { return }
-	}
-	if (-not $extensions) {
-		if ($choice -eq 'yes') { Write-Host "  ${dim}this release pins no extensions (extensions.txt): none installed$reset" }
-		return
-	}
-	$wanted = @()
-	foreach ($e in $extensions) {
-		if ($sources -match "npm:$($e.Package)(@\S*)?(\r?\n|$)") { continue }
-		$other = ($sources -split "`n") | Where-Object { $_ -match '^  [^ ]' -and $_ -match $e.Kind } | Select-Object -First 1
-		if ($other) { Write-Host "  $dim$($e.Package) is not offered: $($other.Trim()) is installed and registers the same tools$reset"; continue }
-		$wanted += $e
-	}
-	if (-not $wanted) { return }
-	if (-not $choice) {
-		Write-Host "`n${bold}Optional extensions by OpenSec$reset $dim(open source, built for Pi-Bolt)$reset`n"
-		foreach ($e in $wanted) { Write-Host ("  $cyan{0,-22}$reset {1}" -f $e.Package, $e.What) }
-		if ((Read-PiBoltAnswer "`nInstall them? [Y/n] ") -match '^(n|no)$') { Write-Host "${dim}You can install them later with: pi-bolt install --pi-bolt npm:<name>$reset"; return }
-	}
-	$registry = if ($env:PIBOLT_NPM_REGISTRY) { $env:PIBOLT_NPM_REGISTRY.TrimEnd('/') } else { 'https://registry.npmjs.org' }
-	foreach ($e in $wanted) {
-		$spec = "$($e.Package)@$($e.Version)"
-		if (-not (Test-PiBoltExtension $registry $e)) {
-			Write-Host "  ${red}did not install $spec (Pi-Bolt itself is installed): the registry's package is not the one this release pins$reset"
-			continue
-		}
-		# From the registry that was checked, and without running the package's install scripts: nothing of it runs until its
-		# lockfile entry has been compared with the pin (below), and an extension of Pi needs none.
-		$saved = @{ NPM_CONFIG_REGISTRY = $env:NPM_CONFIG_REGISTRY; NPM_CONFIG_IGNORE_SCRIPTS = $env:NPM_CONFIG_IGNORE_SCRIPTS }
-		$env:NPM_CONFIG_REGISTRY = $registry
-		$env:NPM_CONFIG_IGNORE_SCRIPTS = 'true'
-		# (In Pi-Bolt's own folder, as `list`: in a project with resources that need trust, the commands load the extensions
-		# to settle it, and with them the one just downloaded, before its pin is compared.)
-		Push-Location -LiteralPath (Split-Path $exe)
-		try {
-			$out = & $exe install --pi-bolt "npm:$spec" 2>&1
-			$installed = $LASTEXITCODE -eq 0
-		} finally {
-			Pop-Location
-			$env:NPM_CONFIG_REGISTRY = $saved.NPM_CONFIG_REGISTRY
-			$env:NPM_CONFIG_IGNORE_SCRIPTS = $saved.NPM_CONFIG_IGNORE_SCRIPTS
-		}
-		if ($installed) {
-			# What the package manager installed is a download of its own: its lockfile says what it got.
-			$check = Test-PiBoltInstalledExtension $exe $e
-			if ($check -ne 'same') {
-				# (Not known is not the pin either: what was installed is a download the installer has not seen.)
-				Push-Location -LiteralPath (Split-Path $exe)
-				try { & $exe remove --pi-bolt "npm:$spec" *> $null; $removed = $LASTEXITCODE -eq 0 } finally { Pop-Location }
-				$why = if ($check -eq 'different') { 'is not the one this release pins' } else { 'cannot be checked against the pin (no lockfile says what it is)' }
-				if ($removed) { Write-Host "  ${red}removed $spec again: what the package manager installed $why$reset" }
-				else { Write-Host "  ${red}$spec $why, and removing it failed: remove it yourself (pi-bolt remove --pi-bolt npm:$spec)$reset" }
-				Write-Host "  ${dim}Install it yourself if you want it: pi-bolt install --pi-bolt npm:$spec$reset"
-				continue
-			}
-		}
-		if ($installed) { Write-Host "  ${green}ok$reset $spec installed" }
-		else {
-			Write-Host "  ${red}could not install $($e.Package) (Pi-Bolt itself is installed): $(($out | Select-Object -Last 1))$reset"
-			Write-Host "  ${dim}Install it later with: pi-bolt install --pi-bolt npm:$($e.Package)$reset"
-		}
-	}
 }
 
 # --- Main -------------------------------------------------------------------------------------------------------------
 
 function Install-PiBolt {
 	Initialize-PiBoltStyle
-	$launcher = $env:PIBOLT_LAUNCHER -eq '1'
-	if ($launcher) { Write-Host "${bold}  Pi-Bolt$reset`n${dim}  First run: getting the native executable$reset`n" }
-	else { Write-Host "`n${bold}  Pi-Bolt Installer$reset`n${dim}  Pi, compiled ahead of time. Native speed, no JIT.$reset`n" }
+	$launcher = $env:MICROPI_LAUNCHER -eq '1'
+	if ($launcher) { Write-Host "${bold}  µPi$reset`n${dim}  First run: getting the native executable$reset`n" }
+	else { Write-Host "`n${bold}  µPi Installer$reset`n${dim}  Pi, compiled ahead of time. Native speed, no JIT.$reset`n" }
 	Test-PiBoltPrerequisites
 
-	$version = if ($env:PIBOLT_VERSION) { $env:PIBOLT_VERSION } else { 'latest' }
-	$channel = $env:PIBOLT_CHANNEL
-	if ($channel -and $channel -notin 'stable', 'beta') { Stop-PiBolt 'PIBOLT_CHANNEL must be stable or beta' }
-	$source = if ($env:PIBOLT_SOURCE) { $env:PIBOLT_SOURCE } else { 'auto' }
-	if ($source -notin 'auto', 'npm', 'github') { Stop-PiBolt 'PIBOLT_SOURCE must be auto, npm or github' }
-	$variant = $env:PIBOLT_VARIANT
-	if ($variant -and $variant -notin 'x64', 'x64-baseline', 'x64-jit') { Stop-PiBolt 'PIBOLT_VARIANT must be x64, x64-baseline or x64-jit' }
+	$version = if ($env:MICROPI_VERSION) { $env:MICROPI_VERSION } else { 'latest' }
+	$channel = $env:MICROPI_CHANNEL
+	if ($channel -and $channel -notin 'stable', 'beta') { Stop-PiBolt 'MICROPI_CHANNEL must be stable or beta' }
+	$source = if ($env:MICROPI_SOURCE) { $env:MICROPI_SOURCE } else { 'auto' }
+	if ($source -notin 'auto', 'npm', 'github') { Stop-PiBolt 'MICROPI_SOURCE must be auto, npm or github' }
+	$variant = $env:MICROPI_VARIANT
+	if ($variant -and $variant -notin 'x64', 'x64-baseline', 'x64-jit') { Stop-PiBolt 'MICROPI_VARIANT must be x64, x64-baseline or x64-jit' }
 	# Which release: the latest is looked up once (where its page redirects to), and everything is downloaded from that tag, so a
 	# release published meanwhile cannot mix two. The version is then checked against the signed checksums.
 	$shown = ''
 	if ($version -ne 'latest') {
-		if ($version -notmatch '^bolt-v(\d+\.\d+\.\d+)$') { Stop-PiBolt 'PIBOLT_VERSION must be a release tag such as bolt-v0.8.0' }
+		if ($version -notmatch '^upi-v(\d+\.\d+\.\d+)$') { Stop-PiBolt 'MICROPI_VERSION must be a release tag such as upi-v0.8.0' }
 		$shown = $Matches[1]
-	} elseif (-not $env:PIBOLT_DOWNLOAD_BASE -and $channel -eq 'beta') {
-		# The newest release, pre-releases included: the highest bolt-vX.Y.Z tag GitHub lists (it lists no drafts to anyone without
+	} elseif (-not $env:MICROPI_DOWNLOAD_BASE -and $channel -eq 'beta') {
+		# The newest release, pre-releases included: the highest upi-vX.Y.Z tag GitHub lists (it lists no drafts to anyone without
 		# write access).
 		try {
 			$releases = (New-PiBoltClient).GetStringAsync("$PiBoltApi/releases?per_page=30").GetAwaiter().GetResult() | ConvertFrom-Json
-			$newest = $releases | Where-Object { -not $_.draft -and $_.tag_name -match '^bolt-v\d+\.\d+\.\d+$' } |
-				ForEach-Object { [version]($_.tag_name -replace '^bolt-v', '') } | Sort-Object -Descending | Select-Object -First 1
+			$newest = $releases | Where-Object { -not $_.draft -and $_.tag_name -match '^upi-v\d+\.\d+\.\d+$' } |
+				ForEach-Object { [version]($_.tag_name -replace '^upi-v', '') } | Sort-Object -Descending | Select-Object -First 1
 			if ($newest) { $shown = $newest.ToString() }
 		} catch { }
-		if (-not $shown) { Stop-PiBolt "could not find the newest release ($PiBoltApi/releases): try again, or set PIBOLT_VERSION=bolt-vX.Y.Z" }
-	} elseif (-not $env:PIBOLT_DOWNLOAD_BASE) {
+		if (-not $shown) { Stop-PiBolt "could not find the newest release ($PiBoltApi/releases): try again, or set MICROPI_VERSION=upi-vX.Y.Z" }
+	} elseif (-not $env:MICROPI_DOWNLOAD_BASE) {
 		try {
 			$response = (New-PiBoltClient).GetAsync("$PiBoltRepo/releases/latest").GetAwaiter().GetResult()
-			if ($response.RequestMessage.RequestUri.AbsoluteUri -match '/tag/bolt-v(\d+\.\d+\.\d+)$') { $shown = $Matches[1] }
+			if ($response.RequestMessage.RequestUri.AbsoluteUri -match '/tag/upi-v(\d+\.\d+\.\d+)$') { $shown = $Matches[1] }
 		} catch { }
-		if (-not $shown) { Stop-PiBolt "could not find out which release is the latest ($PiBoltRepo/releases/latest): try again, or set PIBOLT_VERSION=bolt-vX.Y.Z" }
+		if (-not $shown) { Stop-PiBolt "could not find out which release is the latest ($PiBoltRepo/releases/latest): try again, or set MICROPI_VERSION=upi-vX.Y.Z" }
 	} else {
 		# A mirror says which release it serves: without the version asked for, its checksums would be taken for whichever release
 		# they are (an older one, signed all the same, installed as the latest).
-		Stop-PiBolt 'PIBOLT_DOWNLOAD_BASE needs PIBOLT_VERSION (the release it serves, such as bolt-v0.8.0)'
+		Stop-PiBolt 'MICROPI_DOWNLOAD_BASE needs MICROPI_VERSION (the release it serves, such as upi-v0.8.0)'
 	}
-	$base = "$PiBoltRepo/releases/download/bolt-v$shown"
-	if ($env:PIBOLT_DOWNLOAD_BASE) { $base = $env:PIBOLT_DOWNLOAD_BASE.TrimEnd('/') }
+	$base = "$PiBoltRepo/releases/download/upi-v$shown"
+	if ($env:MICROPI_DOWNLOAD_BASE) { $base = $env:MICROPI_DOWNLOAD_BASE.TrimEnd('/') }
 	if (-not $variant) {
 		$variant = 'x64'
 		# The x64 build runs on any x86-64 CPU (its compiled code needs AVX2; without it, it runs its bytecode). A release that has
 		# a baseline build has it for CPUs without AVX2.
 		if (-not (Test-PiBoltAvx2)) { $variant = 'x64-baseline-if-there' }
 	}
-	$install = if ($env:PIBOLT_INSTALL) { $env:PIBOLT_INSTALL } else { Join-Path $env:USERPROFILE '.pi-bolt' }
+	$install = if ($env:MICROPI_INSTALL) { $env:MICROPI_INSTALL } else { Join-Path $env:USERPROFILE '.micropi' }
 	# A full path, which is what goes on PATH: a relative one there would be looked up from whatever folder a terminal is in.
-	if (-not [System.IO.Path]::IsPathRooted($install)) { Stop-PiBolt "PIBOLT_INSTALL must be a full path (it is $install)" }
+	if (-not [System.IO.Path]::IsPathRooted($install)) { Stop-PiBolt "MICROPI_INSTALL must be a full path (it is $install)" }
 	$install = [System.IO.Path]::GetFullPath($install)
 	$state = @{ Version = $shown; Shown = $(if ($shown) { $shown } else { '(latest)' }); Source = $source; Base = $base; Platform = 'win32'; Install = $install }
 	if ($variant -eq 'x64-baseline-if-there') {
 		$variant = 'x64'
 		try {
 			$sums = (New-PiBoltClient).GetStringAsync("$base/SHA256SUMS").GetAwaiter().GetResult()
-			if ($sums -match ' [ *]?pi-bolt-win32-x64-baseline\.zip(\r?\n|$)') { $variant = 'x64-baseline' }
+			if ($sums -match ' [ *]?upi-win32-x64-baseline\.zip(\r?\n|$)') { $variant = 'x64-baseline' }
 		} catch { }
 	}
 	$state.Variant = $variant
-	$state.Name = "pi-bolt-win32-$variant"
+	$state.Name = "upi-win32-$variant"
 	$state.Dir = Join-Path $install $state.Name
 
 	if ($launcher) {
@@ -906,45 +761,40 @@ function Install-PiBolt {
 	$action = Select-PiBoltAction $state
 	if ($action -eq 'none') { return }
 	if ($action -eq 'uninstall') {
-		foreach ($dir in Get-ChildItem -LiteralPath $install -Directory -Filter 'pi-bolt-win32-*' -ErrorAction SilentlyContinue) {
+		foreach ($dir in Get-ChildItem -LiteralPath $install -Directory -Filter 'upi-win32-*' -ErrorAction SilentlyContinue) {
 			Remove-PiBoltFromPath $dir.FullName
 			Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
-			if (Test-Path -LiteralPath $dir.FullName) { Write-Host "  ${dim}$($dir.FullName) is in use (is Pi-Bolt running?): close it, then remove the folder$reset" }
+			if (Test-Path -LiteralPath $dir.FullName) { Write-Host "  ${dim}$($dir.FullName) is in use (is µPi running?): close it, then remove the folder$reset" }
 		}
 		foreach ($item in 'cache', 'compile.json', 'channel') {
 			Remove-Item -LiteralPath (Join-Path $install $item) -Recurse -Force -ErrorAction SilentlyContinue
 		}
 		if ((Test-Path -LiteralPath $install) -and -not (Get-ChildItem -LiteralPath $install -Force)) { Remove-Item -LiteralPath $install -Force }
-		Write-Host "`nPi-Bolt was uninstalled."
+		Write-Host "`nµPi was uninstalled."
 		return
 	}
 	Install-PiBoltRelease $state
-	# The channel this installation's updates take (Pi-Bolt reads <install>\channel; stable, the default, is no file).
+	# The channel this installation's updates take (µPi reads <install>\channel; stable, the default, is no file).
 	if ($channel -eq 'beta') { Set-Content -LiteralPath (Join-Path $install 'channel') -Value 'beta' -Encoding ascii }
 	elseif ($channel -eq 'stable') { Remove-Item -LiteralPath (Join-Path $install 'channel') -Force -ErrorAction SilentlyContinue }
-	$exe = Join-Path $state.Dir 'pi-bolt.exe'
-	# Pi-Bolt keeps the packages only it runs (OpenSec's extensions) out of Pi's list, which it does as it starts: once now, so
-	# that Pi, if it is started before Pi-Bolt, does not find them (an earlier installer put them there).
-	Push-Location -LiteralPath $state.Dir
-	try { & $exe list *> $null } catch { } finally { Pop-Location }
+	$exe = Join-Path $state.Dir 'upi.exe'
 	$word = if ($action -eq 'reinstall' -and $state.Installed -and $state.Installed -ne $state.Shown) { 'updated' } elseif ($action -eq 'reinstall') { 'reinstalled' } else { 'installed' }
-	Write-Host "`nPi-Bolt $($state.Shown) was $word successfully $dim(Pi $(& $exe --version))$reset."
+	Write-Host "`nµPi $($state.Shown) was $word successfully $dim(Pi $(& $exe --version))$reset."
 	Add-PiBoltToPath $state.Dir ([bool]$state.Existed)
-	Install-PiBoltExtensions $state
-	if ((Get-Command pi-bolt -ErrorAction SilentlyContinue).Source -ieq $exe) { Write-Host "`nRun it with: ${bold}pi-bolt$reset" }
-	if ((Test-PiBoltCanAsk) -and $env:PIBOLT_NO_START -ne '1') {
-		if ((Read-PiBoltAnswer "`nStart pi-bolt now? [Y/n] ") -notmatch '^(n|no)$') { Write-Host ''; & $exe }
+	if ((Get-Command upi -ErrorAction SilentlyContinue).Source -ieq $exe) { Write-Host "`nRun it with: ${bold}upi$reset" }
+	if ((Test-PiBoltCanAsk) -and $env:MICROPI_NO_START -ne '1') {
+		if ((Read-PiBoltAnswer "`nStart upi now? [Y/n] ") -notmatch '^(n|no)$') { Write-Host ''; & $exe }
 	}
 }
 
-if ($env:PIBOLT_INSTALLER_NO_MAIN -ne '1') {
+if ($env:MICROPI_INSTALLER_NO_MAIN -ne '1') {
 	try {
 		Install-PiBolt
 		$global:LASTEXITCODE = 0
 	} catch [System.OperationCanceledException] {
 		$global:LASTEXITCODE = 1
 	} catch {
-		# Anything else is a failure too: said, with an exit status that says so (for `pi-bolt update`), not a success.
+		# Anything else is a failure too: said, with an exit status that says so (for `upi update`), not a success.
 		Clear-PiBoltProgress
 		[Console]::Error.WriteLine("${red}error:$reset the installer stopped: $($_.Exception.Message)")
 		$global:LASTEXITCODE = 1

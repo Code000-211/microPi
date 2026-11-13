@@ -160,7 +160,7 @@ export class JobHubComponent implements Component, Focusable {
 				`${theme.fg("muted", "command")} ${job.command.replace(/\s+/g, " ")}`,
 				`${theme.fg("muted", "cwd")} ${job.cwd}${job.pid ? theme.fg("muted", "  pid ") + job.pid : ""}`,
 				`${theme.fg("muted", "started")} ${new Date(job.startedAt).toLocaleTimeString()}${theme.fg("muted", "  background since ")}${new Date(job.backgroundedAt).toLocaleTimeString()}${job.endedAt ? theme.fg("muted", "  ended ") + new Date(job.endedAt).toLocaleTimeString() : ""}`,
-				`${theme.fg("muted", "output")} ${job.outputFile ?? "(in memory)"}${job.reported ? theme.fg("muted", "  · reported to the agent") : ""}`,
+				`${theme.fg("muted", "output")} ${job.outputFile ?? "(in memory)"}${job.reportedBy !== undefined ? theme.fg("muted", "  · reported to the agent") : ""}`,
 			];
 			for (const line of details) lines.push(padded(line, width));
 			lines.push(rule);

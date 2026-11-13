@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the Pi-Bolt runtime: Bun on the patched WebKit (JavaScriptCore with the ahead-of-time compiler), LTO, release flags.
+# Builds the µPi runtime: Bun on the patched WebKit (JavaScriptCore with the ahead-of-time compiler), LTO, release flags.
 # With a sysroot (scripts/toolchain/make-sysroot.sh) the result needs only glibc 2.17 and carries its own ICU, like official Bun.
 # Usage: scripts/build-runtime.sh [--native] [--lto on|off] [-jN]
 #   --native     link against the host's libc and ICU instead (faster to set up, but the binary only runs on systems like
@@ -75,6 +75,6 @@ if [ "$PIBOLT_OS" = darwin ]; then
 		codesign -s - -f -i bun "$executable"
 	done
 fi
-# Which engine it is (scripts/build-pi.sh records it in the executables it builds, for `pi-bolt doctor`).
+# Which engine it is (scripts/build-pi.sh records it in the executables it builds, for `upi doctor`).
 "$PIBOLT_ROOT/scripts/runtime-stamp.sh" >"$PIBOLT_WORK/runtime/RUNTIME_STAMP" 2>/dev/null || rm -f "$PIBOLT_WORK/runtime/RUNTIME_STAMP"
 log "runtime: $PIBOLT_WORK/runtime/bun ($("$PIBOLT_WORK/runtime/bun" --version))"

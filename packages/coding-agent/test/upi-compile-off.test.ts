@@ -2,11 +2,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type * as PiBolt from "../src/pi-bolt.ts";
-import { runPiBoltCompile } from "../src/pi-bolt-compile.ts";
+import type * as PiBolt from "../src/upi.ts";
+import { runPiBoltCompile } from "../src/upi-compile.ts";
 
-// A Pi-Bolt build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
-vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
+// A µPi build (scripts/build-pi.sh defines PIBOLT_BUILD); the tests run as Pi otherwise. (vi.mock runs before the imports.)
+vi.mock("../src/upi.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof PiBolt>()),
 	PIBOLT: { version: "0.9.1", variant: "arm64", jit: false },
 }));
@@ -16,8 +16,8 @@ let install: string;
 
 beforeEach(() => {
 	install = mkdtempSync(join(tmpdir(), "pibolt-off-"));
-	mkdirSync(join(install, "pi-bolt-linux-x64"));
-	Object.defineProperty(process, "execPath", { value: join(install, "pi-bolt-linux-x64", "pi"), configurable: true });
+	mkdirSync(join(install, "upi-linux-x64"));
+	Object.defineProperty(process, "execPath", { value: join(install, "upi-linux-x64", "pi"), configurable: true });
 	writeFileSync(join(install, "compile.json"), JSON.stringify({ version: "0.9.1", extensions: ["word-count"] }));
 });
 
@@ -26,7 +26,7 @@ afterEach(() => {
 	rmSync(install, { recursive: true, force: true });
 });
 
-describe.skipIf(process.platform === "win32")("pi-bolt compile --off", () => {
+describe.skipIf(process.platform === "win32")("upi compile --off", () => {
 	test("keeps what was compiled in when the release could not be installed again", async () => {
 		expect(await runPiBoltCompile(["--off"], async () => false)).toBe(1);
 		expect(existsSync(join(install, "compile.json"))).toBe(true);

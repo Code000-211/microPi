@@ -3,7 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { spawn } from "child_process";
 import path from "path";
 import { type Static, Type } from "typebox";
-import { PIBOLT } from "../../pi-bolt.ts";
+import { PIBOLT } from "../../upi.ts";
 import { createInterface } from "../../utils/readline.ts";
 import { detachString } from "../../utils/text.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
@@ -73,7 +73,7 @@ const defaultGrepOperations: GrepOperations = {
 export interface GrepToolOptions {
 	/** Custom operations for grep. Default: local filesystem plus ripgrep */
 	operations?: GrepOperations;
-	/** Search in-process instead of with ripgrep (native-search.ts). Default: in Pi-Bolt builds, without custom operations. */
+	/** Search in-process instead of with ripgrep (native-search.ts). Default: in µPi builds, without custom operations. */
 	native?: boolean;
 }
 

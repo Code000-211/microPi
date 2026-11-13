@@ -3,7 +3,7 @@ import { createRequire } from "module";
 import { homedir } from "os";
 import { basename, dirname, join, resolve, sep, win32 } from "path";
 import { fileURLToPath } from "url";
-import { PIBOLT, PIBOLT_INSTALL_COMMAND } from "./pi-bolt.ts";
+import { PIBOLT, PIBOLT_INSTALL_COMMAND } from "./upi.ts";
 import { spawnProcessSync } from "./utils/child-process.ts";
 import { normalizePath } from "./utils/paths.ts";
 import { stripBom } from "./utils/text.ts";
@@ -343,7 +343,7 @@ export function getSelfUpdateUnavailableInstruction(
 	const method = detectInstallMethod();
 	const target = normalizeSelfUpdatePackageTarget(updatePackageTarget);
 	if (method === "bun-binary") {
-		if (PIBOLT) return `Update Pi-Bolt with: ${PIBOLT_INSTALL_COMMAND}`;
+		if (PIBOLT) return `Update µPi with: ${PIBOLT_INSTALL_COMMAND}`;
 		return `Download from: https://github.com/earendil-works/pi/releases/latest`;
 	}
 	const command = getSelfUpdateCommandForMethod(method, packageName, target, npmCommand);
@@ -588,12 +588,12 @@ const piConfigName: string | undefined = pkg.piConfig?.name;
 export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
 export const APP_NAME: string = piConfigName || "pi";
 declare const PIBOLT_BUILD: string | undefined;
-/** The command users type: Pi-Bolt's installer and npm package install it as `pi-bolt` (see pi-bolt.ts). Messages that tell
+/** The command users type: µPi's installer and npm package install it as `upi` (see upi.ts). Messages that tell
  * the user what to run use this; APP_NAME stays "pi" for the environment variables and files named after it. */
-export const COMMAND_NAME: string = typeof PIBOLT_BUILD === "string" ? "pi-bolt" : APP_NAME;
-/** The program's name where a message names it ("Update Pi-Bolt", "Pi-Bolt crashed"): Pi-Bolt in a Pi-Bolt build. */
-export const PRODUCT_NAME: string = PIBOLT ? "Pi-Bolt" : APP_NAME;
-export const APP_TITLE: string = PIBOLT ? "Pi-Bolt" : piConfigName ? APP_NAME : "π";
+export const COMMAND_NAME: string = typeof PIBOLT_BUILD === "string" ? "upi" : APP_NAME;
+/** The program's name where a message names it ("Update µPi", "µPi crashed"): µPi in a µPi build. */
+export const PRODUCT_NAME: string = PIBOLT ? "µPi" : APP_NAME;
+export const APP_TITLE: string = PIBOLT ? "µPi" : piConfigName ? APP_NAME : "π";
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
 export const VERSION: string = pkg.version || "0.0.0";
 

@@ -26,7 +26,7 @@ import type { FileTracker } from "../file-tracking/file-tracker.ts";
 import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
 import { selfKillPattern, selfKillRefusal } from "./bash-self-kill.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
-import { OutputAccumulator, type OutputSnapshot } from "./output-accumulator.ts";
+import { OutputAccumulator, type OutputSnapshot, type RawTail } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { formatSize, type TruncationResult, truncationDetails } from "./truncate.ts";
@@ -96,6 +96,8 @@ export type BashToolOutput = Static<typeof bashOutputSchema>;
 export interface BashToolDetails {
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
+	/** The output so far as it was written (escape sequences included), for a client that shows a terminal. */
+	terminal?: RawTail;
 }
 
 /**
@@ -148,6 +150,9 @@ function keepAsBackgroundJob(child: ChildProcess | undefined): number | undefine
 }
 
 const MOVED_TO_BACKGROUND = Symbol("moved to the background");
+
+/** Words every result of the bash tool that moved its command to the background carries, whatever started the move. */
+export const MOVED_TO_BACKGROUND_NOTE = "moved to the background as job";
 
 function untilBackground<T>(running: Promise<T>, ms: number): Promise<T | typeof MOVED_TO_BACKGROUND> {
 	let timer: NodeJS.Timeout | undefined;
@@ -209,7 +214,7 @@ async function sleepUntilJobEnds(
 	const start = performance.now();
 	const outcome = await jobs.waitForEnd(seconds * 1000, signal);
 	if (outcome === "aborted") throw new Error("Command aborted");
-	const ended = jobs.takeUnreported();
+	const ended = jobs.takeUnreported("bash");
 	if (ended.length === 0) return "";
 	const slept = ((performance.now() - start) / 1000).toFixed(1);
 	return `[The sleep of ${seconds} s ended after ${slept} s: a background job ended.]\n${formatJobReport(ended)}\n\n`;
@@ -762,6 +767,7 @@ class CallOutput {
 			tempFilePrefix,
 			maxBytes: BASH_MAX_BYTES,
 			clean: true,
+			keepRawTail: true,
 			headLines: BASH_HEAD_LINES,
 			headBytes: BASH_HEAD_BYTES,
 		});
@@ -834,6 +840,7 @@ class CallOutput {
 			details: {
 				truncation: snapshot.truncation.truncated ? truncationDetails(snapshot.truncation) : undefined,
 				fullOutputPath: snapshot.fullOutputPath,
+				terminal: this.accumulator.readRawTail(),
 			},
 		});
 	}
@@ -917,8 +924,8 @@ function moveToBackground(params: {
 	const status = background
 		? `Started in the background as job ${id}${stop}.`
 		: atTimeout
-			? `Command still running at its timeout of ${timeout} seconds: moved to the background as job ${id}${stop}, not stopped.`
-			: `Command still running after ${backgroundAfterMs / 1000} seconds: moved to the background as job ${id}${stop}.`;
+			? `Command still running at its timeout of ${timeout} seconds: ${MOVED_TO_BACKGROUND_NOTE} ${id}${stop}, not stopped.`
+			: `Command still running after ${backgroundAfterMs / 1000} seconds: ${MOVED_TO_BACKGROUND_NOTE} ${id}${stop}.`;
 	return {
 		content: [
 			{

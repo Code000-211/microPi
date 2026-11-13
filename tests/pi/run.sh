@@ -2,10 +2,10 @@
 # Tests that need a built Pi (Pi's own ahead-of-time compiled code under an extension), not just the engine: crashes, and
 # extensions that failed to load.
 #
-# Usage: tests/pi/run.sh [PI]     (default: out/pi-bolt/pi)
+# Usage: tests/pi/run.sh [PI]     (default: out/upi/pi)
 # Each test runs several times: the crashes they guard against depended on when the collector ran.
 cd "$(dirname "$0")" || exit 1
-PI="${1:-../../out/pi-bolt/pi}"
+PI="${1:-../../out/upi/pi}"
 [ -x "$PI" ] || { echo "no Pi executable at $PI (scripts/build-pi.sh)"; exit 1; }
 home=$(mktemp -d)
 trap 'rm -rf "$home"' EXIT
@@ -98,7 +98,7 @@ else
 fi
 
 # An extension that needs the JIT (bun:ffi's dlopen): without it, the error says which extension and how to switch to the JIT
-# build; with it, the extension loads. `pi-bolt doctor` reports it the same way, and the rest of the setup.
+# build; with it, the extension loads. `upi doctor` reports it the same way, and the rest of the setup.
 needs="$home/agent/extensions/needs-jit"
 mkdir -p "$needs"
 printf '{"name": "needs-jit", "version": "1.0.0"}\n' >"$needs/package.json"
@@ -113,7 +113,7 @@ jit_on=""; "$PI" --version | grep -q "JIT on" && jit_on=1
 out=$(env -i HOME="$home" PATH=/usr/bin:/bin PI_CODING_AGENT_DIR="$home/agent" DO_NOT_TRACK=1 BUN_ENABLE_CRASH_REPORTING=0 \
 	"$PI" -ne -e "$needs/index.ts" --offline --no-session -p hi 2>&1 </dev/null)
 if { [ -n "$jit_on" ] && grep -q "^needs-jit: loaded" <<<"$out"; } ||
-	{ [ -z "$jit_on" ] && grep -q "bun:ffi requires the JIT\. needs-jit needs Pi-Bolt's JIT build (bun:ffi); switch with: .*PIBOLT_VARIANT=" <<<"$out"; }; then
+	{ [ -z "$jit_on" ] && grep -q "bun:ffi requires the JIT\. needs-jit needs µPi's JIT build (bun:ffi); switch with: .*MICROPI_VARIANT=" <<<"$out"; }; then
 	echo "PASS an extension that needs the JIT ($([ -n "$jit_on" ] && echo "loads" || echo "says so"))"
 else
 	echo "FAIL an extension that needs the JIT"
@@ -124,13 +124,13 @@ out=$(cd "$home" && env -i HOME="$home" PATH=/usr/bin:/bin PI_CODING_AGENT_DIR="
 	"$PI" doctor --offline 2>&1 </dev/null)
 doctor_status=$?
 real_home=$(cd "$home" && pwd -P)
-if [ "$doctor_status" = 0 ] && grep -q "^Pi-Bolt doctor" <<<"$out" && grep -q "^  compiled code  *used" <<<"$out" &&
+if [ "$doctor_status" = 0 ] && grep -q "^µPi doctor" <<<"$out" && grep -q "^  compiled code  *used" <<<"$out" &&
 	{ { [ -n "$jit_on" ] && grep -q "run time  *~/agent/extensions/needs-jit/index.ts: JIT, loaded" <<<"$out"; } ||
-		{ [ -z "$jit_on" ] && grep -q "needs-jit needs Pi-Bolt's JIT build" <<<"$out"; }; } &&
+		{ [ -z "$jit_on" ] && grep -q "needs-jit needs µPi's JIT build" <<<"$out"; }; } &&
 	! grep -q "$home\|$real_home" <<<"$out"; then
-	echo "PASS pi-bolt doctor"
+	echo "PASS upi doctor"
 else
-	echo "FAIL pi-bolt doctor (exit $doctor_status)"
+	echo "FAIL upi doctor (exit $doctor_status)"
 	head -c 3000 <<<"$out" | sed 's/^/   /'
 	status=1
 fi
@@ -161,6 +161,11 @@ bedrock() {
 bedrock "Bedrock loads (the request is refused)" AWS_ENDPOINT_URL_BEDROCK_RUNTIME=http://127.0.0.1:1
 bedrock "Bedrock loads behind a proxy (the proxy refuses)" AWS_ENDPOINT_URL_BEDROCK_RUNTIME=https://127.0.0.1:1 HTTPS_PROXY=http://127.0.0.1:1 https_proxy=http://127.0.0.1:1
 
-# Pi-Bolt's grep and find tools, in-process: on by default, and not with FFF loaded.
+# µPi's grep and find tools, in-process: on by default, and not with FFF loaded.
 python3 search-tools.py "$PI" || status=1
+# The built-in docsearch (build-pi.sh --builtins), when the build has it: project_search is offered with nothing installed,
+# and works (`upi compile`'s build is covered by tests/pi/compile.py, which runs this file's checks on it too).
+if grep -q '^built-in: docsearch' "$(cd "$(dirname "$PI")" && pwd -P)/upi.txt" 2>/dev/null; then
+	python3 docsearch.py "$PI" || status=1
+fi
 exit $status

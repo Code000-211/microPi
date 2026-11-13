@@ -232,8 +232,8 @@ mod tests {
     #[test]
     fn entity_rules() {
         let mut v = Vec::new();
-        entities("Use `pi-bolt compile` with DFlash2 on gfx1201, see [x](docs/PLUGIN.md#a) and the MTP head.", &mut v);
-        for e in ["pi-bolt compile", "dflash2", "gfx1201", "plugin.md", "mtp"] {
+        entities("Use `upi compile` with DFlash2 on gfx1201, see [x](docs/PLUGIN.md#a) and the MTP head.", &mut v);
+        for e in ["upi compile", "dflash2", "gfx1201", "plugin.md", "mtp"] {
             assert!(v.contains(&e.to_string()), "{e} missing from {v:?}");
         }
         assert!(!v.contains(&"head".to_string()));

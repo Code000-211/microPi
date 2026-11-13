@@ -3,20 +3,15 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-	piBoltInstallDir,
-	piBoltInstallerProcess,
-	piBoltInstallMethod,
-	piBoltUpdateEnvironment,
-} from "../src/pi-bolt.ts";
+import { piBoltInstallDir, piBoltInstallerProcess, piBoltInstallMethod, piBoltUpdateEnvironment } from "../src/upi.ts";
 
 const originalExecPath = process.execPath;
-const originalNpm = process.env.PIBOLT_NPM;
+const originalNpm = process.env.MICROPI_NPM;
 
 afterEach(() => {
 	Object.defineProperty(process, "execPath", { configurable: true, writable: true, value: originalExecPath });
-	if (originalNpm === undefined) delete process.env.PIBOLT_NPM;
-	else process.env.PIBOLT_NPM = originalNpm;
+	if (originalNpm === undefined) delete process.env.MICROPI_NPM;
+	else process.env.MICROPI_NPM = originalNpm;
 });
 
 function setExecPath(value: string): void {
@@ -25,23 +20,23 @@ function setExecPath(value: string): void {
 
 describe("piBoltInstallMethod", () => {
 	it("tells an executable the npm package downloaded, on every platform", () => {
-		delete process.env.PIBOLT_NPM;
-		setExecPath("/home/me/.pi-bolt/npm/0.7.0/pi-bolt-linux-x64/pi");
+		delete process.env.MICROPI_NPM;
+		setExecPath("/home/me/.micropi/npm/0.7.0/upi-linux-x64/pi");
 		expect(piBoltInstallMethod()).toBe("npm");
-		setExecPath("/Users/me/.pi-bolt/npm/0.7.0/pi-bolt-darwin-arm64/pi");
+		setExecPath("/Users/me/.micropi/npm/0.7.0/upi-darwin-arm64/pi");
 		expect(piBoltInstallMethod()).toBe("npm");
-		setExecPath("C:\\Users\\me\\.pi-bolt\\npm\\0.7.0\\pi-bolt-win32-x64\\pi-bolt.exe");
+		setExecPath("C:\\Users\\me\\.micropi\\npm\\0.7.0\\upi-win32-x64\\upi.exe");
 		expect(piBoltInstallMethod()).toBe("npm");
 		// Windows: the package's install script puts the executable in its own bin folder (npm/install.cjs).
-		setExecPath("C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\pi-bolt\\bin\\pi-bolt.exe");
+		setExecPath("C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\upi\\bin\\upi.exe");
 		expect(piBoltInstallMethod()).toBe("npm");
 	});
 
 	it("tells an executable the installer put in place", () => {
-		delete process.env.PIBOLT_NPM;
-		setExecPath("/home/me/.pi-bolt/pi-bolt-linux-x64/pi");
+		delete process.env.MICROPI_NPM;
+		setExecPath("/home/me/.micropi/upi-linux-x64/pi");
 		expect(piBoltInstallMethod()).toBe("installer");
-		setExecPath("C:\\Users\\me\\.pi-bolt\\pi-bolt-win32-x64\\pi-bolt.exe");
+		setExecPath("C:\\Users\\me\\.micropi\\upi-win32-x64\\upi.exe");
 		expect(piBoltInstallMethod()).toBe("installer");
 	});
 });
@@ -49,7 +44,7 @@ describe("piBoltInstallMethod", () => {
 describe("piBoltUpdateEnvironment", () => {
 	const saved = { ...process.env };
 	afterEach(() => {
-		for (const name of ["PIBOLT_INSTALL", "PIBOLT_DOWNLOAD_BASE", "PIBOLT_SOURCE", "PIBOLT_VERSION"]) {
+		for (const name of ["MICROPI_INSTALL", "MICROPI_DOWNLOAD_BASE", "MICROPI_SOURCE", "MICROPI_VERSION"]) {
 			if (saved[name] === undefined) delete process.env[name];
 			else process.env[name] = saved[name];
 		}
@@ -57,28 +52,28 @@ describe("piBoltUpdateEnvironment", () => {
 
 	it("updates the installation where it is, to the version decided on, from the signed release", () => {
 		const root = process.platform === "win32" ? "D:\\Tools\\Pi" : "/opt/tools/pi";
-		setExecPath(join(root, `pi-bolt-${process.platform}-x64`, process.platform === "win32" ? "pi-bolt.exe" : "pi"));
-		process.env.PIBOLT_INSTALL = join(root, "elsewhere");
-		process.env.PIBOLT_DOWNLOAD_BASE = "https://mirror.example";
-		process.env.PIBOLT_SOURCE = "github";
-		process.env.PIBOLT_VERSION = "bolt-v0.1.0";
-		process.env.PIBOLT_INSTALLER_NO_MAIN = "1";
+		setExecPath(join(root, `upi-${process.platform}-x64`, process.platform === "win32" ? "upi.exe" : "pi"));
+		process.env.MICROPI_INSTALL = join(root, "elsewhere");
+		process.env.MICROPI_DOWNLOAD_BASE = "https://mirror.example";
+		process.env.MICROPI_SOURCE = "github";
+		process.env.MICROPI_VERSION = "upi-v0.1.0";
+		process.env.MICROPI_INSTALLER_NO_MAIN = "1";
 		const env = piBoltUpdateEnvironment("0.8.0");
-		delete process.env.PIBOLT_INSTALLER_NO_MAIN;
-		expect(env.PIBOLT_INSTALLER_NO_MAIN).toBeUndefined();
-		expect(env.PIBOLT_INSTALL).toBe(root);
-		expect(env.PIBOLT_VERSION).toBe("bolt-v0.8.0");
-		expect(env.PIBOLT_DOWNLOAD_BASE).toBeUndefined();
-		expect(env.PIBOLT_SOURCE).toBeUndefined();
+		delete process.env.MICROPI_INSTALLER_NO_MAIN;
+		expect(env.MICROPI_INSTALLER_NO_MAIN).toBeUndefined();
+		expect(env.MICROPI_INSTALL).toBe(root);
+		expect(env.MICROPI_VERSION).toBe("upi-v0.8.0");
+		expect(env.MICROPI_DOWNLOAD_BASE).toBeUndefined();
+		expect(env.MICROPI_SOURCE).toBeUndefined();
 		// PATH stays as the user left it (on Windows the installer would add this folder without asking).
-		expect(env.PIBOLT_NO_PATH).toBe("1");
+		expect(env.MICROPI_NO_PATH).toBe("1");
 	});
 
-	it("falls back to PIBOLT_INSTALL, then ~/.pi-bolt, for an executable outside a variant's folder", () => {
-		setExecPath(process.platform === "win32" ? "C:\\bin\\pi-bolt.exe" : "/usr/local/bin/pi");
-		delete process.env.PIBOLT_INSTALL;
+	it("falls back to MICROPI_INSTALL, then ~/.micropi, for an executable outside a variant's folder", () => {
+		setExecPath(process.platform === "win32" ? "C:\\bin\\upi.exe" : "/usr/local/bin/pi");
+		delete process.env.MICROPI_INSTALL;
 		expect(piBoltInstallDir()).toBeUndefined();
-		expect(piBoltUpdateEnvironment("0.8.0").PIBOLT_INSTALL).toBe(join(homedir(), ".pi-bolt"));
+		expect(piBoltUpdateEnvironment("0.8.0").MICROPI_INSTALL).toBe(join(homedir(), ".micropi"));
 	});
 });
 
@@ -88,13 +83,17 @@ describe("piBoltInstallerProcess", () => {
 		if (process.platform === "win32") {
 			expect(command.toLowerCase()).toMatch(/\\system32\\windowspowershell\\v1\.0\\powershell\.exe$/);
 			expect(args.at(-1)).toBe(
-				"[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; try { $installer = irm https://pi-bolt.opensec.in/install.ps1 -ErrorAction Stop } catch { Write-Error $_; exit 1 }; iex $installer; exit $LASTEXITCODE",
+				"[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; try { $installer = irm https://github.com/Code000-211/microPi/releases/latest/download/install.ps1 -ErrorAction Stop } catch { Write-Error $_; exit 1 }; iex $installer; exit $LASTEXITCODE",
 			);
 		} else {
 			expect(command).toBe("sh");
 			expect(args[0]).toBe("-c");
-			expect(args[1]).toContain("curl -fsSL https://pi-bolt.opensec.in/install.sh");
-			expect(args[1]).toContain("wget -qO- https://pi-bolt.opensec.in/install.sh");
+			expect(args[1]).toContain(
+				"curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh",
+			);
+			expect(args[1]).toContain(
+				"wget -qO- https://github.com/Code000-211/microPi/releases/latest/download/install.sh",
+			);
 		}
 	});
 
@@ -102,7 +101,7 @@ describe("piBoltInstallerProcess", () => {
 		"downloads with wget where there is no curl; a failed download fails",
 		() => {
 			const { args } = piBoltInstallerProcess();
-			const bin = mkdtempSync(join(tmpdir(), "pi-bolt-installer-"));
+			const bin = mkdtempSync(join(tmpdir(), "upi-installer-"));
 			try {
 				// A PATH with only sh and a wget that prints a tiny installer: no curl.
 				symlinkSync("/bin/sh", join(bin, "sh"));

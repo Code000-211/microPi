@@ -1,6 +1,6 @@
-"""Pi-Bolt's grep and find tools in a built Pi: on by default and searching in-process (no ripgrep or fd on PATH, nothing
-downloaded: PI_OFFLINE), following .gitignore, in path order; not on by default with FFF's extension loaded; and still there when
---tools names them.
+"""µPi's grep and find tools in a built Pi: searching in-process (no ripgrep or fd on PATH, nothing downloaded:
+PI_OFFLINE), following .gitignore, in path order; off by default (their schemas are there to turn on with --tools), on with it,
+and not on with FFF's extension loaded.
   python3 tests/pi/search-tools.py PI
 """
 import json
@@ -94,7 +94,10 @@ try:
         return r, list(seen["tools"]), list(seen["results"])
 
     r, tools, results = session({})
-    check("grep and find are on by default", r.returncode == 0 and "grep" in tools and "find" in tools,
+    check("grep and find are not on by default (settings-manager: their schemas are off until turned on)",
+          r.returncode == 0 and "grep" not in tools and "find" not in tools, f"exit {r.returncode}, tools {tools}")
+    r, tools, results = session({}, "--tools", "grep,find")
+    check("--tools grep and find turn them on", "grep" in tools and "find" in tools,
           f"exit {r.returncode}, tools {tools}, {r.stderr[-300:]}")
     check("grep searches in-process, leaving out what .gitignore does, in path order",
           len(results) == 2 and results[0] == "a/c.ts:1: needle c\nb.ts:1: needle b", repr(results[:1]))

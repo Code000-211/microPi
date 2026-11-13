@@ -1,11 +1,12 @@
 name: ci
 
-# Every push to pi-bolt and every pull request: lint and types, Pi's own tests, Pi-Bolt built and tested on Linux x86-64 and
+# Every push to upi and every pull request: lint and types, Pi's own tests, µPi built and tested on Linux x86-64 and
 # ARM64, on macOS on Apple silicon and on Windows x64, the installers' checks of what they download (install.sh, and install.ps1
 # on Windows), and whether the engine patches still apply.
 #
 # The runtime (patched WebKit and Bun) takes about an hour and 40 GB of disk to build, more than GitHub's runners give, so
-# Pi-Bolt is built here with the latest release's runtime (scripts/fetch-runtime.sh checks its signature). A change to the
+# µPi is built here with the latest release's runtime (scripts/fetch-runtime.sh checks its signature; while µPi has no
+# release, that comes from Pi-Bolt's latest release instead, checked with Pi-Bolt's key). A change to the
 # engine itself is checked by scripts/check-patches.sh here, and built and tested before it is released (docs/RELEASING.md).
 on:
   push:
@@ -32,7 +33,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  # A pull request's newer push replaces its build; every build of pi-bolt runs to the end (the badge and tag read them).
+  # A pull request's newer push replaces its build; every build of upi runs to the end (the badge and tag read them).
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -70,7 +71,7 @@ jobs:
         name: Whether the latest release's runtime is this engine
         # (For the Windows job, which has no bash to compute it: scripts/runtime-stamp.sh.)
         run: |
-          released=$(curl -fsSL https://github.com/opensec-git/Pi-Bolt/releases/latest/download/RUNTIME_STAMP || true)
+          released=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
           if [ "$(scripts/runtime-stamp.sh)" = "$released" ]; then echo "older=false"; else echo "older=true"; fi >>"$GITHUB_OUTPUT"
 
   lint:
@@ -87,9 +88,9 @@ jobs:
           cache: npm
       - name: Shell scripts
         run: |
-          shellcheck -s sh -S warning install.sh npm/bin/pi-bolt
+          shellcheck -s sh -S warning install.sh npm/bin/upi
           shellcheck -x -S warning scripts/*.sh scripts/lib/common.sh scripts/toolchain/*.sh \
-            tests/aot/run.sh tests/pi/run.sh tests/installer/run.sh tests/runtime/run.sh tests/termux/run.sh bench/run-suite.sh
+            tests/aot/run.sh tests/pi/run.sh tests/installer/run.sh tests/runtime/run.sh tests/termux/run.sh
       - name: Workflows
         run: |
           # actionlint 1.7.12, checked against its release's SHA-256 (.github/actionlint.yaml); it runs shellcheck on each
@@ -104,7 +105,7 @@ jobs:
         run: |
           python3 -c 'import json; json.load(open("sources.json"))'
           test "$(python3 -c 'import json; print(json.load(open("npm/package.json"))["version"])')" = "$(cat VERSION)"
-          grep -q "^VERSION=$(cat VERSION)\$" npm/bin/pi-bolt
+          grep -q "^VERSION=$(cat VERSION)\$" npm/bin/upi
           pi=$(python3 -c 'import json; print(json.load(open("sources.json"))["pi"]["tag"][1:])')
           test -f "profiles/pi-$pi/bytecode.order" || { echo "no training profile for Pi $pi (scripts/train-profile.sh)"; exit 1; }
       - name: Dependencies and build
@@ -147,8 +148,8 @@ jobs:
         working-directory: packages/coding-agent
         run: npx vitest run --retry 2
 
-  pi-bolt:
-    name: Pi-Bolt on ${{ matrix.name }}
+  upi:
+    name: µPi on ${{ matrix.name }}
     needs: changes
     # (When only documentation changed, its steps are skipped, not the job: a skipped matrix job reports no check under each
     # of its names.)
@@ -165,7 +166,7 @@ jobs:
             part: all
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    steps: &pi-bolt-steps
+    steps: &upi-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.outputs.code != 'false'
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -188,12 +189,17 @@ jobs:
         id: runtime
         if: needs.changes.outputs.code != 'false'
         run: |
-          # (A platform the latest release has no runtime for, Linux ARM64 before its first release, is skipped.)
-          if [ "$(uname -s)-$(uname -m)" = Linux-aarch64 ] &&
-            ! curl -fsIL -o /dev/null https://github.com/opensec-git/Pi-Bolt/releases/latest/download/pi-bolt-runtime-linux-arm64.tar.gz; then
-            echo "::notice title=No runtime::The latest release has no Linux ARM64 runtime: Pi-Bolt's checks are skipped on Linux ARM64."
-            echo "available=false" >>"$GITHUB_OUTPUT"
-            exit 0
+          # (A µPi release may have no runtime for a platform, or there may be no µPi release yet: scripts/fetch-runtime.sh then
+          # takes the runtime from Pi-Bolt's latest release instead, verified with Pi-Bolt's key. So the µPi checks are skipped
+          # only if that fetch fails too. scripts/build-runtime.sh builds the runtime instead, but is too slow for CI.)
+          case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) NAME=upi-runtime-linux-x64.tar.gz ;;
+          Linux-aarch64) NAME=upi-runtime-linux-arm64.tar.gz ;;
+          Darwin-arm64) NAME=upi-runtime-darwin-arm64.tar.gz ;;
+          *) echo "no runtime name for $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          if ! curl -fsIL -o /dev/null "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/$NAME"; then
+            echo "::notice title=No µPi runtime::µPi's latest release has no $NAME (or there is no release yet): the runtime comes from Pi-Bolt's latest release."
           fi
           scripts/fetch-runtime.sh
           echo "available=true" >>"$GITHUB_OUTPUT"
@@ -203,78 +209,66 @@ jobs:
       - name: Build
         if: steps.runtime.outputs.available == 'true'
         run: |
-          scripts/build-pi.sh --out out/pi-bolt
-          scripts/build-pi.sh --jit on --out out/pi-bolt-jit
-          out/pi-bolt/pi --version | tee /dev/stderr | grep -q "Pi-Bolt $(cat VERSION)"
+          scripts/build-pi.sh --out out/upi
+          scripts/build-pi.sh --jit on --out out/upi-jit
+          out/upi/pi --version | tee /dev/stderr | grep -q "µPi $(cat VERSION)"
       - name: macOS 13 and later
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock' && runner.os == 'macOS'
-        run: scripts/check-macos-floor.sh out/pi-bolt out/pi-bolt-jit
-      - name: Pi-Bolt's tests
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock'
+        if: steps.runtime.outputs.available == 'true' && runner.os == 'macOS'
+        run: scripts/check-macos-floor.sh out/upi out/upi-jit
+      - name: µPi's tests
+        if: steps.runtime.outputs.available == 'true'
+        env:
+          TESTS_LOG: tests.log
         run: |
-          tests/pi/run.sh "$PWD/out/pi-bolt/pi"
-          tests/pi/run.sh "$PWD/out/pi-bolt-jit/pi"
+          rc=0
+          tests/pi/run.sh "$PWD/out/upi/pi" 2>&1 | tee "$TESTS_LOG"; [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+          tests/pi/run.sh "$PWD/out/upi-jit/pi" 2>&1 | tee -a "$TESTS_LOG"; [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+          if [ "$rc" -ne 0 ]; then cat "$TESTS_LOG" >> "$GITHUB_STEP_SUMMARY"; fi
           # Linux ARM64: also as Termux installs it, in an imitation of Android (the runner is thrown away after: it writes /data).
           if [ "$(uname -s)-$(uname -m)" = Linux-aarch64 ]; then
             sudo apt-get install -y -qq busybox-static >/dev/null
-            sudo env PATH="$PATH" PIBOLT_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/out/pi-bolt"
+            sudo env PATH="$PATH" MICROPI_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/out/upi" 2>&1 | tee -a "$TESTS_LOG"; [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+            if [ "$rc" -ne 0 ]; then cat "$TESTS_LOG" >> "$GITHUB_STEP_SUMMARY"; fi
           fi
+          exit $rc
       - name: Engine tests
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock'
+        if: steps.runtime.outputs.available == 'true'
         run: tests/aot/run.sh
       - name: Runtime tests
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'stock'
+        if: steps.runtime.outputs.available == 'true'
         # A test of what the engine in this commit does is skipped while the released runtime is an older engine; the
         # release workflow runs it on the runtime built from this engine (docs/RELEASING.md).
         run: |
-          released=$(curl -fsSL https://github.com/opensec-git/Pi-Bolt/releases/latest/download/RUNTIME_STAMP || true)
+          released=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
           [ "$(scripts/runtime-stamp.sh)" = "$released" ] || export PIBOLT_RUNTIME_OLDER=1
           tests/runtime/run.sh
-      - name: The same as stock Pi
-        if: steps.runtime.outputs.available == 'true' && matrix.part != 'tests'
-        run: |
-          scripts/build-pi.sh --stable --out out/pi-stable
-          python3 bench/e2e_tools.py --reference bun=out/pi-stable/pi --build pi-bolt=out/pi-bolt/pi --build jit=out/pi-bolt-jit/pi
-          python3 bench/e2e_screen.py --reference bun=out/pi-stable/pi --build pi-bolt=out/pi-bolt/pi
-          python3 bench/e2e_fullscreen.py --build pi-bolt=out/pi-bolt/pi
-
-  # macOS, the slowest runner, does the same in two jobs side by side: Pi-Bolt's, engine and runtime tests in one, the comparison
-  # with stock Pi in the other (about 14 minutes one after the other, 7 of them the comparison). Pi-Bolt on macOS Apple silicon
-  # passes when both have.
-  pi-bolt-macos-part:
-    name: Pi-Bolt on macOS Apple silicon (${{ matrix.label }})
+  # macOS, the slowest runner, has one job next to the Linux ones: µPi's, engine and runtime tests. The comparison with
+  # stock Pi is gone: bench's e2e_*.py scripts were removed by the slim cleanup.
+  upi-macos-part:
+    name: µPi on macOS Apple silicon
     needs: changes
-    if: ${{ !cancelled() }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - part: tests
-            label: tests
-          - part: stock
-            label: the same as stock Pi
     runs-on: macos-15
     timeout-minutes: 60
-    steps: *pi-bolt-steps
+    steps: *upi-steps
 
-  pi-bolt-macos:
-    name: Pi-Bolt on macOS Apple silicon
-    needs: pi-bolt-macos-part
+  upi-macos:
+    name: µPi on macOS Apple silicon
+    needs: upi-macos-part
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Its tests and the comparison with stock Pi passed
+      - name: Its tests passed
         run: |
-          echo "Pi-Bolt on macOS Apple silicon (tests, the same as stock Pi): $RESULT"
+          echo "µPi on macOS Apple silicon (tests): $RESULT"
           [ "$RESULT" = success ]
         env:
-          RESULT: ${{ needs.pi-bolt-macos-part.result }}
+          RESULT: ${{ needs.upi-macos-part.result }}
 
-  # Windows, as the release builds and tests it (release.yml) but once, without the determinism check: Pi-Bolt's tests and
+  # Windows, as the release builds and tests it (release.yml) but once, without the determinism check: µPi's tests and
   # Windows' self-test on the build with the JIT off and on, the engine and the runtime tests.
-  pi-bolt-windows:
-    name: Pi-Bolt on Windows x64
+  upi-windows:
+    name: µPi on Windows x64
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: windows-2025
@@ -305,28 +299,68 @@ jobs:
             Add-Content -Encoding utf8 $env:GITHUB_PATH $shim
           }
           python --version
+      - name: Latest release
+        # (The checks and builds below need a release, so that the runtime can come from it: µPi's latest release, or Pi-Bolt's
+        # while µPi has none (fetch-runtime.sh's fallback); the update check needs one, for releases/latest to send them to.)
+        if: needs.changes.outputs.code != 'false'
+        id: latest
+        shell: powershell
+        run: |
+          # (Nonzero from curl means 'no latest release', not failure: the release workflow has not made one yet. Explicit
+          # `exit 0` in both branches, as the runner's trailing `exit $LASTEXITCODE` would otherwise fail on curl's 404.)
+          & curl.exe -fsIL -o NUL "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/upi-runtime-win32-x64.zip"
+          if ($LASTEXITCODE -eq 0) {
+            "available=true" >> $env:GITHUB_OUTPUT
+            "source=micropi" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          & curl.exe -fsIL -o NUL "https://github.com/opensec-git/Pi-Bolt/releases/latest/download/pi-bolt-runtime-win32-x64.zip"
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host '::notice title=No µPi release::µPi''s latest release has no runtime for Windows (or there is no release yet): the runtime comes from Pi-Bolt''s latest release.'
+            "available=true" >> $env:GITHUB_OUTPUT
+            "source=pibolt" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          Write-Host '::notice title=No latest release::Neither µPi''s nor Pi-Bolt''s releases have a Windows runtime; the checks are skipped while there is none.'
+          "available=false" >> $env:GITHUB_OUTPUT
+          exit 0
       - name: Runtime of the latest release
+        if: steps.latest.outputs.available == 'true'
         run: |
           # As scripts/fetch-runtime.sh: the checksums, signed by the release key, say which runtime and which engine it is.
-          $base = 'https://github.com/opensec-git/Pi-Bolt/releases/latest/download'
-          New-Item -ItemType Directory -Force .work\rt, .work\runtime | Out-Null
-          foreach ($name in 'pi-bolt-runtime-win32-x64.zip', 'SHA256SUMS', 'SHA256SUMS.sig', 'RUNTIME_STAMP') {
-            & curl.exe -fsSL -o ".work\rt\$name" "$base/$name"
-            if ($LASTEXITCODE -ne 0) { Write-Host "could not download $name"; exit 1 }
+          # Which release that is, the previous step's source says: µPi's, or Pi-Bolt's while µPi has none, each with its key
+          # and its archive's name.
+          if ($env:SOURCE -eq 'pibolt') {
+            $base = "https://github.com/opensec-git/Pi-Bolt/releases/latest/download"
+            $key = "keys\pibolt-release.pub"
+            $name = "pi-bolt-runtime-win32-x64.zip"
+          } else {
+            $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+            $key = "keys\release.pub"
+            $name = "upi-runtime-win32-x64.zip"
           }
-          & 'C:\Program Files\Git\usr\bin\openssl.exe' pkeyutl -verify -pubin -inkey keys\release.pub -rawin -in .work\rt\SHA256SUMS -sigfile .work\rt\SHA256SUMS.sig
+          Write-Host "runtime source: $base"
+          New-Item -ItemType Directory -Force .work\rt, .work\runtime | Out-Null
+          foreach ($file in $name, 'SHA256SUMS', 'SHA256SUMS.sig', 'RUNTIME_STAMP') {
+            & curl.exe -fsSL -o ".work\rt\$file" "$base/$file"
+            if ($LASTEXITCODE -ne 0) { Write-Host "could not download $file"; exit 1 }
+          }
+          & 'C:\Program Files\Git\usr\bin\openssl.exe' pkeyutl -verify -pubin -inkey $key -rawin -in .work\rt\SHA256SUMS -sigfile .work\rt\SHA256SUMS.sig
           if ($LASTEXITCODE -ne 0) { Write-Host 'the release''s signature does not verify'; exit 1 }
           $lines = Get-Content -LiteralPath .work\rt\SHA256SUMS
-          foreach ($name in 'pi-bolt-runtime-win32-x64.zip', 'RUNTIME_STAMP') {
-            $sum = (Get-FileHash ".work\rt\$name" -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($lines -notcontains "$sum  $name") { Write-Host "$name is not the one the release lists"; exit 1 }
+          foreach ($file in $name, 'RUNTIME_STAMP') {
+            $sum = (Get-FileHash ".work\rt\$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($lines -notcontains "$sum  $file") { Write-Host "$file is not the one the release lists"; exit 1 }
           }
-          Expand-Archive .work\rt\pi-bolt-runtime-win32-x64.zip -DestinationPath .work\rt -Force
-          Copy-Item .work\rt\pi-bolt-runtime-win32-x64\bun.exe .work\runtime\bun.exe
+          Expand-Archive .work\rt\$name -DestinationPath .work\rt -Force
+          Copy-Item ".work\rt\$([IO.Path]::GetFileNameWithoutExtension($name))\bun.exe" .work\runtime\bun.exe
           Copy-Item .work\rt\RUNTIME_STAMP .work\runtime\RUNTIME_STAMP
           & .work\runtime\bun.exe --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
+        env:
+          SOURCE: ${{ steps.latest.outputs.source }}
       - name: Pi
+        if: steps.latest.outputs.available == 'true'
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -334,43 +368,56 @@ jobs:
           npm run build:offline
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Build
+        if: steps.latest.outputs.available == 'true'
         run: |
-          & scripts\build-pi.ps1 -Out out\pi-bolt
+          & scripts\build-pi.ps1 -Out out\upi
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          & scripts\build-pi.ps1 -Jit on -Out out\pi-bolt-jit
+          & scripts\build-pi.ps1 -Jit on -Out out\upi-jit
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          $version = (& out\pi-bolt\pi.exe --version | Out-String)
+          $version = (& out\upi\pi.exe --version | Out-String)
           Write-Host $version
-          if ($version -notmatch "Pi-Bolt $([regex]::Escape((Get-Content VERSION).Trim())),") { Write-Host 'not this version'; exit 1 }
-      - name: Pi-Bolt's tests
+          # (The pattern writes the micro sign as an escape: GitHub gives this step's script to Windows PowerShell 5.1 as UTF-8
+          # without a BOM, which it reads as ANSI, and a literal µ there would not match the output. The console's code page is
+          # set first, so the executable's UTF-8 output is decoded as it is.)
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          if ($version -notmatch "\u00B5Pi $([regex]::Escape((Get-Content VERSION).Trim()))") { Write-Host 'not this version'; exit 1 }
+      - name: µPi's tests
+        if: steps.latest.outputs.available == 'true'
+        env:
+          TESTS_LOG: tests.log
         run: |
-          $failed = 0
-          foreach ($build in 'pi-bolt', 'pi-bolt-jit') {
+          $rc = 0
+          foreach ($build in 'upi', 'upi-jit') {
             $exe = (Resolve-Path "out\$build\pi.exe").Path
-            & tests\pi\run.ps1 $exe
-            if ($LASTEXITCODE -ne 0) { $failed = 1 }
-            & scripts\windows-selftest.ps1 -Pi $exe
-            if ($LASTEXITCODE -ne 0) { $failed = 1 }
+            & tests\pi\run.ps1 $exe | Tee-Object -FilePath $env:TESTS_LOG -Append
+            if ($LASTEXITCODE -ne 0) { $rc = 1 }
+            & scripts\windows-selftest.ps1 -Pi $exe | Tee-Object -FilePath $env:TESTS_LOG -Append
+            if ($LASTEXITCODE -ne 0) { $rc = 1 }
           }
-          exit $failed
+          if ($rc -ne 0) { Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value (Get-Content -LiteralPath $env:TESTS_LOG -Raw) }
+          exit $rc
       - name: Update finds the latest release
+        # (µPi's own release only: while the runtime comes from Pi-Bolt's (there is no µPi release), upi update has no
+        # release of µPi to find.)
+        if: steps.latest.outputs.source == 'micropi'
         run: |
-          # pi-bolt update online, as a user runs it: it finds the latest release where releases/latest redirects, as the
+          # upi update online, as a user runs it: it finds the latest release where releases/latest redirects, as the
           # installers do, not only through GitHub's API, which answers 403 once an address has used its hourly requests (#149).
           # This build is the latest release or newer, so nothing is installed.
-          $out = (& out\pi-bolt\pi.exe update --self | Out-String)
+          $out = (& out\upi\pi.exe update --self | Out-String)
           Write-Host $out
           if ($LASTEXITCODE -ne 0 -or $out -notmatch 'already up to date') { exit 1 }
         env:
           PI_TELEMETRY: "0"
       - name: Engine tests
+        if: steps.latest.outputs.available == 'true'
         run: |
           & tests\aot\run.ps1
           exit $LASTEXITCODE
       - name: Runtime tests
         # (Not while the released runtime is an older engine than this commit's: the release workflow runs them on the runtime
         # built from it, docs/RELEASING.md.)
-        if: needs.changes.outputs.runtime_older != 'true'
+        if: steps.latest.outputs.available == 'true' && needs.changes.outputs.runtime_older != 'true'
         run: |
           & tests\runtime\run.ps1
           exit $LASTEXITCODE
@@ -391,13 +438,24 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Latest release
+        # (The installers' checks download the latest release's files; without a release they cannot run.)
+        id: latest
+        shell: bash
+        run: |
+          if curl -fsIL -o /dev/null "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/SHA256SUMS"; then
+            echo "available=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice title=No latest release::The installers' checks need the latest release (its files); they are skipped while there is none."
+            echo "available=false" >>"$GITHUB_OUTPUT"
+          fi
       - name: Signature and checksum checks
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && steps.latest.outputs.available == 'true'
         run: tests/installer/run.sh
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Signature and checksum checks (install.ps1)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.latest.outputs.available == 'true'
         # Windows PowerShell 5.1, which install.ps1 is written for (as Windows 10 has it).
         shell: powershell
         run: |
@@ -418,29 +476,29 @@ jobs:
           & tests\installer\typeahead.ps1
           exit $LASTEXITCODE
       - name: A bare Debian, with and without OpenSSL
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.latest.outputs.available == 'true'
         run: |
-          docker run --rm -v "$PWD/install.sh:/install.sh:ro" debian:12-slim sh -ec '
+          docker run --rm -e GITHUB_REPOSITORY -v "$PWD/install.sh:/install.sh:ro" debian:12-slim sh -ec '
             apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null
-            run() { env HOME=/root/t PIBOLT_EXTENSIONS=no PIBOLT_NO_START=1 PIBOLT_YES=1 "$@" sh /install.sh </dev/null 2>&1; }
+            run() { env HOME=/root/t MICROPI_NO_START=1 MICROPI_YES=1 "$@" sh /install.sh </dev/null 2>&1; }
             run | tee /tmp/a; grep -q "signature verified" /tmp/a
             dpkg -r --force-depends openssl >/dev/null 2>&1
-            run | tee /tmp/b; grep -q "signature verified" /tmp/b   # checked by the Pi-Bolt installed before
+            run | tee /tmp/b; grep -q "signature verified" /tmp/b   # checked by the µPi installed before
             rm -rf /root/t
-            # No OpenSSL 3, no Pi-Bolt and no ssh-keygen: nothing can check the signature, so nothing is installed
+            # No OpenSSL 3, no µPi and no ssh-keygen: nothing can check the signature, so nothing is installed
             if run >/tmp/c; then cat /tmp/c; echo "installed without checking the signature"; exit 1; fi
             grep -q "nothing here can check" /tmp/c
             # An opt-in left in the environment is not one: only the SHA-256 of the SHA256SUMS of this release lets it in
-            if run PIBOLT_UNVERIFIED=1 >/tmp/d; then cat /tmp/d; echo "installed with PIBOLT_UNVERIFIED=1"; exit 1; fi
+            if run MICROPI_UNVERIFIED=1 >/tmp/d; then cat /tmp/d; echo "installed with MICROPI_UNVERIFIED=1"; exit 1; fi
             # A build there before that does not say what it checked (an exit status alone) is not taken for a check
-            mkdir -p /root/t/.pi-bolt/pi-bolt-linux-x64 && printf "#!/bin/sh\nexit 0\n" >/root/t/.pi-bolt/pi-bolt-linux-x64/pi
-            chmod 755 /root/t/.pi-bolt/pi-bolt-linux-x64/pi
+            mkdir -p /root/t/.micropi/upi-linux-x64 && printf "#!/bin/sh\nexit 0\n" >/root/t/.micropi/upi-linux-x64/pi
+            chmod 755 /root/t/.micropi/upi-linux-x64/pi
             if run >/tmp/e; then cat /tmp/e; echo "an exit status was taken for a check"; exit 1; fi
             grep -q "nothing here can check" /tmp/e
             rm -rf /root/t
-            sums=$(curl -fsSL https://github.com/opensec-git/Pi-Bolt/releases/latest/download/SHA256SUMS | sha256sum | cut -c1-64)
-            run PIBOLT_UNVERIFIED=$sums | tee /tmp/f; grep -q "signature was not checked" /tmp/f
-            /root/t/.local/bin/pi-bolt --version'
+            sums=$(curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/SHA256SUMS | sha256sum | cut -c1-64)
+            run MICROPI_UNVERIFIED=$sums | tee /tmp/f; grep -q "signature was not checked" /tmp/f
+            /root/t/.local/bin/upi --version'
 
   engine:
     name: Engine patches apply
@@ -455,7 +513,7 @@ jobs:
       - name: Whether the release's runtime is still this engine
         run: |
           stamp=$(scripts/runtime-stamp.sh)
-          released=$(curl -fsSL https://github.com/opensec-git/Pi-Bolt/releases/latest/download/RUNTIME_STAMP || true)
+          released=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/RUNTIME_STAMP" || true)
           if [ "$stamp" != "$released" ]; then
-            echo "::notice title=Engine changed::The engine differs from the latest release's runtime ($released, now $stamp): the next release needs its runtime built (docs/RELEASING.md). The Pi-Bolt jobs above used the released runtime."
+            echo "::notice title=Engine changed::The engine differs from the latest release's runtime ($released, now $stamp): the next release needs its runtime built (docs/RELEASING.md). The µPi jobs above used the released runtime."
           fi

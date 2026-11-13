@@ -1,7 +1,7 @@
-// Points the Homebrew formula (Formula/pi-bolt.rb in opensec-git/homebrew-tap) at a release: its version, each archive's URL
+// Points the Homebrew formula (Formula/upi.rb in opensec-git/homebrew-tap) at a release: its version, each archive's URL
 // and the archive's SHA-256 from the release's SHA256SUMS. The publish workflow runs it once the release is published.
 //
-//   node scripts/update-homebrew-formula.mjs <Formula/pi-bolt.rb> <SHA256SUMS> <version>
+//   node scripts/update-homebrew-formula.mjs <Formula/upi.rb> <SHA256SUMS> <version>
 //
 // Each `url` names a release archive (.../releases/download/bolt-vX.Y.Z/<archive>); the `sha256` after it takes that
 // archive's checksum. An archive the SHA256SUMS does not list, or a SHA256SUMS of another release, is an error and the formula
@@ -10,16 +10,16 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const RELEASE_URL = /^(\s*url\s+")(https:\/\/github\.com\/opensec-git\/Pi-Bolt\/releases\/download\/)bolt-v[^/"]+\/([^/"]+)(".*)$/;
+const RELEASE_URL = /^(\s*url\s+")(https:\/\/github\.com\/Code000-211\/microPi\/releases\/download\/)bolt-v[^/"]+\/([^/"]+)(".*)$/;
 const SHA256 = /^(\s*sha256\s+")[0-9a-f]*(".*)$/;
 const VERSION = /^(\s*version\s+")[^"]*(".*)$/;
 
-/** The checksums of SHA256SUMS by archive name, and the release it says it is (its first line, `# pi-bolt X.Y.Z`). */
+/** The checksums of SHA256SUMS by archive name, and the release it says it is (its first line, `# upi X.Y.Z`). */
 export function parseSums(text) {
 	const sums = new Map();
 	let release;
 	for (const line of text.split(/\r?\n/)) {
-		const header = /^# pi-bolt (\S+)$/.exec(line);
+		const header = /^# upi (\S+)$/.exec(line);
 		if (header) release = header[1];
 		const entry = /^([0-9a-f]{64}) [ *](\S+)$/.exec(line);
 		if (entry) sums.set(entry[2], entry[1]);
@@ -70,14 +70,14 @@ export function updateFormula(text, sumsText, version) {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
 	const [formula, sumsFile, version] = process.argv.slice(2);
 	if (!formula || !sumsFile || !version) {
-		console.error("usage: node scripts/update-homebrew-formula.mjs <Formula/pi-bolt.rb> <SHA256SUMS> <version>");
+		console.error("usage: node scripts/update-homebrew-formula.mjs <Formula/upi.rb> <SHA256SUMS> <version>");
 		process.exit(2);
 	}
 	try {
 		const before = readFileSync(formula, "utf8");
 		const after = updateFormula(before, readFileSync(sumsFile, "utf8"), version);
 		writeFileSync(formula, after);
-		console.log(after === before ? `${formula} is already pi-bolt ${version}` : `${formula}: pi-bolt ${version}`);
+		console.log(after === before ? `${formula} is already upi ${version}` : `${formula}: upi ${version}`);
 	} catch (error) {
 		console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
 		process.exit(1);

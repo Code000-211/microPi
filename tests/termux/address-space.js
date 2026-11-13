@@ -1,4 +1,4 @@
-// For tests/termux/run.sh: where Pi-Bolt put what it maps at fixed addresses, which must be within the 512 GB of addresses a process
+// For tests/termux/run.sh: where µPi put what it maps at fixed addresses, which must be within the 512 GB of addresses a process
 // has on Android: its prebuilt heap and code, from its own file (above its ELF segments, at 2 MB), and the Structures.
 import { readFileSync } from "node:fs";
 

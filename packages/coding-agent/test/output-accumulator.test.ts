@@ -18,6 +18,45 @@ vi.mock("../src/utils/output-files.ts", async (importOriginal) => {
 
 import { OutputAccumulator } from "../src/core/tools/output-accumulator.ts";
 
+describe("OutputAccumulator.readRawTail", () => {
+	it("keeps the output as it was written, escape sequences included", () => {
+		const output = new OutputAccumulator({ maxLines: 4, maxBytes: 40, clean: true, keepRawTail: true });
+		output.append(Buffer.from("\x1b[31mfirst\x1b[0m\n", "utf8"));
+		expect(output.readRawTail()).toEqual({ text: "\x1b[31mfirst\x1b[0m\n", totalBytes: 15, truncated: false });
+		// An escape sequence the cleaned path holds back is in the raw tail as it arrives.
+		output.append(Buffer.from("\x1b[3", "utf8"));
+		output.append(Buffer.from("2my\x1b[0m\n", "utf8"));
+		expect(output.readRawTail()).toEqual({
+			text: "\x1b[31mfirst\x1b[0m\n\x1b[32my\x1b[0m\n",
+			totalBytes: 26,
+			truncated: false,
+		});
+		// The cleaned snapshot for the model has no escape sequences.
+		expect(output.snapshot().content).not.toContain("\x1b");
+	});
+
+	it("keeps only the end of long output, cutting it at a character boundary", () => {
+		const output = new OutputAccumulator({ maxLines: 4, maxBytes: 40, clean: true, keepRawTail: true });
+		output.append(Buffer.from("\x1b[31mfirst\x1b[0m\n", "utf8"));
+		// "é" is two bytes, so a cut in its middle would show a broken character.
+		output.append(Buffer.from(`\u00e9${"\u00e9".repeat(119)}\n`, "utf8"));
+		const tail = output.readRawTail();
+		expect(tail?.truncated).toBe(true);
+		expect(tail?.totalBytes).toBe(15 + 241);
+		expect(tail?.text).toMatch(/^[é]+\n$/);
+		output.finish();
+		output.closeTempFile();
+	});
+
+	it("is undefined without the option or without output", () => {
+		const plain = new OutputAccumulator({ maxLines: 4, maxBytes: 40 });
+		plain.append(Buffer.from("text\n", "utf8"));
+		expect(plain.readRawTail()).toBeUndefined();
+		const empty = new OutputAccumulator({ maxLines: 4, maxBytes: 40, clean: true, keepRawTail: true });
+		expect(empty.readRawTail()).toBeUndefined();
+	});
+});
+
 describe("OutputAccumulator.readFullOutput", () => {
 	afterEach(() => {
 		rmSync(scratch, { recursive: true, force: true });

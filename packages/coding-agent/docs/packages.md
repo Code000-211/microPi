@@ -37,7 +37,7 @@ pi -e npm:@example/pi-tools
 | URL | `https://github.com/example/pi-tools` | Treated as a git source |
 | Local | `./pi-tools` | Loaded from the resolved path without copying |
 
-npm sources are installed with `npm`, or with the command in the `npmCommand` setting. A compiled Bun executable (such as Pi-Bolt) on a machine without `npm` installs them with the bun package manager built into the executable, into the same directory, so it needs neither Node.js nor npm. bun reads `.npmrc` for registries and tokens. Unlike npm, bun runs dependency install scripts only for packages it trusts.
+npm sources are installed with `npm`, or with the command in the `npmCommand` setting. A compiled Bun executable (such as µPi) on a machine without `npm` installs them with the bun package manager built into the executable, into the same directory, so it needs neither Node.js nor npm. bun reads `.npmrc` for registries and tokens. Unlike npm, bun runs dependency install scripts only for packages it trusts.
 
 Versioned npm specifications are pinned. Git tags and commits are also pinned; package updates reconcile the checkout but do not move a configured ref.
 

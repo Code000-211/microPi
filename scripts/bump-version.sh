@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sets Pi-Bolt's version everywhere it is written: VERSION, npm/package.json, npm/bin/pi-bolt, and (with --pi) the Pi version in
+# Sets µPi's version everywhere it is written: VERSION, npm/package.json, npm/bin/upi, and (with --pi) the Pi version in
 # sources.json. Without --version, the last number goes up by one (0.7.0 -> 0.7.1), a new Pi version included.
 # Usage: scripts/bump-version.sh [--version X.Y.Z] [--pi X.Y.Z]
 source "$(dirname "$0")/lib/common.sh"
@@ -23,7 +23,7 @@ fi
 [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "not a version: $NEW"
 echo "$NEW" >VERSION
 # (Not sed -i, which takes its argument differently in macOS's sed.)
-perl -pi -e "s/^VERSION=.*/VERSION=$NEW/" npm/bin/pi-bolt
+perl -pi -e "s/^VERSION=.*/VERSION=$NEW/" npm/bin/upi
 python3 - "$NEW" "$PI" <<'PY'
 import json, sys
 new, pi = sys.argv[1], sys.argv[2]
@@ -36,4 +36,4 @@ if pi:
     s["pi"]["profile"] = "profiles/pi-" + pi
     open("sources.json", "w").write(json.dumps(s, indent=2) + "\n")
 PY
-log "Pi-Bolt $CURRENT -> $NEW${PI:+ (Pi $PI)}"
+log "µPi $CURRENT -> $NEW${PI:+ (Pi $PI)}"

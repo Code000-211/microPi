@@ -1,12 +1,12 @@
 /**
- * Pi-Bolt's default build has no JIT. bun:ffi makes the code that calls into a native library while the program runs, so
+ * µPi's default build has no JIT. bun:ffi makes the code that calls into a native library while the program runs, so
  * there dlopen(), cc(), linkSymbols(), CFunction() and new JSCallback() throw "bun:ffi requires the JIT", and an extension
  * that needs them works only with the -jit build. Where Pi shows that error (an extension that failed to load, an error in one
- * of its handlers, a notice the extension shows itself), Pi-Bolt adds which extension needs the JIT build and the command that
+ * of its handlers, a notice the extension shows itself), µPi adds which extension needs the JIT build and the command that
  * installs it:
  *
- *   Failed to load extension: bun:ffi requires the JIT. pi-foo needs Pi-Bolt's JIT build (bun:ffi); switch with:
- *   curl -fsSL https://pi-bolt.opensec.in/install.sh | PIBOLT_VARIANT=arm64-jit sh
+ *   Failed to load extension: bun:ffi requires the JIT. pi-foo needs µPi's JIT build (bun:ffi); switch with:
+ *   curl -fsSL https://github.com/Code000-211/microPi/releases/latest/download/install.sh | MICROPI_VARIANT=arm64-jit sh
  *
  * Nothing is looked at before such an error is shown (bun:ffi is not even loaded), so this costs nothing otherwise. In every
  * other build (stock Pi, the -jit build) messages are left as they are.
@@ -15,11 +15,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, sep } from "node:path";
-import { PIBOLT, piBoltJitSwitchCommand } from "../../pi-bolt.ts";
+import { PIBOLT, piBoltJitSwitchCommand } from "../../upi.ts";
 
 /** The engine's message (patches/bun.patch): a TypeError from the bun:ffi functions that make native code. */
 export const JIT_REQUIRED_MESSAGE = "bun:ffi requires the JIT";
-const HINT_MARK = "needs Pi-Bolt's JIT build";
+const HINT_MARK = "needs µPi's JIT build";
 
 /** Whether `message` is (or includes) the engine's "bun:ffi requires the JIT", on a build where it applies. */
 export function isJitRequiredMessage(message: unknown): message is string {

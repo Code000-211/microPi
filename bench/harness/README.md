@@ -36,11 +36,11 @@ harnesses.
 ```bash
 python3 harnessbench.py selftest   # every task: the untouched project fails, the reference solution passes
 python3 harnessbench.py run --suite quick --model melious/glm-5.3-flash \
-    --harness before=/path/to/old/pi-bolt --harness after=/path/to/new/pi-bolt   # before a pull request, ~5 min
-python3 harnessbench.py run --harness pi='node /path/to/pi' --harness lightspeed=/path/to/pi-bolt \
+    --harness before=/path/to/old/upi --harness after=/path/to/new/upi   # before a pull request, ~5 min
+python3 harnessbench.py run --harness pi='node /path/to/pi' --harness micropi=/path/to/upi \
     --model melious/glm-5.3-flash --reps 5
 python3 harnessbench.py run --suite hard --model melious/glm-5.3 --model melious/deepseek-v4.1-flash \
-    --harness pi='node /path/to/pi' --harness lightspeed=/path/to/pi-bolt --reps 3 --parallel 4
+    --harness pi='node /path/to/pi' --harness micropi=/path/to/upi --reps 3 --parallel 4
 python3 harnessbench.py report results/<dir>
 ```
 
@@ -51,5 +51,5 @@ files with headers in include/, Rust, TypeScript, a precise edit, search, a defi
 2 repetitions, 8 at once, each stopped after 300 s: about 5 minutes for two builds. It finds a failure or a large
 slowdown, not a 10% change; for that, `--suite all --reps 5` (about 40 minutes). With two harnesses the report
 compares them run by run: the ratios of wall time, cost and turns, with a bootstrap 95% interval. A build to compare
-is the whole `out/pi-bolt` folder, copied: its `pi` alone lacks the native addons (`native/`), and C then gets no
+is the whole `out/upi` folder, copied: its `pi` alone lacks the native addons (`native/`), and C then gets no
 libclang checks.

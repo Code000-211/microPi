@@ -26,7 +26,7 @@ import { handlePackageCommand } from "../src/package-manager-cli.ts";
 import { allowNetwork } from "./test-network-env.ts";
 
 const build = vi.hoisted(() => ({ piBolt: true }));
-vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
+vi.mock("../src/upi.ts", async (importOriginal) => ({
 	...(await importOriginal<object>()),
 	get PIBOLT() {
 		return build.piBolt ? { version: "0.8.4", variant: "arm64", jit: false } : undefined;
@@ -41,7 +41,7 @@ let projectFile: string;
 let originalCwd: string;
 let originalExitCode: typeof process.exitCode;
 
-/** Fixture Pi-Bolt lists are overlays, as Pi-Bolt writes them; writeLegacySettings writes pre-0.9.1 copies. */
+/** Fixture µPi lists are overlays, as µPi writes them; writeLegacySettings writes pre-0.9.1 copies. */
 function overlay(settings: Settings): Settings {
 	return Array.isArray(settings.piBolt?.packages)
 		? { ...settings, piBolt: { ...settings.piBolt, packagesOverlay: true } }
@@ -117,7 +117,7 @@ afterEach(() => {
 });
 
 // #28: exercise raw settings, the real resolver, configuration writes and CLI dispatch without network installs.
-describe("Pi-Bolt additive package inheritance", () => {
+describe("µPi additive package inheritance", () => {
 	test("ordinary install/remove edits shared packages, and later shared changes remain visible", async () => {
 		const shared = localPackage("shared");
 		const own = localPackage("own");
@@ -176,7 +176,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 		expect(readSettings().piBolt?.packages).toEqual(copied);
 	});
 
-	// #28: a list copied from packages by Pi-Bolt before 0.9.1 keeps its removals when it becomes an overlay.
+	// #28: a list copied from packages by µPi before 0.9.1 keeps its removals when it becomes an overlay.
 	test("legacy copied list is converted once: removals excluded, identical entries dropped, others kept", async () => {
 		const local = localPackage("local");
 		const plain = localPackage("plain");
@@ -202,7 +202,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 			theme: "dark",
 		};
 		expect(readSettings()).toEqual(converted);
-		// Pi-Bolt loads what the copy declared, as before.
+		// µPi loads what the copy declared, as before.
 		expect(settings.getResolvedPackages("global")).toEqual([
 			"npm:tools",
 			localFiltered,
@@ -221,7 +221,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 		expect(settings.getResolvedPackages("global")).toContain("npm:later");
 	});
 
-	// #28: the conversion runs per settings file, only in trusted projects and only in Pi-Bolt.
+	// #28: the conversion runs per settings file, only in trusted projects and only in µPi.
 	test("legacy project copy is converted when trusted; stock Pi and unreadable files are left alone", async () => {
 		const legacyProject = { packages: ["npm:a", "npm:b"], piBolt: { packages: ["npm:a"] } };
 		writeLegacySettings({ packages: ["npm:a"], piBolt: { packages: ["npm:a"] } }, legacyProject);
@@ -340,7 +340,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 		]);
 	});
 
-	test("removing an inherited or overridden package excludes it only for Pi-Bolt, and install re-enables it", async () => {
+	test("removing an inherited or overridden package excludes it only for µPi, and install re-enables it", async () => {
 		const shared = localPackage("shared");
 		writeSettings({ packages: [shared] });
 		const { settings, packages } = manager();
@@ -383,7 +383,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 		},
 	);
 
-	// #28: a plain remove must not report success while Pi-Bolt keeps loading the package.
+	// #28: a plain remove must not report success while µPi keeps loading the package.
 	test.each([false, true])("plain remove drops a package from both lists (local=%s)", async (local) => {
 		const shared = localPackage("shared");
 		const other = localPackage("other");
@@ -397,12 +397,12 @@ describe("Pi-Bolt additive package inheritance", () => {
 			expect(readSettings(file)).toEqual(overlay(expected));
 			expect((await manager().packages.resolve()).extensions).toHaveLength(0);
 		};
-		// Replacement with Pi-Bolt-only filters.
+		// Replacement with µPi-only filters.
 		await check(
 			{ packages: [shared], piBolt: { packages: [{ source: shared, skills: [] }] } },
 			{ packages: [], piBolt: { packages: [] } },
 		);
-		// Pi-Bolt-only addition.
+		// µPi-only addition.
 		await check({ packages: [], piBolt: { packages: [shared] } }, { packages: [], piBolt: { packages: [] } });
 		// After the legacy conversion dropped the identical copy of shared and excluded other.
 		writeLegacySettings(
@@ -472,7 +472,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 		await settings.flush();
 		expect(readSettings().packages).toEqual([shared, relative(agentDir, own)]);
 		expect(readSettings().piBolt?.packages).toEqual([`-${shared}`, own]);
-		expect(() => settings.setPackages([], { piBolt: true })).toThrow("Pi-Bolt build");
+		expect(() => settings.setPackages([], { piBolt: true })).toThrow("µPi build");
 	});
 
 	test("config selector updates shared and explicit declaration filters without copying other packages", async () => {
@@ -515,7 +515,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 
 	// #28: SDK raw lists and runtime-only overrides must remain distinct.
 	test.each([false, true])(
-		"SDK getPackages keeps project precedence and applyOverrides without persisting it (Pi-Bolt=%s)",
+		"SDK getPackages keeps project precedence and applyOverrides without persisting it (µPi=%s)",
 		async (piBolt) => {
 			build.piBolt = piBolt;
 			writeSettings(
@@ -536,8 +536,8 @@ describe("Pi-Bolt additive package inheritance", () => {
 		},
 	);
 
-	// #28: a project with only Pi-Bolt entries adds to the global packages; only project `packages` replaces them.
-	test("SDK getPackages adds project Pi-Bolt entries to global packages", () => {
+	// #28: a project with only µPi entries adds to the global packages; only project `packages` replaces them.
+	test("SDK getPackages adds project µPi entries to global packages", () => {
 		writeSettings(
 			{ packages: ["npm:global", "npm:replaced@1.0.0"] },
 			{ piBolt: { packages: ["npm:project-own", "npm:replaced@2.0.0", "-npm:global"] } },
@@ -604,7 +604,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 	});
 
 	// #28: project selector writes follow the raw owner and keep project/global delta precedence.
-	test("project config selector edits Pi-Bolt declarations and cycles inherited Pi-Bolt deltas", async () => {
+	test("project config selector edits µPi declarations and cycles inherited µPi deltas", async () => {
 		const own = localPackage("own");
 		writeSettings({ piBolt: { packages: [own] } }, { piBolt: { packages: [] } });
 		const { settings, packages } = manager();
@@ -659,8 +659,8 @@ describe("Pi-Bolt additive package inheritance", () => {
 		},
 	);
 
-	// #28: stock Pi never uses the Pi-Bolt declarations to retain files during removal.
-	test("stock Pi removal ignores Pi-Bolt declarations", async () => {
+	// #28: stock Pi never uses the µPi declarations to retain files during removal.
+	test("stock Pi removal ignores µPi declarations", async () => {
 		build.piBolt = false;
 		const source = "git:github.com/example/tools";
 		const installed = join(agentDir, "git", "github.com", "example", "tools");
@@ -675,7 +675,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 
 	// #28: retain tolerance for non-array overlays in every new consumer, without validating shared entries.
 	test.each(["bad", null, 1, {}])(
-		"ignores malformed Pi-Bolt package list %j and explicit install normalizes it",
+		"ignores malformed µPi package list %j and explicit install normalizes it",
 		async (malformed) => {
 			const shared = localPackage("shared");
 			const own = localPackage("own");
@@ -887,7 +887,7 @@ describe("Pi-Bolt additive package inheritance", () => {
 	});
 
 	// #28: conflict advice must lead to a working exclusion without changing Pi's shared declarations.
-	test("tool conflict recovery excludes only the selected Pi-Bolt package", async () => {
+	test("tool conflict recovery excludes only the selected µPi package", async () => {
 		const sources = [localPackage("tools-a"), localPackage("tools-b")];
 		for (const source of sources) {
 			writeFileSync(
@@ -905,9 +905,9 @@ describe("Pi-Bolt additive package inheritance", () => {
 		const conflict = loader
 			.getExtensions()
 			.errors.find((entry) => entry.error.includes('Tool "example_tool" conflicts'));
-		expect(conflict?.error).toContain("pi-bolt remove --pi-bolt <source>");
+		expect(conflict?.error).toContain("upi remove --upi <source>");
 		expect(conflict?.error).not.toContain("a package list of its own");
-		await handlePackageCommand(["remove", "--pi-bolt", sources[1]]);
+		await handlePackageCommand(["remove", "--upi", sources[1]]);
 		expect(process.exitCode).toBeUndefined();
 		expect(readSettings().packages).toEqual(sources);
 		expect(readSettings().piBolt?.packages).toEqual([`-${sources[1]}`]);
@@ -975,22 +975,22 @@ describe("Pi-Bolt additive package inheritance", () => {
 });
 
 // #28: CLI tests use real handlers and local package fixtures, including rejection before settings migrations.
-describe("package CLI --pi-bolt", () => {
-	test.each([false, true])("install/remove select Pi-Bolt list explicitly (local=%s)", async (local) => {
+describe("package CLI --upi", () => {
+	test.each([false, true])("install/remove select µPi list explicitly (local=%s)", async (local) => {
 		const shared = localPackage("shared");
 		const own = localPackage("own");
 		writeSettings({ packages: [shared] }, { packages: [shared] });
 		const scopeFlags = local ? ["--local", "--approve"] : [];
-		await handlePackageCommand(["install", own, "--pi-bolt", ...scopeFlags]);
+		await handlePackageCommand(["install", own, "--upi", ...scopeFlags]);
 		expect(process.exitCode).toBeUndefined();
 		const file = local ? projectFile : globalFile;
 		const baseDir = local ? join(cwd, CONFIG_DIR_NAME) : agentDir;
 		expect(readSettings(file)).toEqual(
 			overlay({ packages: [shared], piBolt: { packages: [relative(baseDir, own)] } }),
 		);
-		await handlePackageCommand(["uninstall", own, "--pi-bolt", ...scopeFlags]);
+		await handlePackageCommand(["uninstall", own, "--upi", ...scopeFlags]);
 		expect(readSettings(file)).toEqual(overlay({ packages: [shared], piBolt: { packages: [] } }));
-		await handlePackageCommand(["remove", shared, "--pi-bolt", ...scopeFlags]);
+		await handlePackageCommand(["remove", shared, "--upi", ...scopeFlags]);
 		expect(readSettings(file).piBolt?.packages).toEqual([`-${shared}`]);
 	});
 
@@ -1002,12 +1002,12 @@ describe("package CLI --pi-bolt", () => {
 		expect(readSettings()).toEqual(overlay({ packages: [relative(agentDir, shared)], piBolt: { packages: [own] } }));
 	});
 
-	// #28: a plain install must take effect for Pi-Bolt, not leave a stale replacement or an exclusion in its way.
+	// #28: a plain install must take effect for µPi, not leave a stale replacement or an exclusion in its way.
 	test.each([
 		{ shared: ["npm:tools@1.0.0"], own: ["npm:tools@1.0.0", "npm:other"] },
 		{ shared: ["npm:tools@1.0.0"], own: ["-npm:tools", "npm:other"] },
 		{ shared: [], own: [{ source: "npm:tools@1.0.0", skills: [] }, "npm:other"] },
-	])("plain install replaces Pi-Bolt's entry for the package: $own", async ({ shared, own }) => {
+	])("plain install replaces µPi's entry for the package: $own", async ({ shared, own }) => {
 		const install = vi.spyOn(DefaultPackageManager.prototype, "install").mockResolvedValue();
 		writeSettings({ packages: shared, piBolt: { packages: own } });
 		await handlePackageCommand(["install", "npm:tools@2.0.0"]);
@@ -1017,9 +1017,9 @@ describe("package CLI --pi-bolt", () => {
 		expect(manager().settings.getResolvedPackages("global")).toEqual(["npm:tools@2.0.0", "npm:other"]);
 	});
 
-	test("untrusted --local --pi-bolt is rejected without project writes", async () => {
+	test("untrusted --local --upi is rejected without project writes", async () => {
 		writeSettings({}, { piBolt: { packages: [] } });
-		await handlePackageCommand(["install", localPackage("own"), "--pi-bolt", "--local", "--no-approve"]);
+		await handlePackageCommand(["install", localPackage("own"), "--upi", "--local", "--no-approve"]);
 		expect(process.exitCode).toBe(1);
 		expect(readSettings(projectFile)).toEqual(overlay({ piBolt: { packages: [] } }));
 	});
@@ -1029,19 +1029,19 @@ describe("package CLI --pi-bolt", () => {
 		async (command) => {
 			writeSettings({ packages: ["npm:opensec-pi-todo"] });
 			const before = readFileSync(globalFile, "utf8");
-			await main([command, "--pi-bolt"]);
+			await main([command, "--upi"]);
 			expect(process.exitCode).toBe(1);
 			expect(readFileSync(globalFile, "utf8")).toBe(before);
 			expect(existsSync(join(agentDir, "sessions"))).toBe(false);
 		},
 	);
 
-	test("stock Pi rejects --pi-bolt before installs, settings writes or help dispatch", async () => {
+	test("stock Pi rejects --upi before installs, settings writes or help dispatch", async () => {
 		build.piBolt = false;
 		for (const args of [
-			["install", "npm:tools", "--pi-bolt"],
-			["remove", "npm:tools", "--pi-bolt"],
-			["install", "--help", "--pi-bolt"],
+			["install", "npm:tools", "--upi"],
+			["remove", "npm:tools", "--upi"],
+			["install", "--help", "--upi"],
 		]) {
 			process.exitCode = undefined;
 			await main(args);
@@ -1052,24 +1052,24 @@ describe("package CLI --pi-bolt", () => {
 	});
 
 	// #28: an explicit install re-enables an identity despite duplicate manual modifiers and retains its filters.
-	test("install --pi-bolt removes all same-identity modifiers before enabling the source", async () => {
+	test("install --upi removes all same-identity modifiers before enabling the source", async () => {
 		const shared = localPackage("shared");
 		writeSettings({
 			packages: [shared],
 			piBolt: { packages: [shared, `-${shared}`, { source: shared, skills: [] }, `-${shared}`] },
 		});
-		await handlePackageCommand(["install", shared, "--pi-bolt"]);
+		await handlePackageCommand(["install", shared, "--upi"]);
 		expect(process.exitCode).toBeUndefined();
 		expect(readSettings()).toEqual(
 			overlay({ packages: [shared], piBolt: { packages: [{ source: relative(agentDir, shared), skills: [] }] } }),
 		);
 		expect((await manager().packages.resolve()).extensions).toHaveLength(2);
-		await handlePackageCommand(["remove", shared, "--pi-bolt"]);
+		await handlePackageCommand(["remove", shared, "--upi"]);
 		expect(readSettings().piBolt?.packages).toEqual([`-${shared}`]);
 	});
 
 	// #28: validate every flag occurrence before any migration or installation.
-	test.each([{ flags: ["--pi-bolt", "--pi-bolt=true"] }, { flags: ["--pi-bolt=false", "--pi-bolt"] }])(
+	test.each([{ flags: ["--upi", "--upi=true"] }, { flags: ["--upi=false", "--upi"] }])(
 		"rejects malformed repeated selectors: $flags",
 		async ({ flags }) => {
 			writeSettings({ packages: ["npm:opensec-pi-todo"] });

@@ -498,13 +498,20 @@ function radisaSuite(dir: string): string | undefined {
 	return undefined;
 }
 
-/** The compile_commands.json for a file, as the C/C++ linter finds it. */
-function compileDb(dir: string): string | undefined {
-	const found = findUp(dir, ["compile_commands.json", join("build", "compile_commands.json")]);
-	if (!found) return undefined;
-	return existsSync(join(found, "compile_commands.json"))
-		? join(found, "compile_commands.json")
-		: join(found, "build", "compile_commands.json");
+/**
+ * The compile_commands.json for a file: `RADISA_COMPILE_COMMANDS` when it names one that lists the file (as radisa's own
+ * edit hook reads it; for a build folder outside the source tree, which nothing above the file leads to), else the
+ * nearest above the file, in the folder itself or in a build folder of the usual names. A file the variable's database
+ * does not list (a scratch copy, another project) is not checked against it: radisa would only say it is not there.
+ */
+function compileDb(file: string): string | undefined {
+	const env = process.env.RADISA_COMPILE_COMMANDS;
+	if (env && existsSync(env) && offloadArchs(resolve(env)).has(resolve(file))) return resolve(env);
+	const names = ["", "build", "out", "cmake-build-release", "cmake-build-debug"].map((sub) =>
+		join(sub, "compile_commands.json"),
+	);
+	const found = findUp(dirname(file), names);
+	return found ? join(found, names.find((name) => existsSync(join(found, name)))!) : undefined;
 }
 
 const archCache = new Map<string, { mtimeMs: number; archs: Map<string, string[]> }>();
@@ -571,10 +578,10 @@ interface RadisaReport {
 }
 
 /**
- * Rules that are not the agent's to fix: compile errors come from the C/C++/HIP check already, and LLVM emits VOPD pairs
- * with an X/Y anti-dependency on purpose (a note in radisa now, a warning in checkouts before November 2026).
+ * Rules that are not the agent's to fix: the compiler's warnings come from the C/C++/HIP check already, and LLVM emits
+ * VOPD pairs with an X/Y anti-dependency on purpose (a note in radisa now, a warning in checkouts before November 2026).
  */
-const RADISA_IGNORED = new Set(["VOPD_ANTIDEP", "COMPILE", "COMPILER_DIAGNOSTICS"]);
+const RADISA_IGNORED = new Set(["VOPD_ANTIDEP", "COMPILER_DIAGNOSTICS"]);
 
 /**
  * The SGPR hazard rules. LLVM inserts the `s_wait_alu` they ask for from version 20 on (AMDGPUWaitSGPRHazards); the
@@ -617,6 +624,14 @@ export function radisaDiagnostics(report: RadisaReport, file: string): Diagnosti
 		if (!severity) return;
 		let message = f.message.replace(/\s*\(pc 0x[0-9a-f]+\)/g, "");
 		let loc = f.loc;
+		if (f.rule === "COMPILE") {
+			// The unit did not compile for gfx1201, so none of its kernels was checked. The error itself is the C/C++/HIP
+			// check's to report, when it is one of the source; here only that, and why, this check saw nothing. (Without
+			// the build's flags a unit that needs them fails here although it builds: then the reason names a header.)
+			const why = /\berror: (.*)$/m.exec(message)?.[1] ?? "see `radisa check`";
+			severity = "warning";
+			message = `not checked: the unit did not compile for gfx1201 (${why})`;
+		}
 		if (f.rule === "ASSEMBLER") {
 			// llvm-mc's own line, `path:line:col: error: text`, then the source line and a caret.
 			const m = /^(.+?):(\d+):(\d+): error: (.*)$/m.exec(message);
@@ -641,7 +656,7 @@ export function radisaDiagnostics(report: RadisaReport, file: string): Diagnosti
 					: `(${Math.abs(d)} line${Math.abs(d) === 1 ? "" : "s"} ${d < 0 ? "above" : "below"})`;
 			});
 		}
-		if (f.severity === "incomplete") message = `not checked: ${message}`;
+		if (f.severity === "incomplete" && f.rule !== "COMPILE") message = `not checked: ${message}`;
 		if (f.instruction) message += ` [${f.instruction}]`;
 		if (!loc && kernel) message = `in ${kernel.callee ? "function" : "kernel"} ${kernel.name}: ${message}`;
 		out.push(diag(at, loc?.line ?? 1, loc?.column ?? 1, message, f.rule, severity));
@@ -680,7 +695,7 @@ const rdna4: Checker = {
 		const python3 = onPath("python3");
 		const suite = radisaSuite(dirname(path));
 		if (!python3 || !suite) return undefined;
-		if (extension(path) !== "s" && !buildsForGfx12(path, compileDb(dirname(path)))) return undefined;
+		if (extension(path) !== "s" && !buildsForGfx12(path, compileDb(path))) return undefined;
 		return { key: `rdna4-isa:${path}`, checker: rdna4, cwd: dirname(path), file: path };
 	},
 	async run(unit, signal) {
@@ -691,7 +706,7 @@ const rdna4: Checker = {
 		const work = mkdtempSync(join(tmpdir(), "pi-radisa-"));
 		try {
 			const out = join(work, "report.json");
-			const db = extension(unit.file!) === "s" ? undefined : compileDb(unit.cwd);
+			const db = extension(unit.file!) === "s" ? undefined : compileDb(unit.file!);
 			// -I keeps the edited project's modules and PYTHON* settings out; radisa is imported from the suite alone.
 			const argv = [
 				"python3",
@@ -705,6 +720,9 @@ const rdna4: Checker = {
 				out,
 			];
 			if (db) argv.push("--compile-commands", db);
+			// radisa compiles as many kernels at once as the machine has threads; PI_RADISA_JOBS leaves some to the agent.
+			const jobs = Number(process.env.PI_RADISA_JOBS);
+			if (jobs >= 1) argv.push("--jobs", String(Math.floor(jobs)));
 			const ran = await run(argv, unit.cwd, signal, undefined, RADISA_TIMEOUT_MS);
 			// 2: radisa did not start the check (a .radisa.json it cannot read, a baseline that is missing).
 			if (ran.code === 2) {

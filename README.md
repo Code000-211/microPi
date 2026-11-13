@@ -284,6 +284,14 @@ again; the others come from radisa's cache. With ROCm's clang 24 on a Radeon AI 
 and a later one reports; `PI_RADISA_TIMEOUT` (seconds) raises the limit for this checker alone. A check can still
 report after the run ended (`PI_CHECKS_WAIT`). `PI_CHECKS` names it `rdna4-isa`.
 
+The unit is compiled with the flags of its entry in `compile_commands.json`: the nearest above the file, also in a
+`build`, `out` or `cmake-build-*` folder. A build folder outside the source tree is not found that way: name its file
+in `RADISA_COMPILE_COMMANDS`. Without the flags a unit that needs them does not compile, and the check then says only
+`not checked: the unit did not compile for gfx1201 (...)`, as a lint finding. That finding is compared with the state
+before your edit like every other, so a unit that never compiled stays silent: run
+`python3 -m radisa check FILE --compile-commands ...` once by hand to see that a project is set up. radisa compiles as
+many kernels at once as the machine has threads; `PI_RADISA_JOBS` sets fewer.
+
 On Moebius (443 Rust files), a type error the model wrote was reported 3 s after the edit, before the run ended, and
 fixed; rust-analyzer, which Pi used before, reported nothing within 84 s and took 3.2 GB. `PI_CHECKS=off` turns the
 checks off (for a harness that runs its own, as Moebius's lens), `PI_CHECKS=rust,python` keeps those named, and

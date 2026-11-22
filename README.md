@@ -1,7 +1,8 @@
 <h1 align="center">µPi</h1>
 
 <p align="center">
-  <b>The Pi coding agent, tuned so the model wastes less time.</b><br>
+  <b>She said it's the perfect size. This time it's true.</b><br>
+  The Pi coding agent, tuned so the model wastes less time.<br>
   Native executable · sees its compiler errors after every edit · never sleeps on a build · cheaper context
 </p>
 

@@ -143,6 +143,28 @@ describe("tool calls with Claude Code's argument names", () => {
 		});
 	});
 
+	it("read takes Qwen Code's absolute_path", async () => {
+		const dir = await createTempDir();
+		await writeFile(join(dir, "a.txt"), "one\ntwo\n", "utf8");
+		const tool = createReadTool(dir);
+		const args = callArguments(tool, { absolute_path: join(dir, "a.txt") });
+		expect(args).toEqual({ path: join(dir, "a.txt") });
+		expect(textOf(await tool.execute("call-1", args))).toContain("two");
+	});
+
+	it("grep takes Qwen Code's include", async () => {
+		const tool = createGrepTool(await createTempDir());
+		expect(callArguments(tool, { pattern: "x", include: "*.ts" })).toEqual({ pattern: "x", glob: "*.ts" });
+	});
+
+	it("bash takes Qwen Code's is_background", async () => {
+		const tool = createBashTool(await createTempDir());
+		expect(callArguments(tool, { command: "true", is_background: false, description: "no-op" })).toMatchObject({
+			command: "true",
+			background: false,
+		});
+	});
+
 	it("count for the file lists of a compaction", () => {
 		const message: AssistantMessage = {
 			role: "assistant",

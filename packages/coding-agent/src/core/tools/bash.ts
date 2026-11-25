@@ -965,8 +965,9 @@ export function createShellToolDefinition(
 		executionMode: "sequential",
 		outputSchema: bashOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
-		// Claude Code's name for the same option (argument-aliases.ts).
-		prepareArguments: (args) => renameArgumentAliases<BashToolInput>(args, { run_in_background: "background" }),
+		// Claude Code's and Qwen Code's names for the same option (argument-aliases.ts).
+		prepareArguments: (args) =>
+			renameArgumentAliases<BashToolInput>(args, { run_in_background: "background", is_background: "background" }),
 		async execute(
 			_toolCallId,
 			{ command, timeout, background }: { command: string; timeout?: number; background?: boolean },

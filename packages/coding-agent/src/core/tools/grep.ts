@@ -172,9 +172,14 @@ export function createGrepToolDefinition(
 		description: `Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to ${DEFAULT_LIMIT} matches or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to ${GREP_MAX_LINE_LENGTH} chars.`,
 		promptSnippet: grepToolSystemPromptContribution.snippet,
 		parameters: grepSchema,
-		// Claude Code's names for the same options (argument-aliases.ts).
+		// Claude Code's names for the same options, and `include` from Qwen Code's first releases (argument-aliases.ts).
 		prepareArguments: (args) =>
-			renameArgumentAliases<GrepToolInput>(args, { "-i": "ignoreCase", "-C": "context", head_limit: "limit" }),
+			renameArgumentAliases<GrepToolInput>(args, {
+				"-i": "ignoreCase",
+				"-C": "context",
+				head_limit: "limit",
+				include: "glob",
+			}),
 		async execute(
 			_toolCallId,
 			{

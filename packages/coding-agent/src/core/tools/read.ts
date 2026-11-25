@@ -41,6 +41,9 @@ export const readToolSystemPromptContribution = {
 
 export type ReadToolInput = Static<typeof readSchema>;
 
+/** `path` as other harnesses name it; `absolute_path` is from Qwen Code's first releases (argument-aliases.ts). */
+const READ_PATH_ALIASES = { ...FILE_PATH_ALIAS, absolute_path: "path" } as const;
+
 /**
  * Result for programmatic callers such as codemode scripts: the text for text files, and an image
  * block for images that codemode's `image()` accepts. `note` is the text that goes with the image,
@@ -283,7 +286,7 @@ export function createReadToolDefinition(
 		parameters: readSchema,
 		outputSchema: readOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
-		prepareArguments: (args) => renameArgumentAliases<ReadToolInput>(args, FILE_PATH_ALIAS),
+		prepareArguments: (args) => renameArgumentAliases<ReadToolInput>(args, READ_PATH_ALIASES),
 		async execute(
 			_toolCallId,
 			{ path, offset, limit }: { path: string; offset?: number; limit?: number },

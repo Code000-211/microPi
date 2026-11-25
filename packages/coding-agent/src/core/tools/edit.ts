@@ -6,6 +6,7 @@ import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { StaleFileError } from "../file-tracking/file-state.ts";
 import { defaultFileTracker, type FileTracker } from "../file-tracking/file-tracker.ts";
+import { FILE_PATH_ALIAS, renameArgumentAliases } from "./argument-aliases.ts";
 import {
 	applyEditsToNormalizedContent,
 	describeClosestText,
@@ -71,6 +72,9 @@ type LegacyEditToolInput = EditToolInput & {
 
 type SingleEditInput = { oldText: string; newText: string };
 
+/** A replacement's texts, as Claude Code names them (argument-aliases.ts). */
+const REPLACEMENT_ALIASES = { old_string: "oldText", new_string: "newText" } as const;
+
 function isSingleEditInput(value: unknown): value is SingleEditInput {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		return false;
@@ -124,21 +128,29 @@ function prepareEditArguments(input: unknown): EditToolInput {
 		return input as EditToolInput;
 	}
 
-	const args = input as Record<string, unknown>;
+	const args = renameArgumentAliases<Record<string, unknown>>(input, {
+		...FILE_PATH_ALIAS,
+		...REPLACEMENT_ALIASES,
+	});
+	const renameReplacement = (edit: unknown) => renameArgumentAliases<unknown>(edit, REPLACEMENT_ALIASES);
 
 	// Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array.
 	// Others send a single edit object instead of a one-element edits array.
 	if (typeof args.edits === "string") {
 		try {
-			const parsed = JSON.parse(args.edits);
+			const parsed = renameReplacement(JSON.parse(args.edits));
 			if (Array.isArray(parsed)) {
 				args.edits = parsed;
 			} else if (isSingleEditInput(parsed)) {
 				args.edits = [parsed];
 			}
 		} catch {}
-	} else if (isSingleEditInput(args.edits)) {
-		args.edits = [args.edits];
+	} else {
+		const single = renameReplacement(args.edits);
+		if (isSingleEditInput(single)) args.edits = [single];
+	}
+	if (Array.isArray(args.edits) && args.edits.some((edit) => renameReplacement(edit) !== edit)) {
+		args.edits = args.edits.map(renameReplacement);
 	}
 
 	const legacy = args as LegacyEditToolInput;

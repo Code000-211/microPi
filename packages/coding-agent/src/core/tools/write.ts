@@ -4,6 +4,7 @@ import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { defaultFileTracker, type FileTracker } from "../file-tracking/file-tracker.ts";
+import { FILE_PATH_ALIAS, renameArgumentAliases } from "./argument-aliases.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { writeRenderers } from "./renderers/write.ts";
@@ -83,6 +84,7 @@ export function createWriteToolDefinition(
 		// tests it can come in one response (see the system prompt's rule), which saves a turn.
 		executionMode: "sequential",
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
+		prepareArguments: (args) => renameArgumentAliases<WriteToolInput>(args, FILE_PATH_ALIAS),
 		async execute(
 			_toolCallId,
 			{ path, content }: { path: string; content: string },

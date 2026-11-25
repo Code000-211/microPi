@@ -45,7 +45,9 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 }
 
 function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
-	const path = typeof args?.path === "string" ? args.path : undefined;
+	// A recorded call keeps the names the model sent: `file_path` is the file tools' alias of `path` (argument-aliases.ts).
+	const rawPath = args?.path ?? args?.file_path;
+	const path = typeof rawPath === "string" ? rawPath : undefined;
 	if (!path) return;
 	switch (toolName) {
 		case "read":

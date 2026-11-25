@@ -23,6 +23,7 @@ import {
 import { type BackgroundJobs, formatJobReport } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import type { FileTracker } from "../file-tracking/file-tracker.ts";
+import { renameArgumentAliases } from "./argument-aliases.ts";
 import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
 import { selfKillPattern, selfKillRefusal } from "./bash-self-kill.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
@@ -964,6 +965,8 @@ export function createShellToolDefinition(
 		executionMode: "sequential",
 		outputSchema: bashOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
+		// Claude Code's name for the same option (argument-aliases.ts).
+		prepareArguments: (args) => renameArgumentAliases<BashToolInput>(args, { run_in_background: "background" }),
 		async execute(
 			_toolCallId,
 			{ command, timeout, background }: { command: string; timeout?: number; background?: boolean },

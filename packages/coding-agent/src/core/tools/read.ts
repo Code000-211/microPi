@@ -15,6 +15,7 @@ import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import { detachSharedString } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { defaultFileTracker, type FileTracker } from "../file-tracking/file-tracker.ts";
+import { FILE_PATH_ALIAS, renameArgumentAliases } from "./argument-aliases.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -282,6 +283,7 @@ export function createReadToolDefinition(
 		parameters: readSchema,
 		outputSchema: readOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
+		prepareArguments: (args) => renameArgumentAliases<ReadToolInput>(args, FILE_PATH_ALIAS),
 		async execute(
 			_toolCallId,
 			{ path, offset, limit }: { path: string; offset?: number; limit?: number },

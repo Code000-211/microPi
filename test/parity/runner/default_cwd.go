@@ -1,0 +1,313 @@
+//go:build parity
+
+package runner
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"math/rand/v2"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/testenv"
+)
+
+// Every driver copies its cwd fixture under a validated temporary root. Ancestor context discovery remains enabled in both binaries, so the root must be outside the checkout and have no discoverable ancestor context files.
+
+// snapshotIDDigits is the width of the random suffix of every per-binary
+// snapshot directory. A fixed width keeps each path that embeds one the same
+// length for pig and pi, so layout, truncation, and the system-prompt size
+// cannot differ between the binaries or between runs.
+const snapshotIDDigits = 10
+
+// extensionSnapshotPrefix names the per-binary copy of an extension fixture (snapshotExtensionPath).
+const extensionSnapshotPrefix = "parity-snap-extension-"
+
+// mkdirTempFixed creates a directory under the canonical, context-free os.TempDir, named prefix followed by snapshotIDDigits random decimal digits.
+func mkdirTempFixed(prefix string) (string, error) {
+	root, err := cleanSnapshotRoot(os.TempDir())
+	if err != nil {
+		return "", fmt.Errorf("parity cwd temporary root: %w; set %s to an existing directory outside the checkout with no ancestor context files", err, tempDirVar)
+	}
+	return mkdirFixed(root, prefix)
+}
+
+// cleanSnapshotRoot checks the same canonical ancestry the child process will use as its cwd. Returning the resolved path prevents a symlink alias from selecting a different ancestor chain.
+func cleanSnapshotRoot(root string) (string, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", root)
+	}
+	checkout, err := filepath.EvalSymlinks(filepath.Join(defaultCWDFixture(), "..", "..", ".."))
+	if err != nil {
+		return "", fmt.Errorf("resolve checkout: %w", err)
+	}
+	for dir := root; ; dir = filepath.Dir(dir) {
+		if dir == checkout {
+			return "", fmt.Errorf("%s is inside checkout %s", root, checkout)
+		}
+		// upstream: packages/coding-agent/src/core/resource-loader.ts:loadContextFileFromDir
+		for _, name := range []string{"AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"} {
+			path := filepath.Join(dir, name)
+			info, err := os.Stat(path)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return "", fmt.Errorf("inspect ancestor context: %w", err)
+			}
+			if err == nil && info.Mode().IsRegular() {
+				return "", fmt.Errorf("%s inherits ancestor context %s", root, path)
+			}
+		}
+		if filepath.Dir(dir) == dir {
+			return root, nil
+		}
+	}
+}
+
+// mkdirFixed creates a new directory under root named prefix followed by
+// snapshotIDDigits random decimal digits.
+func mkdirFixed(root, prefix string) (string, error) {
+	return mkdirFixedDigits(root, prefix, snapshotIDDigits)
+}
+
+// mkdirFixedDigits creates a new directory under root named prefix followed by digits random decimal digits.
+func mkdirFixedDigits(root, prefix string, digits int) (string, error) {
+	// On Windows promptPathRoot is \t on the temp directory's drive, which
+	// exists only once a run creates it.
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", err
+	}
+	limit := uint64(1)
+	for range digits {
+		limit *= 10
+	}
+	for range 100 {
+		name := fmt.Sprintf("%s%0*d", prefix, digits, rand.Uint64N(limit))
+		dir := filepath.Join(root, name)
+		err := os.Mkdir(dir, 0o700)
+		if err == nil {
+			return dir, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("mkdir %s: too many collisions", filepath.Join(root, prefix+"*"))
+}
+
+// Documentation paths in the system prompt.
+//
+// With no provider usage, the footer's context percentage is a chars/4
+// estimate of the system prompt. The prompts of pig and pi differ only in the
+// docs section and preamble (D22): pig names itself and points at
+// <PIG_HOME>/docs twice, and Pi points at its package directory three times.
+// If those directories lived under the temp root or the checkout, the two
+// estimates would move apart with the host's path lengths and round to
+// different percentages. The runner therefore places both under the fixed
+// promptPathRoot with lengths that make the two prompts equally long:
+//
+//	3*len(piPackageDir) == 2*(len(pigHome)+len("/docs")+pigBundleDirLen) + d22ConstantGap
+//
+// d22ConstantGap is how many more characters pig's fixed docs and preamble
+// text has than Pi's: pig's examples location is a 54-character URL where
+// Pi's README, docs and examples paths each end in a suffix that pig's docs
+// directory and URL do not repeat (40 characters net), and "pig" replaces
+// "pi" in the preamble, the docs heading and the path-resolution sentence
+// (3 characters). Three package directories must equal two pig directories
+// plus that gap, so pigHomeIDDigits is the one free length that makes the
+// equation solvable in whole characters. TestPromptPathLengthsBalance checks
+// the arithmetic, TestPromptPathLengthsMatchRealPrompts measures it against
+// the real prompts, and the rpc get_session_stats scenario checks the
+// estimate itself.
+//
+// promptPathRoot is /tmp on Unix. Pi prints PI_PACKAGE_DIR resolved to an
+// absolute path while pig prints PIG_HOME as given, so on Windows the root is
+// an absolute path of the same four characters: the temp directory's drive
+// and \t (C:\t).
+var promptPathRoot = func() string {
+	if runtime.GOOS == "windows" {
+		return filepath.VolumeName(os.TempDir()) + `\t`
+	}
+	return "/tmp"
+}()
+
+// checkPromptPathRoot reports a promptPathRoot other than four characters,
+// which would make pig's and Pi's system prompts differ in length. On Windows
+// that happens when TMP is a UNC path (\\server\share\...).
+func checkPromptPathRoot() error {
+	if len(promptPathRoot) != len("/tmp") {
+		return fmt.Errorf("PIG_HOME's snapshot root %q must be four characters, as /tmp is, so the pig and Pi system prompts stay the same length; set TMP to a directory on a drive letter (C:\\...), not a UNC path", promptPathRoot)
+	}
+	return nil
+}
+
+const (
+	pigHomePrefix = "parity-snap-PIG_HOME-"
+	// pigHomeIDDigits is the random suffix width of pig's PIG_HOME snapshot, which no comparison masks, so it is free to differ from snapshotIDDigits.
+	pigHomeIDDigits = snapshotIDDigits + 2
+	piPackagePrefix = "parity-pi-pkg-"
+	// piPackageLink is padded so that Pi's three package paths are as long as pig's two docs paths, which name the docs bundle directory.
+	piPackageLink  = "pi-coding-pkg-with-bundle-pad"
+	d22ConstantGap = 43
+	// pigBundleDirLen is len("/bundle-") plus the 16 hex digits of the content hash that names pig's docs bundle directory (internal/pigdocs).
+	pigBundleDirLen = len("/bundle-") + 16
+)
+
+// defaultCWDFixture returns test/parity/testdata/default-cwd.
+func defaultCWDFixture() string {
+	dir, err := testenv.PackageDirPath()
+	if err != nil {
+		return filepath.Join("test/parity", "testdata", "default-cwd")
+	}
+	return filepath.Join(filepath.Dir(dir), "testdata", "default-cwd")
+}
+
+// defaultCWD returns a fresh per-binary snapshot of the default cwd fixture.
+func defaultCWD(t *testing.T) (string, error) {
+	t.Helper()
+	return snapshotCWD(t, defaultCWDFixture())
+}
+
+// initSnapshotGitBranch makes dir an empty git repository whose HEAD names
+// the unborn branch, when branch is set. Pi and pig both ask git for the
+// branch (git symbolic-ref --short HEAD), so the repository must be real.
+func initSnapshotGitBranch(ctx context.Context, dir, branch string) error {
+	if branch == "" {
+		return nil
+	}
+	for _, args := range [][]string{
+		{"init", "--quiet", dir},
+		{"-C", dir, "symbolic-ref", "HEAD", "refs/heads/" + branch},
+	} {
+		//nolint:gosec // G204 (class a): program is literal git; args are fixed "init --quiet <tmp>" and "-C <tmp> symbolic-ref HEAD refs/heads/<branch>", where the branch is prefixed by "refs/heads/".
+		if out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+// snapshotID matches the random suffix of a cwd or extension snapshot
+// directory, also when a renderer truncated the path inside it.
+var snapshotID = regexp.MustCompile(`(parity-snap-(?:cwd|extension)-)([0-9]{1,` + fmt.Sprint(snapshotIDDigits) + `})`)
+
+// maskSnapshotIDs replaces the random digits of every cwd and extension
+// snapshot directory name with zeros of the same count. The digits are the
+// only part of the path that differs between pig and pi, and the equal count
+// keeps padding and truncation byte-identical.
+func maskSnapshotIDs(s string) string {
+	if !strings.Contains(s, "parity-snap-") {
+		return s
+	}
+	return snapshotID.ReplaceAllStringFunc(s, func(m string) string {
+		prefix := m[:strings.LastIndexByte(m, '-')+1]
+		return prefix + strings.Repeat("0", len(m)-len(prefix))
+	})
+}
+
+// maskResultSnapshotIDs applies maskSnapshotIDs to every compared field of r.
+func maskResultSnapshotIDs(r Result) Result {
+	r.Output = maskSnapshotIDs(r.Output)
+	r.Escaped = maskSnapshotIDs(r.Escaped)
+	r.Artifact = maskSnapshotIDs(r.Artifact)
+	return r
+}
+
+// pinPiPackageDir returns ref with PI_PACKAGE_DIR pointing at a symlink,
+// under promptPathRoot, to the Pi package that owns ref.Path. Pi writes its
+// package directory three times into the system prompt's docs section
+// (getReadmePath, getDocsPath, getExamplesPath); see "Documentation paths in
+// the system prompt". PI_PACKAGE_DIR is Pi's own override for that directory
+// (config.ts getPackageDir), and the symlink keeps every file Pi reads through
+// it unchanged.
+func pinPiPackageDir(t *testing.T, ref BinaryRef) BinaryRef {
+	t.Helper()
+	root, err := piPackageRoot(ref.Path)
+	if err != nil {
+		t.Fatalf("parity: locate the Pi package for PI_PACKAGE_DIR: %v", err)
+	}
+	dir, err := mkdirFixed(promptPathRoot, piPackagePrefix)
+	if err != nil {
+		t.Fatalf("parity: create PI_PACKAGE_DIR link dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	link := filepath.Join(dir, piPackageLink)
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatalf("parity: link PI_PACKAGE_DIR: %v", err)
+	}
+	ref.Env = append(slices.Clone(ref.Env), "PI_PACKAGE_DIR="+link)
+	return ref
+}
+
+// piPackageRoot resolves bin's symlinks, or the npm shim it is, and walks up
+// to the directory whose package.json names the Pi coding-agent package.
+func piPackageRoot(bin string) (string, error) {
+	real, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		return "", err
+	}
+	if script, ok := npmCmdShimScript(real); ok {
+		real = script
+	}
+	for dir := filepath.Dir(real); ; dir = filepath.Dir(dir) {
+		data, err := os.ReadFile(filepath.Join(dir, "package.json"))
+		if err == nil {
+			var pkg struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(data, &pkg) == nil && strings.HasSuffix(pkg.Name, "/pi-coding-agent") {
+				return dir, nil
+			}
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			return "", fmt.Errorf("no pi-coding-agent package.json above %s", real)
+		}
+	}
+}
+
+// npmShimScriptPattern matches a path that an npm .cmd shim quotes relative to
+// its own directory: "%dp0%\..\pkg\dist\cli.js".
+var npmShimScriptPattern = regexp.MustCompile(`"%dp0%\\([^"%]+)"`)
+
+// npmCmdShimScript returns the script that the npm .cmd shim at bin runs. On
+// Windows npm installs node_modules/.bin/<name>.cmd where other hosts get a
+// symlink to the script. The shim's last %dp0%-relative path is the script;
+// the earlier ones name a node.exe beside it.
+func npmCmdShimScript(bin string) (string, bool) {
+	if !strings.EqualFold(filepath.Ext(bin), ".cmd") {
+		return "", false
+	}
+	data, err := os.ReadFile(bin)
+	if err != nil {
+		return "", false
+	}
+	matches := npmShimScriptPattern.FindAllStringSubmatch(string(data), -1)
+	if len(matches) == 0 {
+		return "", false
+	}
+	relative := strings.ReplaceAll(matches[len(matches)-1][1], `\`, "/")
+	return filepath.Join(filepath.Dir(bin), filepath.FromSlash(relative)), true
+}

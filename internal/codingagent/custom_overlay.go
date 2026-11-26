@@ -1,0 +1,360 @@
+package codingagent
+
+import (
+	"context"
+	"slices"
+	"sync"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/frontend"
+	"github.com/MichaelKinsy/PiG/tui"
+)
+
+// customOverlay is the Go-side counterpart to a remote (subprocess) custom
+// overlay. The component caches lines pushed by the remote producer,
+// forwards every input chunk to the registered handler, and exposes a
+// terminal Done flag so the input loop in
+// [ExtUIContext.RunRemoteOverlay] can exit cleanly.
+//
+// Render copies cached rows on the owning TUI loop and performs no subprocess I/O. UpdateLines accepts concurrent producer updates.
+//
+// pig-specific: no upstream equivalent. Upstream's CustomComponent is
+// constructed in-process by the extension; the subprocess shim instead
+// caches lines and forwards input.
+type customOverlay struct {
+	mu    sync.RWMutex
+	lines []string
+	width int
+	// view draws the overlay when its frames carry a view (D107); lines is
+	// then unused.
+	view extension.ViewSurface
+	// terminalWidth runs only during Render on the owning TUI loop. The
+	// component's render width may be smaller than this terminal geometry key.
+	terminalWidth func() int
+	done          bool
+	result        any
+	onInput       func(data string)
+	// onMouse hands a mouse event to the extension's component.
+	onMouse func(event extension.RemoteMouseEvent) extension.ViewMouseResult
+	// capturesViewport is the component's capturesViewportInput as its latest frame reported it.
+	capturesViewport func() bool
+	onChange         func()
+
+	// closedCh is closed exactly once by Close so a waiter blocked on input can
+	// observe an extension-initiated close instead of sitting on its input
+	// channel until the next keystroke happens to arrive.
+	control func(context.Context, string, bool, *extension.RemoteOverlayFocusTarget) (extension.RemoteOverlayState, error)
+	// onFocus runs on the owner loop when the TUI moves focus to or from the component (SetFocused). inputCh is the input lease
+	// held while it has focus; inputRetired refuses a lease once the RunRemoteOverlay call returned.
+	onFocus      func(focused bool)
+	inputCh      chan []byte
+	releaseInput func()
+	inputChanged chan struct{}
+	inputRetired bool
+	// pendingInvalidations counts the TUI invalidations not yet published to the extension.
+	pendingInvalidations int
+	// endOnHide marks a raw overlay (ExtUIContext.ShowRemoteOverlay): no ui.custom call owns it, so its handle's hide ends it.
+	// Set before the controls are bound.
+	endOnHide bool
+	// retire takes the overlay off the screen without ending the call that mounted it (Retire).
+	retire func()
+
+	closedCh  chan struct{}
+	closeOnce sync.Once
+}
+
+func newCustomOverlay(onChange func()) *customOverlay {
+	return &customOverlay{onChange: onChange, closedCh: make(chan struct{}), inputChanged: make(chan struct{})}
+}
+
+// Render returns cached lines only for their terminal geometry. It performs no socket I/O.
+// Satisfies tui.Component.
+func (c *customOverlay) Render(width int) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	renderWidth := width
+	if c.terminalWidth != nil {
+		width = c.terminalWidth()
+	}
+	if c.width > 0 && c.width != width {
+		return nil
+	}
+	if c.view != nil {
+		// The host renders the view at the overlay's own width.
+		return c.view.Render(renderWidth)
+	}
+	if len(c.lines) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.lines))
+	copy(out, c.lines)
+	return out
+}
+
+// Invalidate drops a view's cached lines; cached lines from the extension
+// have nothing to drop.
+// Invalidate is the TUI's invalidation of the component (Pi's TUI.invalidate, tui.ts:951-954). The TUI calls it on its owner
+// loop, which never writes to the extension's connection: the invalidation is counted here, and the goroutine that delivers the
+// component's input publishes it (serveRemoteInput).
+func (c *customOverlay) Invalidate() {
+	c.mu.Lock()
+	view := c.view
+	c.pendingInvalidations++
+	close(c.inputChanged)
+	c.inputChanged = make(chan struct{})
+	c.mu.Unlock()
+	if view != nil {
+		view.Invalidate()
+	}
+}
+
+// takeInvalidations returns how many invalidations the extension has not been told of, and forgets them.
+func (c *customOverlay) takeInvalidations() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := c.pendingInvalidations
+	c.pendingInvalidations = 0
+	return n
+}
+
+// FrontendView reports the view's structure to a D91 frontend (D107).
+func (c *customOverlay) FrontendView(width int) *frontend.View {
+	c.mu.RLock()
+	view := c.view
+	c.mu.RUnlock()
+	if view == nil {
+		return nil
+	}
+	return view.FrontendView(width)
+}
+
+// UpdateViewAt draws the overlay from a view surface laid out for the
+// terminal width (0 for any width). Satisfies extension.ViewTarget.
+func (c *customOverlay) UpdateViewAt(view extension.ViewSurface, width int) {
+	c.mu.Lock()
+	c.view = view
+	c.lines = nil
+	c.width = width
+	cb := c.onChange
+	c.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+// HandleInput forwards the input chunk to the registered handler.
+// Satisfies tui.InputHandler.
+func (c *customOverlay) HandleInput(data string) {
+	c.mu.RLock()
+	fn := c.onInput
+	c.mu.RUnlock()
+	if fn != nil {
+		fn(data)
+	}
+}
+
+// SetOnInput registers the input-forwarding handler. Replaces any
+// previous handler.
+func (c *customOverlay) SetOnInput(fn func(data string)) {
+	c.mu.Lock()
+	c.onInput = fn
+	c.mu.Unlock()
+}
+
+// SetOnMouse registers the mouse handler: the bridge's view dispatch and
+// forward to the extension.
+func (c *customOverlay) SetOnMouse(fn func(event extension.RemoteMouseEvent) extension.ViewMouseResult) {
+	c.mu.Lock()
+	c.onMouse = fn
+	c.mu.Unlock()
+}
+
+// SetCapturesViewportInput registers the reader of the component's capturesViewportInput.
+func (c *customOverlay) SetCapturesViewportInput(fn func() bool) {
+	c.mu.Lock()
+	c.capturesViewport = fn
+	c.mu.Unlock()
+}
+
+// CapturesViewportInput is the extension component's optional capturesViewportInput (Component.capturesViewportInput in packages/tui/src/tui.ts):
+// while the overlay has focus in fullscreen mode, PageUp, PageDown and the other viewport keys go to the component. Satisfies tui.ViewportInputCapturer.
+func (c *customOverlay) CapturesViewportInput() bool {
+	c.mu.RLock()
+	fn := c.capturesViewport
+	c.mu.RUnlock()
+	return fn != nil && fn()
+}
+
+// HandleMouse hands a fullscreen mouse event to the component, as Pi's
+// renderer calls an extension component's handleMouse; the
+// component lives in the extension. The overlay stays the target of
+// the gesture, so its drag, release and click come back here too; the
+// view's own components follow the gesture inside. Satisfies
+// tui.MouseHandler.
+func (c *customOverlay) HandleMouse(event tui.TuiMouseEvent) *tui.TuiMouseDispatchResult {
+	c.mu.RLock()
+	fn, done := c.onMouse, c.done
+	c.mu.RUnlock()
+	if fn == nil || done {
+		return nil
+	}
+	result := fn(RemoteMouseEvent(event))
+	if !result.Handled && !result.Capture && !result.Focus {
+		return nil
+	}
+	dispatched := &tui.TuiMouseDispatchResult{
+		Handled: true, Capture: result.Capture, Focus: result.Focus, Render: result.Render,
+		Target: tui.TuiMouseDispatchTarget{
+			Component: c, OriginX: event.ScreenX - event.X, OriginY: event.ScreenY - event.Y,
+			Width: event.Width, Height: event.Height,
+		},
+	}
+	if result.Focus {
+		dispatched.FocusTarget = c
+	}
+	return dispatched
+}
+
+// RemoteMouseEvent is event as it crosses to an extension: every field of pi-tui's TuiMouseEvent, the modifiers and wheel delta included. The overlay and
+// editor mouse paths use it, and the extension conformance rows hand their events through it.
+func RemoteMouseEvent(event tui.TuiMouseEvent) extension.RemoteMouseEvent {
+	return extension.RemoteMouseEvent{
+		Type: string(event.Type), Button: string(event.Button), X: event.X, Y: event.Y, ScreenX: event.ScreenX,
+		ScreenY: event.ScreenY, Width: event.Width, Height: event.Height, Shift: event.Shift, Alt: event.Alt,
+		Ctrl: event.Ctrl, WheelDelta: event.WheelDelta, ClickCount: event.ClickCount,
+	}
+}
+
+// UpdateLines replaces the cached lines and triggers a re-render.
+func (c *customOverlay) UpdateLines(lines []string) {
+	c.UpdateLinesAt(lines, 0)
+}
+
+// UpdateLinesAt retains the terminal width with the snapshot so a resize cannot paint stale rows.
+func (c *customOverlay) UpdateLinesAt(lines []string, width int) {
+	c.mu.Lock()
+	if c.view == nil && c.width == width && slices.Equal(c.lines, lines) {
+		c.mu.Unlock()
+		return
+	}
+	c.view = nil
+	if len(lines) == 0 {
+		c.lines = nil
+	} else {
+		c.lines = append([]string(nil), lines...)
+	}
+	c.width = width
+	cb := c.onChange
+	c.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+// Close marks the overlay as done with the given result and triggers
+// a re-render so the surrounding input loop can exit.
+func (c *customOverlay) Close(result any) {
+	c.mu.Lock()
+	c.done = true
+	c.result = result
+	cb := c.onChange
+	c.mu.Unlock()
+	c.closeOnce.Do(func() { close(c.closedCh) })
+	if cb != nil {
+		cb()
+	}
+}
+
+// Retire takes the overlay off the screen and leaves the ui.custom call that mounted it waiting, as Pi's resetExtensionUI does at a reload: it removes the extension
+// overlays "the same way done() does, but leave the promises pending" (interactive-mode.ts:2592-2598). The component's own close still ends the call. A raw overlay
+// (ShowRemoteOverlay) has no call to leave waiting and is not retired.
+func (c *customOverlay) Retire() {
+	c.mu.RLock()
+	retire := c.retire
+	c.mu.RUnlock()
+	if retire != nil {
+		retire()
+	}
+}
+
+// setRetire installs what Retire runs once RunRemoteOverlay mounted the overlay; it is safe to run more than once.
+func (c *customOverlay) setRetire(retire func()) {
+	c.mu.Lock()
+	c.retire = retire
+	c.mu.Unlock()
+}
+
+// Closed reports the close as it happens. Done() only answers when asked, so a
+// caller parked on input needs this to wake.
+func (c *customOverlay) Closed() <-chan struct{} { return c.closedCh }
+
+// Done reports whether the overlay has been closed.
+func (c *customOverlay) Done() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.done
+}
+
+// Result returns the close value. Defined when Done() is true.
+func (c *customOverlay) Result() any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.result
+}
+
+// Compile-time component checks.
+var (
+	_ tui.Component    = (*customOverlay)(nil)
+	_ tui.MouseHandler = (*customOverlay)(nil)
+)
+
+// remoteOverlayTUIOptions maps a remote ui.custom() overlay request onto TUI
+// overlay options. Upstream showOverlay mounts the component with no frame and
+// resolves width/maxHeight/anchor/margin from overlayOptions (defaulting to
+// min(80, available) centred), so that is the path unless the caller used
+// pig's legacy modal fields (title/widthFraction/heightFraction) without
+// upstream overlayOptions.
+func remoteOverlayTUIOptions(opts extension.RemoteOverlayOptions) tui.OverlayOptions {
+	legacyModal := opts.Title != "" || opts.WidthFraction > 0 || opts.HeightFraction > 0
+	if opts.Layout == nil && legacyModal {
+		wf := opts.WidthFraction
+		if wf <= 0 {
+			wf = 0.75
+		}
+		hf := opts.HeightFraction
+		if hf <= 0 {
+			hf = 0.7
+		}
+		return tui.OverlayOptions{Title: opts.Title, WidthFraction: wf, HeightFraction: hf}
+	}
+	if opts.Layout == nil {
+		return tui.OverlaySpec{}.Options()
+	}
+	l := opts.Layout
+	spec := tui.OverlaySpec{
+		Width:        overlayValue(l.Width),
+		MinWidth:     l.MinWidth,
+		MaxHeight:    overlayValue(l.MaxHeight),
+		Anchor:       l.Anchor,
+		OffsetX:      l.OffsetX,
+		OffsetY:      l.OffsetY,
+		Row:          overlayValue(l.Row),
+		Col:          overlayValue(l.Col),
+		NonCapturing: l.NonCapturing,
+	}
+	if m := l.Margin; m != nil {
+		if m.All != nil {
+			spec.Margin = tui.OverlayMarginAll(*m.All)
+		} else {
+			spec.Margin = tui.OverlayMarginSpec{Top: m.Top, Right: m.Right, Bottom: m.Bottom, Left: m.Left}
+		}
+	}
+	return spec.Options()
+}
+
+func overlayValue(v *extension.OverlaySizeValue) *tui.OverlayValue {
+	if v == nil {
+		return nil
+	}
+	return &tui.OverlayValue{Value: v.Value, Percent: v.Percent, Invalid: v.Invalid}
+}

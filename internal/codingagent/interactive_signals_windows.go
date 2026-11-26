@@ -1,0 +1,57 @@
+//go:build windows
+
+package codingagent
+
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (handleCtrlZ; the resize handler is the pig terminal wiring of the same lifecycle).
+
+import (
+	"context"
+	"os"
+	"time"
+
+	"golang.org/x/term"
+)
+
+// resizePollInterval is how often the Windows resize watcher samples the
+// console size. Windows has no SIGWINCH, so pig polls; ~120ms is imperceptible
+// for re-render yet cheap.
+const resizePollInterval = 120 * time.Millisecond
+
+// installResizeHandler polls the console size and drives onTerminalResize on
+// change. Returns a stop func; the goroutine also exits when ctx is cancelled.
+// This is pig's mechanism for the same observable "resize -> re-render" that
+// upstream gets from Node's stdout "resize" event.
+func (m *InteractiveMode) installResizeHandler(ctx context.Context) func() {
+	go func() {
+		ticker := time.NewTicker(resizePollInterval)
+		defer ticker.Stop()
+		lastW, lastH, _ := term.GetSize(int(os.Stdout.Fd()))
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				w, h, err := term.GetSize(int(os.Stdout.Fd()))
+				if err != nil {
+					continue
+				}
+				if w != lastW || h != lastH {
+					lastW, lastH = w, h
+					m.onTerminalResize()
+				}
+			}
+		}
+	}()
+	return func() {}
+}
+
+// installContinueHandler does nothing on Windows: there is no SIGCONT.
+func (m *InteractiveMode) installContinueHandler(context.Context) func() { return func() {} }
+
+// handleSuspend shows a status message on Windows: suspend-to-background needs
+// SIGTSTP job control, which Windows lacks. Mirrors upstream handleCtrlZ's
+// win32 branch (interactive-mode.ts), which calls showStatus.
+func (m *InteractiveMode) handleSuspend() error {
+	//portlint:allow ctxbackground interactive-mode.ts:4399-4401 handleCtrlZ only shows a status on win32; suspendTerminal returns before it reads the context
+	return suspendTerminal(context.Background(), "windows", m.showStatus, suspendOperations{})
+}

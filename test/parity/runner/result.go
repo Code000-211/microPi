@@ -1,0 +1,68 @@
+//go:build parity
+
+package runner
+
+// Result captures one run of one binary on one scenario.
+type Result struct {
+	System         string // "pig" or "pi"
+	Output         string // captured stdout/stderr or tmux pane
+	Stderr         string // separate stderr when StderrCaptured is true
+	RawOutput      string // untouched process stdout before optional key canonicalization
+	StderrCaptured bool
+	IdentityRoots  map[string]string // exact isolated roots, keyed by cwd/temp/agent
+	Escaped        string            // tmux -e capture, if available
+	// PlainUncropped and EscapedUncropped mark a tmux capture that no comparator of the scenario reads and that was kept whole instead of cropped to its capture markers.
+	PlainUncropped, EscapedUncropped bool
+	ExitCode                         int
+	RuntimeMs                        int64
+	ReadyOK                          bool // tmux: did the ready pattern appear?
+	Err                              error
+
+	// Artifact holds the contents of the file named by the driver's
+	// artifact_path, read after the run. It lets a scenario assert on what
+	// a command wrote rather than only on what it printed: an exporter that
+	// reports success on stdout proves nothing about the file it produced.
+	Artifact string
+	// ArtifactErr records why artifact_path could not be read, so a missing
+	// or unreadable artifact fails loudly instead of comparing empty to empty.
+	ArtifactErr error
+
+	// FrameWatch is what the steps' frame_watch saw.
+	FrameWatch FrameWatchResult
+
+	// FinalFrame is what the steps' final_frame saw in the raw transcript.
+	FinalFrame FinalFrameResult
+
+	// ChangelogSource is the binary's independent document input for complete release-header assertions.
+	ChangelogSource string
+
+	// Sequences is what each of the scenario's transcript_sequences_equal windows held in the finished terminal transcript, in declaration order.
+	Sequences []SequenceWindowResult
+
+	// HangDump is what the tmux driver recorded when a wait of this run timed out: the pane, the process tree and, for pig, the goroutine dump (hang_dump.go). It is whole; Err carries a capped copy. Empty for a run whose waits passed.
+	HangDump string
+}
+
+// SystemResults groups multiple runs of the same binary on one scenario.
+type SystemResults struct {
+	System   string
+	Runs     []Result
+	MedianMs int64
+	AllOK    bool
+}
+
+// ScenarioOutcome is the final verdict for one scenario across both systems.
+type ScenarioOutcome struct {
+	Scenario *Scenario
+	Pig      SystemResults
+	Pi       SystemResults
+	Failures []string // human-readable assertion failures, empty == pass
+	// SkipPerfGate is set by the test driver when the scenario ran under
+	// CPU contention (parallel mode). EvaluateOutcome will still record
+	// the runtime ratio for offline analysis but will NOT add it to
+	// Failures. Use `make parity-perf` to enforce the perf gate.
+	SkipPerfGate bool
+}
+
+// Passed is true when no assertion failed.
+func (o *ScenarioOutcome) Passed() bool { return len(o.Failures) == 0 }

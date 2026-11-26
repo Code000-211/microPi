@@ -1,0 +1,68 @@
+package coding
+
+import (
+	"slices"
+	"sync/atomic"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// Ports packages/coding-agent/src/core/agent-session.ts.
+// ScopedModel pairs a native cycling model with its optional thinking preference.
+type ScopedModel = extension.ScopedModel
+
+type sessionScopedModels struct {
+	value atomic.Pointer[[]ScopedModel]
+}
+
+// ScopedModels returns the current read-only cycling scope without copying its list or models. An empty scope means all available models.
+func (s *Session) ScopedModels() []ScopedModel {
+	if value := s.scopedModels.value.Load(); value != nil {
+		return *value
+	}
+	return []ScopedModel{}
+}
+
+// AvailableModelSnapshot returns the Session ModelRuntime's available models, each bound to its backend. Scope entries must come from it: a catalog descriptor carries no backend, so a model cycled to from such an entry fails prompt validation with agent.ErrNoModelSelected.
+// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:showModelsSelector (this.session.modelRuntime.getAvailableSnapshot())
+func (s *Session) AvailableModelSnapshot() []*ai.Model { return s.modelRuntime.GetAvailableSnapshot() }
+
+// SetScopedModels replaces the session-only cycling scope, retaining the supplied list and model identities without changing settings. Nil means an empty scope.
+func (s *Session) SetScopedModels(models []ScopedModel) {
+	if models == nil {
+		models = []ScopedModel{}
+	}
+	s.scopedModels.value.Store(&models)
+}
+
+// addPersistedDefaultToNonEmptyScope appends a missing default without mutating any previously returned list.
+// upstream: packages/coding-agent/src/core/agent-session.ts:_addPersistedDefaultToNonEmptyScope
+func (s *Session) addPersistedDefaultToNonEmptyScope(model *ai.Model) {
+	for {
+		previous := s.scopedModels.value.Load()
+		if previous == nil || len(*previous) == 0 {
+			return
+		}
+		if slices.ContainsFunc(*previous, func(entry ScopedModel) bool {
+			return entry.Model != nil && entry.Model.ID == model.ID && providerID(entry.Model) == providerID(model)
+		}) {
+			return
+		}
+		next := append(slices.Clone(*previous), ScopedModel{Model: model})
+		if s.scopedModels.value.CompareAndSwap(previous, &next) {
+			break
+		}
+	}
+	settings := s.SettingsManager()
+	enabled := settings.GetEnabledModels()
+	reference := providerID(model) + "/" + model.ID
+	if len(enabled) == 0 || slices.ContainsFunc(enabled, func(pattern string) bool { return jsstring.ToLower(pattern) == jsstring.ToLower(reference) }) {
+		return
+	}
+	enabled = append(slices.Clone(enabled), reference)
+	// A failed write is recorded by the settings manager, as Pi's setEnabledModels queues it.
+	// upstream: packages/coding-agent/src/core/settings-manager.ts:enqueueWrite
+	_ = settings.UpdateGlobal(func(value *Settings) { value.EnabledModels = enabled })
+}

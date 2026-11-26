@@ -1,0 +1,914 @@
+mod proxy;
+#[cfg(all(test, unix))]
+#[path = "provider_stream_shutdown_tests.rs"]
+mod stream_shutdown_tests;
+
+use crate::context::ModelEventStream;
+use crate::extension::RequestThreads;
+use crate::protocol::{CallMsg, Connection, Envelope, ProviderDef, RequestMsg};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+
+pub type ProviderModel = Arc<Value>;
+pub type ProviderResult<T> = Result<T, String>;
+pub type ProviderStreamFn = Arc<
+    dyn Fn(ProviderModel, Value, ProviderStreamOptions) -> ProviderResult<Arc<ModelEventStream>>
+        + Send
+        + Sync,
+>;
+/// One image or classifier operation of a provider: the model, the request context and the options, answered with the result object.
+pub type ProviderOperationFn = Arc<
+    dyn Fn(ProviderModel, Value, ProviderOperationOptions) -> ProviderResult<Value> + Send + Sync,
+>;
+/// The legacy `refreshModels` of a provider config: it refreshes the provider's models and returns the model definitions that replace the extension-provided ones, or `None` to leave them.
+pub type ProviderRefreshModelsFn =
+    Arc<dyn Fn(RefreshModelsContext) -> ProviderResult<Option<Vec<Value>>> + Send + Sync>;
+/// The legacy `streamSimple` of a provider config: it runs in the extension with the request's context and returns the provider's event stream.
+pub type ProviderStreamSimpleFn = Arc<
+    dyn Fn(&crate::Context, Value, Value, Value) -> ProviderResult<Arc<ModelEventStream>>
+        + Send
+        + Sync,
+>;
+pub type ProviderFilterFn = Arc<
+    dyn Fn(&[ProviderModel], Option<Value>) -> ProviderResult<Vec<ProviderModel>> + Send + Sync,
+>;
+type Callback = Arc<dyn Fn(Value) -> ProviderResult<Value> + Send + Sync>;
+type Callbacks = HashMap<String, Callback>;
+type APIKeyCheckFn =
+    Arc<dyn Fn(APIKeyAuthInput) -> ProviderResult<Option<AuthCheck>> + Send + Sync>;
+type ProviderPayloadHook = Arc<dyn Fn(Value, ProviderModel) -> ProviderResult<Value> + Send + Sync>;
+type ProviderEventHook = Arc<dyn Fn(Value, ProviderModel) -> ProviderResult<()> + Send + Sync>;
+type CancelDeferredFn =
+    Arc<dyn Fn(ProviderModel, Value, ProviderStreamOptions) -> ProviderResult<()> + Send + Sync>;
+type UpdateFn = Arc<dyn Fn() -> ProviderResult<()> + Send + Sync>;
+type MethodCallback = Arc<dyn Fn(&str, Value) -> ProviderResult<Value> + Send + Sync>;
+
+#[derive(Default)]
+struct SignalState {
+    cancelled: bool,
+    next: u64,
+    listeners: HashMap<u64, Arc<dyn Fn() + Send + Sync>>,
+}
+#[derive(Clone, Default)]
+pub struct ProviderSignal {
+    inner: Arc<(Mutex<SignalState>, Condvar)>,
+}
+/// Two signals are equal when they are the same signal: a clone is equal to its source.
+impl PartialEq for ProviderSignal {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+impl std::fmt::Debug for ProviderSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSignal")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+pub struct ProviderSignalSubscription {
+    signal: Weak<(Mutex<SignalState>, Condvar)>,
+    id: u64,
+}
+impl Drop for ProviderSignalSubscription {
+    fn drop(&mut self) {
+        if let Some(signal) = self.signal.upgrade() {
+            signal.0.lock().unwrap().listeners.remove(&self.id);
+        }
+    }
+}
+impl ProviderSignal {
+    /// How many handles share this signal, for the tests that show a holder keeps it alive.
+    #[cfg(test)]
+    pub(crate) fn holders(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.0.lock().unwrap().cancelled
+    }
+    pub fn cancel(&self) {
+        let callbacks = {
+            let mut state = self.inner.0.lock().unwrap();
+            if state.cancelled {
+                return;
+            }
+            state.cancelled = true;
+            self.inner.1.notify_all();
+            state
+                .listeners
+                .drain()
+                .map(|(_, callback)| callback)
+                .collect::<Vec<_>>()
+        };
+        for callback in callbacks {
+            callback()
+        }
+    }
+    pub fn on_cancel(&self, callback: Arc<dyn Fn() + Send + Sync>) {
+        let cancelled = {
+            let mut state = self.inner.0.lock().unwrap();
+            if !state.cancelled {
+                state.next += 1;
+                let id = state.next;
+                state.listeners.insert(id, callback.clone());
+                false
+            } else {
+                true
+            }
+        };
+        if cancelled {
+            callback()
+        }
+    }
+    pub fn wait(&self) {
+        let state = self.inner.0.lock().unwrap();
+        drop(self.inner.1.wait_while(state, |s| !s.cancelled).unwrap());
+    }
+    pub fn subscribe(&self, callback: Arc<dyn Fn() + Send + Sync>) -> ProviderSignalSubscription {
+        let (id, cancelled) = {
+            let mut state = self.inner.0.lock().unwrap();
+            state.next += 1;
+            let id = state.next;
+            state.listeners.insert(id, callback.clone());
+            (id, state.cancelled)
+        };
+        if cancelled {
+            callback()
+        }
+        ProviderSignalSubscription {
+            signal: Arc::downgrade(&self.inner),
+            id,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthContext {
+    pub env: Arc<dyn Fn(String) -> ProviderResult<Option<String>> + Send + Sync>,
+    pub file_exists: Arc<dyn Fn(String) -> ProviderResult<bool> + Send + Sync>,
+}
+#[derive(Clone)]
+pub struct APIKeyAuthInput {
+    pub ctx: AuthContext,
+    pub credential: Option<Value>,
+    pub signal: ProviderSignal,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AuthResult {
+    pub auth: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AuthCheck {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+#[derive(Clone)]
+pub struct AuthInteraction {
+    pub signal: ProviderSignal,
+    pub prompt: Arc<dyn Fn(Value) -> ProviderResult<String> + Send + Sync>,
+    pub notify: Arc<dyn Fn(Value) -> ProviderResult<()> + Send + Sync>,
+}
+/// Pi's LoginOptions (packages/ai/src/auth/types.ts:202-214), which the app passes to an OAuth login.
+#[derive(Clone, Default)]
+pub struct LoginOptions {
+    /// Returns the stable ID of this app installation. Call it only when the flow needs it: the app creates the ID on first use. None means the app supplies none.
+    pub get_device_id: Option<Arc<dyn Fn() -> ProviderResult<String> + Send + Sync>>,
+    /// The name the app introduces itself with during login; None means the flow's own default.
+    pub agent_name: Option<String>,
+}
+pub struct APIKeyAuth {
+    pub name: String,
+    pub check: Option<APIKeyCheckFn>,
+    pub resolve: Arc<dyn Fn(APIKeyAuthInput) -> ProviderResult<Option<AuthResult>> + Send + Sync>,
+    pub login: Option<Arc<dyn Fn(AuthInteraction) -> ProviderResult<Value> + Send + Sync>>,
+}
+pub struct OAuthAuth {
+    pub name: String,
+    pub is_subscription: Option<bool>,
+    pub login_label: Option<String>,
+    pub login: Arc<dyn Fn(AuthInteraction, LoginOptions) -> ProviderResult<Value> + Send + Sync>,
+    pub refresh: Arc<dyn Fn(Value, ProviderSignal) -> ProviderResult<Value> + Send + Sync>,
+    pub to_auth: Arc<dyn Fn(Value) -> ProviderResult<Value> + Send + Sync>,
+}
+#[derive(Default)]
+pub struct ProviderAuth {
+    pub api_key: Option<APIKeyAuth>,
+    pub oauth: Option<OAuthAuth>,
+}
+#[derive(Clone, Default)]
+pub struct ProviderStreamOptions {
+    pub signal: ProviderSignal,
+    pub values: Value,
+    pub on_payload: Option<ProviderPayloadHook>,
+    pub on_response: Option<ProviderEventHook>,
+    /// The caller's onProviderStreamEvent (upstream types.ts StreamOptions.onProviderStreamEvent). Pi's Models strips transformHeaders before Provider.stream (model-runtime.ts:671), so the options carry no transformHeaders.
+    pub on_provider_stream_event: Option<ProviderEventHook>,
+}
+/// What an image or classifier implementation receives besides the model and the request: the resolved request options, and the request's cancellation.
+#[derive(Clone, Default)]
+pub struct ProviderOperationOptions {
+    pub signal: ProviderSignal,
+    pub values: Value,
+}
+/// The image and classifier implementations of a provider config, keyed by API (upstream `ProviderConfig.images` and `ProviderConfig.classifiers`).
+#[derive(Default, Clone)]
+pub struct ProviderOperations {
+    pub images: Vec<(String, ProviderOperationFn)>,
+    pub classifiers: Vec<(String, ProviderOperationFn)>,
+    pub stream_simple: Option<ProviderStreamSimpleFn>,
+    pub refresh_models: Option<ProviderRefreshModelsFn>,
+}
+impl ProviderOperations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Adds the implementation of one image API.
+    pub fn images(
+        mut self,
+        api: impl Into<String>,
+        generate: impl Fn(ProviderModel, Value, ProviderOperationOptions) -> ProviderResult<Value>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.images.push((api.into(), Arc::new(generate)));
+        self
+    }
+    /// Sets the config's `refreshModels` (upstream `ProviderConfig.refreshModels`, types.ts:1930): the callback refreshes the provider's model list and returns the model definitions that replace the extension-provided models (`None` leaves them as they are). A catalog that should persist is published through `context.publish` while the callback runs.
+    pub fn refresh_models(
+        mut self,
+        handler: impl Fn(RefreshModelsContext) -> ProviderResult<Option<Vec<Value>>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.refresh_models = Some(Arc::new(handler));
+        self
+    }
+    /// Sets the config's `streamSimple`.
+    pub fn stream_simple(
+        mut self,
+        handler: impl Fn(&crate::Context, Value, Value, Value) -> ProviderResult<Arc<ModelEventStream>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.stream_simple = Some(Arc::new(handler));
+        self
+    }
+    /// Adds the implementation of one classifier API.
+    pub fn classifier(
+        mut self,
+        api: impl Into<String>,
+        classify: impl Fn(ProviderModel, Value, ProviderOperationOptions) -> ProviderResult<Value>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.classifiers.push((api.into(), Arc::new(classify)));
+        self
+    }
+}
+/// The implementations an extension holds for its provider configs, by provider name: the registrations the factory made and those made after it share one map, so a provider registered late runs exactly as one registered in the factory. The host asks for them through `provider_operation` and `provider_stream_simple` requests.
+#[derive(Default)]
+pub(crate) struct ProviderCallbacks {
+    held: Mutex<HashMap<String, ProviderOperations>>,
+}
+
+impl ProviderCallbacks {
+    /// Keeps the implementations of a registration and returns the declaration the host receives. A re-registration replaces only the kinds it defines, as registerProvider merges defined values (model-runtime.ts registerProvider) and the host keeps the APIs it wired.
+    pub(crate) fn declare(
+        &self,
+        name: String,
+        config: Value,
+        operations: ProviderOperations,
+    ) -> ProviderDef {
+        let mut image_apis: Vec<String> = operations
+            .images
+            .iter()
+            .map(|(api, _)| api.clone())
+            .collect();
+        let mut classifier_apis: Vec<String> = operations
+            .classifiers
+            .iter()
+            .map(|(api, _)| api.clone())
+            .collect();
+        image_apis.sort();
+        image_apis.dedup();
+        classifier_apis.sort();
+        classifier_apis.dedup();
+        let stream_simple = operations.stream_simple.is_some();
+        let refresh_models = operations.refresh_models.is_some();
+        let mut held = self.held.lock().unwrap();
+        if !(operations.images.is_empty()
+            && operations.classifiers.is_empty()
+            && !stream_simple
+            && !refresh_models)
+        {
+            let kept = held.entry(name.clone()).or_default();
+            if !operations.images.is_empty() {
+                kept.images = operations.images;
+            }
+            if !operations.classifiers.is_empty() {
+                kept.classifiers = operations.classifiers;
+            }
+            if operations.stream_simple.is_some() {
+                kept.stream_simple = operations.stream_simple;
+            }
+            if operations.refresh_models.is_some() {
+                kept.refresh_models = operations.refresh_models;
+            }
+        }
+        ProviderDef {
+            name,
+            config,
+            native: None,
+            stream_simple,
+            image_apis,
+            classifier_apis,
+            refresh_models,
+        }
+    }
+
+    /// What the extension holds for a provider, to restore it when the host refuses a registration.
+    pub(crate) fn held(&self, name: &str) -> Option<ProviderOperations> {
+        self.held.lock().unwrap().get(name).cloned()
+    }
+
+    /// Makes the extension hold exactly `kept` for a provider.
+    pub(crate) fn restore(&self, name: &str, kept: Option<ProviderOperations>) {
+        let mut held = self.held.lock().unwrap();
+        match kept {
+            Some(kept) => {
+                held.insert(name.to_string(), kept);
+            }
+            None => {
+                held.remove(name);
+            }
+        }
+    }
+
+    pub(crate) fn operation(
+        &self,
+        provider: &str,
+        images: bool,
+        api: &str,
+    ) -> Option<ProviderOperationFn> {
+        let held = self.held.lock().unwrap();
+        let operations = held.get(provider)?;
+        let implementations = if images {
+            &operations.images
+        } else {
+            &operations.classifiers
+        };
+        // A later implementation of the same API replaces an earlier one, as a repeated key of Pi's `images`/`classifiers` object does.
+        implementations
+            .iter()
+            .rev()
+            .find(|(name, _)| name == api)
+            .map(|(_, callback)| callback.clone())
+    }
+
+    pub(crate) fn stream_simple(&self, provider: &str) -> Option<ProviderStreamSimpleFn> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(provider)?
+            .stream_simple
+            .clone()
+    }
+
+    pub(crate) fn refresh_models(&self, provider: &str) -> Option<ProviderRefreshModelsFn> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(provider)?
+            .refresh_models
+            .clone()
+    }
+}
+
+pub struct ModelsPublication {
+    pub persist: Option<Value>,
+    pub update: Option<Arc<dyn Fn() -> ProviderResult<()> + Send + Sync>>,
+}
+pub struct RefreshModelsContext {
+    pub credential: Option<Value>,
+    pub stored: Option<Value>,
+    pub allow_network: bool,
+    pub force: Option<bool>,
+    pub signal: ProviderSignal,
+    pub publish: Arc<dyn Fn(ModelsPublication) -> ProviderResult<bool> + Send + Sync>,
+    /// The registered provider's base URL, including configuration overrides that wrappers apply outside the provider; `None` when it has none.
+    pub base_url: Option<String>,
+}
+pub struct Provider {
+    pub id: String,
+    pub name: String,
+    pub base_url: Option<String>,
+    pub headers: Option<Value>,
+    /// Pi `Provider.refreshModelsAuth`: `"credential"` (the default, also when `None`) or `"configured"`, which runs the network phase of a catalog refresh without the credential and without an OAuth refresh first.
+    pub refresh_models_auth: Option<String>,
+    pub auth: ProviderAuth,
+    pub get_models: Arc<dyn Fn() -> ProviderResult<Vec<ProviderModel>> + Send + Sync>,
+    pub filter_models: Option<ProviderFilterFn>,
+    /// Lists the models of every type; without it `get_models` does. Pi `Provider.getAllModels`.
+    pub get_all_models: Option<Arc<dyn Fn() -> ProviderResult<Vec<ProviderModel>> + Send + Sync>>,
+    /// Filters the models of every type by credential; without it `filter_models` filters the chat models. Pi `Provider.filterAllModels`.
+    pub filter_all_models: Option<ProviderFilterFn>,
+    pub refresh_models:
+        Option<Arc<dyn Fn(RefreshModelsContext) -> ProviderResult<()> + Send + Sync>>,
+    pub stream: ProviderStreamFn,
+    pub stream_simple: ProviderStreamFn,
+    pub fetch_deferred: Option<ProviderStreamFn>,
+    pub cancel_deferred: Option<CancelDeferredFn>,
+    /// The provider's image generation and classification, declared like its other methods.
+    pub generate_images: Option<ProviderOperationFn>,
+    pub classify: Option<ProviderOperationFn>,
+}
+
+#[derive(Default)]
+pub(crate) struct ProviderObjects {
+    native: Mutex<HashMap<String, Arc<Provider>>>,
+    proxies: Mutex<HashMap<String, (String, Weak<Provider>)>>,
+    callbacks: Mutex<HashMap<String, Callbacks>>,
+    updates: Mutex<HashMap<String, UpdateFn>>,
+    pub(crate) streams: crate::context::ModelStreams,
+    pub(crate) workers: Arc<RequestThreads>,
+}
+impl ProviderObjects {
+    fn key(&self) -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "provider-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+    pub(crate) fn release(&self, key: &str) {
+        self.native.lock().unwrap().remove(key);
+    }
+    pub(crate) fn clear(&self) {
+        self.native.lock().unwrap().clear();
+        self.proxies.lock().unwrap().clear();
+        self.callbacks.lock().unwrap().clear();
+        self.updates.lock().unwrap().clear();
+    }
+    pub(crate) fn register(&self, provider: Arc<Provider>) -> ProviderResult<ProviderDef> {
+        if provider.id.trim().is_empty() {
+            return Err("Provider id must not be empty".into());
+        }
+        let key = self.key();
+        let mut methods = vec!["getModels", "stream", "streamSimple"];
+        for (method, present) in [
+            ("getAllModels", provider.get_all_models.is_some()),
+            ("filterModels", provider.filter_models.is_some()),
+            ("filterAllModels", provider.filter_all_models.is_some()),
+            ("refreshModels", provider.refresh_models.is_some()),
+            ("fetchDeferred", provider.fetch_deferred.is_some()),
+            ("cancelDeferred", provider.cancel_deferred.is_some()),
+            ("generateImages", provider.generate_images.is_some()),
+            ("classify", provider.classify.is_some()),
+        ] {
+            if present {
+                methods.push(method)
+            }
+        }
+        let mut auth = json!({});
+        let mut oauth = Value::Null;
+        if let Some(method) = &provider.auth.api_key {
+            auth["apiKey"] = json!({"name":method.name});
+            methods.push("auth.apiKey.resolve");
+            if method.check.is_some() {
+                methods.push("auth.apiKey.check")
+            }
+            if method.login.is_some() {
+                methods.push("auth.apiKey.login")
+            }
+        }
+        if let Some(method) = &provider.auth.oauth {
+            auth["oauth"] = json!({"name":method.name});
+            if let Some(value) = method.is_subscription {
+                auth["oauth"]["isSubscription"] = json!(value)
+            }
+            if let Some(value) = &method.login_label {
+                auth["oauth"]["loginLabel"] = json!(value)
+            }
+            oauth = json!({"name":method.name,"isSubscription":method.is_subscription.unwrap_or(false),"has_login":true,"has_refresh":true,"has_get_api_key":true});
+            methods.extend([
+                "auth.oauth.login",
+                "auth.oauth.refresh",
+                "auth.oauth.toAuth",
+            ]);
+        }
+        let models = match &provider.get_all_models {
+            Some(all) => all(),
+            None => (provider.get_models)(),
+        }
+        .unwrap_or_default();
+        let mut native = json!({"id":provider.id,"key":key,"name":provider.name,"auth":auth,"models":models.iter().map(|m|m.as_ref()).collect::<Vec<_>>(),"methods":methods});
+        if let Some(value) = &provider.base_url {
+            native["baseUrl"] = json!(value)
+        }
+        if let Some(value) = &provider.headers {
+            native["headers"] = value.clone()
+        }
+        if let Some(value) = &provider.refresh_models_auth {
+            native["refreshModelsAuth"] = json!(value)
+        }
+        if !oauth.is_null() {
+            native["oauth"] = oauth
+        }
+        self.native.lock().unwrap().insert(key, provider.clone());
+        Ok(ProviderDef {
+            name: provider.id.clone(),
+            config: json!({}),
+            native: Some(native),
+            stream_simple: false,
+            image_apis: Vec::new(),
+            classifier_apis: Vec::new(),
+            refresh_models: false,
+        })
+    }
+    pub(crate) fn dispatch_callback(&self, request: &RequestMsg) -> ProviderResult<Value> {
+        let args = request.args.as_ref().ok_or("missing callback args")?;
+        let callback = self
+            .callbacks
+            .lock()
+            .unwrap()
+            .get(request.tool.as_deref().unwrap_or_default())
+            .and_then(|v| v.get(args["method"].as_str().unwrap_or_default()))
+            .cloned()
+            .ok_or("Provider callback is no longer active")?;
+        callback(args["params"].clone())
+    }
+    /// The RefreshModelsContext of a refresh request: `publish` sends the publication's persistence and the token of its update to the host as a publish callback of the request, and the host runs the update here by token (the `update` provider_sync request) while it applies the publication.
+    fn refresh_context(
+        self: &Arc<Self>,
+        callback: MethodCallback,
+        params: &Value,
+        signal: ProviderSignal,
+    ) -> RefreshModelsContext {
+        let state = self.clone();
+        let publish = Arc::new(move |publication: ModelsPublication| {
+            let token = state.key();
+            let mut value = json!({"publication":{}});
+            if let Some(persist) = publication.persist {
+                value["publication"]["persist"] = persist
+            }
+            if let Some(update) = publication.update {
+                state.updates.lock().unwrap().insert(token.clone(), update);
+                value["token"] = json!(token)
+            }
+            let result = callback("publish", value);
+            state.updates.lock().unwrap().remove(&token);
+            serde_json::from_value(result?).map_err(|e| e.to_string())
+        });
+        RefreshModelsContext {
+            credential: optional(&params["credential"]),
+            stored: optional(&params["stored"]),
+            allow_network: params["allowNetwork"].as_bool().unwrap_or(false),
+            force: params["force"].as_bool(),
+            base_url: params["baseUrl"].as_str().map(str::to_owned),
+            signal,
+            publish,
+        }
+    }
+    /// Runs the `refreshModels` of a provider config (types.ts:1930) for the `provider_operation` request `id`: its context's publish calls reach the host as callbacks of that request, and the models it returns (null for none) are the answer.
+    pub(crate) fn refresh_config(
+        self: &Arc<Self>,
+        conn: &Arc<Connection>,
+        id: &str,
+        provider: &str,
+        context: &Value,
+        signal: ProviderSignal,
+        refresh: &ProviderRefreshModelsFn,
+    ) -> ProviderResult<Value> {
+        let callback: MethodCallback = {
+            let conn = conn.clone();
+            let parent = id.to_owned();
+            let key = provider.to_owned();
+            Arc::new(move |method, params| {
+                call_value(
+                    &conn,
+                    Some(&parent),
+                    "provider.callback",
+                    json!({"provider":key,"method":method,"params":params}),
+                )
+            })
+        };
+        let models = refresh(self.refresh_context(callback, context, signal))?;
+        Ok(models.map_or(Value::Null, Value::Array))
+    }
+    pub(crate) fn dispatch(
+        self: &Arc<Self>,
+        conn: &Arc<Connection>,
+        id: &str,
+        request: &RequestMsg,
+        signal: ProviderSignal,
+    ) -> ProviderResult<Value> {
+        let args = request.args.as_ref().ok_or("missing Provider args")?;
+        let method = args["method"].as_str().ok_or("missing Provider method")?;
+        let params = &args["params"];
+        if method == "update" {
+            let update = self
+                .updates
+                .lock()
+                .unwrap()
+                .get(params["token"].as_str().unwrap_or_default())
+                .cloned()
+                .ok_or("Provider publication is no longer active")?;
+            update()?;
+            return Ok(Value::Null);
+        }
+        let key = request.tool.as_deref().unwrap_or_default();
+        let provider = self
+            .native
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or("Provider object is no longer registered")?;
+        let callback: MethodCallback = {
+            let conn = conn.clone();
+            let parent = id.to_owned();
+            let key = key.to_owned();
+            Arc::new(move |method, params| {
+                call_value(
+                    &conn,
+                    Some(&parent),
+                    "provider.callback",
+                    json!({"provider":key,"method":method,"params":params}),
+                )
+            })
+        };
+        let input = APIKeyAuthInput {
+            credential: optional(&params["credential"]),
+            signal: signal.clone(),
+            ctx: AuthContext {
+                env: {
+                    let callback = callback.clone();
+                    Arc::new(move |name| {
+                        serde_json::from_value(callback("env", json!({"name":name}))?)
+                            .map_err(|e| e.to_string())
+                    })
+                },
+                file_exists: {
+                    let callback = callback.clone();
+                    Arc::new(move |path| {
+                        serde_json::from_value(callback("fileExists", json!({"path":path}))?)
+                            .map_err(|e| e.to_string())
+                    })
+                },
+            },
+        };
+        let interaction = AuthInteraction {
+            signal: signal.clone(),
+            prompt: {
+                let callback = callback.clone();
+                Arc::new(move |prompt| {
+                    serde_json::from_value(callback("prompt", json!({"prompt":prompt}))?)
+                        .map_err(|e| e.to_string())
+                })
+            },
+            notify: {
+                let callback = callback.clone();
+                Arc::new(move |event| {
+                    callback("notify", json!({"event":event}))?;
+                    Ok(())
+                })
+            },
+        };
+        match method {
+            "getModels" => Ok(json!(
+                (provider.get_models)()?
+                    .iter()
+                    .map(|m| m.as_ref())
+                    .collect::<Vec<_>>()
+            )),
+            "getAllModels" => Ok(json!(
+                provider
+                    .get_all_models
+                    .as_ref()
+                    .ok_or("getAllModels absent")?()?
+                .iter()
+                .map(|m| m.as_ref())
+                .collect::<Vec<_>>()
+            )),
+            "filterModels" | "filterAllModels" => {
+                let models = params["models"]
+                    .as_array()
+                    .ok_or("models must be an array")?
+                    .iter()
+                    .cloned()
+                    .map(Arc::new)
+                    .collect::<Vec<_>>();
+                let filter = if method == "filterAllModels" {
+                    &provider.filter_all_models
+                } else {
+                    &provider.filter_models
+                };
+                let result = filter.as_ref().ok_or("filter absent")?(
+                    &models,
+                    optional(&params["credential"]),
+                )?;
+                let indices = result
+                    .iter()
+                    .map(|model| {
+                        models
+                            .iter()
+                            .position(|input| Arc::ptr_eq(model, input))
+                            .map(|i| i as i64)
+                            .unwrap_or(-1)
+                    })
+                    .collect::<Vec<_>>();
+                Ok(
+                    json!({"models":result.iter().map(|m|m.as_ref()).collect::<Vec<_>>(),"indices":indices}),
+                )
+            }
+            "auth.apiKey.check" => {
+                serde_json::to_value(provider
+                    .auth
+                    .api_key
+                    .as_ref()
+                    .ok_or("apiKey absent")?
+                    .check
+                    .as_ref()
+                    .ok_or("check absent")?(input)?)
+                .map_err(|e| e.to_string())
+            }
+            "auth.apiKey.resolve" => serde_json::to_value((provider
+                .auth
+                .api_key
+                .as_ref()
+                .ok_or("apiKey absent")?
+                .resolve)(input)?)
+            .map_err(|e| e.to_string()),
+            "auth.apiKey.login" => provider
+                .auth
+                .api_key
+                .as_ref()
+                .ok_or("apiKey absent")?
+                .login
+                .as_ref()
+                .ok_or("login absent")?(interaction),
+            "auth.oauth.login" => {
+                // The host lists the LoginOptions the app supplies; get_device_id stays a call back to it.
+                let wire = &params["options"];
+                let options = LoginOptions {
+                    get_device_id: (wire["getDeviceId"] == json!(true)).then(|| {
+                        let callback = callback.clone();
+                        Arc::new(move || {
+                            serde_json::from_value(callback("getDeviceId", json!({}))?)
+                                .map_err(|e| e.to_string())
+                        })
+                            as Arc<dyn Fn() -> ProviderResult<String> + Send + Sync>
+                    }),
+                    agent_name: wire["agentName"].as_str().map(str::to_owned),
+                };
+                (provider.auth.oauth.as_ref().ok_or("oauth absent")?.login)(interaction, options)
+            }
+            "auth.oauth.refresh" => (provider.auth.oauth.as_ref().ok_or("oauth absent")?.refresh)(
+                params["credential"].clone(),
+                signal,
+            ),
+            "auth.oauth.toAuth" => (provider.auth.oauth.as_ref().ok_or("oauth absent")?.to_auth)(
+                params["credential"].clone(),
+            ),
+            "refreshModels" => {
+                provider
+                    .refresh_models
+                    .as_ref()
+                    .ok_or("refreshModels absent")?(
+                    self.refresh_context(callback, params, signal),
+                )?;
+                Ok(Value::Null)
+            }
+            "stream" | "streamSimple" | "fetchDeferred" | "cancelDeferred" => {
+                if params["aborted"] == true {
+                    signal.cancel()
+                }
+                let mut options = ProviderStreamOptions {
+                    values: params["options"].clone(),
+                    signal,
+                    ..Default::default()
+                };
+                let flags = params["callbacks"].as_array().cloned().unwrap_or_default();
+                if flags.contains(&json!("onPayload")) {
+                    let callback = callback.clone();
+                    options.on_payload = Some(Arc::new(move |value, model| {
+                        callback("onPayload", json!({"value":value,"model":model.as_ref()}))
+                    }))
+                }
+                if flags.contains(&json!("onResponse")) {
+                    let callback = callback.clone();
+                    options.on_response = Some(Arc::new(move |value, model| {
+                        callback("onResponse", json!({"value":value,"model":model.as_ref()}))?;
+                        Ok(())
+                    }))
+                }
+                if flags.contains(&json!("onProviderStreamEvent")) {
+                    let callback = callback.clone();
+                    options.on_provider_stream_event = Some(Arc::new(move |value, model| {
+                        callback(
+                            "onProviderStreamEvent",
+                            json!({"value":value,"model":model.as_ref()}),
+                        )?;
+                        Ok(())
+                    }))
+                }
+                let model = Arc::new(params["model"].clone());
+                if method == "cancelDeferred" {
+                    provider
+                        .cancel_deferred
+                        .as_ref()
+                        .ok_or("cancelDeferred absent")?(
+                        model, params["handle"].clone(), options
+                    )?;
+                    return Ok(Value::Null);
+                }
+                let implementation = match method {
+                    "stream" => &provider.stream,
+                    "streamSimple" => &provider.stream_simple,
+                    _ => provider
+                        .fetch_deferred
+                        .as_ref()
+                        .ok_or("fetchDeferred absent")?,
+                };
+                let stream = implementation(
+                    model,
+                    if method == "fetchDeferred" {
+                        params["handle"].clone()
+                    } else {
+                        params["context"].clone()
+                    },
+                    options,
+                )?;
+                conn.notify(
+                    "tool_update",
+                    Some(json!({"request_id":id,"result":{"type":"provider_started"}})),
+                )
+                .map_err(|e| e.to_string())?;
+                stream.forward(&conn.closed_signal, |event| {
+                    conn.notify("tool_update", Some(json!({"request_id":id,"result":event})))
+                        .map_err(|error| error.to_string())
+                })?;
+                Ok(Value::Null)
+            }
+            "generateImages" | "classify" => {
+                let implementation = if method == "generateImages" {
+                    provider.generate_images.as_ref()
+                } else {
+                    provider.classify.as_ref()
+                }
+                .ok_or_else(|| format!("Provider has no {method}"))?;
+                implementation(
+                    Arc::new(params["model"].clone()),
+                    params["context"].clone(),
+                    ProviderOperationOptions {
+                        signal,
+                        values: params["options"].clone(),
+                    },
+                )
+            }
+            _ => Err(format!("Unknown Provider method {method}")),
+        }
+    }
+}
+fn optional(value: &Value) -> Option<Value> {
+    (!value.is_null()).then(|| value.clone())
+}
+fn call_value(
+    conn: &Connection,
+    parent: Option<&str>,
+    method: &str,
+    args: Value,
+) -> ProviderResult<Value> {
+    let result = conn
+        .call_for(parent, method, Some(args))
+        .map_err(|e| e.to_string())?;
+    result_value(result)
+}
+fn result_value(result: crate::protocol::CallResultMsg) -> ProviderResult<Value> {
+    if let Some(error) = result.error {
+        Err(error.message)
+    } else {
+        Ok(result.result.unwrap_or(Value::Null))
+    }
+}

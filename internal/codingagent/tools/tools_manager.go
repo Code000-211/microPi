@@ -1,0 +1,644 @@
+// Package tools: fd/rg installer.
+//
+// This file ports the download/extract pipeline from upstream
+// packages/coding-agent/src/utils/tools-manager.ts. The pipeline ensures
+// that fd and rg are available even when the user has not installed them
+// via the system package manager:
+//
+//  1. EnsureTool first checks <agentDir>/bin/<binary> (local install),
+//  2. then PATH (system install),
+//  3. then, if neither is found and we're online and not on Android/Termux,
+//     downloads the appropriate platform asset from GitHub Releases,
+//     extracts it, and installs the binary into <agentDir>/bin.
+//
+// The asset table selects platform-specific release archives. On darwin/x64, fd uses a pinned release.
+//
+// Extraction divergence (D14: documented in docs/parity/DIVERGENCES.md): upstream
+// spawns `tar`, `unzip`, and PowerShell. pig uses Go stdlib
+// (archive/tar + compress/gzip + archive/zip) on all platforms. The
+// extracted binary is byte-identical; only the error message text on
+// extraction failure differs.
+package tools
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/managementhttp"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
+	_ "github.com/MichaelKinsy/PiG/internal/tlsdistrust" // hardens http.DefaultTransport, which the tool downloads use (pig additive (D191))
+)
+
+const (
+	toolsNetworkTimeout  = 10 * time.Second
+	toolsDownloadTimeout = 120 * time.Second
+)
+
+// toolConfig mirrors upstream ToolConfig (tools-manager.ts:20–27).
+type toolConfig struct {
+	Name              string
+	Repo              string   // GitHub repo (e.g. "sharkdp/fd")
+	BinaryName        string   // Name of the binary inside the archive
+	SystemBinaryNames []string // Alternative system command names to try
+	TagPrefix         string   // Prefix for tags ("v" or "")
+	// GetAssetName returns the release asset filename for a release target
+	// (releaseTarget's suffix). Matches upstream (version, target) → string.
+	GetAssetName func(version, target string) string
+}
+
+// toolsTable selects fd and rg release archives for each platform.
+// Linux selects the musl archive for both tools on every architecture.
+var toolsTable = map[string]toolConfig{
+	"fd": {
+		Name:              "fd",
+		Repo:              "sharkdp/fd",
+		BinaryName:        "fd",
+		SystemBinaryNames: []string{"fd", "fdfind"},
+		TagPrefix:         "v",
+		GetAssetName:      func(version, target string) string { return "fd-v" + version + "-" + target },
+	},
+	"rg": {
+		Name:         "ripgrep",
+		Repo:         "BurntSushi/ripgrep",
+		BinaryName:   "rg",
+		TagPrefix:    "",
+		GetAssetName: func(version, target string) string { return "ripgrep-" + version + "-" + target },
+	},
+}
+
+// releaseTarget mirrors upstream getReleaseTarget: the release target suffix shared by fd and ripgrep, or ""
+// when the platform or architecture has no prebuilt archive. Only x64 and arm64 are mapped; any other
+// architecture (ARM32, ia32, riscv64) must not fall back to an x86-64 binary (Pi #11209).
+func releaseTarget(plat, architecture string) string {
+	var archStr string
+	switch architecture {
+	case "arm64", "aarch64":
+		archStr = "aarch64"
+	case "x64", "amd64", "x86_64":
+		archStr = "x86_64"
+	default:
+		return ""
+	}
+	switch plat {
+	case "darwin":
+		return archStr + "-apple-darwin.tar.gz"
+	case "linux":
+		return archStr + "-unknown-linux-musl.tar.gz"
+	case "windows", "win32":
+		return archStr + "-pc-windows-msvc.zip"
+	}
+	return ""
+}
+
+// termuxPackages mirrors upstream TERMUX_PACKAGES (tools-manager.ts:339).
+var termuxPackages = map[string]string{
+	"fd": "fd",
+	"rg": "ripgrep",
+}
+
+// ToolsManager provides the download/install pipeline for fd and rg.
+// It is parameterised on the agent dir so tests can use a tempdir.
+//
+// Concurrent EnsureTool calls for the same tool deduplicate downloads
+// via the singleflight in-flight map.
+type ToolsManager struct {
+	agentDir string
+
+	mu       sync.Mutex
+	inflight map[string]chan struct{}
+
+	// httpClient is the client used for GitHub API and asset downloads.
+	// Tests may override this to point at a fake server.
+	httpClient *http.Client
+
+	// releaseBaseURL is the GitHub web origin that serves both the
+	// releases/latest redirect and the asset downloads. Tests may override it
+	// to point at a local server. Default: "https://github.com".
+	releaseBaseURL string
+
+	// platform/arch overrides for testing. Empty means use runtime values.
+	platformOverride string
+	archOverride     string
+
+	// beforeInflightLock, when set by a test, runs after BeginEnsureTool's first
+	// installed-tool lookup misses and before it takes the in-flight lock.
+	beforeInflightLock func(tool string)
+}
+
+// NewToolsManager constructs a manager rooted at agentDir.
+func NewToolsManager(agentDir string) *ToolsManager {
+	return &ToolsManager{
+		agentDir:       agentDir,
+		inflight:       map[string]chan struct{}{},
+		httpClient:     &http.Client{Timeout: toolsDownloadTimeout},
+		releaseBaseURL: "https://github.com",
+	}
+}
+
+// BinDir returns <agentDir>/bin (mirrors upstream getBinDir).
+func (m *ToolsManager) BinDir() string {
+	return filepath.Join(m.agentDir, "bin")
+}
+
+func (m *ToolsManager) platform() string {
+	if m.platformOverride != "" {
+		return m.platformOverride
+	}
+	// Map Go's runtime.GOOS to Node's process.platform vocabulary so the
+	// asset-name table can be shared.
+	switch runtime.GOOS {
+	case "windows":
+		return "win32"
+	case "android":
+		return "android"
+	}
+	return runtime.GOOS // "darwin", "linux"
+}
+
+func (m *ToolsManager) arch() string {
+	if m.archOverride != "" {
+		return m.archOverride
+	}
+	if runtime.GOARCH == "amd64" {
+		return "x64"
+	}
+	return runtime.GOARCH // "arm64"
+}
+
+// GetToolPath mirrors upstream getToolPath (tools-manager.ts:80).
+// Returns the path to the tool, or "" if not found.
+//
+// Lookup order:
+//  1. <agentDir>/bin/<binary>[.exe] (local install)
+//  2. systemBinaryNames in PATH that pass the --version identity probe
+//     (see LookupToolPath)
+func (m *ToolsManager) GetToolPath(tool string) string {
+	config, ok := toolsTable[tool]
+	if !ok {
+		return ""
+	}
+	binExt := ""
+	if m.platform() == "win32" {
+		binExt = ".exe"
+	}
+	localPath := filepath.Join(m.BinDir(), config.BinaryName+binExt)
+	if _, err := os.Stat(localPath); err == nil {
+		return localPath
+	}
+	return systemToolPath(tool, systemToolConfigs[tool])
+}
+
+// ToolStatus mirrors upstream ToolStatus: progress and failures EnsureTool
+// reports instead of printing. Type is "info" or "warning".
+type ToolStatus struct {
+	Type    string
+	Message string
+}
+
+// EnsureTool mirrors upstream ensureTool: it returns the tool's path, or "" when unavailable. It reports progress and failures through onStatus (nil discards them), never writes to the console, and includes up to five distinct cause messages in download warnings.
+func (m *ToolsManager) EnsureTool(ctx context.Context, tool string, onStatus func(ToolStatus)) string {
+	path, download := m.BeginEnsureTool(tool, onStatus)
+	if download == nil {
+		return path
+	}
+	return download(ctx, onStatus)
+}
+
+// BeginEnsureTool runs upstream ensureTool up to its first await on the caller: it resolves a present tool, reports why a missing one is not downloaded, or reports that its download starts. download is nil when ensureTool settles without awaiting; otherwise the caller must call it, and it finishes the download (or waits for this manager's download of the same tool) and reports the result through its onStatus.
+func (m *ToolsManager) BeginEnsureTool(tool string, onStatus func(ToolStatus)) (path string, download func(ctx context.Context, onStatus func(ToolStatus)) string) {
+	if existing := m.GetToolPath(tool); existing != "" {
+		return existing, nil
+	}
+	config, ok := toolsTable[tool]
+	if !ok {
+		return "", nil
+	}
+
+	if IsOfflineModeEnabled() {
+		reportToolStatus(onStatus, "warning", config.Name+" not found. Offline mode enabled, skipping download.")
+		return "", nil
+	}
+	if m.platform() == "android" {
+		pkg := termuxPackages[tool]
+		if pkg == "" {
+			pkg = tool
+		}
+		reportToolStatus(onStatus, "warning", config.Name+" not found. Install with: pkg install "+pkg)
+		return "", nil
+	}
+
+	// Prebuilt downloads only exist for the targets mapped in releaseTarget.
+	if releaseTarget(m.platform(), m.arch()) == "" {
+		reportToolStatus(onStatus, "warning", fmt.Sprintf("%s not found. Automatic download is not supported on %s/%s. Install %s with your system package manager.", config.Name, m.platform(), m.arch(), config.Name))
+		return "", nil
+	}
+
+	// pig additive (D81): coalesce same-tool downloads within this manager.
+	if m.beforeInflightLock != nil {
+		m.beforeInflightLock(tool)
+	}
+	m.mu.Lock()
+	if ch, busy := m.inflight[tool]; busy {
+		m.mu.Unlock()
+		return "", func(ctx context.Context, _ func(ToolStatus)) string {
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return ""
+			}
+			return m.GetToolPath(tool)
+		}
+	}
+	// A download that finished after the check above has already installed
+	// the tool and cleared its in-flight entry; look again under the lock so
+	// a late caller uses that install instead of downloading it a second time.
+	if existing := m.GetToolPath(tool); existing != "" {
+		m.mu.Unlock()
+		return existing, nil
+	}
+	ch := make(chan struct{})
+	m.inflight[tool] = ch
+	m.mu.Unlock()
+
+	reportToolStatus(onStatus, "info", config.Name+" not found. Downloading...")
+	return "", func(ctx context.Context, onStatus func(ToolStatus)) string {
+		defer func() {
+			m.mu.Lock()
+			delete(m.inflight, tool)
+			close(ch)
+			m.mu.Unlock()
+		}()
+		path, err := m.downloadTool(ctx, tool)
+		if err != nil {
+			reportToolStatus(onStatus, "warning", "Failed to download "+config.Name+": "+toolFailureMessage(err))
+			return ""
+		}
+		reportToolStatus(onStatus, "info", config.Name+" installed to "+path)
+		return path
+	}
+}
+
+func reportToolStatus(onStatus func(ToolStatus), kind, message string) {
+	if onStatus != nil {
+		onStatus(ToolStatus{Type: kind, Message: message})
+	}
+}
+
+// toolFailureMessage joins distinct cause messages in order. Go wrappers often already append their cause text; remove that suffix before joining so the same cause is not printed twice.
+func toolFailureMessage(err error) string {
+	var messages []string
+	// upstream: packages/coding-agent/src/utils/tools-manager.ts:ensureTool
+	for depth := 0; err != nil && depth < 5; depth++ {
+		message := err.Error()
+		cause := errors.Unwrap(err)
+		if cause != nil {
+			message = strings.TrimSuffix(message, ": "+cause.Error())
+		}
+		if !slices.Contains(messages, message) {
+			messages = append(messages, message)
+		}
+		err = cause
+	}
+	return strings.Join(messages, ": ")
+}
+
+// IsOfflineModeEnabled mirrors the env-var check used elsewhere in pig.
+// Duplicated here (instead of imported from cmd/pig) because tools is a
+// lower-level package that cannot depend on the CLI.
+func IsOfflineModeEnabled() bool {
+	// tools-manager.ts compares PI_OFFLINE exactly; PIG_OFFLINE is PiG's alias.
+	if v := os.Getenv("PI_OFFLINE"); v != "" {
+		l := jsstring.ToLower(v)
+		if v == "1" || l == "true" || l == "yes" {
+			return true
+		}
+	}
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("PIG_OFFLINE")))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+// getLatestVersion mirrors upstream getLatestVersion (tools-manager.ts). It
+// resolves the version from the releases/latest redirect on the web origin,
+// which, unlike the api.github.com endpoint, costs no anonymous API quota.
+// Returns the tag with one leading "v" stripped.
+func (m *ToolsManager) getLatestVersion(ctx context.Context, repo string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.releaseBaseURL+"/"+repo+"/releases/latest", nil)
+	if err != nil {
+		return "", err
+	}
+	// tools-manager.ts getLatestVersion sends getPiUserAgent(VERSION), the detailed identity User-Agent (D65).
+	req.Header.Set("User-Agent", ai.FormatUserAgent(nil))
+	// redirect: "manual": only the status and Location matter.
+	client := *m.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := managementhttp.FetchWithRetry(&client, req, managementhttp.FetchRetryOptions{Timeout: toolsNetworkTimeout})
+	if err != nil {
+		return "", err
+	}
+	// Only the headers matter. Like Response.body.cancel upstream, close
+	// without reading a potentially unbounded redirect body.
+	_ = resp.Body.Close()
+
+	location := ""
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		location = resp.Header.Get("Location")
+	}
+	if location == "" {
+		return "", fmt.Errorf("Failed to resolve latest %s release: HTTP %d without redirect", repo, resp.StatusCode)
+	}
+	return latestReleaseTagVersion(repo, location)
+}
+
+// latestReleaseTagVersion mirrors the upstream redirect parsing: resolve the
+// Location against https://github.com, take the last path segment, and require
+// a /releases/tag/ target.
+func latestReleaseTagVersion(repo, location string) (string, error) {
+	resolved, err := nodeurl.ResolveURL(location, "https://github.com")
+	if err != nil {
+		return "", err
+	}
+	pathname := resolved.Pathname
+	segments := strings.Split(pathname, "/")
+	last := segments[len(segments)-1]
+	if last == "" || !strings.Contains(location, "/releases/tag/") {
+		return "", fmt.Errorf("Failed to resolve latest %s release: unexpected redirect to %s", repo, location)
+	}
+	tag, err := nodeurl.DecodeURIComponent(last)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(tag, "v"), nil
+}
+
+// downloadFile mirrors upstream downloadFile (tools-manager.ts).
+func (m *ToolsManager) downloadFile(ctx context.Context, rawURL, dest string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := managementhttp.FetchWithRetry(m.httpClient, req, managementhttp.FetchRetryOptions{Timeout: toolsDownloadTimeout})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Download failed with HTTP %d: %s", resp.StatusCode, rawURL)
+	}
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return err
+	}
+	return nil
+}
+
+// findBinaryRecursively mirrors upstream findBinaryRecursively
+// (tools-manager.ts:144). Returns the full path or "".
+func findBinaryRecursively(rootDir, binaryFileName string) string {
+	var found string
+	_ = filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() && d.Name() == binaryFileName {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// localArchiveEntry reports whether an archive entry name stays inside the
+// extraction directory: relative, and with no ".." anywhere in it (the fd and
+// rg archives never use one).
+func localArchiveEntry(name string) bool {
+	return !strings.Contains(name, "..") && filepath.IsLocal(filepath.FromSlash(name))
+}
+
+// pig divergence (D14): use Go archive readers. Ignore links that the fd and
+// rg binaries do not require.
+func extractTarGz(archivePath, extractDir string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !localArchiveEntry(hdr.Name) {
+			return fmt.Errorf("tar entry escapes extract dir: %s", hdr.Name)
+		}
+		target := filepath.Join(extractDir, hdr.Name)
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&0o777)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, tr); err != nil {
+				_ = out.Close()
+				return err
+			}
+			_ = out.Close()
+		case tar.TypeSymlink, tar.TypeLink:
+			continue
+		}
+	}
+}
+
+// pig divergence (D14): use Go's ZIP reader instead of external tools.
+func extractZip(archivePath, extractDir string) error {
+	r, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = r.Close() }()
+	for _, f := range r.File {
+		if !localArchiveEntry(f.Name) {
+			return fmt.Errorf("zip entry escapes extract dir: %s", f.Name)
+		}
+		target := filepath.Join(extractDir, f.Name)
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, f.Mode().Perm())
+		if err != nil {
+			_ = rc.Close()
+			return err
+		}
+		if _, err := io.Copy(out, rc); err != nil {
+			_ = rc.Close()
+			_ = out.Close()
+			return err
+		}
+		_ = rc.Close()
+		_ = out.Close()
+	}
+	return nil
+}
+
+// downloadTool mirrors upstream downloadTool (tools-manager.ts:247).
+func (m *ToolsManager) downloadTool(ctx context.Context, tool string) (string, error) {
+	config, ok := toolsTable[tool]
+	if !ok {
+		return "", fmt.Errorf("Unknown tool: %s", tool)
+	}
+	plat := m.platform()
+	architecture := m.arch()
+	target := releaseTarget(plat, architecture)
+	if target == "" {
+		return "", fmt.Errorf("Unsupported platform: %s/%s", plat, architecture)
+	}
+
+	// fd is pinned on darwin/x64, so skip the version lookup there.
+	version := "10.3.0"
+	if tool != "fd" || plat != "darwin" || architecture != "x64" {
+		var err error
+		version, err = m.getLatestVersion(ctx, config.Repo)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	assetName := config.GetAssetName(version, target)
+
+	if err := os.MkdirAll(m.BinDir(), 0o755); err != nil {
+		return "", err
+	}
+
+	downloadURL := fmt.Sprintf("%s/%s/releases/download/%s%s/%s",
+		m.releaseBaseURL, config.Repo, config.TagPrefix, version, assetName)
+	archivePath := filepath.Join(m.BinDir(), assetName)
+	binExt := ""
+	if plat == "win32" {
+		binExt = ".exe"
+	}
+	binaryFileName := config.BinaryName + binExt
+	binaryPath := filepath.Join(m.BinDir(), binaryFileName)
+
+	if err := m.downloadFile(ctx, downloadURL, archivePath); err != nil {
+		return "", err
+	}
+
+	// Unique temp dir so concurrent EnsureTool calls don't collide,
+	// mirroring upstream's `extract_tmp_<bin>_<pid>_<ms>_<rand>` pattern.
+	extractDir, err := os.MkdirTemp(m.BinDir(), fmt.Sprintf("extract_tmp_%s_", config.BinaryName))
+	if err != nil {
+		_ = os.Remove(archivePath)
+		return "", err
+	}
+	defer func() {
+		_ = os.Remove(archivePath)
+		_ = os.RemoveAll(extractDir)
+	}()
+
+	switch {
+	case strings.HasSuffix(assetName, ".tar.gz"):
+		if err := extractTarGz(archivePath, extractDir); err != nil {
+			return "", fmt.Errorf("Failed to extract %s: %w", assetName, err)
+		}
+	case strings.HasSuffix(assetName, ".zip"):
+		if err := extractZip(archivePath, extractDir); err != nil {
+			return "", fmt.Errorf("Failed to extract %s: %w", assetName, err)
+		}
+	default:
+		return "", fmt.Errorf("Unsupported archive format: %s", assetName)
+	}
+
+	// Probe the conventional nested dir first (fast path), then walk.
+	nestedDir := filepath.Join(extractDir, strings.TrimSuffix(strings.TrimSuffix(assetName, ".tar.gz"), ".zip"))
+	candidates := []string{
+		filepath.Join(nestedDir, binaryFileName),
+		filepath.Join(extractDir, binaryFileName),
+	}
+	var extractedBinary string
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			extractedBinary = c
+			break
+		}
+	}
+	if extractedBinary == "" {
+		extractedBinary = findBinaryRecursively(extractDir, binaryFileName)
+	}
+	if extractedBinary == "" {
+		return "", fmt.Errorf("Binary not found in archive: expected %s under %s", binaryFileName, extractDir)
+	}
+
+	// Move into place. Use os.Rename when possible; fall back to copy when
+	// crossing filesystems.
+	if err := os.Rename(extractedBinary, binaryPath); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			if cerr := copyFile(extractedBinary, binaryPath); cerr != nil {
+				return "", cerr
+			}
+		}
+	}
+	if plat != "win32" {
+		_ = os.Chmod(binaryPath, 0o755)
+	}
+	return binaryPath, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+	_, err = io.Copy(out, in)
+	return err
+}

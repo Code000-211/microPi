@@ -1,0 +1,498 @@
+package coding
+
+// Ports packages/coding-agent/src/core/agent-session.ts (_installAgentToolHooks).
+// Ports packages/coding-agent/src/core/sdk.ts (the context, before_provider_request and before_provider_headers hooks of createAgent).
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"reflect"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	"github.com/MichaelKinsy/PiG/internal/boundarywire"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// installExtensionHooks installs the Session's extension hooks on its agent,
+// once, for every mode. Mirrors upstream AgentSession._installAgentToolHooks
+// (agent-session.ts:529-590): each hook reads the current runner and checks
+// hasHandlers at call time, so a runner swapped by reload, or a handler added
+// after the Session started, is honored without reinstalling anything.
+//
+// The context, before_provider_request and before_provider_headers hooks are sdk.ts createAgent's options, not AgentSession's, so an Agent the caller supplied (SessionOptions.Agent) keeps its own transformContext, onPayload and header hook, as Pi's AgentSession leaves them (agent-session.ts:486,514-519).
+func (s *Session) installExtensionHooks(agentSupplied bool) {
+	s.agent.AddBeforeToolCallHook(s.extensionToolCallHook)
+	s.agent.AddAfterToolCallHook(s.extensionToolResultHook)
+	if agentSupplied {
+		return
+	}
+	// sdk.ts installs transformContext and onPayload on the Agent for every mode.
+	s.agent.SetTransformContextWithContext(s.extensionContextHook)
+	s.agent.SetBeforeProviderHook(s.extensionProviderRequestHook)
+	s.agent.SetTransformHeaders(s.extensionProviderHeadersHook)
+	// sdk.ts:432-434 createAgent: onResponse and onProviderStreamEvent are Agent options, so they reach the agent's own requests only; summaries pass options of their own to the stream function.
+	s.agent.SetOnResponse(s.extensionProviderResponseHook)
+	s.agent.SetOnProviderStreamEvent(s.extensionProviderStreamEventHook)
+}
+
+// extensionToolCallHook emits tool_call. A handler error blocks the call with
+// the error message, as upstream rethrows it and the agent loop turns it into
+// an error tool result. A handler may block (with terminate) or mutate
+// event.input in place; mutated input runs without revalidation.
+func (s *Session) extensionToolCallHook(ctx context.Context, toolCallID, toolName string, args json.RawMessage) agent.ToolCallHookResult {
+	return s.toolCallHook(ctx, toolCallID, "", toolName, args)
+}
+
+// toolCallHook is [Session.extensionToolCallHook] for a call another tool made: parentToolCallID is that tool's call id, and is empty for a call the model issued.
+//
+// upstream: agent-session.ts:_beforeToolCall(context, parentToolCallId)
+func (s *Session) toolCallHook(ctx context.Context, toolCallID, parentToolCallID, toolName string, args json.RawMessage) agent.ToolCallHookResult {
+	runner := s.currentRunner()
+	if runner == nil || !runner.HasHandlers(icodingagent.EventToolCall) {
+		return agent.ToolCallHookResult{}
+	}
+	s.endEventTask()
+	var input map[string]any
+	if len(args) > 0 {
+		// A lone UTF-16 surrogate in the model's arguments stays that unit, as JSON.parse reads it: the handler, the before/after comparison and InputJSON all see it.
+		_ = jsstring.UnmarshalKeepingSurrogates(args, &input) // invalid JSON yields a nil input, as validation already ran
+	}
+	// The event carries the members in the order the model wrote them (JSON.stringify of Pi's input), and a subprocess handler's edit replaces these bytes. The agent loop runs the tool with whatever order they hold afterwards.
+	var wireInput *json.RawMessage
+	if canonical, err := jsonstringify.Canonicalize(args); err == nil && input != nil {
+		wire := json.RawMessage(canonical)
+		wireInput = &wire
+	}
+	before := ""
+	if wireInput != nil {
+		before = string(*wireInput)
+	}
+	beforeValues, _ := jsstring.MarshalKeepingSurrogates(input)
+	event := extension.CustomToolCallEvent{
+		Type: icodingagent.EventToolCall, ToolCallID: toolCallID, ParentToolCallID: parentToolCallID, WireInput: wireInput,
+		ToolName: toolName,
+		Input:    input,
+	}
+	result, err := runner.EmitToolCall(ctx, event)
+	if err != nil {
+		return agent.ToolCallHookResult{Err: err}
+	}
+	var hook agent.ToolCallHookResult
+	if afterValues, err := jsstring.MarshalKeepingSurrogates(input); err == nil && (!bytes.Equal(beforeValues, afterValues) || (wireInput != nil && string(*wireInput) != before)) {
+		if after, err := event.InputJSON(); err == nil {
+			hook.Args = after
+		}
+	}
+	if result != nil {
+		hook.Block = result.Block
+		hook.Reason = result.Reason
+		hook.Terminate = result.Terminate
+	}
+	return hook
+}
+
+// extensionToolResultHook emits tool_result and applies the chained override.
+func (s *Session) extensionToolResultHook(ctx context.Context, toolCallID, toolName string, args json.RawMessage, result agent.AgentToolResult) agent.AfterToolCallResult {
+	return s.toolResultHook(ctx, toolCallID, "", toolName, args, result)
+}
+
+// toolResultHook is [Session.extensionToolResultHook] for a call another tool made; see [Session.toolCallHook].
+//
+// upstream: agent-session.ts:_afterToolCall(context, parentToolCallId)
+func (s *Session) toolResultHook(ctx context.Context, toolCallID, parentToolCallID, toolName string, args json.RawMessage, result agent.AgentToolResult) agent.AfterToolCallResult {
+	runner := s.currentRunner()
+	if runner == nil {
+		return agent.AfterToolCallResult{}
+	}
+	if runner.HasHandlers(icodingagent.EventToolCall) {
+		// pig additive (D19): Pi runs the tool on the extensions' event loop, so what a tool_call handler queued, such as a sendUserMessage and the input it starts, runs before tool_result (agent-session.ts:1968-2000). The tool ran in Go, so each extension that saw tool_call on a loop of its own takes one turn first.
+		runner.AwaitEventLoopTurns(ctx, icodingagent.EventToolCall)
+	}
+	if !runner.HasHandlers(icodingagent.EventToolResult) {
+		return agent.AfterToolCallResult{}
+	}
+	var input map[string]any
+	if len(args) > 0 {
+		_ = jsstring.UnmarshalKeepingSurrogates(args, &input)
+	}
+	if started := agent.ToolHookStartedFromContext(ctx); started != nil {
+		// A parallel batch starts the tool_result hooks of its calls in the order their tools settled (agent-loop.ts:619-647); the dispatch reports when the first handler started.
+		ctx = extension.WithDispatchStarted(ctx, started)
+	}
+	details := extension.ToolResultDetailsFor(result.Details)
+	if result.DetailsNull() {
+		// upstream: agent-session.ts:_afterToolCall sets `details: result.details`, so a tool's details: null reaches the handlers as null.
+		details = json.RawMessage("null")
+	}
+	hookResult, err := runner.EmitToolResult(ctx, extension.CustomToolResultEvent{
+		Type:              icodingagent.EventToolResult,
+		ToolCallID:        toolCallID,
+		ParentToolCallID:  parentToolCallID,
+		Input:             input,
+		WireInput:         args,
+		Content:           icodingagent.ToolResultEventContent(result),
+		StructuredContent: result.StructuredContent,
+		IsError:           result.IsError,
+		Usage:             toolResultEventUsage(result.Usage),
+		ToolName:          toolName,
+		Details:           details,
+	})
+	if err != nil || hookResult == nil {
+		return agent.AfterToolCallResult{}
+	}
+	return icodingagent.ToolResultEventOverride(hookResult)
+}
+
+// extensionContextHook emits context before each provider request and uses
+// the returned conversation. Mirrors upstream runner.emitContext's context
+// phase (runner.ts:1190-1223): handlers see only the non-system messages, an
+// unchanged conversation keeps every system message in place, and a changed
+// one gets the current prompt and tool state as one leading system message.
+func (s *Session) extensionContextHook(ctx context.Context, messages []agent.AgentMessage) ([]agent.AgentMessage, error) {
+	runner := s.currentRunner()
+	if runner == nil {
+		return messages, nil
+	}
+	transformed, err := s.contextPhase(ctx, runner, messages)
+	if err != nil {
+		return nil, err
+	}
+	return s.contextWithSystemPhase(ctx, runner, transformed)
+}
+
+// contextWithSystemPhase runs context_with_system handlers on the full
+// transcript and uses their result as returned.
+func (s *Session) contextWithSystemPhase(ctx context.Context, runner *inproc.Runner, messages []agent.AgentMessage) ([]agent.AgentMessage, error) {
+	if !runner.HasHandlers(icodingagent.EventContextWithSystem) {
+		return messages, nil
+	}
+	return runner.EmitContextWithSystem(boundarywire.WithContextEncodings(ctx, &s.contextWithSystemEncodings), messages)
+}
+
+func (s *Session) contextPhase(ctx context.Context, runner *inproc.Runner, messages []agent.AgentMessage) ([]agent.AgentMessage, error) {
+	if !runner.HasHandlers(icodingagent.EventContext) {
+		return messages, nil
+	}
+	visible := make([]agent.AgentMessage, 0, len(messages))
+	var systems []ai.Message
+	for _, message := range messages {
+		if message.System != nil {
+			systems = append(systems, *message.System)
+			continue
+		}
+		visible = append(visible, message)
+	}
+	returned, replaced, err := runner.EmitContextTracked(boundarywire.WithContextEncodings(ctx, &s.contextEncodings), visible)
+	if err != nil {
+		return nil, err
+	}
+	// Identity, not value, decides replacement (upstream sameMessages): a
+	// fresh message with equal fields is still a replacement, so the value
+	// shortcut applies only when no handler replaced the list.
+	if !replaced && sameContextMessages(returned, visible) {
+		return messages, nil
+	}
+	converted := returned
+	if !replaced && len(converted) == len(visible) {
+		// upstream restoreSystemMessages: an unchanged conversation (edited in
+		// place) keeps every system message where it was.
+		out := make([]agent.AgentMessage, 0, len(messages))
+		next := 0
+		for _, message := range messages {
+			if message.System != nil {
+				out = append(out, message)
+				continue
+			}
+			if sameContextMessages([]extension.AgentMessage{returned[next]}, []extension.AgentMessage{visible[next]}) {
+				out = append(out, message)
+			} else {
+				out = append(out, converted[next])
+			}
+			next++
+		}
+		return out, nil
+	}
+	if head := ai.GetCurrentSystemMessage(systems); head != nil {
+		return append([]agent.AgentMessage{{System: head}}, converted...), nil
+	}
+	return converted, nil
+}
+
+// sameContextMessages reports whether handlers left the conversation
+// unchanged. The runner hands handlers a clone, and a subprocess handler
+// returns decoded JSON, so equality is by value rather than identity.
+func sameContextMessages(returned, visible []extension.AgentMessage) bool {
+	if len(returned) != len(visible) {
+		return false
+	}
+	if len(returned) > 0 && &returned[0] == &visible[0] {
+		// A dispatch of subprocess handlers that changed nothing hands the caller's own list back.
+		return true
+	}
+	for i := range returned {
+		if reflect.DeepEqual(returned[i], visible[i]) {
+			continue
+		}
+		// A handler that turns one lone surrogate into another changed the message: json.Marshal writes both as U+FFFD.
+		left, errLeft := jsstring.MarshalKeepingSurrogates(returned[i])
+		right, errRight := jsstring.MarshalKeepingSurrogates(visible[i])
+		if errLeft != nil || errRight != nil {
+			return false
+		}
+		if bytes.Equal(left, right) {
+			continue
+		}
+		var leftValue, rightValue any
+		if jsstring.UnmarshalKeepingSurrogates(left, &leftValue) != nil || jsstring.UnmarshalKeepingSurrogates(right, &rightValue) != nil || !reflect.DeepEqual(leftValue, rightValue) {
+			return false
+		}
+	}
+	return true
+}
+
+// extensionProviderRequestHook emits before_provider_request with the
+// provider's final wire payload; a handler may return a replacement.
+func (s *Session) extensionProviderRequestHook(payload any, _ *ai.Model) (any, error) {
+	runner := s.currentRunner()
+	if runner == nil || !runner.HasHandlers(icodingagent.EventBeforeProviderRequest) {
+		return payload, nil
+	}
+	result, err := runner.EmitBeforeProviderRequest(context.Background(), payload)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return payload, nil
+	}
+	return result, nil
+}
+
+// extensionProviderResponseHook awaits observers before the provider consumes its response.
+func (s *Session) extensionProviderResponseHook(ctx context.Context, response ai.ProviderResponse, _ *ai.Model) error {
+	runner := s.currentRunner()
+	if runner == nil || !runner.HasHandlers(icodingagent.EventAfterProviderResponse) {
+		return nil
+	}
+	_, err := runner.Emit(ctx, extension.AfterProviderResponseEvent{Type: icodingagent.EventAfterProviderResponse, Status: response.Status, Headers: response.Headers})
+	return err
+}
+
+// extensionProviderStreamEventWanted reports whether extensionProviderStreamEventHook would emit an event now; when it would not, the hook returns nil and does nothing else.
+func (s *Session) extensionProviderStreamEventWanted() bool {
+	runner := s.currentRunner()
+	return runner != nil && runner.HasHandlers(icodingagent.EventProviderStreamEvent)
+}
+
+// extensionProviderStreamEventHook emits provider_stream_event for a parsed provider stream event before normalization, awaiting observers.
+//
+// upstream: sdk.ts:396-409 (handleProviderStreamEvent)
+func (s *Session) extensionProviderStreamEventHook(ctx context.Context, data any, model *ai.Model) error {
+	runner := s.currentRunner()
+	if runner == nil || !runner.HasHandlers(icodingagent.EventProviderStreamEvent) {
+		return nil
+	}
+	providerID := model.ProviderMeta.ProviderID
+	if providerID == "" && model.Provider != nil {
+		providerID = model.Provider.ID()
+	}
+	_, err := runner.Emit(ctx, extension.ProviderStreamEvent{Type: icodingagent.EventProviderStreamEvent, Provider: providerID, API: string(model.ProviderMeta.API), Model: model.ID, Data: data})
+	return err
+}
+
+// extensionProviderHeadersHook emits before_provider_headers on the merged
+// request headers (sdk.ts buildRequestOptions.transformHeaders).
+func (s *Session) extensionProviderHeadersHook(ctx context.Context, headers ai.ProviderHeaders) (ai.ProviderHeaders, error) {
+	runner := s.currentRunner()
+	if runner == nil || !runner.HasHandlers(icodingagent.EventBeforeProviderHeaders) {
+		return headers, nil
+	}
+	return runner.EmitBeforeProviderHeaders(ctx, headers)
+}
+
+// extensionEventHook runs on the agent goroutine for every agent event,
+// before persistence and delivery, as upstream _handleAgentEvent awaits
+// _emitExtensionEvent before it persists or notifies listeners. A
+// message_end replacement from a handler is applied in place. A panic during
+// dispatch is reported and the event continues.
+func (s *Session) extensionEventHook(ev agent.AgentEvent) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.reportAgentEventPanic(ev, recovered)
+		}
+	}()
+	runner := s.currentRunner()
+	if runner == nil {
+		return
+	}
+	// One look at the handlers serves the dispatch and the task: an event no handler takes is dispatched to nobody (every emit helper of DispatchAgentLoopEvent returns at once), and only an event a handler takes ends the task.
+	if eventType := icodingagent.AgentLoopEventType(ev); eventType == "" || !runner.HasHandlers(eventType) {
+		if start, ok := ev.(agent.MessageStartEvent); ok {
+			// The dispatch records the message of a message_start whether or not a handler takes it.
+			s.extCurrentMessage = start.Message
+		}
+		return
+	}
+	// Pi's loop turns while a handler awaits, so what precedes the handler is drawn while it runs: the task ends before the dispatch.
+	s.eventRegions.task.End()
+	end, ok := ev.(agent.MessageEndEvent)
+	if !ok {
+		icodingagent.DispatchAgentLoopEvent(runner, ev, &s.extCurrentMessage, &s.messageSeqs)
+		return
+	}
+	if !runner.HasHandlers(icodingagent.EventMessageEnd) {
+		return
+	}
+	ctx := extension.WithMessageSequences(icodingagent.AgentEventContext(ev), func() []uint64 { return []uint64{s.messageSeqs.Sequence(end.Message)} })
+	replacement, err := runner.EmitMessageEnd(ctx, extension.MessageEndEvent{Type: "message_end", Message: end.Message})
+	if err != nil || replacement == nil {
+		return
+	}
+	agent.ReplaceMessageInPlace(end.Message, normalizeReplacementContent(*replacement))
+}
+
+// normalizeReplacementContent gives a user, assistant, toolResult or custom
+// replacement with missing content an empty content list, as upstream
+// normalizes untyped handler results before they enter agent state or session
+// history. A system replacement keeps the content it has, as upstream's role
+// check leaves it.
+func normalizeReplacementContent(message agent.AgentMessage) agent.AgentMessage {
+	switch {
+	case message.System == nil && message.NullContent(),
+		message.Custom != nil && message.Custom["role"] == agent.RoleCustom && message.Custom["content"] == nil:
+		return message.WithEmptyContent()
+	}
+	return message
+}
+
+// QueueAgentStartMessages holds the messages a before_agent_start dispatch
+// returned; the next prompt carries them as custom messages after the user
+// message and any next-turn messages (agent-session.ts prompt()). Every mode
+// that emits before_agent_start hands its result here.
+func (s *Session) QueueAgentStartMessages(messages []extension.CustomMessageRef) {
+	if len(messages) == 0 {
+		return
+	}
+	timestamp := time.Now().UnixMilli()
+	custom := make([]agent.AgentMessage, 0, len(messages))
+	for _, message := range messages {
+		content := message.Content
+		if content == nil {
+			// Untyped extensions can pass null or missing content.
+			content = []any{}
+		}
+		fields := map[string]any{
+			"role":       agent.RoleCustom,
+			"customType": message.CustomType,
+			"content":    content,
+			"timestamp":  timestamp,
+		}
+		fields["display"] = message.Display
+		if message.Details != nil {
+			fields["details"] = message.Details
+		}
+		custom = append(custom, agent.AgentMessage{Custom: fields}.WithOrderRecord())
+	}
+	s.agentStartMu.Lock()
+	s.agentStartMessages = append(s.agentStartMessages, custom...)
+	s.agentStartMu.Unlock()
+}
+
+func (s *Session) takeAgentStartMessages() []agent.AgentMessage {
+	s.agentStartMu.Lock()
+	defer s.agentStartMu.Unlock()
+	messages := s.agentStartMessages
+	s.agentStartMessages = nil
+	return messages
+}
+
+// ExtensionCommandActions returns the command-context actions the Session
+// backs in every mode. Modes may bind their own versions over them (for
+// example to refresh a UI after navigating).
+func (s *Session) ExtensionCommandActions() extension.CommandActions {
+	return extension.CommandActions{
+		WaitForIdle:        func() error { return s.WaitForIdle(context.Background()) },
+		WaitForIdleContext: s.WaitForIdle,
+		NewSession: func(opts *extension.NewSessionOptions) (extension.CancelledResult, error) {
+			return s.extensionNewSession(context.Background(), opts)
+		},
+		NewSessionContext: s.extensionNewSession,
+		Fork: func(entryID string, opts *extension.ForkOptions) (extension.CancelledResult, error) {
+			return s.extensionFork(context.Background(), entryID, opts)
+		},
+		ForkContext: s.extensionFork,
+		SwitchSession: func(path string, opts *extension.SwitchSessionOptions) (extension.CancelledResult, error) {
+			return s.extensionSwitchSession(context.Background(), path, opts)
+		},
+		SwitchSessionContext: s.extensionSwitchSession,
+		// upstream print-mode.ts/rpc-mode.ts bind navigateTree to
+		// session.navigateTree and return only whether it was cancelled.
+		NavigateTree: func(targetID string, opts *extension.NavigateTreeOptions) (extension.CancelledResult, error) {
+			var options NavigateTreeOptions
+			if opts != nil {
+				options.Summarize = opts.Summarize
+				options.CustomInstructions = opts.CustomInstructions
+				options.ReplaceInstructions = opts.ReplaceInstructions
+				options.Label = opts.Label
+			}
+			result, err := s.NavigateTree(context.Background(), targetID, options)
+			if err != nil {
+				return extension.CancelledResult{}, err
+			}
+			return extension.CancelledResult{Cancelled: result.Cancelled}, nil
+		},
+	}
+}
+
+// bindExtensionCommandActions binds the Session's views, message delivery, abort and command actions without replacing mode-owned callbacks. Abort is extensionAbort: the mode's abort handler when it stored one, else a cancellation request; neither awaits the handler's own run.
+func (s *Session) bindExtensionCommandActions(runner *inproc.Runner) {
+	if runner != nil {
+		runner.BindAbort(s.extensionAbort)
+		runner.BindScopedModels(s.ScopedModels)
+		runner.BindSystemPromptOptions(s.GetSystemPromptOptions)
+		runner.BindTools(extension.ContextActions{
+			GetAllTools: s.GetAllTools, GetActiveTools: s.ActiveToolNames,
+			SetActiveTools: s.SetActiveToolsByName, RefreshTools: s.RefreshTools, GetSystemPrompt: s.systemPrompt,
+			GetModel: func() extension.Model { return s.Model() }, SessionManager: s.inner.Load(),
+			ModelRegistry: s.ModelRegistry(), IsIdle: s.IsIdle, HasPendingMessages: s.HasPendingMessages, GetSignal: s.Signal,
+			SendUserMessage: s.SendExtensionUserMessage,
+			ToolActions:     s.ToolActions(),
+		})
+		runner.BindCommandActions(s.ExtensionCommandActions())
+	}
+}
+
+// toolResultEventUsage exposes the tool's own usage on the event, or nothing.
+func toolResultEventUsage(usage *ai.Usage) any {
+	if usage == nil {
+		return nil
+	}
+	return usage
+}
+
+// ReloadExtensions is the runtime rebuild of upstream's reload() for the extensions the mode loaded again (agent-session.ts:3547-3567 _buildRuntime): a runner over them, bound to the Session, replaces the current one, which goes stale, and the tool registry is rebuilt so the tools a settings reload newly added to defaultTools activate and every extension tool that activates on registration is active again (agent-session.ts:3598-3609, RefreshToolsAfterReload). The caller binds its own UI and command actions to the returned runner and then emits session_start.
+func (s *Session) ReloadExtensions(extensions []extension.Extension, runtime ...*extension.ExtensionRuntime) (*inproc.Runner, error) {
+	previous := s.currentRunner()
+	var extensionRuntime *extension.ExtensionRuntime
+	if len(runtime) > 0 {
+		extensionRuntime = runtime[0]
+	}
+	runner := NewExtensionRunner(extensions, extensionRuntime, s.services.CWD(), s.inner.Load(), s.services.Registry())
+	s.bindExtensionCore(runner)
+	s.ReplaceRunner(runner)
+	if previous != nil {
+		if len(runtime) != 0 && runtime[0] == previous.Runtime() {
+			// The factories registered against the runtime the previous runner binds: the rebuilt runner keeps it.
+			previous.InvalidateKeepingRuntime("")
+		} else {
+			previous.Invalidate("")
+		}
+	}
+	return runner, s.RefreshToolsAfterReload()
+}

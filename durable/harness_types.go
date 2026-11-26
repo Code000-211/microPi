@@ -1,0 +1,768 @@
+package durable
+
+import (
+	"context"
+	"encoding/json"
+	"slices"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/durable/env"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// Ports the subset of packages/durable/src/harness/types.ts that packages/durable/src/types.ts references:
+// TaskRuntime and the entry kinds need these declarations, and types.ts and harness/types.ts import each other. Go
+// packages cannot import each other, so these declarations live in the root package and durable/harness declares the
+// rest of harness/types.ts over them.
+
+// ModelRef is a provider and model ID resolved through pi-ai Models.
+type ModelRef struct {
+	Provider string `json:"provider"`
+	ModelId  string `json:"modelId"`
+}
+
+// UserInput is the content of a user message.
+type UserInput = ai.UserContent
+
+// WhenBusy is the busy policy of an input submission.
+type WhenBusy string
+
+const (
+	WhenBusySteer    WhenBusy = "steer"
+	WhenBusyFollowUp WhenBusy = "followUp"
+	WhenBusyReject   WhenBusy = "reject"
+)
+
+// WhenIdle is the idle policy of an input submission.
+type WhenIdle string
+
+const (
+	// WhenIdleReject rejects an input that reaches an idle conversation (no run) with ConversationIdle and writes
+	// nothing, so the input never starts a run of its own.
+	WhenIdleReject WhenIdle = "reject"
+)
+
+// OnAbort is what a conversation abort does with a queued input submission (types.ts SubmissionDraft onAbort).
+type OnAbort string
+
+const (
+	// OnAbortWithdraw, the default, settles the queued input unanswered with reason aborted.
+	OnAbortWithdraw OnAbort = "withdraw"
+	// OnAbortKeep leaves the input queued through Conversation.Abort and abort cascades.
+	OnAbortKeep OnAbort = "keep"
+)
+
+// InputEntry is the entry an input is placed as, instead of pi.user: an application kind, and data the transcript shows,
+// such as its author. Its model message is still the input's user message (types.ts InputEntry).
+type InputEntry struct {
+	// Kind is a non-empty string that does not start with "pi.".
+	Kind string `json:"kind"`
+	// Data is the JSON payload of the placed entry; nil when absent.
+	Data JsonValue `json:"data,omitempty"`
+}
+
+// SubmissionDraft is a host submission: user input (type input, with Content, an optional WhenBusy, an optional WhenIdle
+// and an optional InputEntry) that may start a run, a passive entry write (type write, with Entry), or a continue
+// (type continue, with no other field than RequestId): a run without a new user message, for an idle conversation whose
+// context the model still owes an answer (it ends in a user message or tool results, for example after a run that ended
+// without an answer).
+type SubmissionDraft struct {
+	// RequestId is nil when absent.
+	RequestId *string
+	Type      SubmissionType
+	Content   UserInput
+	WhenBusy  WhenBusy
+	// WhenIdle reject: an idle conversation (no run) rejects the input with ConversationIdle and writes nothing, so the
+	// input never starts a run of its own. With WhenBusy steer it steers the current run or is refused; a run that
+	// answered and waits for its afterRun tasks is still busy, and such an input queues and starts the next run.
+	WhenIdle WhenIdle
+	// OnAbort is what Conversation.Abort and abort cascades do with the input while it is queued: OnAbortWithdraw, the
+	// default, settles it unanswered with reason aborted; OnAbortKeep leaves it queued, as a failed run leaves its queue
+	// under AfterFailedRun keep, so the next input places it and that run answers it. For input its sender cannot take
+	// back, such as another agent's message. Submission.Abort withdraws it either way. Only input submissions carry it.
+	OnAbort OnAbort
+	// InputEntry places an input as that entry; nil places it as pi.user without data. Only input submissions carry it
+	// (types.ts SubmissionDraft: an input's `entry` is an InputEntry, a write's is an EntryDraft).
+	InputEntry *InputEntry
+	Entry      *EntryDraft
+	// Notify, when the submission settles, delivers SubmissionSettledSignal (the settled record) to Notify.TaskId under
+	// Notify.Key, in the settling commit; a delivery the task refuses (closed, not_found) fails nothing. A submission that
+	// settles before the task sleeps on the key wakes the sleep at once. Nil when absent.
+	Notify *SubmissionNotify
+}
+
+// InputSubmissionDraft is a SubmissionDraft of type input.
+type InputSubmissionDraft = SubmissionDraft
+
+// SettledSubmissionRecord is a SubmissionRecord whose status is done or unanswered.
+type SettledSubmissionRecord = SubmissionRecord
+
+// SubmissionAbortResult is the result of aborting one submission.
+type SubmissionAbortResult string
+
+const (
+	SubmissionAborted       SubmissionAbortResult = "aborted"
+	SubmissionAlreadyPlaced SubmissionAbortResult = "already_placed"
+	SubmissionSettled       SubmissionAbortResult = "settled"
+	SubmissionNotFound      SubmissionAbortResult = "not_found"
+)
+
+// Submission is the awaitable host object for one durably admitted submission.
+type Submission interface {
+	Id() SubmissionId
+	Status(ctx context.Context) (SubmissionRecord, error)
+	Wait(ctx context.Context) (SettledSubmissionRecord, error)
+	Abort(ctx context.Context) (SubmissionAbortResult, error)
+}
+
+// SettledTask is a task record in the terminal state.
+type SettledTask[R any] = TaskRecord[JsonValue, JsonValue, R]
+
+// ConversationAbortOptions holds the options of Conversation.Abort.
+type ConversationAbortOptions struct {
+	// Background crosses background boundaries: mark every live task reached ignoring the background flag when the
+	// abort is admitted, withdraw the queued inputs of every conversation reached, and wait until those tasks are
+	// terminal and the conversation is ordinarily idle. Background work created afterwards is neither marked nor
+	// awaited.
+	Background bool
+}
+
+// ConversationHandle holds the invocation-bound conversation operations for tasks and tools. It fails after the
+// invocation ends. Submit and SubmitIn take any submission, in both forms of Conversation.Submit: a subagent's
+// conversation is an ordinary one, so a tool may also continue it, and a task may admit a submission in the same commit
+// as its own writes (TaskRuntime.Commit); entries the admission appends there carry the task's byTaskId. SubmitIn also
+// fails once the invocation is aborted.
+type ConversationHandle interface {
+	Id() ConversationId
+	Submit(ctx context.Context, submission SubmissionDraft) (Submission, error)
+	// SubmitIn is the transaction form of Submit (`submit(tx, submission)`).
+	SubmitIn(tx Tx, submission SubmissionDraft) (SubmissionId, error)
+	// Abort is Conversation.Abort: withdraw queued inputs, abort the ordinary ownership scope, and wait until it is
+	// idle.
+	Abort(ctx context.Context, options *ConversationAbortOptions) error
+	// WaitForIdle returns when the conversation's ordinary ownership scope has no live non-background task.
+	WaitForIdle(ctx context.Context) error
+}
+
+// ToolControl holds the post-tools controls requested by a tool result.
+type ToolControl struct {
+	// AddTools is nil when absent; an empty non-nil list is written as [].
+	AddTools []string `json:"addTools,omitempty"`
+	// Terminate is Pi's `terminate?: true`: false is absent.
+	Terminate bool `json:"terminate,omitempty"`
+	// Handoff, when set, starts a new context with this text as its user message, as Reset(handoff) writes, and continues the
+	// run there. The last handoff in call order wins. Nil when absent.
+	Handoff *string `json:"handoff,omitempty"`
+}
+
+// MarshalJSON writes the controls as Pi stores them after dropping undefined keys (tool.ts copyJson with
+// omitUndefinedProperties): an absent key is omitted, and an empty addTools list is kept.
+func (control ToolControl) MarshalJSON() ([]byte, error) {
+	var addTools *[]string
+	if control.AddTools != nil {
+		addTools = &control.AddTools
+	}
+	return jsstring.MarshalKeepingSurrogates(struct {
+		AddTools  *[]string `json:"addTools,omitempty"`
+		Terminate bool      `json:"terminate,omitempty"`
+		Handoff   *string   `json:"handoff,omitempty"`
+	}{addTools, control.Terminate, control.Handoff})
+}
+
+// ToolDiagnosticSeverity is "info", "warn", or "error".
+type ToolDiagnosticSeverity string
+
+const (
+	SeverityInfo  ToolDiagnosticSeverity = "info"
+	SeverityWarn  ToolDiagnosticSeverity = "warn"
+	SeverityError ToolDiagnosticSeverity = "error"
+)
+
+// ToolDiagnostic is a remark about a call for the model and the UI, such as truncation or a spill path; never part of
+// the tool's data.
+type ToolDiagnostic struct {
+	Severity ToolDiagnosticSeverity `json:"severity"`
+	Message  string                 `json:"message"`
+	Code     string                 `json:"code,omitempty"`
+}
+
+// ToolExecutionResult is the result of one tool execution.
+type ToolExecutionResult struct {
+	// Output is for the model; nil when omitted: the retained output() text becomes the output.
+	Output []ai.ToolResultMessageContent
+	// StructuredOutput is for programs that call the tool (executeTool() callers, code mode scripts), present only when
+	// HasStructuredOutput is true. A tool that declares a structured output schema must return one unless the result is
+	// an error, and it is validated against the schema; a tool without a schema must not return one, and programs get
+	// the output itself.
+	StructuredOutput    JsonValue
+	HasStructuredOutput bool
+	IsError             *bool
+	// Details is omitted when HasDetails is false: the last details() value becomes the details.
+	Details    JsonValue
+	HasDetails bool
+	// Diagnostics are added after those recorded through api.Diagnostic.
+	Diagnostics []ToolDiagnostic
+	// Usage is the spend of the execution itself, such as a model call; stored on the result and in pi.usage.tools.
+	Usage   *ai.Usage
+	Control *ToolControl
+	// Park, when set, parks the call instead of returning a result (spec suspendable §4): no other field may be set, and
+	// a park with one is invalid. Upstream's result and park are distinct object types, and a Go tool returns one struct.
+	Park *ToolPark
+}
+
+// ToolParkSleep is a park's sleep: until Until, for Signals, or both.
+type ToolParkSleep struct {
+	// Checkpoint is what the call parks with, given back as api.Checkpoint on the next run; set only with HasCheckpoint.
+	Checkpoint    JsonValue
+	HasCheckpoint bool
+	Until         *float64
+	Signals       []SignalKey
+}
+
+// ToolParkWait is a park's wait: for tasks the call's task owns.
+type ToolParkWait struct {
+	Checkpoint    JsonValue
+	HasCheckpoint bool
+	On            []TaskId
+	Policy        JoinPolicy
+}
+
+// ToolPark is what Execute returns instead of a result to park the call (spec suspendable §4): Sleep until Until, for
+// Signals, or both; or Wait for tasks the call's task owns; exactly one. The call holds no invocation meanwhile, then runs
+// Execute again with the same arguments, api.Wake saying why, and api.Checkpoint set to the park's checkpoint. Returned
+// by pointer: a wrapper's composite may return only a park its base returned.
+type ToolPark struct {
+	Sleep *ToolParkSleep
+	Wait  *ToolParkWait
+}
+
+// ToolTaskOptions is the options of ToolExecutionApi.CreateTaskErased: the creation options without ConversationId, and
+// the key of the task.
+type ToolTaskOptions struct {
+	TaskOptions
+	// Key records the task under a key of the call; nil when absent.
+	Key *string
+}
+
+// ToolExecutionMode is whether the tools of one round run at once or one after another in call order.
+type ToolExecutionMode string
+
+const (
+	ToolExecutionParallel   ToolExecutionMode = "parallel"
+	ToolExecutionSequential ToolExecutionMode = "sequential"
+)
+
+// QueueMode is how many queued items of one mode a boundary places: the first, or all of them.
+type QueueMode string
+
+const (
+	QueueAll        QueueMode = "all"
+	QueueOneAtATime QueueMode = "one-at-a-time"
+)
+
+// ToolExecutionApi holds the operations available to one tool invocation. Every operation fails after the invocation
+// ends.
+type ToolExecutionApi interface {
+	DocumentObserver
+	DocumentReader
+
+	TaskId() TaskId
+	ConversationId() ConversationId
+	CallId() string
+	// Wake is why this run started after a park; nil on a fresh call, and in Cancel.
+	Wake() *WakeReason
+	// Checkpoint is what the call last parked with; ok is false on a fresh call or after a park without one.
+	Checkpoint() (value JsonValue, ok bool)
+	// Registry is the tool task's phase snapshot.
+	Registry() RegistrySnapshot
+	// Agent is the calling conversation's agent, as the tool task's phase resolved it.
+	Agent(ctx context.Context) (Agent, error)
+	// Models is HarnessOptions.models: the catalog, credentials, and request transforms generation uses.
+	Models() Models
+	// Env is built by HarnessOptions.env for this call; nil without an environment.
+	Env() env.ExecutionEnv
+	// Now is the Harness clock (HarnessOptions.Now), for times a rerun after a restart compares against.
+	Now() float64
+	// Output appends running output, a string or []byte; it becomes the result content when the result omits
+	// Content. The optional skipped marks a chunk that follows output an environment omitted, as reported by an
+	// environment given OutputWindow (ShellOutputInfo.Skipped). The omitted output is more than the tail window by at
+	// least one byte or line, and only tail retention accepts it. Only the first skipped counts.
+	Output(chunk any, skipped ...env.ShellOutputSkip)
+	// OutputWindow is the tail this call's output keeps and the pace of its progress commits, for
+	// ShellExecOptions.Window; nil when the tool keeps the head of its output, which cannot accept skips. A wrapper
+	// that replaces Output and transforms text must also replace this with nil, so skipped text cannot bypass its
+	// transform.
+	OutputWindow() *env.ShellOutputWindow
+	// RetainedOutput is the output retained so far, as the model will see it when the result omits Output, and whether
+	// earlier output was dropped; for a tool that also returns that text in its StructuredOutput.
+	RetainedOutput() (text string, truncated bool)
+	// Diagnostic records a model-visible remark about this call.
+	Diagnostic(diagnostic ToolDiagnostic)
+	// Details replaces running details; the last value becomes the result details when the result omits Details.
+	Details(ctx context.Context, value JsonValue) error
+	// Commit commits on this call's task; options.Persistence may defer storing it (CommitPersistence).
+	Commit(ctx context.Context, change func(tx Tx) (any, error), options ...CommitOptions) (any, error)
+	// Memo reads a durable memo of the tool task; ok is false when absent.
+	Memo(ctx context.Context, name string) (value JsonValue, ok bool, err error)
+	MemoCandidate(ctx context.Context, name string, candidate JsonValue) (JsonValue, error)
+	// ReadSignalErased is a signal key's committed state in this call's task, as TaskRuntime.ReadSignalErased; ReadSignal
+	// is the typed read.
+	ReadSignalErased(ctx context.Context, token AnySignalSource, key string) (*ErasedSignalState, error)
+	// CreateTaskErased creates a task in one commit in the calling conversation; options.ConversationId is ignored. A
+	// child task of a tool that is not replay-safe defaults to AbandonOnRestart: the tool never resumes after a restart,
+	// so nothing awaits the child then (harness/types.ts:232-234). With a Key, validated like a nested call's, the task
+	// is recorded under it in the same commit, and a later call with the key, in this run, a rerun, or a run after a
+	// wake, returns that task; another task kind, other input, or a key a nested call uses fails. After a wake (Wake set)
+	// a key is required.
+	CreateTaskErased(ctx context.Context, task AnyTask, input JsonValue, options ToolTaskOptions) (TaskId, error)
+	// GetTask returns nil when absent.
+	GetTask(ctx context.Context, id TaskId) (*TaskRecord[JsonValue, JsonValue, JsonValue], error)
+	WaitForTask(ctx context.Context, id TaskId) (SettledTask[JsonValue], error)
+	// Conversation returns an invocation-bound handle of an existing conversation, such as one this tool created in
+	// Commit; nil when absent.
+	Conversation(ctx context.Context, id ConversationId) (ConversationHandle, error)
+	// ExecuteTool calls another tool as a nested call: its own pi.tool task owned by this call, which runs validation, the
+	// ToolTask hooks (whose ToolHookCall carries the parent), and the tool, and whose result comes back here, not in
+	// the transcript. A nested call that ends in an error result still returns it; the error return is for a call that
+	// could not be made or waited for. Calls made without a key are keyed by their order, so a rerun that calls in the
+	// same order reattaches to the calls it made. Cancelling ctx stops only the wait.
+	ExecuteTool(ctx context.Context, name string, args map[string]any, options ...NestedCallOptions) (NestedToolExecutionResult, error)
+	// ExecuteToolNoWait is ExecuteTool with `wait: false`, which upstream's overload types as a call that returns
+	// a NestedToolCall (a Go method has one result type): it returns once the nested call is started or found, with a
+	// handle to its result, so a tool can park on its nested calls (a park's wait.on) and let the Session go idle.
+	// Awaiting a nested call with ExecuteTool holds this call's invocation for as long as it takes, also while it is
+	// parked.
+	ExecuteToolNoWait(ctx context.Context, name string, args map[string]any, options ...NestedCallOptions) (NestedToolCall, error)
+}
+
+// NestedCallOptions are the options of ExecuteTool (types.ts ToolExecutionApi.executeTool).
+type NestedCallOptions struct {
+	// Key names the call among this call's nested calls, so a rerun finds it. It is a path segment of the nested call's
+	// ID: non-empty, without "/", not "__proto__", and not a positive integer, which default keys use. Nil: the call's
+	// order among this call's nested calls. After a wake (Wake set) the same position may mean another call, so a key
+	// is required.
+	Key *string
+	// Progress false commits no running output, details, or diagnostics to the call's slot; the result still gets them.
+	Progress *bool
+	// ArgumentsJSON is args as JSON text in the caller's member order, such as the text a script's object came from. A Go
+	// map has no order, and Pi keeps the order of the arguments object: the stored call, its slot, validation, hooks and
+	// the execute intent write args' members in this order. Members it lacks follow in sorted order. Nil: sorted order.
+	ArgumentsJSON json.RawMessage
+}
+
+// NestedToolExecutionResult is the result of a nested call, as ExecuteTool returns it. Programs read StructuredOutput;
+// the output for the model is not kept, and Control does not apply.
+type NestedToolExecutionResult struct {
+	// TaskId is the nested call's tool task.
+	TaskId TaskId
+	// StructuredOutput is the tool's value for programs, present when HasStructuredOutput. A tool with a schema: its
+	// validated structured output, also on an error result that has one; absent otherwise, and an error's text is then in an
+	// error diagnostic. A tool without: its bounded output, success or error, as a string for one text item, an ImageContent
+	// for one image, "" for none, and the content list otherwise. Absent on an error result the Harness wrote itself
+	// (unavailable, invalid, blocked, interrupted, aborted); Diagnostics say what went wrong.
+	StructuredOutput    JsonValue
+	HasStructuredOutput bool
+	IsError             bool
+	Details             JsonValue
+	HasDetails          bool
+	Diagnostics         []ToolDiagnostic
+	Usage               *ai.Usage
+	// DurationMs is the span from the tool task's first run (StartedAt) to its result on the Harness clock, hooks, parks,
+	// crash downtime, and reruns included; results that never executed have one too. A record written before StartedAt
+	// existed keeps the execution time of the last attempt. Nil when absent.
+	DurationMs *int64
+}
+
+// NestedToolCall is a nested call started without waiting for it (ExecuteToolNoWait, upstream's executeTool with wait
+// false).
+type NestedToolCall struct {
+	// TaskId is the nested call's tool task, for a park's wait.on.
+	TaskId TaskId
+	// Result is the stored result once the nested call is terminal; otherwise it waits for it. Cancelling ctx stops only
+	// the wait.
+	Result func(ctx context.Context) (NestedToolExecutionResult, error)
+}
+
+// ToolReplay is whether an interrupted execution may rerun on recovery.
+type ToolReplay string
+
+const (
+	ReplaySafe   ToolReplay = "safe"
+	ReplayUnsafe ToolReplay = "unsafe"
+)
+
+// ToolOutputRetain is which end of oversized output a tool keeps.
+type ToolOutputRetain string
+
+const (
+	RetainHead ToolOutputRetain = "head"
+	RetainTail ToolOutputRetain = "tail"
+)
+
+// ToolOutputLimits bounds the retained output of a tool; nil fields use the defaults.
+type ToolOutputLimits struct {
+	MaxBytes *int
+	MaxLines *int
+	Retain   ToolOutputRetain
+}
+
+// ToolRegistration is an executable tool registered in a registry. Only the pi-ai Tool fields enter the transcript.
+// Arguments are validated against Parameters before Execute; DefineTool types both.
+type ToolRegistration struct {
+	ai.ToolSchema
+	// Replay defaults to unsafe.
+	Replay ToolReplay
+	// ExecutionMode defaults to the settings' toolExecution. One sequential call makes its whole round sequential.
+	ExecutionMode ToolExecutionMode
+	// PrepareArguments repairs arguments models commonly get wrong before validation, such as a JSON string where an
+	// array belongs. It must be pure and must not mutate args: it runs again when a call is retried before its intent
+	// is recorded. Its result is still validated against Parameters. Nil when absent.
+	PrepareArguments func(args any) (any, error)
+	OutputLimits     *ToolOutputLimits
+	// StructuredOutputSchema is the JSON schema of StructuredOutput, which programs that call the tool receive. Nil: they
+	// receive the result's bounded output, success or error.
+	StructuredOutputSchema map[string]any
+	// Callers is who may call the tool: the model, other tools through executeTool(), or both (nil, the default). A
+	// code mode tool is {CallerModel}, so scripts cannot start scripts; tools behind code mode, such as MCP tools, can
+	// be {CallerTools}, so the model is never offered them.
+	Callers []ToolCaller
+	// Deferred tools are not offered to the model until loaded: the model gets the tool only when modelTools names it, in
+	// its exact list or its add, which a tool such as tool_search writes with the addTools control. Other tools can call it
+	// any time.
+	Deferred bool
+	// Execute runs the tool and returns its result, or a park (ToolExecutionResult.Park): the call then runs Execute again
+	// once woken.
+	Execute func(ctx context.Context, args any, api ToolExecutionApi) (ToolExecutionResult, error)
+	// Cancel cleans up the external work of a call that parked, when it is aborted while no code of the tool runs (spec
+	// suspendable §4.2): api.Checkpoint is the last park's, api.Wake nil, and it starts no nested calls or tasks. It may
+	// run more than once, so it is idempotent. A failure is reported and the call still ends. Nil when absent.
+	Cancel func(ctx context.Context, args any, api ToolExecutionApi) error
+}
+
+// ToolCaller is a kind of caller a tool admits (types.ts ToolRegistration.callers).
+type ToolCaller string
+
+// The kinds of tool callers.
+const (
+	CallerModel ToolCaller = "model"
+	CallerTools ToolCaller = "tools"
+)
+
+// CallableBy reports whether the tool admits the caller kind: a tool without callers admits both.
+func (tool *ToolRegistration) CallableBy(caller ToolCaller) bool {
+	return tool.Callers == nil || slices.Contains(tool.Callers, caller)
+}
+
+// PromptInput is the input to system prompt section rendering for one request preparation.
+type PromptInput struct {
+	ConversationId ConversationId
+	// Agent is the request's resolution; Agent.Tools are the tools offered in this request.
+	Agent Agent
+	// Env is built by HarnessOptions.env for this preparation; nil without an environment.
+	Env env.ExecutionEnv
+	// Shown holds the sections already in effect after replaying the active transcript.
+	Shown map[string]string
+	// Read holds committed document reads.
+	Read DocumentReader
+}
+
+// PromptSection is one system prompt section; the agent's sections render in order before each request.
+type PromptSection struct {
+	Key string
+	// Render returns nil to omit the section.
+	Render func(ctx context.Context, input PromptInput) (*string, error)
+	// Tag defaults to true: wrap the text as `<key>\n...\n</key>`.
+	Tag *bool
+}
+
+// HookRegistration is built by Hook; it matches tasks by name.
+type HookRegistration struct {
+	Task     string
+	Handlers any
+}
+
+// Wrap is upstream's `{ tool; wrap(tool) } | { section; wrap(section) }` (harness/types.ts:263-265): a sealed union of ToolWrap, built by WrapTool,
+// and SectionWrap, built by WrapSection. A wrap targets a tool name or a section key. Wrappers are pure.
+type Wrap interface{ isWrap() }
+
+// ToolWrap is the `{ tool: string; wrap(tool: Tool): Tool }` member of Wrap.
+type ToolWrap struct {
+	Tool string
+	Wrap func(tool *ToolRegistration) *ToolRegistration
+}
+
+// SectionWrap is the `{ section: string; wrap(section: PromptSection<Tool>): PromptSection<Tool> }` member of Wrap.
+type SectionWrap struct {
+	Section string
+	Wrap    func(section *PromptSection) *PromptSection
+}
+
+func (ToolWrap) isWrap()    {}
+func (SectionWrap) isWrap() {}
+
+// ToolNamespace is a named group of tools for code mode: the extension that brings the tools declares it (Ports
+// packages/durable/src/harness/types.ts, Pi 5e24c6b1f). Description is one line, shown in the `codemode` prompt section;
+// Instructions is the longer how-to, returned only by `describeNamespace()` (empty: none); `searchTools()` searches both.
+type ToolNamespace struct {
+	Name         string
+	Description  string
+	Instructions string
+}
+
+// Extension is a named bundle of code, installed in a registry and selected by conversations by name.
+type Extension struct {
+	Name string
+	// Namespace is the code-mode namespace of this extension's tools (a tool named by several extensions belongs to the
+	// first one's). The `codemode` section lists it while the extension is selected, also before it has any tools.
+	Namespace *ToolNamespace
+	Tools     []*ToolRegistration
+	Sections  []*PromptSection
+	Hooks     []HookRegistration
+	// Wraps apply where this extension is selected, in order.
+	Wraps []Wrap
+	// Tasks are resolved by name for every task, whichever conversations select this extension.
+	Tasks []AnyTask
+}
+
+// RegistryTool is an installed tool with its extension.
+type RegistryTool struct {
+	Extension *Extension
+	Tool      *ToolRegistration
+}
+
+// RegistrySection is an installed prompt section with its extension.
+type RegistrySection struct {
+	Extension *Extension
+	Section   *PromptSection
+}
+
+// RegistrySnapshot is an immutable view of one published registry state.
+type RegistrySnapshot interface {
+	Installed() []*Extension
+	// Extension returns nil when absent.
+	Extension(name string) *Extension
+	// Tools returns every installed tool with its extension, in install order. Names may repeat across extensions.
+	Tools() []RegistryTool
+	Sections() []RegistrySection
+	// Tasks returns the built-in and installed task definitions.
+	Tasks() []AnyTask
+	// Task returns nil when absent.
+	Task(name string) AnyTask
+}
+
+// Agent is a conversation's agent resolved against a registry snapshot and the settings.
+type Agent struct {
+	Model         *ModelRef
+	ThinkingLevel ai.ModelThinkingLevel
+	Extensions    []*Extension
+	// Tools are the tools a request offers, in order: enabled, callable by the model, and selected by modelTools.
+	Tools []*ToolRegistration
+	// Callable are the tools nested calls (executeTool()) resolve among, in order: enabled and callable by tools.
+	Callable []*ToolRegistration
+	// Deferred are the enabled deferred tools the model may call and is not offered yet, in registry order: what tool_search loads.
+	Deferred []*ToolRegistration
+	// Sections are the extension sections, then instructions when set.
+	Sections     []*PromptSection
+	Instructions *string
+	Cwd          *string
+	// MaxTurns is the tool rounds one run takes at most (pi.live.run.turns): the round that reaches it runs its tools, then
+	// the run ends unanswered with turn_limit. An integer, 1 or more; nil, no limit. Task-owned children and forks inherit it.
+	MaxTurns *int
+	// Compaction is this conversation's compaction settings over the harness's (AgentState.compaction); nil when it has none.
+	Compaction *CompactionSettings
+}
+
+// ConversationStreamOptions holds curated pi-ai request options; absent fields use pi-ai defaults.
+type ConversationStreamOptions struct {
+	Transport ai.Transport `json:"transport,omitempty"`
+	TimeoutMs *int         `json:"timeoutMs,omitempty"`
+	// WebsocketConnectTimeoutMs is the WebSocket connection/open handshake timeout; stream idleness uses TimeoutMs.
+	WebsocketConnectTimeoutMs *int `json:"websocketConnectTimeoutMs,omitempty"`
+	// ThinkingBudgets are custom token budgets for thinking levels on token-based providers.
+	ThinkingBudgets *ai.ThinkingBudgets `json:"thinkingBudgets,omitempty"`
+	// MaxRetries is provider/SDK retries inside one request attempt.
+	MaxRetries      *int               `json:"maxRetries,omitempty"`
+	MaxRetryDelayMs *int               `json:"maxRetryDelayMs,omitempty"`
+	Headers         map[string]string  `json:"headers,omitempty"`
+	Metadata        map[string]any     `json:"metadata,omitempty"`
+	CacheRetention  ai.CacheRetention  `json:"cacheRetention,omitempty"`
+	Deferred        *ai.DeferredOption `json:"deferred,omitempty"`
+}
+
+// ConversationRetryPolicy holds durable generation attempt retries; the JSON shape of pi-ai RetryPolicy.
+type ConversationRetryPolicy struct {
+	Enabled         bool `json:"enabled"`
+	MaxRetries      int  `json:"maxRetries"`
+	BaseDelayMs     int  `json:"baseDelayMs"`
+	MaxAgentDelayMs *int `json:"maxAgentDelayMs,omitempty"`
+}
+
+// CompactionPolicy holds the automatic compaction thresholds (spec §8.7); manual compaction ignores Enabled.
+type CompactionPolicy struct {
+	// Enabled controls threshold and overflow compaction.
+	Enabled bool `json:"enabled"`
+	// ReserveTokens is room kept free for the answer: generation blocks to compact above
+	// contextWindow - reserveTokens.
+	ReserveTokens int `json:"reserveTokens"`
+	// KeepRecentTokens is the approximate size of the recent context a summary keeps verbatim.
+	KeepRecentTokens int `json:"keepRecentTokens"`
+	// BackgroundTokens starts background compaction this far below the blocking threshold; 0 disables it.
+	BackgroundTokens int `json:"backgroundTokens"`
+	// ModelOverrides is the resolved CompactionSettings.modelOverrides, keyed by exact "provider/modelId"; nil without
+	// any. PolicyFor applies it.
+	//portlint:allow emptydrop an unset ModelOverrides is Pi's absent modelOverrides (Settings spreads only the keys a host set); an explicit {} is kept
+	ModelOverrides CompactionOverrides `json:"modelOverrides,omitzero"`
+}
+
+// CompactionPolicyOverride is Partial<CompactionPolicy>: one model's entry of modelOverrides; nil fields keep the
+// Harness-wide value.
+type CompactionPolicyOverride struct {
+	Enabled          *bool `json:"enabled,omitempty"`
+	ReserveTokens    *int  `json:"reserveTokens,omitempty"`
+	KeepRecentTokens *int  `json:"keepRecentTokens,omitempty"`
+	BackgroundTokens *int  `json:"backgroundTokens,omitempty"`
+}
+
+// CompactionSettings is Pi's CompactionSettings: Partial<CompactionPolicy> plus modelOverrides, of the Harness
+// (HarnessSettings.Compaction) or of one conversation (AgentState.Compaction). Nil fields are unset. ModelOverrides is keyed
+// by exact "provider/modelId"; each field an entry sets replaces the general one for that model.
+type CompactionSettings struct {
+	Enabled          *bool `json:"enabled,omitempty"`
+	ReserveTokens    *int  `json:"reserveTokens,omitempty"`
+	KeepRecentTokens *int  `json:"keepRecentTokens,omitempty"`
+	BackgroundTokens *int  `json:"backgroundTokens,omitempty"`
+	//portlint:allow emptydrop an unset ModelOverrides is Pi's absent modelOverrides; an explicit {} is stored as {}
+	ModelOverrides CompactionOverrides `json:"modelOverrides,omitzero"`
+}
+
+// own is the settings' own fields as a layer of the resolution.
+func (settings *CompactionSettings) own() CompactionPolicyOverride {
+	return CompactionPolicyOverride{Enabled: settings.Enabled, ReserveTokens: settings.ReserveTokens, KeepRecentTokens: settings.KeepRecentTokens, BackgroundTokens: settings.BackgroundTokens}
+}
+
+// PolicyFor is compaction.ts compactionPolicy, field by field: the conversation's modelOverrides entry for the model, the
+// Harness's, the conversation's own fields, then the Harness-wide policy. A model-specific value beats a general one, and the
+// conversation beats the Harness at the same level; the exception is the conversation's own enabled: false, which also beats
+// the Harness's model override, since turning compaction off for a conversation does not depend on the model. The result
+// carries no overrides.
+func (policy CompactionPolicy) PolicyFor(model ModelRef, conversation *CompactionSettings) CompactionPolicy {
+	key := model.Provider + "/" + model.ModelId
+	var layers [3]CompactionPolicyOverride
+	var conversationModel CompactionPolicyOverride
+	if conversation != nil {
+		conversationModel, _ = conversation.ModelOverrides.Get(key)
+		layers[0], layers[2] = conversationModel, conversation.own()
+	}
+	layers[1], _ = policy.ModelOverrides.Get(key)
+	field := func(pick func(CompactionPolicyOverride) *int, harness int) int {
+		for _, layer := range layers {
+			if value := pick(layer); value != nil {
+				return *value
+			}
+		}
+		return harness
+	}
+	resolved := CompactionPolicy{
+		ReserveTokens:    field(func(layer CompactionPolicyOverride) *int { return layer.ReserveTokens }, policy.ReserveTokens),
+		KeepRecentTokens: field(func(layer CompactionPolicyOverride) *int { return layer.KeepRecentTokens }, policy.KeepRecentTokens),
+		BackgroundTokens: field(func(layer CompactionPolicyOverride) *int { return layer.BackgroundTokens }, policy.BackgroundTokens),
+	}
+	switch {
+	case conversationModel.Enabled != nil:
+		resolved.Enabled = *conversationModel.Enabled
+	case conversation != nil && conversation.Enabled != nil && !*conversation.Enabled:
+		resolved.Enabled = false
+	default:
+		resolved.Enabled = policy.Enabled
+		for _, layer := range layers {
+			if layer.Enabled != nil {
+				resolved.Enabled = *layer.Enabled
+				break
+			}
+		}
+	}
+	return resolved
+}
+
+// ProgressPolicy is how often running progress is committed, and how long it may wait in memory before it is stored.
+// Progress commits are deferred (CommitPersistence): watches see each at once, and Storage gets them together, at the
+// run's next phase boundary or after PersistWithinMs. A host can commit less often, so live answers and tool output
+// appear in larger steps.
+type ProgressPolicy struct {
+	// PartialIntervalMs is the minimum pause between commits of the answer being generated.
+	PartialIntervalMs float64 `json:"partialIntervalMs"`
+	// OutputIntervalMs is the minimum pause between commits of running tool output; large commits also pause in
+	// proportion to their size.
+	OutputIntervalMs float64 `json:"outputIntervalMs"`
+	// PersistWithinMs is how long these commits, and other deferred commits without their own WithinMs, may stay in
+	// memory before they are stored; a crash loses at most about this much of an answer or of tool output. Default
+	// 1,000; +Inf stores them only at the next commit that reads or writes their document and at close.
+	PersistWithinMs float64 `json:"persistWithinMs"`
+}
+
+// CompactionReason is why a compaction runs: Compact(), a threshold in generation preparation, or a context overflow.
+type CompactionReason string
+
+const (
+	CompactionManual    CompactionReason = "manual"
+	CompactionThreshold CompactionReason = "threshold"
+	CompactionOverflow  CompactionReason = "overflow"
+)
+
+// Settings holds the resolved settings: every field over its built-in default, object fields merged.
+type Settings struct {
+	// Extensions is nil for every installed extension, in install order.
+	Extensions    []*Extension
+	Stream        ConversationStreamOptions
+	Retry         ConversationRetryPolicy
+	Compaction    CompactionPolicy
+	Progress      ProgressPolicy
+	ToolExecution ToolExecutionMode
+	SteeringMode  QueueMode
+	FollowUpMode  QueueMode
+	// ContextRetentionMs is how long an idle conversation keeps its last context read in memory, so its next run reads
+	// only newer entries. Busy conversations always keep it; 0 drops it once the conversation is idle.
+	ContextRetentionMs float64
+	// DocumentRetentionMs is how long a loaded document that no watch or document state observes stays in memory after
+	// its last read or write; the next access loads it from Storage. Observed documents always stay. Default ten
+	// minutes; 0 drops one right after use; +Inf keeps them.
+	DocumentRetentionMs float64
+	// AfterFailedRun is what a run that fails (model_error, no_model, interrupted, restart_limit, nothing_to_answer,
+	// turn_limit) does with the inputs queued behind it.
+	AfterFailedRun AfterFailedRun
+	// RestartLimit is how many times in a row a task may be cut off by a crash, eviction, or reset (a close does not
+	// count) without changing its state before it ends instead of running again: a tool call with an error result, a
+	// compaction failed into pi.live.compactionFailure, a run with pi.live.runFailure reason restart_limit, any other task
+	// faulted with detail {reason: "restart_limit"}. A generation's request or poll the host died during is a failed
+	// attempt under retry first; the limit bounds it only when charging that attempt keeps being cut off. +Inf never ends
+	// a task for it.
+	RestartLimit float64
+}
+
+// AfterFailedRun is what a failed run does with the inputs queued behind it (HarnessSettings.afterFailedRun).
+type AfterFailedRun string
+
+// The failed-run policies: keep leaves the inputs queued until the next input or queued write, continue starts the next
+// run with them, as an answer would, and withdraw settles them unanswered with reason run_failed.
+const (
+	AfterFailedRunKeep     AfterFailedRun = "keep"
+	AfterFailedRunContinue AfterFailedRun = "continue"
+	AfterFailedRunWithdraw AfterFailedRun = "withdraw"
+)
+
+// DefaultRestartLimit is the default of HarnessSettings.RestartLimit.
+const DefaultRestartLimit = 5
+
+// ContextView is the raw active transcript and the derived model context.
+type ContextView struct {
+	// Head is the newest applicable head marker; nil when none.
+	Head *EntryRecord
+	// Entries are the raw active entries: the head marker followed by non-head entries from its head through the
+	// tail.
+	Entries []EntryRecord
+	// Contributions holds, per entry of Entries, its model messages after edits and excluded stop reasons, before
+	// tool result ordering.
+	Contributions [][]ai.Message
+	// Messages is the model context for the next provider request.
+	Messages []ai.Message
+}

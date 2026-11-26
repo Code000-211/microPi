@@ -1,0 +1,832 @@
+package tui
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/linkerexec"
+	"github.com/MichaelKinsy/PiG/internal/nodebase64"
+	"github.com/MichaelKinsy/PiG/internal/nodepath"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
+	"github.com/MichaelKinsy/PiG/tui/widthx"
+)
+
+type ImageProtocol string
+
+const (
+	ImageProtocolKitty  ImageProtocol = "kitty"
+	ImageProtocolITerm2 ImageProtocol = "iterm2"
+)
+
+type TerminalCapabilities struct {
+	Images     ImageProtocol
+	TrueColor  bool
+	Hyperlinks bool
+}
+
+type CellDimensions struct {
+	WidthPx  int
+	HeightPx int
+}
+
+type ImageDimensions struct {
+	WidthPx  int
+	HeightPx int
+}
+
+type ImageRenderOptions struct {
+	MaxWidthCells       int
+	MaxHeightCells      int
+	PreserveAspectRatio *bool // nil preserves the aspect ratio
+	ImageID             int
+	Name                string
+	MoveCursor          *bool // nil permits Kitty cursor movement; false emits C=1
+}
+
+type renderedImage struct {
+	Sequence string
+	Columns  int
+	Rows     int
+	ImageID  int
+}
+
+// CapabilityOverrides mirrors upstream Partial<TerminalCapabilities> as passed
+// to setCapabilityOverrides. A nil field is absent. Images points at "" for
+// upstream's null (no image protocol).
+type CapabilityOverrides struct {
+	Images     *ImageProtocol
+	TrueColor  *bool
+	Hyperlinks *bool
+}
+
+func (o CapabilityOverrides) equal(other CapabilityOverrides) bool {
+	return ptrValueEqual(o.Images, other.Images) &&
+		ptrValueEqual(o.TrueColor, other.TrueColor) &&
+		ptrValueEqual(o.Hyperlinks, other.Hyperlinks)
+}
+
+func ptrValueEqual[T comparable](a, b *T) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func (o CapabilityOverrides) clone() CapabilityOverrides {
+	return CapabilityOverrides{Images: clonePtr(o.Images), TrueColor: clonePtr(o.TrueColor), Hyperlinks: clonePtr(o.Hyperlinks)}
+}
+
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+var (
+	// capabilityMu makes override replacement and cache invalidation one
+	// operation. The cache remains atomic because renderers read it often.
+	capabilityMu         sync.Mutex
+	cachedCapabilities   atomic.Pointer[TerminalCapabilities]
+	capabilityOverrides  CapabilityOverrides
+	cellDimensions       = CellDimensions{WidthPx: 9, HeightPx: 18}
+	tmuxHyperlinkProbe   = probeTmuxHyperlinks
+	tmuxProbeTimeout     = 250 * time.Millisecond // upstream: terminal-image.ts:probeTmuxHyperlinks
+	capabilityDetectGOOS = runtime.GOOS
+)
+
+func GetCellDimensions() CellDimensions { return cellDimensions }
+func SetCellDimensions(dims CellDimensions) {
+	cellDimensions = dims
+}
+
+// probeTmuxHyperlinks mirrors upstream probeTmuxHyperlinks: tmux re-emits OSC 8
+// only when the attached client's client_termfeatures lists hyperlinks. Any
+// error, including the 250ms timeout, reports false.
+func probeTmuxHyperlinks() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), tmuxProbeTimeout)
+	defer cancel()
+	cmd := linkerexec.CommandContext(ctx, "tmux", "display-message", "-p", "#{client_termfeatures}")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return tmuxTermfeaturesIncludeHyperlinks(string(out))
+}
+
+func tmuxTermfeaturesIncludeHyperlinks(termfeatures string) bool {
+	for feature := range strings.SplitSeq(termfeatures, ",") {
+		if strings.TrimSpace(feature) == "hyperlinks" {
+			return true
+		}
+	}
+	return false
+}
+
+// detectCapabilitiesFromEnvironment mirrors upstream
+// detectCapabilitiesFromEnvironment. goos stands in for process.platform.
+func detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink func() bool, goos string) TerminalCapabilities {
+	termProgram := jsstring.ToLower(os.Getenv("TERM_PROGRAM"))
+	terminalEmulator := jsstring.ToLower(os.Getenv("TERMINAL_EMULATOR"))
+	term := jsstring.ToLower(os.Getenv("TERM"))
+	colorTerm := jsstring.ToLower(os.Getenv("COLORTERM"))
+	hasTrueColorHint := colorTerm == "truecolor" || colorTerm == "24bit" || strings.HasSuffix(term, "-direct")
+	isWindowsConsole := goos == "windows"
+
+	// Emit OSC 8 hyperlinks only when tmux confirms it forwards. Image
+	// protocols are unreliable under tmux, so leave images off.
+	if os.Getenv("TMUX") != "" || strings.HasPrefix(term, "tmux") {
+		return TerminalCapabilities{Images: "", TrueColor: hasTrueColorHint, Hyperlinks: tmuxForwardsHyperlink()}
+	}
+	// screen does not forward OSC 8 hyperlinks, so keep them off there.
+	if strings.HasPrefix(term, "screen") {
+		return TerminalCapabilities{Images: "", TrueColor: hasTrueColorHint, Hyperlinks: false}
+	}
+	// pig divergence (D44): require Herdr's explicit image-forwarding signal at the immediate terminal boundary.
+	if os.Getenv("HERDR_ENV") == "1" && os.Getenv("HERDR_KITTY_GRAPHICS") == "1" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	// Herdr forwards OSC 8 hyperlinks and supports the Kitty graphics protocol. Check it before
+	// outer-terminal detection because variables like KITTY_WINDOW_ID can leak into its panes.
+	if termProgram == "herdr" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: hasTrueColorHint, Hyperlinks: true}
+	}
+	// Rex supports OSC 8 hyperlinks and only partially implements the Kitty graphics protocol
+	// (no Unicode placeholders), but enough to support Pi.
+	// Ports packages/tui/src/terminal-image.ts detectCapabilitiesFromEnvironment (396ecd7b).
+	if termProgram == "rex" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	// pig divergence (D44): without Herdr's positive graphics signal, ignore inherited outer-terminal image hints.
+	if os.Getenv("HERDR_ENV") == "1" {
+		return TerminalCapabilities{Images: "", TrueColor: hasTrueColorHint, Hyperlinks: false}
+	}
+	// Orca supports Kitty graphics but only advertises it through ORCA_IMAGE_PROTOCOL. Require both signals so Orca releases
+	// predating that advertisement keep the text fallback instead of reserving image rows that nothing renders.
+	if termProgram == "orca" && os.Getenv("ORCA_IMAGE_PROTOCOL") == "kitty" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	if os.Getenv("KITTY_WINDOW_ID") != "" || termProgram == "kitty" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	if termProgram == "ghostty" || strings.Contains(term, "ghostty") || os.Getenv("GHOSTTY_RESOURCES_DIR") != "" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	if os.Getenv("WEZTERM_PANE") != "" || termProgram == "wezterm" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	// Warp supports the Kitty graphics protocol and OSC 8 hyperlinks.
+	if termProgram == "warpterminal" || os.Getenv("WARP_SESSION_ID") != "" || os.Getenv("WARP_TERMINAL_SESSION_UUID") != "" {
+		return TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true}
+	}
+	if os.Getenv("ITERM_SESSION_ID") != "" || termProgram == "iterm.app" {
+		return TerminalCapabilities{Images: ImageProtocolITerm2, TrueColor: true, Hyperlinks: true}
+	}
+	if os.Getenv("WT_SESSION") != "" {
+		return TerminalCapabilities{Images: "", TrueColor: true, Hyperlinks: true}
+	}
+	// Alacritty does not set TERM_PROGRAM. It sets TERM=alacritty when its terminfo entry is installed (otherwise
+	// xterm-256color) and ALACRITTY_WINDOW_ID on Unix and macOS (Pi main 2af8a42f5).
+	isAlacritty := termProgram == "alacritty" || strings.HasPrefix(term, "alacritty") || os.Getenv("ALACRITTY_WINDOW_ID") != ""
+	if isAlacritty || termProgram == "vscode" || termProgram == "zed" {
+		return TerminalCapabilities{Images: "", TrueColor: true, Hyperlinks: true}
+	}
+	if terminalEmulator == "jetbrains-jediterm" {
+		return TerminalCapabilities{Images: "", TrueColor: true, Hyperlinks: false}
+	}
+	// Windows Terminal does not always set WT_SESSION. Modern Windows consoles
+	// support truecolor; keep hyperlinks off unless positively detected above.
+	if isWindowsConsole {
+		return TerminalCapabilities{Images: "", TrueColor: true, Hyperlinks: false}
+	}
+	// Unknown terminal: be conservative about OSC 8, which terminals that
+	// swallow it render as bare text with the URL gone.
+	return TerminalCapabilities{Images: "", TrueColor: hasTrueColorHint, Hyperlinks: false}
+}
+
+// parseBooleanCapabilityOverride mirrors upstream: only "1" and "0" override.
+func parseBooleanCapabilityOverride(value string) *bool {
+	switch value {
+	case "1":
+		return new(true)
+	case "0":
+		return new(false)
+	}
+	return nil
+}
+
+// DetectCapabilities mirrors upstream detectCapabilities: PI_HYPERLINKS,
+// PI_IMAGE_PROTOCOL, and PI_TRUE_COLOR override auto-detection, and an
+// explicit PI_HYPERLINKS replaces the tmux probe. A nil tmuxForwardsHyperlink
+// uses the default tmux probe.
+func DetectCapabilities(tmuxForwardsHyperlink func() bool) TerminalCapabilities {
+	if tmuxForwardsHyperlink == nil {
+		tmuxForwardsHyperlink = tmuxHyperlinkProbe
+	}
+	hyperlinks := parseBooleanCapabilityOverride(os.Getenv("PI_HYPERLINKS"))
+	probe := tmuxForwardsHyperlink
+	if hyperlinks != nil {
+		probe = func() bool { return *hyperlinks }
+	}
+	detected := detectCapabilitiesFromEnvironment(probe, capabilityDetectGOOS)
+	switch imageProtocol := jsstring.ToLower(os.Getenv("PI_IMAGE_PROTOCOL")); imageProtocol {
+	case "kitty", "iterm2":
+		detected.Images = ImageProtocol(imageProtocol)
+	case "none", "0":
+		detected.Images = ""
+	}
+	if trueColor := parseBooleanCapabilityOverride(os.Getenv("PI_TRUE_COLOR")); trueColor != nil {
+		detected.TrueColor = *trueColor
+	}
+	if hyperlinks != nil {
+		detected.Hyperlinks = *hyperlinks
+	}
+	return detected
+}
+
+// GetCapabilities mirrors upstream getCapabilities: detection with the PI_*
+// environment, then the settings overrides on top.
+func GetCapabilities() TerminalCapabilities {
+	capabilityMu.Lock()
+	defer capabilityMu.Unlock()
+	if cached := cachedCapabilities.Load(); cached != nil {
+		return *cached
+	}
+	overrides := capabilityOverrides
+	var probe func() bool
+	if overrides.Hyperlinks != nil {
+		hyperlinks := *overrides.Hyperlinks
+		probe = func() bool { return hyperlinks }
+	}
+	caps := ApplyCapabilityOverrides(DetectCapabilities(probe), overrides)
+	cachedCapabilities.Store(&caps)
+	return caps
+}
+
+// ApplyCapabilityOverrides lays the settings overrides over detected capabilities, as `{...detectCapabilities(), ...overrides}` does.
+func ApplyCapabilityOverrides(caps TerminalCapabilities, overrides CapabilityOverrides) TerminalCapabilities {
+	if overrides.Images != nil {
+		caps.Images = *overrides.Images
+	}
+	if overrides.TrueColor != nil {
+		caps.TrueColor = *overrides.TrueColor
+	}
+	if overrides.Hyperlinks != nil {
+		caps.Hyperlinks = *overrides.Hyperlinks
+	}
+	return caps
+}
+
+// GetTerminalColorMode is the color depth the terminal supports: truecolor when capabilities report it, else 256 colors. Without an argument it
+// reads TrueColor as getCapabilities() would, without the tmux probe.
+func GetTerminalColorMode(capabilities ...TerminalCapabilities) TerminalColorMode {
+	var trueColor bool
+	if len(capabilities) > 0 {
+		trueColor = capabilities[0].TrueColor
+	} else {
+		trueColor = currentTrueColor()
+	}
+	if trueColor {
+		return TerminalColorModeTrueColor
+	}
+	return TerminalColorMode256
+}
+
+// The tmux probe decides only Hyperlinks.
+func currentTrueColor() bool {
+	if cached := cachedCapabilities.Load(); cached != nil {
+		return cached.TrueColor
+	}
+	capabilityMu.Lock()
+	overrides := capabilityOverrides
+	capabilityMu.Unlock()
+	return ApplyCapabilityOverrides(DetectCapabilities(func() bool { return false }), overrides).TrueColor
+}
+
+func ResetCapabilitiesCache() {
+	capabilityMu.Lock()
+	cachedCapabilities.Store(nil)
+	capabilityMu.Unlock()
+}
+
+// SetCapabilityOverrides mirrors upstream setCapabilityOverrides: it replaces
+// the overrides and drops the cache only when a field changed.
+func SetCapabilityOverrides(overrides CapabilityOverrides) {
+	capabilityMu.Lock()
+	defer capabilityMu.Unlock()
+	if capabilityOverrides.equal(overrides) {
+		return
+	}
+	capabilityOverrides = overrides.clone()
+	cachedCapabilities.Store(nil)
+}
+
+// SetCapabilities overrides the cached capabilities. Mirrors upstream
+// setCapabilities.
+func SetCapabilities(caps TerminalCapabilities) {
+	capabilityMu.Lock()
+	cachedCapabilities.Store(&caps)
+	capabilityMu.Unlock()
+}
+
+// IsImageLine reports whether the line contains Kitty or iTerm2 image protocol bytes.
+// Mirrors upstream terminal-image.ts isImageLine().
+func IsImageLine(line string) bool { return widthx.IsImageLine(line) }
+
+// iterm2Prefix begins an iTerm2 inline image sequence. Mirrors upstream ITERM2_PREFIX.
+const iterm2Prefix = "\x1b]1337;File="
+
+// imageExtentUnbounded is upstream's Infinity for the cells of an image line: a count the line does not state, or one beyond
+// every terminal's size. Its sum with a row or column of a frame fits a 32-bit int.
+const imageExtentUnbounded = 1 << 30
+
+// imageLineExtent is the cells covered by the image placement on an image line. Rows are relative to the line; columns are
+// absolute, with endCol exclusive and imageExtentUnbounded when the image width cannot be read. Mirrors upstream ImageLineExtent.
+type imageLineExtent struct {
+	firstRow, lastRow, startCol, endCol int
+}
+
+// getImageLineExtent returns the cells an image line draws over. Kitty places the image at the line and extends it
+// downward; iTerm2 lines move the cursor up before drawing, so the image ends at the line. Mirrors upstream
+// getImageLineExtent. An image line carries the image's payload and the overlay compositor reads every image line of the
+// viewport each frame, so upstream's regular expressions over the line are byte searches here.
+func getImageLineExtent(line string) (imageLineExtent, bool) {
+	if leading, command, isKitty := strings.Cut(line, kittyPrefix); isKitty {
+		// /\x1b_G([^;]*);/: the controls of the first command, none when no ";" follows it.
+		controls, _, found := strings.Cut(command, ";")
+		if !found {
+			controls = ""
+		}
+		metadata, registered := getRegisteredKittyImageMetadataFromControls(controls)
+		startCol := widthx.VisibleWidth(leading)
+		endCol := imageExtentUnbounded
+		if value := kittyImageColumnsPattern.FindStringSubmatch(controls); value != nil {
+			endCol = min(startCol+parseImageExtentCount(value[1]), imageExtentUnbounded)
+		} else if registered {
+			endCol = min(startCol+metadata.Columns, imageExtentUnbounded)
+		}
+		// getKittyImagePlacementRows(line) ?? 1: the explicit `r=` rows, else the registered image's.
+		rows := 1
+		if explicit, ok := getExplicitKittyImageRows(controls); ok {
+			rows = explicit
+		} else if registered {
+			rows = metadata.Rows
+		}
+		return imageLineExtent{firstRow: 0, lastRow: min(rows-1, imageExtentUnbounded), startCol: startCol, endCol: endCol}, true
+	}
+	iterm2Start := strings.Index(line, iterm2Prefix)
+	if iterm2Start == -1 {
+		return imageLineExtent{}, false
+	}
+	// visibleWidth counts the cursor-up sequence as text, so measure only what precedes it.
+	before := line[:iterm2Start]
+	firstRow := 0
+	if moveUp, count, ok := trailingCursorUp(before); ok {
+		before = before[:moveUp]
+		firstRow = -parseImageExtentCount(count)
+	}
+	startCol := widthx.VisibleWidth(before)
+	endCol := imageExtentUnbounded
+	// Only a plain cell count is a known width; `auto`, pixel and percent widths depend on the image.
+	if columns, ok := iterm2WidthCells(line[iterm2Start:]); ok {
+		endCol = min(startCol+columns, imageExtentUnbounded)
+	}
+	return imageLineExtent{firstRow: firstRow, lastRow: 0, startCol: startCol, endCol: endCol}, true
+}
+
+// parseImageExtentCount is upstream's Number.parseInt(digits, 10) as a count of cells: a count at or beyond imageExtentUnbounded
+// is imageExtentUnbounded, and so is NaN. Every caller passes a (\d+) capture.
+func parseImageExtentCount(digits string) int {
+	count := jsnumber.ParseInt(digits)
+	if !(count < imageExtentUnbounded) { // NaN fails the comparison
+		return imageExtentUnbounded
+	}
+	if count <= -imageExtentUnbounded {
+		return -imageExtentUnbounded
+	}
+	//portlint:allow numbers terminal-image.ts parsed cell count: Number.parseInt yields an integer or NaN, and NaN and every value outside (-2^30, 2^30) returned above
+	return int(count)
+}
+
+// trailingCursorUp matches upstream's /\x1b\[(\d+)A$/ against text: the index the sequence starts at and its digits.
+func trailingCursorUp(text string) (start int, count string, ok bool) {
+	end := len(text) - 1
+	if end < 0 || text[end] != 'A' {
+		return 0, "", false
+	}
+	digits := end
+	for digits > 0 && text[digits-1] >= '0' && text[digits-1] <= '9' {
+		digits--
+	}
+	if digits == end || !strings.HasSuffix(text[:digits], "\x1b[") {
+		return 0, "", false
+	}
+	return digits - len("\x1b["), text[digits:end], true
+}
+
+// iterm2WidthCells is the first match of upstream's /[;=]width=(\d+)[;:]/ in text, the line from its iTerm2 sequence on.
+func iterm2WidthCells(text string) (int, bool) {
+	const key = "width="
+	for from := 0; ; {
+		at := strings.Index(text[from:], key)
+		if at == -1 {
+			return 0, false
+		}
+		at += from
+		digits := at + len(key)
+		end := digits
+		for end < len(text) && text[end] >= '0' && text[end] <= '9' {
+			end++
+		}
+		if at > 0 && (text[at-1] == ';' || text[at-1] == '=') && end > digits && end < len(text) && (text[end] == ';' || text[end] == ':') {
+			return parseImageExtentCount(text[digits:end]), true
+		}
+		from = at + 1
+	}
+}
+
+// stripImageSequences removes Kitty and iTerm2 image sequences, including iTerm2's cursor-up prefix, keeping the text.
+// Mirrors upstream stripImageSequences: /\x1b_G[^\x1b]*\x1b\\/g, then /(?:\x1b\[\d+A)?\x1b\]1337;File=[^\x07]*\x07/g.
+func stripImageSequences(line string) string {
+	return stripITerm2ImageSequences(stripKittyImageSequences(line))
+}
+
+func stripKittyImageSequences(line string) string {
+	var kept strings.Builder
+	copied := 0
+	for start := strings.Index(line, kittyPrefix); start != -1; {
+		// The body runs to the next ESC, which has to begin the terminator; when it does not, a command may start at it.
+		body := start + len(kittyPrefix)
+		escape := strings.IndexByte(line[body:], '\x1b')
+		if escape == -1 {
+			break
+		}
+		next := body + escape
+		if strings.HasPrefix(line[next:], "\x1b\\") {
+			kept.WriteString(line[copied:start])
+			next += len("\x1b\\")
+			copied = next
+		}
+		if start = strings.Index(line[next:], kittyPrefix); start != -1 {
+			start += next
+		}
+	}
+	if copied == 0 {
+		return line
+	}
+	kept.WriteString(line[copied:])
+	return kept.String()
+}
+
+func stripITerm2ImageSequences(line string) string {
+	var kept strings.Builder
+	copied := 0
+	for {
+		start := strings.Index(line[copied:], iterm2Prefix)
+		if start == -1 {
+			break
+		}
+		start += copied
+		bell := strings.IndexByte(line[start+len(iterm2Prefix):], '\x07')
+		if bell == -1 {
+			break
+		}
+		end := start + len(iterm2Prefix) + bell + 1
+		if moveUp, _, ok := trailingCursorUp(line[copied:start]); ok {
+			start = copied + moveUp
+		}
+		kept.WriteString(line[copied:start])
+		copied = end
+	}
+	if copied == 0 {
+		return line
+	}
+	kept.WriteString(line[copied:])
+	return kept.String()
+}
+
+func AllocateImageID() int {
+	return int(rand.Uint32()%0xfffffffe) + 1
+}
+
+func EncodeKitty(base64Data string, columns, rows, imageID int, moveCursor ...bool) string {
+	const chunkSize = 4096
+	params := []string{"a=T", "f=100", "q=2"}
+	if len(moveCursor) > 0 && !moveCursor[0] {
+		params = append(params, "C=1")
+	}
+	if columns != 0 {
+		params = append(params, fmt.Sprintf("c=%d", columns))
+	}
+	if rows != 0 {
+		params = append(params, fmt.Sprintf("r=%d", rows))
+	}
+	if imageID != 0 {
+		params = append(params, fmt.Sprintf("i=%d", imageID))
+	}
+	// Pi measures and slices base64Data in UTF-16 units. Real base64 is ASCII, one unit per byte, so a payload whose
+	// unit count equals its byte count is sliced by byte.
+	length := jsstring.Length(base64Data)
+	if length <= chunkSize {
+		return "\x1b_G" + strings.Join(params, ",") + ";" + base64Data + "\x1b\\"
+	}
+	ascii := length == len(base64Data)
+	var chunks []string
+	for off := 0; off < length; off += chunkSize {
+		end := min(off+chunkSize, length)
+		var chunk string
+		if ascii {
+			chunk = base64Data[off:end]
+		} else {
+			chunk = jsstring.Slice(base64Data, off, off+chunkSize)
+		}
+		switch {
+		case off == 0:
+			chunks = append(chunks, "\x1b_G"+strings.Join(params, ",")+",m=1;"+chunk+"\x1b\\")
+		case end == length:
+			chunks = append(chunks, "\x1b_Gm=0;"+chunk+"\x1b\\")
+		default:
+			chunks = append(chunks, "\x1b_Gm=1;"+chunk+"\x1b\\")
+		}
+	}
+	return strings.Join(chunks, "")
+}
+
+func DeleteKittyImage(imageID int) string {
+	return fmt.Sprintf("\x1b_Ga=d,d=I,i=%d,q=2\x1b\\", imageID)
+}
+
+func DeleteAllKittyImages() string { return "\x1b_Ga=d,d=A,q=2\x1b\\" }
+
+// DeleteAllKittyPlacements removes every Kitty image placement (visible
+// renderings) while leaving the transmitted image data intact. Mirrors upstream
+// deleteAllKittyPlacements.
+func DeleteAllKittyPlacements() string { return "\x1b_Ga=d,d=a,q=2\x1b\\" }
+
+// ITerm2Options mirrors the options object of upstream encodeITerm2. A nil Width or Height, an empty Name and a nil pointer are the absent fields.
+// Width and Height are a number or a string, as in upstream.
+type ITerm2Options struct {
+	Width               any
+	Height              any
+	Name                string
+	PreserveAspectRatio *bool
+	Inline              *bool
+}
+
+// EncodeITerm2 includes the decoded payload byte length in OSC 1337 metadata.
+func EncodeITerm2(base64Data string, options ITerm2Options) string {
+	width, height, name := options.Width, options.Height, options.Name
+	// Node Buffer.byteLength(value, "base64") counts UTF-16 units and trailing padding without decoding the payload.
+	size := utf16Length(base64Data)
+	if strings.HasSuffix(base64Data, "=") {
+		size--
+	}
+	if strings.HasSuffix(base64Data, "==") {
+		size--
+	}
+	inline := 1
+	if options.Inline != nil && !*options.Inline {
+		inline = 0
+	}
+	params := []string{fmt.Sprintf("inline=%d", inline), fmt.Sprintf("size=%d", size*3>>2)}
+	if width != nil {
+		params = append(params, fmt.Sprintf("width=%v", width))
+	}
+	if height != nil {
+		params = append(params, fmt.Sprintf("height=%v", height))
+	}
+	if name != "" {
+		params = append(params, "name="+base64.StdEncoding.EncodeToString([]byte(name)))
+	}
+	if options.PreserveAspectRatio != nil && !*options.PreserveAspectRatio {
+		params = append(params, "preserveAspectRatio=0")
+	}
+	return "\x1b]1337;File=" + strings.Join(params, ";") + ":" + base64Data + "\x07"
+}
+
+type ImageCellSize struct {
+	Columns int
+	Rows    int
+}
+
+// CalculateImageCellSize mirrors calculateImageCellSize; upstream defaults optimizeAspectRatio to false, so omit the argument for that default.
+func CalculateImageCellSize(imageDimensions ImageDimensions, maxWidthCells int, maxHeightCells int, dims CellDimensions, optimizeAspectRatio ...bool) ImageCellSize {
+	maxWidth := max(1, maxWidthCells)
+	imageWidth := max(1, imageDimensions.WidthPx)
+	imageHeight := max(1, imageDimensions.HeightPx)
+
+	widthScale := float64(maxWidth*dims.WidthPx) / float64(imageWidth)
+	heightScale := widthScale
+	if maxHeightCells > 0 {
+		heightScale = float64(maxHeightCells*dims.HeightPx) / float64(imageHeight)
+	}
+	scale := min(widthScale, heightScale)
+
+	scaledWidthPx := float64(imageWidth) * scale
+	scaledHeightPx := float64(imageHeight) * scale
+	//portlint:allow numbers cell dimensions are positive (SetCellDimensions takes only the positive terminal response and the 9x18 default), so the quotient is finite and at most maxWidth cells wide after the min
+	columns := max(1, min(maxWidth, int(math.Ceil(scaledWidthPx/float64(dims.WidthPx)))))
+	//portlint:allow numbers same positive cell dimensions, so the quotient is finite
+	rows := max(1, int(math.Ceil(scaledHeightPx/float64(dims.HeightPx))))
+	if maxHeightCells > 0 {
+		rows = min(maxHeightCells, rows)
+	}
+
+	if len(optimizeAspectRatio) == 0 || !optimizeAspectRatio[0] {
+		return ImageCellSize{Columns: columns, Rows: rows}
+	}
+
+	if widthScale <= heightScale {
+		idealRows := (float64(columns*dims.WidthPx) * float64(imageHeight)) / float64(imageWidth*dims.HeightPx)
+		rows = chooseLessDistortedCellCount(rows, idealRows)
+	} else {
+		idealColumns := (float64(rows*dims.HeightPx) * float64(imageWidth)) / float64(imageHeight*dims.WidthPx)
+		columns = chooseLessDistortedCellCount(columns, idealColumns)
+	}
+	return ImageCellSize{Columns: columns, Rows: rows}
+}
+
+// chooseLessDistortedCellCount picks upperCount or one cell fewer, whichever distorts the image less against the ideal count.
+func chooseLessDistortedCellCount(upperCount int, idealCount float64) int {
+	if upperCount <= 1 {
+		return upperCount
+	}
+	lowerCount := upperCount - 1
+	upperDistortion := math.Max(float64(upperCount)/idealCount, idealCount/float64(upperCount))
+	lowerDistortion := math.Max(float64(lowerCount)/idealCount, idealCount/float64(lowerCount))
+	if lowerDistortion < upperDistortion {
+		return lowerCount
+	}
+	return upperCount
+}
+
+func CalculateImageRows(imageDimensions ImageDimensions, targetWidthCells int, dims CellDimensions) int {
+	return CalculateImageCellSize(imageDimensions, targetWidthCells, 0, dims).Rows
+}
+
+func GetPNGDimensions(base64Data string) *ImageDimensions {
+	buf := nodebase64.Decode(base64Data)
+	if len(buf) < 24 {
+		return nil
+	}
+	if buf[0] != 0x89 || buf[1] != 0x50 || buf[2] != 0x4e || buf[3] != 0x47 {
+		return nil
+	}
+	width := int(buf[16])<<24 | int(buf[17])<<16 | int(buf[18])<<8 | int(buf[19])
+	height := int(buf[20])<<24 | int(buf[21])<<16 | int(buf[22])<<8 | int(buf[23])
+	return &ImageDimensions{WidthPx: width, HeightPx: height}
+}
+
+func GetJPEGDimensions(base64Data string) *ImageDimensions {
+	buf := nodebase64.Decode(base64Data)
+	if len(buf) < 2 || buf[0] != 0xff || buf[1] != 0xd8 {
+		return nil
+	}
+	for offset := 2; offset < len(buf)-9; {
+		if buf[offset] != 0xff {
+			offset++
+			continue
+		}
+		marker := buf[offset+1]
+		if marker >= 0xc0 && marker <= 0xc2 {
+			height := int(buf[offset+5])<<8 | int(buf[offset+6])
+			width := int(buf[offset+7])<<8 | int(buf[offset+8])
+			return &ImageDimensions{WidthPx: width, HeightPx: height}
+		}
+		if offset+3 >= len(buf) {
+			return nil
+		}
+		length := int(buf[offset+2])<<8 | int(buf[offset+3])
+		if length < 2 {
+			return nil
+		}
+		offset += 2 + length
+	}
+	return nil
+}
+
+func GetGIFDimensions(base64Data string) *ImageDimensions {
+	buf := nodebase64.Decode(base64Data)
+	if len(buf) < 10 {
+		return nil
+	}
+	sig := string(buf[:6])
+	if sig != "GIF87a" && sig != "GIF89a" {
+		return nil
+	}
+	width := int(buf[6]) | int(buf[7])<<8
+	height := int(buf[8]) | int(buf[9])<<8
+	return &ImageDimensions{WidthPx: width, HeightPx: height}
+}
+
+func GetWebPDimensions(base64Data string) *ImageDimensions {
+	buf := nodebase64.Decode(base64Data)
+	if len(buf) < 30 {
+		return nil
+	}
+	if string(buf[:4]) != "RIFF" || string(buf[8:12]) != "WEBP" {
+		return nil
+	}
+	chunk := string(buf[12:16])
+	switch chunk {
+	case "VP8 ":
+		width := (int(buf[26]) | int(buf[27])<<8) & 0x3fff
+		height := (int(buf[28]) | int(buf[29])<<8) & 0x3fff
+		return &ImageDimensions{WidthPx: width, HeightPx: height}
+	case "VP8L":
+		bits := int(buf[21]) | int(buf[22])<<8 | int(buf[23])<<16 | int(buf[24])<<24
+		width := (bits & 0x3fff) + 1
+		height := ((bits >> 14) & 0x3fff) + 1
+		return &ImageDimensions{WidthPx: width, HeightPx: height}
+	case "VP8X":
+		width := (int(buf[24]) | int(buf[25])<<8 | int(buf[26])<<16) + 1
+		height := (int(buf[27]) | int(buf[28])<<8 | int(buf[29])<<16) + 1
+		return &ImageDimensions{WidthPx: width, HeightPx: height}
+	default:
+		return nil
+	}
+}
+
+func GetImageDimensions(base64Data, mimeType string) *ImageDimensions {
+	switch mimeType {
+	case "image/png":
+		return GetPNGDimensions(base64Data)
+	case "image/jpeg":
+		return GetJPEGDimensions(base64Data)
+	case "image/gif":
+		return GetGIFDimensions(base64Data)
+	case "image/webp":
+		return GetWebPDimensions(base64Data)
+	default:
+		return nil
+	}
+}
+
+// RenderImage preserves aspect ratio and permits Kitty cursor movement unless explicitly disabled in options.
+func RenderImage(base64Data string, imageDimensions ImageDimensions, options ImageRenderOptions) *renderedImage {
+	caps := GetCapabilities()
+	if caps.Images == "" {
+		return nil
+	}
+	maxWidth := options.MaxWidthCells
+	if maxWidth <= 0 {
+		maxWidth = 80
+	}
+	// Reduce Kitty's cell-aligned distortion without shrinking iTerm2 reservations.
+	size := CalculateImageCellSize(imageDimensions, maxWidth, options.MaxHeightCells, GetCellDimensions(), caps.Images == ImageProtocolKitty)
+	switch caps.Images {
+	case ImageProtocolKitty:
+		if options.ImageID > 0 {
+			RegisterKittyImageMetadata(KittyImageMetadata{
+				ImageID:  options.ImageID,
+				Columns:  size.Columns,
+				Rows:     size.Rows,
+				WidthPx:  imageDimensions.WidthPx,
+				HeightPx: imageDimensions.HeightPx,
+			})
+		}
+		seq := EncodeKitty(base64Data, size.Columns, size.Rows, options.ImageID, options.MoveCursor == nil || *options.MoveCursor)
+		return &renderedImage{Sequence: seq, Columns: size.Columns, Rows: size.Rows, ImageID: options.ImageID}
+	case ImageProtocolITerm2:
+		seq := EncodeITerm2(base64Data, ITerm2Options{Width: size.Columns, Height: "auto", PreserveAspectRatio: options.PreserveAspectRatio})
+		return &renderedImage{Sequence: seq, Columns: size.Columns, Rows: size.Rows}
+	default:
+		return nil
+	}
+}
+
+func Hyperlink(text, url string) string {
+	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
+}
+
+// ImageFallback shortens home-prefixed paths and links absolute paths when the terminal supports hyperlinks.
+func ImageFallback(mimeType string, dimensions *ImageDimensions, filename string) string {
+	parts := []string{}
+	if filename != "" {
+		display := filename
+		if home, err := os.UserHomeDir(); err == nil && home != "" && (filename == home || strings.HasPrefix(filename, home+"/") || strings.HasPrefix(filename, home+"\\")) {
+			display = "~" + filename[len(home):]
+		}
+		if GetCapabilities().Hyperlinks && nodepath.IsAbsolute(filename) {
+			display = Hyperlink(display, nodeurl.PathToFileURL(filename, runtime.GOOS == "windows"))
+		}
+		parts = append(parts, display)
+	}
+	parts = append(parts, "["+mimeType+"]")
+	if dimensions != nil {
+		parts = append(parts, fmt.Sprintf("%dx%d", dimensions.WidthPx, dimensions.HeightPx))
+	}
+	return "[Image: " + strings.Join(parts, " ") + "]"
+}

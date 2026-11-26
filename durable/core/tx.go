@@ -1,0 +1,1121 @@
+// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
+// SPDX-License-Identifier: MIT
+
+package core
+
+import (
+	"errors"
+
+	"github.com/MichaelKinsy/PiG/durable/core/abi"
+	"github.com/MichaelKinsy/PiG/durable/core/inbox"
+	"github.com/MichaelKinsy/PiG/durable/core/internal/delta"
+	"github.com/MichaelKinsy/PiG/durable/core/jv"
+	"github.com/MichaelKinsy/PiG/durable/core/session"
+	"github.com/MichaelKinsy/PiG/durable/core/session/hopcost"
+	"github.com/MichaelKinsy/PiG/durable/core/turn"
+)
+
+// hostTx is one extension transaction (ABI section 8): a Session transaction whose callback runs in the host, one
+// operation per tx event, from begin to end or abort.
+type hostTx struct {
+	id    uint32
+	scope session.TxScope
+	tx    *session.Tx // nil until the transaction holds the Session line
+	// rt is the invocation of a custom task phase that began the transaction; current is the task record read at begin.
+	rt      *session.Runtime
+	current *jv.Object
+	docs    map[string]*hostDoc
+	// mintDone is set when the host's Storage answered the mintId a mint operation asked for; the operation then runs and
+	// clears it.
+	mintDone bool
+	// convDone is set when the host's Storage answered the conversation read an operation makes first (transaction.ts #requireConversation).
+	convDone bool
+	// elapsed is the microtask passes the host's callback spent holding the line (the end operation's `elapsed`): Pi's job duration
+	// includes them, so the commit is held for the rest.
+	elapsed int
+	// abandoned is set when the host aborted the transaction before it held the line (a caller that stopped waiting for it): the
+	// transaction still takes its turn in the line's order, which grant then gives up at once.
+	abandoned bool
+	// job is the transaction's job on the Session line; aborted is set when the host's callback threw, which the host knows.
+	job     *session.HostJob
+	aborted bool
+}
+
+// hostDoc is the definition of a document a host transaction opened, with the values the host computed for it.
+type hostDoc struct {
+	def        *session.DocDef
+	args       session.DocArgs
+	initial    *jv.Object
+	hasInitial bool
+	migrated   *jv.Object
+	hasMigrate bool
+	checkpoint bool
+	// found is set when the host's Storage answered the findDocument the first access to the document asked for.
+	found bool
+}
+
+// needHost is the error a host-run definition function returns when the host has not sent its value yet.
+func needHost(kind string) error {
+	return &session.NeedRead{Reads: []session.ReadRequest{{Kind: kind}}}
+}
+
+func (h *handler) txAnswer(id uint32, body []byte) { h.notice(abi.NoticeTxResult, id, body) }
+
+func (h *handler) txResult(id uint32, value any) {
+	out := append(make([]byte, 0, 64), `{"result":`...)
+	out = jv.Append(out, value)
+	h.txAnswer(id, append(out, '}'))
+}
+
+func (h *handler) txRejected(id uint32, err error) {
+	out := append(make([]byte, 0, 64), `{"rejected":`...)
+	out = append(out, errorJSON(err)...)
+	h.txAnswer(id, append(out, '}'))
+}
+
+//go:noinline
+func (h *handler) onTx(ev *abi.Event) error {
+	v, err := jv.Parse(ev.Payload)
+	if err != nil {
+		return err
+	}
+	op, ok := v.(*jv.Object)
+	if !ok {
+		return &Rejection{"TypeError", "tx: the operation is not an object"}
+	}
+	name := strOf(op, "op")
+	if name == "begin" {
+		return h.txBegin(ev.ID, op)
+	}
+	t := h.txs[ev.ID]
+	if t != nil && t.tx == nil && name == "abort" {
+		// The host stopped waiting for the line: no callback will run for this transaction, so it must never hold the line (a
+		// holder nobody ends blocks every later job and the close). Its turn in the queue stays, as a job whose caller gave up does.
+		t.abandoned = true
+		return nil
+	}
+	if t == nil || t.tx == nil {
+		return &Rejection{"Error", "the transaction is not open"}
+	}
+	switch name {
+	case "end":
+		t.elapsed = int(numOf(op, "elapsed"))
+		return h.txEnd(t, objOf(op, "state"))
+	case "abort":
+		// The host's callback threw: nothing is staged, and the job ends with its error, which the host knows.
+		e := objOf(op, "error")
+		err := errors.New(strOf(e, "message"))
+		t.elapsed = int(numOf(op, "elapsed"))
+		if t.rt != nil {
+			t.rt.AbandonHost(t.tx, err)
+		} else {
+			h.sess.Abandon(t.tx, err)
+		}
+		t.tx, t.aborted = nil, true
+		h.endingTx = t
+		t.job.End(err)
+		return nil
+	}
+	h.txRun(t, name, op)
+	return nil
+}
+
+// Read-only: assigned once at initialization.
+//
+// errTxWaiting is what a transaction operation returns while the host's Storage answers a read it asked for; the
+// operation runs again from the start, and answers, when the read completes.
+var errTxWaiting = errors.New("transaction operation waiting for the host's Storage")
+
+// txRun runs one operation and answers it, unless it waits for the host's Storage.
+func (h *handler) txRun(t *hostTx, name string, op *jv.Object) {
+	// A transaction operation asks the Storage for its reads itself (txStorageRead, before it changes anything): the adapter's
+	// shadow reads (gateRead) stay out of it.
+	h.inTxOp = true
+	result, err := h.txOp(t, name, op)
+	h.inTxOp = false
+	if errors.Is(err, errTxWaiting) {
+		return
+	}
+	t.mintDone, t.convDone = false, false
+	if np, ok := needPublication(err); ok {
+		// A key the operation touches has an unpublished writer: the operation waits for its publication and runs again, as Pi's callback
+		// continues after its `await gate` (session.ts touch).
+		h.txWait(t, name, op, np)
+		return
+	}
+	if err != nil {
+		if need, ok := session.IsNeedRead(err); ok && len(need.Reads) != 0 {
+			h.txResultNeed(t.id, need.Reads[0].Kind, result)
+			return
+		}
+		h.txRejected(t.id, err)
+		return
+	}
+	h.txResult(t.id, result)
+}
+
+// txStorageRead asks the host's Storage to run one Pi Storage call (hook storageRead) that the operation makes before it
+// takes effect: session.ts #acquire loads the document with findDocument, and every record ID is minted with mintId. The
+// operation answers when the call completes, as the transaction callback's await does; a rejection answers the operation. A call with nil args takes the one record ID id.
+func (h *handler) txStorageRead(t *hostTx, name string, op *jv.Object, method string, args any, id float64, done *bool) {
+	body := jv.NewObject()
+	body.Set("name", "storageRead")
+	body.Set("handler", float64(0))
+	body.Set("conversationId", float64(0))
+	body.Set("taskId", float64(0))
+	if args == nil {
+		// The calls that take one record ID.
+		args = []any{id}
+	}
+	body.Set("payload", jobj("method", method, "args", args))
+	h.startEffect(abi.EffectHook, jv.Append(nil, body), &pending{done: func(outcome uint8, payload []byte) {
+		if outcome != abi.OutcomeResult {
+			value, err := jv.Parse(payload)
+			if err != nil {
+				h.txRejected(t.id, err)
+			} else {
+				h.txRejected(t.id, thrown(value))
+			}
+			return
+		}
+		*done = true
+		h.txRun(t, name, op)
+	}})
+}
+
+// noStorageArgs are the arguments of a Storage call that takes none (mintId). It is read-only: the hook payload only reads it, so
+// every call shares the one object rather than allocating its own.
+var noStorageArgs = jv.NewObject()
+
+// requiredConversation is the conversation an operation requires to exist, or 0 when it names none (the operation then reports its own
+// error).
+func requiredConversation(t *hostTx, name string, op *jv.Object) session.ID {
+	switch name {
+	case "appendEntry":
+		return session.ID(numOf(op, "conversationId"))
+	case "createTask":
+		// options.conversationId, else the conversation the commit is bound to (transaction.ts createTask defaults).
+		if id := session.ID(numOf(objOf(op, "options"), "conversationId")); id != 0 {
+			return id
+		}
+		return t.scope.ConversationID
+	case "createSubmission":
+		return session.ID(numOf(objOf(op, "create"), "conversationId"))
+	case "submit":
+		return session.ID(numOf(op, "conversationId"))
+	}
+	return 0
+}
+
+// mintOps are the operations that mint one record ID through the Storage (transaction.ts createConversation, appendEntry,
+// createTask, createSubmission).
+func isMintOp(name string) bool {
+	switch name {
+	case "createRootConversation", "createConversation", "appendEntry", "createTask", "createSubmission":
+		return true
+	}
+	return false
+}
+
+// txResultNeed answers an operation that needs a value only the host's definition code can compute: {result: {need,
+// ...}}.
+func (h *handler) txResultNeed(id uint32, kind string, detail any) {
+	out := append(make([]byte, 0, 64), `{"result":{"need":`...)
+	out = jv.AppendString(out, kind)
+	if o, ok := detail.(*jv.Object); ok {
+		o.Entries(func(k string, v any) bool {
+			out = append(out, ',')
+			out = jv.AppendString(out, k)
+			out = append(out, ':')
+			out = jv.Append(out, v)
+			return true
+		})
+	}
+	h.txAnswer(id, append(out, '}', '}'))
+}
+
+func (h *handler) txBegin(id uint32, op *jv.Object) error {
+	if _, dup := h.txs[id]; dup {
+		return &Rejection{"Error", "the transaction is already open"}
+	}
+	// A transaction is commitWith: its admission is checked as it is enqueued (session.ts #assertUsable).
+	if err := h.sess.Admit(); err != nil {
+		h.txRejected(id, err)
+		return nil
+	}
+	t := &hostTx{id: id, docs: map[string]*hostDoc{}}
+	t.scope.ConversationID = session.ID(numOf(op, "conversationId"))
+	// The Context of the commit: the span its entry and settlement events go to, and its carrier, which a task it creates inherits.
+	t.scope.Span = uint32(numOf(op, "span"))
+	t.scope.Trace, _ = op.Get("trace")
+	if persistence := objOf(op, "persistence"); persistence != nil && strOf(persistence, "kind") == "deferred" {
+		// CommitOptions.persistence (spec section 4.1): the host checked withinMs; absent means the Session's default window.
+		t.scope.Deferred, t.scope.WithinMs = true, -1
+		if within, ok := valueOf(persistence, "withinMs").(float64); ok {
+			t.scope.WithinMs = within
+		}
+	}
+	if invocation := session.ID(numOf(op, "invocation")); invocation != 0 {
+		if t.rt = h.runtimes[invocation]; t.rt == nil {
+			return &Rejection{"Error", "transaction begin: no running invocation of task " + itoa(int64(invocation))}
+		}
+	}
+	h.txs[id] = t
+	// The transaction takes its turn on the Session line behind the jobs already queued (session.ts #enqueue is one FIFO).
+	if h.loop.Busy() {
+		h.txAnswer(id, []byte(`{"waiting":true}`))
+	}
+	t.scope.Host = true
+	t.job = h.loop.LineHostLead(func() error { return h.grant(t) }, func(err error) { h.txDone(t, err) }, hostAnswerLead)
+	return nil
+}
+
+// grant gives the Session line to a transaction and tells the host it is ready. A transaction the host abandoned while it waited
+// takes nothing; one the Session refuses ends with the error, which txDone answers.
+func (h *handler) grant(t *hostTx) error {
+	if t.abandoned {
+		delete(h.txs, t.id)
+		return session.ErrHostNotGranted
+	}
+	var tx *session.Tx
+	var err error
+	if t.rt != nil {
+		tx, t.current, err = t.rt.BeginHost(t.scope.Span, t.scope.Trace)
+	} else {
+		tx, err = h.sess.Begin(t.scope)
+	}
+	if err != nil {
+		return err
+	}
+	if t.scope.Deferred {
+		tx.DeferWithin(t.scope.WithinMs)
+	}
+	t.tx = tx
+	if t.current != nil {
+		// A transaction of a task invocation also answers the task record it read as it took the line: the `current` of
+		// Runtime.commit's callback.
+		h.txAnswer(t.id, append(append([]byte(`{"ready":true,"current":`), jv.Append(nil, t.current)...), '}'))
+		return nil
+	}
+	h.txAnswer(t.id, []byte(`{"ready":true}`))
+	return nil
+}
+
+// hostAnswerLead is the ticks the facade needs from the core's answer of a transaction's end to its caller's resumption
+// (host/cf/src/client.ts end, facade/tx.ts runCommit): the core answers that many ticks before Pi's caller resumes.
+const hostAnswerLead = hopcost.Delivery
+
+// txEnd is the end of the host's callback: the Session settles the transaction and admits its writes to the writer, and the job's
+// outcome follows from the Loop (txDone).
+func (h *handler) txEnd(t *hostTx, state *jv.Object) error {
+	tx := t.tx
+	var err error
+	h.finishing = true
+	h.beginGateReads()
+	if t.rt != nil {
+		_, err = t.rt.FinishHost(tx, t.current, state)
+	} else {
+		_, err = h.sess.Finish(tx)
+	}
+	h.finishing = false
+	if need, ok := session.IsNeedRead(err); ok && len(need.Reads) == 0 {
+		// The settle's chain load reads through the host's Storage: it waits for the answer and settles again.
+		h.finishTx, h.finishState = t, state
+		return nil
+	}
+	h.endGateReads()
+	if np, ok := needPublication(err); ok {
+		// The settle read a key an unpublished commit writes: it waits for its publication and settles again.
+		np.Gate.Wait(func() { _ = h.txEnd(t, state) })
+		return nil
+	}
+	t.tx = nil
+	h.endingTx = t
+	t.job.End(err)
+	return nil
+}
+
+// finishAgain is txEnd once the host's Storage answered the read the settle waited for.
+func (h *handler) finishAgain() {
+	t, state := h.finishTx, h.finishState
+	h.finishTx, h.finishState = nil, nil
+	_ = h.txEnd(t, state)
+}
+
+// txDone is the outcome of the transaction's job, delivered in line order: where Pi's `await commit(...)` resumes. It answers the end.
+func (h *handler) txDone(t *hostTx, err error) {
+	delete(h.txs, t.id)
+	if t.aborted {
+		// The host's callback threw: the caller's promise settles with its own error once the job's outcome is delivered.
+		h.txResult(t.id, nil)
+		return
+	}
+	if err != nil {
+		h.txRejected(t.id, err)
+		return
+	}
+	// The host's end() returns to the task: a task that ended for crashes is reported (scheduler.ts runtime.commit).
+	if t.rt != nil {
+		t.rt.ReportEnded()
+	}
+	h.txResult(t.id, nil)
+}
+
+// txWait runs a transaction operation again once the part that writes the key it touched is published.
+func (h *handler) txWait(t *hostTx, name string, op *jv.Object, np *session.NeedPublication) {
+	np.Gate.Wait(func() {
+		h.loop.Wait(hopcost.GateResume+np.Extra, txRetry{h, t, name, op})
+	})
+}
+
+// txRetry is the continuation of an operation that waited at a gate.
+type txRetry struct {
+	h    *handler
+	t    *hostTx
+	name string
+	op   *jv.Object
+}
+
+func (r txRetry) Resume() { r.h.txRun(r.t, r.name, r.op) }
+
+// publish emits the published notice of one commit (durable/core/host/PROTOCOL.md, Notices). The notice is written an
+// item at a time into abi.Chunks, so a 20,000-task commit's (megabytes) needs no block of its size.
+func (h *handler) publish(pub *session.Publication) {
+	if pub.Span != 0 && !pub.Memory {
+		h.publishEvents(pub)
+	}
+	var out abi.Chunks
+	item := make([]byte, 0, 128)
+	if pub.Memory {
+		// A commit held in memory (session/held.go) is shown to watches and views now and to the host's observeCommits observers
+		// once stored. The host's internal observers (observeCommits) see it in a notice with no sequence number and no tables.
+		if h.changes {
+			out.Append(h.appendChanges(append(item, `{"memory":true,"changes":`...), pub.Changes, valueFromOps))
+			out.Append(append(item[:0], '}'))
+			h.b.NoticeChunks(abi.NoticePublished, out)
+		}
+		h.publishWatches(pub)
+		return
+	}
+	out.Append(appendPublishedSpan(jv.AppendNumber(append(item, `{"seq":`...), float64(pub.Seq)), pub))
+	for _, kind := range [...]session.WriteKind{session.WriteSubmission, session.WriteEntry, session.WriteTask} {
+		item = append(item[:0], `,"`...)
+		switch kind {
+		case session.WriteSubmission:
+			item = append(item, "submissions"...)
+		case session.WriteEntry:
+			item = append(item, "entries"...)
+		default:
+			item = append(item, "tasks"...)
+		}
+		out.Append(append(item, `":[`...))
+		first := true
+		for _, c := range pub.Changes {
+			if c.Kind != session.ChangeTable || c.Table != kind {
+				continue
+			}
+			item = item[:0]
+			if !first {
+				item = append(item, ',')
+			}
+			first = false
+			switch kind {
+			case session.WriteEntry:
+				item = jv.AppendNumber(item, numOf(c.Record, "id"))
+			case session.WriteTask:
+				item = append(item, `{"id":`...)
+				item = jv.AppendNumber(item, numOf(c.Record, "id"))
+				item = append(item, `,"kind":`...)
+				item = jv.AppendString(item, strOf(c.Record, "kind"))
+				item = append(item, `,"status":`...)
+				item = jv.AppendString(item, strOf(objOf(c.Record, "state"), "status"))
+				item = append(item, '}')
+			case session.WriteSubmission:
+				item = append(item, `{"id":`...)
+				item = jv.AppendNumber(item, numOf(c.Record, "id"))
+				item = append(item, `,"conversationId":`...)
+				item = jv.AppendNumber(item, numOf(c.Record, "conversationId"))
+				if r, ok := c.Record.Get("requestId"); ok {
+					item = append(item, `,"requestId":`...)
+					item = jv.Append(item, r)
+				}
+				item = append(item, `,"status":`...)
+				item = jv.AppendString(item, strOf(c.Record, "status"))
+				item = append(item, '}')
+			}
+			out.Append(item)
+		}
+		out.Append(append(item[:0], ']'))
+	}
+	if h.changes {
+		// The host restores `observed` before `changes` (harness.ts onNotice), so it is rendered first: the sent set takes this commit's own
+		// values before a stored change of the same document is left out as one the host holds.
+		if pub.Stored != nil {
+			// The Session's own observers see this commit's own changes only (session.ts #publish `observed`); a deadline's store shows them none.
+			out.Append(h.appendChanges(append(item[:0], `,"observed":`...), pub.Changes, valueFromOps))
+		}
+		out.Append(h.appendChanges(append(item[:0], `,"changes":`...), pub.StoredChanges(), storedMode(pub)))
+	}
+	out.Append(append(item[:0], '}'))
+	h.b.NoticeChunks(abi.NoticePublished, out)
+	h.publishWatches(pub)
+}
+
+// page renders Pi's Page<T, Cursor>: {items, next?: {after, order}}.
+func page(p session.Page, order string) *jv.Object {
+	items := make([]any, len(p.Items))
+	for i, it := range p.Items {
+		items[i] = it
+	}
+	out := jv.NewObject()
+	out.Set("items", items)
+	if p.After != 0 {
+		next := jv.NewObject()
+		next.Set("after", float64(p.After))
+		next.Set("order", order)
+		out.Set("next", next)
+	}
+	return out
+}
+
+// rawPage is page for items that are already JSON text, spliced into the answer as they are.
+func rawPage(items []jv.Raw, after session.ID, order string) *jv.Object {
+	list := make([]any, len(items))
+	for i, it := range items {
+		list[i] = it
+	}
+	out := jv.NewObject()
+	out.Set("items", list)
+	if after != 0 {
+		next := jv.NewObject()
+		next.Set("after", float64(after))
+		next.Set("order", order)
+		out.Set("next", next)
+	}
+	return out
+}
+
+// scanStart is pi-durable's scanStart (storage/scan.ts): the order a scan runs in and the ID it continues after.
+func scanStart(query *jv.Object, cursor any, fallback string) (order string, after session.ID, err error) {
+	requested, hasOrder := "", false
+	if v, ok := query.Get("order"); ok && v != nil {
+		s, isStr := v.(string)
+		if !isStr || (s != "ascending" && s != "descending") {
+			return "", 0, session.NewStorageRequestError("Invalid scan order: " + jsString(v))
+		}
+		requested, hasOrder = s, true
+	}
+	c, _ := cursor.(*jv.Object)
+	if c == nil {
+		if hasOrder {
+			return requested, 0, nil
+		}
+		return fallback, 0, nil
+	}
+	a, ok := c.Get("after")
+	f, isNum := a.(float64)
+	if !ok || !isNum || f != float64(int64(f)) {
+		return "", 0, session.NewStorageRequestError("Invalid storage cursor")
+	}
+	order = fallback
+	if sv, ok := c.Get("order"); ok {
+		s, isStr := sv.(string)
+		if !isStr || (s != "ascending" && s != "descending") {
+			return "", 0, session.NewStorageRequestError("Invalid storage cursor")
+		}
+		order = s
+	}
+	if hasOrder && requested != order {
+		return "", 0, session.NewStorageRequestError("The cursor continues a " + order + " scan; the query asks for " + requested)
+	}
+	return order, session.ID(f), nil
+}
+
+func jsString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return jv.Stringify(v)
+}
+
+func optBool(o *jv.Object, k string) *bool {
+	if b, ok := boolOf(o, k); ok {
+		return &b
+	}
+	return nil
+}
+
+// txOp runs one Tx operation. A nil record answers null.
+func (h *handler) txOp(t *hostTx, name string, op *jv.Object) (any, error) {
+	tx := t.tx
+	// transaction.ts #requireConversation: appendEntry, createTask and createSubmission read the conversation from the Storage first,
+	// unless this transaction created it.
+	if conv := requiredConversation(t, name, op); conv != 0 && !t.convDone && h.gated("conversation") && !tx.ConversationCreated(conv) {
+		h.txStorageRead(t, name, op, "conversation", nil, float64(conv), &t.convDone)
+		return nil, errTxWaiting
+	}
+	if isMintOp(name) && !t.mintDone && h.gated("mintId") {
+		h.txStorageRead(t, name, op, "mintId", noStorageArgs, 0, &t.mintDone)
+		return nil, errTxWaiting
+	}
+	// transaction.ts conversation, entry, task, submission and submissionByRequest read the record from the Storage
+	// (storage.conversation, entry, task, submission, submissionByRequest) before they answer.
+	switch name {
+	case "conversation", "entry", "task", "submission", "submissionByRequest":
+		if !t.mintDone && h.gated(name) {
+			if name == "submissionByRequest" {
+				h.txStorageRead(t, name, op, name, []any{numOf(op, "conversationId"), strOf(op, "requestId")}, 0, &t.mintDone)
+			} else {
+				h.txStorageRead(t, name, op, name, nil, numOf(op, "id"), &t.mintDone)
+			}
+			return nil, errTxWaiting
+		}
+	}
+	id := session.ID(numOf(op, "id"))
+	nilRec := func(o *jv.Object, err error) (any, error) {
+		if err != nil || o == nil {
+			return nil, err
+		}
+		return o, nil
+	}
+	switch name {
+	case "conversation":
+		return nilRec(tx.Conversation(id))
+	case "entry":
+		e, err := tx.Entry(id)
+		if err != nil || e == nil {
+			return nil, err
+		}
+		if kind := strOf(op, "kind"); has(op, "kind") && strOf(e, "kind") != kind {
+			return nil, nil
+		}
+		return e, nil
+	case "task":
+		return nilRec(tx.Task(id))
+	case "latestHeadMarker":
+		return nilRec(tx.LatestHeadMarkerAt(session.ID(numOf(op, "conversationId")), session.ID(numOf(op, "at"))))
+	case "latestEntryId":
+		latest, err := tx.LatestEntryID(session.ID(numOf(op, "conversationId")))
+		if err != nil || latest == 0 {
+			return nil, err
+		}
+		return float64(latest), nil
+	case "submission":
+		return nilRec(tx.Submission(id))
+	case "submissionByRequest":
+		return nilRec(tx.SubmissionByRequest(session.ID(numOf(op, "conversationId")), strOf(op, "requestId")))
+	case "scanConversations", "scanEntries", "scanTasks":
+		return h.scan(tx, name, op)
+	case "createRootConversation":
+		return tx.CreateRootConversation()
+	case "createConversation":
+		return tx.CreateConversation(ownership(objOf(op, "ownership")))
+	case "forkConversation":
+		return tx.ForkConversation(session.ID(numOf(op, "parentConversationId")), session.ID(numOf(op, "at")), ownership(objOf(op, "ownership")))
+	case "appendEntry":
+		draft := objOf(op, "value")
+		if draft == nil {
+			return nil, &typeError{"Tx.appendEntry() requires an entry draft"}
+		}
+		if kind, ok := op.Get("kind"); ok {
+			draft = draft.Shallow()
+			draft.Set("kind", kind)
+		}
+		return tx.AppendEntry(session.ID(numOf(op, "conversationId")), draft)
+	case "createTask":
+		return h.createTask(tx, op)
+	case "setTask":
+		value := objOf(op, "value")
+		if value == nil {
+			return nil, &typeError{"Tx.setTask() requires a task record"}
+		}
+		return nil, tx.SetTask(value)
+	case "createCompaction":
+		id, err := turn.CreateCompaction(tx, session.ID(numOf(op, "conversationId")), objOf(op, "input"), 0)
+		return float64(id), err
+	case "submit":
+		// Conversation.submit(tx, draft): the admission of the submit event inside the host's transaction. It must come before the first
+		// table write, on every path (submissions.ts admit).
+		if tx.HasTableWrite() {
+			return nil, session.ReadAfterWriteOf("submit(tx, draft)")
+		}
+		var admitted inbox.Admission
+		err := inbox.AdmitStatus(tx, turn.Runs{}, session.ID(numOf(op, "conversationId")), submissionDraft(op), h.now, h.queueModes(), &admitted)
+		if err != nil {
+			return nil, err
+		}
+		answer := jobj("id", float64(admitted.ID), "status", admitted.Status)
+		if admitted.Link != nil {
+			// A steer admission to a busy run links its span to the run's carrier, as the submit event's answer does.
+			answer.Set("link", admitted.Link)
+		}
+		return answer, nil
+	case "createSubmission":
+		return tx.CreateSubmission(objOf(op, "create"))
+	case "settleSubmission":
+		return nil, tx.SettleSubmission(id, objOf(op, "settlement"))
+	case "placeSubmission":
+		return nil, tx.PlaceSubmission(id, session.ID(numOf(op, "entry")))
+	case "touch":
+		// session.ts touch of the host's own read on the line: it waits while the key has an unpublished writer.
+		return nil, h.sess.Touch(strOf(op, "key"))
+	case "doc":
+		return h.txDoc(t, op)
+	case "doc.write":
+		return h.txDocWrite(t, op)
+	case "retireDoc":
+		def, args, err := docDef(op)
+		if err != nil {
+			return nil, err
+		}
+		return nil, tx.RetireDoc(def, args)
+	}
+	return nil, &Rejection{"Error", "unknown transaction operation " + name}
+}
+
+func ownership(o *jv.Object) session.Ownership {
+	if strOf(o, "kind") == "task" {
+		return session.Ownership{Task: session.ID(numOf(o, "taskId"))}
+	}
+	return session.Ownership{}
+}
+
+func (h *handler) scan(tx *session.Tx, name string, op *jv.Object) (any, error) {
+	q := objOf(op, "query")
+	if q == nil {
+		q = jv.NewObject()
+	}
+	cursor, _ := op.Get("cursor")
+	limit := int(numOf(op, "limit"))
+	switch name {
+	case "scanConversations":
+		order, after, err := scanStart(q, cursor, "ascending")
+		if err != nil {
+			return nil, err
+		}
+		p, err := tx.ScanConversations(session.ConversationQuery{
+			OwnerConversationID: session.ID(numOf(q, "ownerConversationId")), OwnerTaskID: session.ID(numOf(q, "ownerTaskId")),
+			Descending: order == "descending",
+		}, limit, after)
+		if err != nil {
+			return nil, err
+		}
+		return page(p, order), nil
+	case "scanEntries":
+		order, after, err := scanStart(q, cursor, "descending")
+		if err != nil {
+			return nil, err
+		}
+		p, err := tx.ScanEntries(session.EntryQuery{
+			ConversationID: session.ID(numOf(q, "conversationId")), MinEntryID: session.ID(numOf(q, "minEntryId")),
+			MaxEntryID: session.ID(numOf(q, "maxEntryId")), Ascending: order == "ascending",
+		}, limit, after)
+		if err != nil {
+			return nil, err
+		}
+		return page(p, order), nil
+	default:
+		order, after, err := scanStart(q, cursor, "ascending")
+		if err != nil {
+			return nil, err
+		}
+		p, err := tx.ScanTasks(session.TaskQuery{
+			ConversationID: session.ID(numOf(q, "conversationId")), Kind: strOf(q, "kind"), Status: strOf(q, "status"),
+			AbortRequested: optBool(q, "abortRequested"), Background: optBool(q, "background"), Descending: order == "descending",
+		}, limit, after)
+		if err != nil {
+			return nil, err
+		}
+		return page(p, order), nil
+	}
+}
+
+// createTask is Tx.createTask: the host computed initial(input) for a task whose definition it holds and sends it as
+// state; a built-in task (generation, tool, compaction) gets its first checkpoint from the core.
+func (h *handler) createTask(tx *session.Tx, op *jv.Object) (any, error) {
+	name := strOf(op, "task")
+	version := int(numOf(op, "version"))
+	if version == 0 {
+		version = 1
+	}
+	state, hasState := op.Get("state")
+	if !hasState {
+		for _, impl := range h.builtins {
+			if impl.Def.Name == name {
+				// The record stores the version the caller's definition names (a task stored by a newer definition).
+				def := impl.Def
+				def.Version = version
+				return h.createTaskWith(tx, &def, op)
+			}
+		}
+	}
+	def := &session.TaskDef{Name: name, Version: version, Initial: func(any) any {
+		if hasState {
+			return state
+		}
+		return nil
+	}}
+	return h.createTaskWith(tx, def, op)
+}
+
+func (h *handler) createTaskWith(tx *session.Tx, def *session.TaskDef, op *jv.Object) (any, error) {
+	opts := objOf(op, "options")
+	own := objOf(opts, "ownership")
+	if own == nil {
+		return nil, &typeError{"Tx.createTask() requires options.ownership"}
+	}
+	var to session.TaskOptions
+	if strOf(own, "kind") == "task" {
+		to.OwnerTask = session.ID(numOf(own, "taskId"))
+	}
+	to.ConversationID = session.ID(numOf(opts, "conversationId"))
+	to.Background, _ = boolOf(opts, "background")
+	to.AbandonOnRestart, _ = boolOf(opts, "abandonOnRestart")
+	// TaskOptions.trace: `"root"` stores no carrier; an omitted one is the transaction's own, and a carrier is the host's.
+	if trace, ok := opts.Get("trace"); ok {
+		if s, isString := trace.(string); isString && s == "root" {
+			to.NoTrace = true
+		} else {
+			to.Trace = trace
+		}
+	}
+	if links, ok := opts.Get("links"); ok {
+		to.Links, _ = links.([]any)
+	}
+	input, _ := op.Get("input")
+	to.Owned = true
+	id, err := tx.CreateTask(def, input, to)
+	if err != nil {
+		return nil, err
+	}
+	return float64(id), nil
+}
+
+// docDef reads a document address and definition from an operation: address {scope, definition, conversationId?,
+// taskId?, key?} and def {kind, version, scope, history?, fork?, family?}.
+func docDef(op *jv.Object) (*session.DocDef, session.DocArgs, error) {
+	addr := objOf(op, "address")
+	if addr == nil {
+		addr = objOf(op, "doc")
+	}
+	if addr == nil {
+		return nil, session.DocArgs{}, &typeError{"a document operation requires an address"}
+	}
+	d := objOf(op, "def")
+	def := &session.DocDef{Kind: strOf(addr, "definition"), Scope: session.ScopeKind(strOf(addr, "scope"))}
+	if d != nil {
+		if k := strOf(d, "kind"); k != "" {
+			def.Kind = k
+		}
+		def.Version = int(numOf(d, "version"))
+		def.History = session.History(strOf(d, "history"))
+		def.Fork = session.ForkPolicy(strOf(d, "fork"))
+		def.Family, _ = boolOf(d, "family")
+	}
+	if def.Version == 0 {
+		def.Version = int(numOf(op, "version"))
+	}
+	if def.Version == 0 {
+		def.Version = 1
+	}
+	if def.Scope == session.ScopeConversation && def.History == "" {
+		def.History = "latest"
+	}
+	if def.Scope == session.ScopeConversation && def.Fork == "" {
+		def.Fork = "copy"
+	}
+	var args session.DocArgs
+	switch def.Scope {
+	case session.ScopeConversation:
+		args.Owner = session.ID(numOf(addr, "conversationId"))
+	case session.ScopeTask:
+		args.Owner = session.ID(numOf(addr, "taskId"))
+	}
+	if k, ok := addr.Get("key"); ok {
+		s, _ := k.(string)
+		args.Key = s
+		def.Family = true
+	}
+	if seed, ok := op.Get("seed"); ok {
+		args.Seed = seed
+	}
+	return def, args, nil
+}
+
+// txDoc is Tx.doc: the document's draft starts from the returned value; the host keeps the draft and sends its
+// operations with doc.write. The host runs initial and migrate: the first answer may be {need: "initial"} or {need:
+// "migrate", value, from}, and the operation comes again with initial or migrated.
+func (h *handler) txDoc(t *hostTx, op *jv.Object) (any, error) {
+	def, args, err := docDef(op)
+	if err != nil {
+		return nil, err
+	}
+	key := session.DocAddress(def, args)
+	hd := t.docs[key]
+	if hd == nil {
+		hd = &hostDoc{def: def, args: args}
+		t.docs[key] = hd
+	}
+	if v, ok := op.Get("initial"); ok {
+		hd.initial, hd.hasInitial = asObject(v), true
+	}
+	if v, ok := op.Get("migrated"); ok {
+		hd.migrated, hd.hasMigrate = asObject(v), true
+	}
+	// session.ts #acquire: a document that is not in the Session's loaded cache is looked up in the Storage (findDocument) first.
+	if !hd.found && !hd.hasInitial && !hd.hasMigrate && h.gated("findDocument") && !h.sess.Loaded(def, args) {
+		h.txStorageRead(t, "doc", op, "findDocument", jobj("address", docAddress(op)), 0, &hd.found)
+		return nil, errTxWaiting
+	}
+	waitMint := false
+	def.HostInitial = func(any) (*jv.Object, error) {
+		if !hd.hasInitial {
+			return nil, needHost("initial")
+		}
+		// After initial(), an absent document takes its ID from Storage.mintId.
+		if !t.mintDone && h.gated("mintId") {
+			// A NeedRead leaves no document entry behind: the call runs again once the Storage answered.
+			waitMint = true
+			return nil, needHost("mint")
+		}
+		return hd.initial, nil
+	}
+	var migrateFrom *jv.Object
+	def.HostMigrate = func(value *jv.Object, from int) (*jv.Object, error) {
+		if !hd.hasMigrate {
+			migrateFrom = jv.NewObject()
+			migrateFrom.Set("value", value)
+			migrateFrom.Set("from", float64(from))
+			return nil, needHost("migrate")
+		}
+		return hd.migrated, nil
+	}
+	def.CheckpointWhen = func(*jv.Object, []delta.Op, int) bool { return hd.checkpoint }
+	hd.def = def
+	var have session.DocRevision
+	holds := has(op, "revisions")
+	if holds {
+		held := objOf(op, "revisions")
+		have = session.DocRevision{Epoch: uint64(numOf(held, "epoch")), Adopted: int(numOf(held, "adopted"))}
+	}
+	host, err := t.tx.HostDoc(def, args, have, holds)
+	if waitMint {
+		h.txStorageRead(t, "doc", op, "mintId", noStorageArgs, 0, &t.mintDone)
+		return nil, errTxWaiting
+	}
+	if err != nil {
+		if migrateFrom != nil {
+			return migrateFrom, err
+		}
+		return nil, err
+	}
+	out := jv.NewObject()
+	if host.Incremental {
+		out.Set("ops", delta.OpsValue(host.Ops))
+	} else {
+		out.Set("value", host.Value)
+	}
+	if host.Tracked {
+		setNumber(out, "epoch", float64(host.Revision.Epoch))
+		setNumber(out, "adopted", float64(host.Revision.Adopted))
+	}
+	setNumber(out, "entry", float64(t.tx.DocEntry(def, args)))
+	if host.Loaded {
+		setNumber(out, "id", float64(t.tx.DocRecordID(def, args)))
+		setNumber(out, "deltasSinceBase", float64(host.DeltasSinceBase))
+	}
+	return out, nil
+}
+
+// setNumber sets a number member: the one place a document answer boxes one.
+func setNumber(out *jv.Object, key string, value float64) { out.Set(key, value) }
+
+// txDocWrite takes a draft's operations (Chord Op[]) and the host's checkpointWhen verdict.
+func (h *handler) txDocWrite(t *hostTx, op *jv.Object) (any, error) {
+	def, args, err := docDef(op)
+	if err != nil {
+		return nil, err
+	}
+	hd := t.docs[session.DocAddress(def, args)]
+	if hd == nil {
+		return nil, &Rejection{"Error", "doc.write for a document the transaction did not open"}
+	}
+	raw, _ := op.Get("ops")
+	ops, err := delta.DecodeOps(raw)
+	if err != nil {
+		return nil, err
+	}
+	hd.checkpoint, _ = boolOf(op, "checkpoint")
+	entry := -1
+	if has(op, "entry") {
+		entry = int(numOf(op, "entry"))
+	}
+	return nil, t.tx.SetDocOps(hd.def, hd.args, entry, ops)
+}
+
+// docAddress is the Storage's DocumentAddress ({kind, scope, key?}) of the wire address of a document operation.
+func docAddress(op *jv.Object) *jv.Object {
+	addr := objOf(op, "address")
+	scope := jobj("kind", strOf(addr, "scope"))
+	if has(addr, "conversationId") {
+		scope.Set("conversationId", numOf(addr, "conversationId"))
+	}
+	if has(addr, "taskId") {
+		scope.Set("taskId", numOf(addr, "taskId"))
+	}
+	out := jobj("kind", strOf(addr, "definition"), "scope", scope)
+	if k, ok := addr.Get("key"); ok {
+		out.Set("key", k)
+	}
+	return out
+}
+
+func asObject(v any) *jv.Object {
+	o, _ := v.(*jv.Object)
+	return o
+}
+
+// sentValues is the documents whose value a published notice carried to the host's commit listeners, for as long as one is subscribed;
+// nil while none is. The host keeps the latest value of each (memory notices omit the value of one it holds).
+func (h *handler) sentValues() *idSet {
+	if !h.changes {
+		return nil
+	}
+	return &h.sent
+}
+
+// appendChanges appends the commit changes as JSON (one place that boxes them, for the three notices that carry them).
+func (h *handler) appendChanges(dst []byte, changes []session.Change, mode valueMode) []byte {
+	return jv.Append(dst, commitChanges(changes, h.sentValues(), mode))
+}
+
+// idSet is a set of record IDs, as a sorted slice: the documents with a commit listener's value are few, and a slice allocates nothing a
+// map would per entry.
+type idSet []session.ID
+
+func (s *idSet) at(id session.ID) (int, bool) {
+	low, high := 0, len(*s)
+	for low < high {
+		middle := (low + high) >> 1
+		if (*s)[middle] < id {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low, low < len(*s) && (*s)[low] == id
+}
+
+func (s *idSet) has(id session.ID) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.at(id)
+	return ok
+}
+
+func (s *idSet) add(id session.ID) {
+	if s == nil {
+		return
+	}
+	if at, ok := s.at(id); !ok {
+		*s = append(*s, 0)
+		copy((*s)[at+1:], (*s)[at:])
+		(*s)[at] = id
+	}
+}
+
+func (s *idSet) remove(id session.ID) {
+	if s == nil {
+		return
+	}
+	if at, ok := s.at(id); ok {
+		*s = append((*s)[:at], (*s)[at+1:]...)
+	}
+}
+
+// valueMode is how commitChanges treats the value of a document change the host may already hold (sentValues).
+type valueMode uint8
+
+const (
+	// valueWhole: the value always travels.
+	valueWhole valueMode = iota
+	// valueFromOps: the value is left out when the host holds the previous one and the change has operations to apply to it.
+	valueFromOps
+	// valueCurrent: the value is left out, with `current: true`, when the host holds it: it is the one memory has.
+	valueCurrent
+)
+
+// storedMode is how the changes a storage transaction stored travel: a transaction that stored held changes (or only them) stored the
+// value memory has; any other commit's value is its own.
+func storedMode(pub *session.Publication) valueMode {
+	if pub.Stored != nil {
+		return valueCurrent
+	}
+	return valueWhole
+}
+
+// commitChanges renders the CommitPublication changes of Session.observeCommits (types.ts CommitChange): a table
+// write is {type, value: record}; a document change {type: "document", kind: "change", record, conversationId, version, value,
+// ops}, a retirement {type: "document", kind: "retire", record, conversationId}; a copy {type: "document.copy", record, conversationId, source}.
+//
+// Not inlined: only a commit listener asks for changes, and an inlined copy would be compiled by V8 with its hot caller, publish.
+//
+//go:noinline
+func commitChanges(changes []session.Change, sent *idSet, mode valueMode) []any {
+	out := make([]any, 0, len(changes))
+	for _, c := range changes {
+		o := jv.NewObject()
+		switch c.Kind {
+		case session.ChangeTable:
+			o.Set("type", [...]string{session.WriteConversation: "conversation", session.WriteEntry: "entry", session.WriteTask: "task", session.WriteSubmission: "submission"}[c.Table])
+			o.Set("value", c.Record)
+		case session.ChangeDocument:
+			o.Set("type", "document")
+			id := session.ID(numOf(c.Record, "id"))
+			if c.Value == nil {
+				sent.remove(id)
+				o.Set("kind", "retire")
+				o.Set("record", c.Record)
+				if c.ConversationID != 0 {
+					o.Set("conversationId", float64(c.ConversationID))
+				}
+				break
+			}
+			o.Set("kind", "change")
+			o.Set("record", c.Record)
+			if c.ConversationID != 0 {
+				o.Set("conversationId", float64(c.ConversationID))
+			}
+			switch {
+			case mode == valueFromOps && sent.has(id) && len(c.Ops) > 0 && c.Ops[0].Verb != delta.Replace:
+				// The host holds the value this document had (a notice carried it) and applies the operations to it: a partial commit's
+				// notice costs its new text, not the length of the answer so far (host/cf/src/facade/harness.ts onNotice).
+				o.Set("version", float64(c.Version))
+			case mode == valueCurrent && sent.has(id):
+				// What a storage transaction stored of a held document is the value memory has, which the host holds.
+				o.Set("version", float64(c.Version))
+				o.Set("current", true)
+			default:
+				o.Set("version", float64(c.Version))
+				o.Set("value", c.Value)
+				sent.add(id)
+			}
+			o.Set("ops", delta.OpsValue(c.Ops))
+		case session.ChangeDocumentCopy:
+			o.Set("type", "document.copy")
+			o.Set("record", c.Record)
+			o.Set("conversationId", float64(c.ConversationID))
+			source := jv.NewObject()
+			source.Set("id", float64(c.Source.ID))
+			if c.Source.At.Current {
+				source.Set("at", "current")
+			} else {
+				source.Set("at", float64(c.Source.At.Seq))
+			}
+			o.Set("source", source)
+		}
+		out = append(out, o)
+	}
+	return out
+}

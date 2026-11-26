@@ -1,0 +1,66 @@
+// Package subprocess implements pig's out-of-process extension transport:
+// extensions communicate over a local stream socket with length-prefixed JSON
+// framing. The socket is AF_UNIX, except that a Node extension on Windows gets
+// a named pipe, because Node's net module cannot reach AF_UNIX there. The
+// extension finds its address in PIG_EXT_SOCKET; framing and handshake are
+// the same on both.
+//
+// # Process environment
+//
+// The host starts every extension process with its own environment plus the entries below and runtime-specific ones (harness, Node runtime, Python path).
+// An isolated process gets PIG_EXT_SOCKET, the address above, and PIG_EXT_NAME, the extension's name; a packed cell process gets one
+// PIG_EXT_SOCKET_<NAME> per member instead (runtimecell.SocketEnvName). PIG_EXT_HOST_INFO (set by [Host.SetHostInfo]; absent when the host has none) is a JSON object {"agentDir", "configDirName", "version", "packageDir", "shell"}: Pi's
+// getAgentDir(), CONFIG_DIR_NAME, VERSION, getPackageDir() and the default getShellConfig() as the host resolved them, which an SDK returns from before its factory runs because the ready message comes
+// later. A Node extension answers getAgentDir() and CONFIG_DIR_NAME from its environment (shims/pig-config.mjs) and VERSION from the bundled Pi package
+// (shims/pi-dist/pi-coding-agent/config.js).
+//
+// PIG_EXT_LOG names the log the process's SDK writes its own diagnostics to: the stack of a handler panic it recovered, a host call it could not make, a frame it
+// dropped. It is the path of the process's stderr log, which the host's load and crash diagnostics read and which also holds a copy of everything the process writes to
+// stderr, so an SDK appends one whole diagnostic per write and the host's handle appends too. The host forwards what an extension's own code writes to PiG's terminal
+// (Host.extensionOutput) and Pi writes no stack for a throwing handler, so an SDK's diagnostics must not go there; the SDK writes them to stderr only when the variable is
+// unset or the log cannot be written, and bounds what it writes to the log. An isolated process gets its own log, a packed cell process its cell's, and the fused extensions
+// of a Piglet Binary, which run in the host's process and share its environment, one log for the Host. The first two the host creates and reads. The fused one has no
+// reader: the host names a path that does not exist (PIG_EXT_LOG_CREATE=1 lets the Go SDK create it) and the SDK makes the file with the first diagnostic, so a session in
+// which no handler fails puts nothing in the temporary directory, as Pi's puts nothing; Shutdown and TerminateHostProcesses remove it. What the Go runtime writes for a
+// fatal error is not an SDK diagnostic and stays on stderr.
+//
+// # Architecture
+//
+// The subprocess host spawns extension binaries, connects via those sockets,
+// translates subprocess registrations into [extension.Extension] structs, and
+// feeds them to the existing [inproc.Runner]. This is additive: it sits ABOVE
+// the in-process runner, not beside it. The inproc runner remains the dispatch
+// engine; the subprocess layer is a transport adapter.
+//
+//	┌─────────────────────────────────────────────────────────┐
+//	│             inproc.Runner (dispatch engine)              │
+//	│   Consumes []extension.Extension: doesn't care how     │
+//	│   they were created (compiled-in vs subprocess)          │
+//	└─────────────────────┬───────────────────────────────────┘
+//	                      │ feeds []extension.Extension
+//	┌─────────────────────┴───────────────────────────────────┐
+//	│             subprocess.Host (this package)               │
+//	│   Spawns binaries, manages sockets, translates          │
+//	│   register messages → extension.Extension structs       │
+//	└─────────────────────────────────────────────────────────┘
+//
+// # Wire Protocol
+//
+// Messages are length-prefixed JSON: 4 bytes big-endian uint32 length followed
+// by that many bytes of UTF-8 JSON. Message types:
+//
+//   - register (ext→host): declares tools, commands, shortcuts, event handlers
+//   - ready (host→ext): acknowledges registration, sends context (cwd, theme)
+//   - notify (bidirectional): fire-and-forget (no response expected)
+//   - request (host→ext): expects a response (tool_call, event dispatch)
+//   - response (ext→host): reply to a request
+//   - call (ext→host): extension calls host method (ui.notify, sendMessage, etc.)
+//   - call_result (host→ext): reply to a call
+//   - shutdown (host→ext): graceful shutdown signal
+//
+// # pig-specific: no upstream equivalent
+//
+// This entire package is pig-specific. Upstream pi uses TypeScript extensions
+// loaded via jiti in-process. The subprocess protocol exists to support compiled
+// extensions in Go, Rust, or any language that can speak Unix socket + JSON.
+package subprocess

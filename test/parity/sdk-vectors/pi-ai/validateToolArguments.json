@@ -1,0 +1,2693 @@
+{
+ "pin": "1.6.0",
+ "package": "pi-ai@1.6.0",
+ "module": "pi-ai",
+ "export": "validateToolArguments",
+ "cases": [
+  {
+   "name": "number from \"42\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "42"
+     }
+    }
+   ],
+   "result": {
+    "value": 42
+   }
+  },
+  {
+   "name": "number from true",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": true
+     }
+    }
+   ],
+   "result": {
+    "value": 1
+   }
+  },
+  {
+   "name": "number from null",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": null
+     }
+    }
+   ],
+   "result": {
+    "value": 0
+   }
+  },
+  {
+   "name": "integer from \"42\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "42"
+     }
+    }
+   ],
+   "result": {
+    "value": 42
+   }
+  },
+  {
+   "name": "integer from \"42.1\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "42.1"
+     }
+    }
+   ],
+   "result": {
+    "value": 42
+   }
+  },
+  {
+   "name": "boolean from \"true\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "true"
+     }
+    }
+   ],
+   "result": {
+    "value": true
+   }
+  },
+  {
+   "name": "boolean from \"false\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "false"
+     }
+    }
+   ],
+   "result": {
+    "value": false
+   }
+  },
+  {
+   "name": "boolean from 1",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": 1
+     }
+    }
+   ],
+   "result": {
+    "value": true
+   }
+  },
+  {
+   "name": "boolean from 0",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": 0
+     }
+    }
+   ],
+   "result": {
+    "value": false
+   }
+  },
+  {
+   "name": "boolean from \"1\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "1"
+     }
+    }
+   ],
+   "result": {
+    "value": true
+   }
+  },
+  {
+   "name": "boolean from \"0\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "0"
+     }
+    }
+   ],
+   "result": {
+    "value": false
+   }
+  },
+  {
+   "name": "string from null",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": null
+     }
+    }
+   ],
+   "result": {
+    "value": "null"
+   }
+  },
+  {
+   "name": "string from true",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": true
+     }
+    }
+   ],
+   "result": {
+    "value": "true"
+   }
+  },
+  {
+   "name": "null from \"\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "null"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": ""
+     }
+    }
+   ],
+   "result": {
+    "value": null
+   }
+  },
+  {
+   "name": "null from 0",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "null"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": 0
+     }
+    }
+   ],
+   "result": {
+    "value": null
+   }
+  },
+  {
+   "name": "null from false",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "null"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": false
+     }
+    }
+   ],
+   "result": {
+    "value": null
+   }
+  },
+  {
+   "name": "null from \"null\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "null"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "null"
+     }
+    }
+   ],
+   "result": {
+    "value": null
+   }
+  },
+  {
+   "name": "an array of numbers from one value",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "7"
+     }
+    }
+   ],
+   "result": {
+    "value": [
+     7
+    ]
+   }
+  },
+  {
+   "name": "a number or string keeps the string",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": [
+         "number",
+         "string"
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "1"
+     }
+    }
+   ],
+   "result": {
+    "value": "1"
+   }
+  },
+  {
+   "name": "a boolean or number takes the number",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": [
+         "boolean",
+         "number"
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "1"
+     }
+    }
+   ],
+   "result": {
+    "value": 1
+   }
+  },
+  {
+   "name": "a nullable union arm keeps null",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": null
+     }
+    }
+   ],
+   "result": {
+    "value": null
+   }
+  },
+  {
+   "name": "a nullable union arm converts the number",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "42"
+     }
+    }
+   ],
+   "result": {
+    "value": 42
+   }
+  },
+  {
+   "name": "a nullable oneOf arm keeps null",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "oneOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": null
+     }
+    }
+   ],
+   "result": {
+    "value": null
+   }
+  },
+  {
+   "name": "a nullable array keeps null",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": [
+         "array",
+         "null"
+        ],
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": null
+     }
+    }
+   ],
+   "result": {
+    "value": null
+   }
+  },
+  {
+   "name": "a referenced nullable optional keeps null",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "$ref": "#/$defs/value"
+       }
+      },
+      "$defs": {
+       "value": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": null
+     }
+    }
+   ],
+   "result": {
+    "value": null
+   }
+  },
+  {
+   "name": "an optional null is omitted",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "offset": {
+        "type": "number"
+       },
+       "nullable": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "metadata": {
+        "type": "object",
+        "properties": {
+         "enabled": {
+          "type": "boolean"
+         }
+        }
+       }
+      },
+      "required": [
+       "path",
+       "metadata"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "path": "file.txt",
+      "offset": null,
+      "nullable": null,
+      "metadata": {
+       "enabled": null
+      }
+     }
+    }
+   ],
+   "result": {
+    "path": "file.txt",
+    "nullable": null,
+    "metadata": {}
+   }
+  },
+  {
+   "name": "boolean rejects \"yes\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "yes"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected boolean, got string\n\nReceived arguments:\n{\n  \"value\": \"yes\"\n}"
+  },
+  {
+   "name": "number rejects \"abc\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "abc"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected number, got string\n\nReceived arguments:\n{\n  \"value\": \"abc\"\n}"
+  },
+  {
+   "name": "null rejects \"nil\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "null"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "nil"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected null, got string\n\nReceived arguments:\n{\n  \"value\": \"nil\"\n}"
+  },
+  {
+   "name": "integer rejects \"4x\"",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "4x"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected integer, got string\n\nReceived arguments:\n{\n  \"value\": \"4x\"\n}"
+  },
+  {
+   "name": "errors, then the arguments received",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "many"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected number, got string\n\nReceived arguments:\n{\n  \"value\": \"many\"\n}"
+  },
+  {
+   "name": "a missing required property is reported at the property",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {}
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: missing\n\nReceived arguments:\n{}"
+  },
+  {
+   "name": "two errors in the schema's member order",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "zeta": {
+        "type": "string"
+       },
+       "alpha": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "alpha": [
+       1
+      ],
+      "zeta": [
+       2
+      ]
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - zeta: expected string, got array\n  - alpha: expected string, got array\n\nReceived arguments:\n{\n  \"alpha\": [\n    1\n  ],\n  \"zeta\": [\n    2\n  ]\n}"
+  },
+  {
+   "name": "the received arguments keep the call's member order",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "zeta": 1,
+      "alpha": {
+       "y": 2,
+       "b": 3
+      }
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - path: missing\n\nReceived arguments:\n{\n  \"zeta\": 1,\n  \"alpha\": {\n    \"y\": 2,\n    \"b\": 3\n  }\n}"
+  },
+  {
+   "name": "read: valid",
+   "args": [
+    {
+     "name": "read",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "offset": {
+        "type": "number"
+       },
+       "limit": {
+        "type": "number"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "read",
+     "arguments": {
+      "path": "a.txt",
+      "offset": 2,
+      "limit": 10
+     }
+    }
+   ],
+   "result": {
+    "path": "a.txt",
+    "offset": 2,
+    "limit": 10
+   }
+  },
+  {
+   "name": "read: numeric strings and a null optional",
+   "args": [
+    {
+     "name": "read",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "offset": {
+        "type": "number"
+       },
+       "limit": {
+        "type": "number"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "read",
+     "arguments": {
+      "path": "a.txt",
+      "offset": "2",
+      "limit": null
+     }
+    }
+   ],
+   "result": {
+    "path": "a.txt",
+    "offset": 2
+   }
+  },
+  {
+   "name": "read: extra properties pass untouched",
+   "args": [
+    {
+     "name": "read",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "offset": {
+        "type": "number"
+       },
+       "limit": {
+        "type": "number"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "read",
+     "arguments": {
+      "path": "a.txt",
+      "extra": {
+       "n": "10"
+      }
+     }
+    }
+   ],
+   "result": {
+    "path": "a.txt",
+    "extra": {
+     "n": "10"
+    }
+   }
+  },
+  {
+   "name": "read: path missing",
+   "args": [
+    {
+     "name": "read",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "offset": {
+        "type": "number"
+       },
+       "limit": {
+        "type": "number"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "read",
+     "arguments": {
+      "offset": 1
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"read\":\n  - path: missing\n\nReceived arguments:\n{\n  \"offset\": 1\n}"
+  },
+  {
+   "name": "read: path a number",
+   "args": [
+    {
+     "name": "read",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "offset": {
+        "type": "number"
+       },
+       "limit": {
+        "type": "number"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "read",
+     "arguments": {
+      "path": 12
+     }
+    }
+   ],
+   "result": {
+    "path": "12"
+   }
+  },
+  {
+   "name": "read: path a list",
+   "args": [
+    {
+     "name": "read",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "offset": {
+        "type": "number"
+       },
+       "limit": {
+        "type": "number"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "read",
+     "arguments": {
+      "path": [
+       "a"
+      ]
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"read\":\n  - path: expected string, got array\n\nReceived arguments:\n{\n  \"path\": [\n    \"a\"\n  ]\n}"
+  },
+  {
+   "name": "edit: one edit",
+   "args": [
+    {
+     "name": "edit",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path",
+       "edits"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "edits": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "required": [
+          "oldText",
+          "newText"
+         ],
+         "properties": {
+          "oldText": {
+           "type": "string"
+          },
+          "newText": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "edit",
+     "arguments": {
+      "path": "f",
+      "edits": [
+       {
+        "oldText": "a",
+        "newText": "b"
+       }
+      ]
+     }
+    }
+   ],
+   "result": {
+    "path": "f",
+    "edits": [
+     {
+      "oldText": "a",
+      "newText": "b"
+     }
+    ]
+   }
+  },
+  {
+   "name": "edit: one edit as an object",
+   "args": [
+    {
+     "name": "edit",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path",
+       "edits"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "edits": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "required": [
+          "oldText",
+          "newText"
+         ],
+         "properties": {
+          "oldText": {
+           "type": "string"
+          },
+          "newText": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "edit",
+     "arguments": {
+      "path": "f",
+      "edits": {
+       "oldText": "a",
+       "newText": "b"
+      }
+     }
+    }
+   ],
+   "result": {
+    "path": "f",
+    "edits": [
+     {
+      "oldText": "a",
+      "newText": "b"
+     }
+    ]
+   }
+  },
+  {
+   "name": "edit: wrong types inside edits",
+   "args": [
+    {
+     "name": "edit",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path",
+       "edits"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "edits": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "required": [
+          "oldText",
+          "newText"
+         ],
+         "properties": {
+          "oldText": {
+           "type": "string"
+          },
+          "newText": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "edit",
+     "arguments": {
+      "path": "f",
+      "edits": [
+       {
+        "oldText": 1,
+        "newText": null
+       },
+       {
+        "oldText": "x"
+       }
+      ]
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"edit\":\n  - edits.1.newText: missing\n\nReceived arguments:\n{\n  \"path\": \"f\",\n  \"edits\": [\n    {\n      \"oldText\": 1,\n      \"newText\": null\n    },\n    {\n      \"oldText\": \"x\"\n    }\n  ]\n}"
+  },
+  {
+   "name": "edit: edits a string",
+   "args": [
+    {
+     "name": "edit",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "required": [
+       "path",
+       "edits"
+      ],
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "edits": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "required": [
+          "oldText",
+          "newText"
+         ],
+         "properties": {
+          "oldText": {
+           "type": "string"
+          },
+          "newText": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "edit",
+     "arguments": {
+      "path": "f",
+      "edits": "x"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"edit\":\n  - edits.0: expected object, got string\n\nReceived arguments:\n{\n  \"path\": \"f\",\n  \"edits\": \"x\"\n}"
+  },
+  {
+   "name": "a string with a lone surrogate",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "a\ud800b"
+     }
+    }
+   ],
+   "result": {
+    "value": "a\ud800b"
+   }
+  },
+  {
+   "name": "a lone surrogate as a number",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "\ud800"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected number, got string\n\nReceived arguments:\n{\n  \"value\": \"\\ud800\"\n}"
+  },
+  {
+   "name": "astral characters count once for minLength",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string",
+        "minLength": 2
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "😀"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected at least 2 characters\n\nReceived arguments:\n{\n  \"value\": \"😀\"\n}"
+  },
+  {
+   "name": "a lone surrogate counts once for maxLength",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string",
+        "maxLength": 1
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "\ud800A"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected at most 1 characters\n\nReceived arguments:\n{\n  \"value\": \"\\ud800A\"\n}"
+  },
+  {
+   "name": "a $ref that names nothing rejects only its value",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "t": {
+        "$ref": "#/definitions/Missing"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "t": 1
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - t: unresolved reference #/definitions/Missing\n\nReceived arguments:\n{\n  \"t\": 1\n}"
+  },
+  {
+   "name": "a $ref that names nothing, absent",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "t": {
+        "$ref": "#/definitions/Missing"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {}
+    }
+   ],
+   "result": {}
+  },
+  {
+   "name": "an external $ref",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "t": {
+        "$ref": "https://example.com/schemas/t.json"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "t": 1
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - t: unresolved reference https://example.com/schemas/t.json\n\nReceived arguments:\n{\n  \"t\": 1\n}"
+  },
+  {
+   "name": "definitions of draft 7",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "required": [
+       "t"
+      ],
+      "properties": {
+       "t": {
+        "$ref": "#/definitions/T"
+       }
+      },
+      "definitions": {
+       "T": {
+        "type": "object",
+        "required": [
+         "path"
+        ],
+        "properties": {
+         "path": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "t": {
+       "path": 42
+      }
+     }
+    }
+   ],
+   "result": {
+    "t": {
+     "path": "42"
+    }
+   }
+  },
+  {
+   "name": "a recursive reference",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "root": {
+        "$ref": "#/$defs/N"
+       }
+      },
+      "$defs": {
+       "N": {
+        "type": "object",
+        "properties": {
+         "c": {
+          "type": "array",
+          "items": {
+           "$ref": "#/$defs/N"
+          }
+         },
+         "v": {
+          "type": "integer"
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "root": {
+       "v": "2",
+       "c": [
+        {
+         "v": "3",
+         "c": []
+        }
+       ]
+      }
+     }
+    }
+   ],
+   "result": {
+    "root": {
+     "v": 2,
+     "c": [
+      {
+       "v": 3,
+       "c": []
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "a recursive union",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "t": {
+        "$ref": "#/$defs/Tree"
+       }
+      },
+      "$defs": {
+       "Tree": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "array",
+          "items": {
+           "$ref": "#/$defs/Tree"
+          }
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "t": [
+       5,
+       [
+        "a"
+       ]
+      ]
+     }
+    }
+   ],
+   "result": {
+    "t": [
+     "5",
+     [
+      "a"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "the url format",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string",
+        "format": "url"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "not a url"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected format url\n\nReceived arguments:\n{\n  \"value\": \"not a url\"\n}"
+  },
+  {
+   "name": "the json-pointer-uri-fragment format",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string",
+        "format": "json-pointer-uri-fragment"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "#/a/b"
+     }
+    }
+   ],
+   "result": {
+    "value": "#/a/b"
+   }
+  },
+  {
+   "name": "an unknown format passes",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string",
+        "format": "made-up"
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "x"
+     }
+    }
+   ],
+   "result": {
+    "value": "x"
+   }
+  },
+  {
+   "name": "an enum lists its values",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string",
+        "enum": [
+         "a",
+         "b",
+         "c"
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "z"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected one of [\"a\",\"b\",\"c\"]\n\nReceived arguments:\n{\n  \"value\": \"z\"\n}"
+  },
+  {
+   "name": "an enum of 30 values lists 20",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "type": "string",
+        "enum": [
+         "v0",
+         "v1",
+         "v2",
+         "v3",
+         "v4",
+         "v5",
+         "v6",
+         "v7",
+         "v8",
+         "v9",
+         "v10",
+         "v11",
+         "v12",
+         "v13",
+         "v14",
+         "v15",
+         "v16",
+         "v17",
+         "v18",
+         "v19",
+         "v20",
+         "v21",
+         "v22",
+         "v23",
+         "v24",
+         "v25",
+         "v26",
+         "v27",
+         "v28",
+         "v29"
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "z"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: expected one of [\"v0\",\"v1\",\"v2\",\"v3\",\"v4\",\"v5\",\"v6\",\"v7\",\"v8\",\"v9\",\"v10\",\"v11\",\"v12\",\"v13\",\"v14\",\"v15\",\"v16\",\"v17\",\"v18\",\"v19\", ... and 10 more]\n\nReceived arguments:\n{\n  \"value\": \"z\"\n}"
+  },
+  {
+   "name": "oneOf matching two alternatives",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "string",
+          "maxLength": 5
+         }
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "abc"
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - value: matches more than one alternative\n\nReceived arguments:\n{\n  \"value\": \"abc\"\n}"
+  },
+  {
+   "name": "anyOf converts the first alternative that accepts",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "value": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "boolean"
+         }
+        ]
+       }
+      },
+      "required": [
+       "value"
+      ]
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "value": "3"
+     }
+    }
+   ],
+   "result": {
+    "value": 3
+   }
+  },
+  {
+   "name": "patternProperties convert the matching members",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "patternProperties": {
+       "^n_": {
+        "type": "integer"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "n_a": "1",
+      "other": "2"
+     }
+    }
+   ],
+   "result": {
+    "n_a": 1,
+    "other": "2"
+   }
+  },
+  {
+   "name": "additionalProperties convert only the undeclared members",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "amount": {
+        "type": "number"
+       }
+      },
+      "additionalProperties": {
+       "type": "integer"
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "amount": "3.5",
+      "extra": "7"
+     }
+    }
+   ],
+   "result": {
+    "amount": 3.5,
+    "extra": 7
+   }
+  },
+  {
+   "name": "property names are names, not patterns",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a.b": {
+        "type": "integer"
+       },
+       "axb": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "a.b": "4",
+      "axb": "5.8"
+     }
+    }
+   ],
+   "result": {
+    "a.b": 4,
+    "axb": "5.8"
+   }
+  },
+  {
+   "name": "a boolean schema",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": true,
+       "b": false
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "b": 1
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - b: no value is allowed here\n\nReceived arguments:\n{\n  \"b\": 1\n}"
+  },
+  {
+   "name": "unknown keywords are ignored",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "~kind": "Object",
+      "properties": {
+       "n": {
+        "~kind": "Number",
+        "type": "number"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "n": "5"
+     }
+    }
+   ],
+   "result": {
+    "n": 5
+   }
+  },
+  {
+   "name": "an invalid pattern throws at compile",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "type": "string",
+        "pattern": "["
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "s": "y"
+     }
+    }
+   ],
+   "throws": "Invalid regular expression: /[/: Unterminated character class"
+  },
+  {
+   "name": "a deep recursive union without exponential work",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "s": {
+        "$ref": "#/$defs/S"
+       }
+      },
+      "$defs": {
+       "S": {
+        "anyOf": [
+         {
+          "type": "object",
+          "additionalProperties": {
+           "$ref": "#/$defs/S"
+          },
+          "required": [
+           "a"
+          ]
+         },
+         {
+          "type": "object",
+          "additionalProperties": {
+           "$ref": "#/$defs/S"
+          },
+          "required": [
+           "b"
+          ]
+         }
+        ]
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "s": {
+       "c": {
+        "c": {
+         "c": {
+          "c": {
+           "c": {
+            "c": {
+             "c": {
+              "c": {
+               "c": {
+                "c": {
+                 "c": {
+                  "c": {
+                   "c": {
+                    "c": {
+                     "c": {
+                      "c": {
+                       "c": {
+                        "c": {
+                         "c": {
+                          "c": {
+                           "c": {
+                            "c": {
+                             "c": {
+                              "c": {
+                               "c": {
+                                "c": {
+                                 "c": {
+                                  "c": {
+                                   "c": {
+                                    "c": {
+                                     "c": {
+                                      "c": {
+                                       "c": {
+                                        "c": {
+                                         "c": {
+                                          "c": {
+                                           "c": {
+                                            "c": {
+                                             "c": {
+                                              "c": {
+                                               "x": 1
+                                              }
+                                             }
+                                            }
+                                           }
+                                          }
+                                         }
+                                        }
+                                       }
+                                      }
+                                     }
+                                    }
+                                   }
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             }
+                            }
+                           }
+                          }
+                         }
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  }
+                 }
+                }
+               }
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - s.a: missing\n  - s.c.a: missing\n  - s.c.c.a: missing\n  - s.c.c.c.a: missing\n  - s.c.c.c.c.a: missing\n  - s.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.a: missing\n  - s.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.c.x: expected object, got integer\n\nReceived arguments:\n{\n  \"s\": {\n    \"c\": {\n      \"c\": {\n        \"c\": {\n          \"c\": {\n            \"c\": {\n              \"c\": {\n                \"c\": {\n                  \"c\": {\n                    \"c\": {\n                      \"c\": {\n                        \"c\": {\n                          \"c\": {\n                            \"c\": {\n                              \"c\": {\n                                \"c\": {\n                                  \"c\": {\n                                    \"c\": {\n                                      \"c\": {\n                                        \"c\": {\n                                          \"c\": {\n                                            \"c\": {\n                                              \"c\": {\n                                                \"c\": {\n                                                  \"c\": {\n                                                    \"c\": {\n                                                      \"c\": {\n                                                        \"c\": {\n                                                          \"c\": {\n                                                            \"c\": {\n                                                              \"c\": {\n                                                                \"c\": {\n                                                                  \"c\": {\n                                                                    \"c\": {\n                                                                      \"c\": {\n                                                                        \"c\": {\n                                                                          \"c\": {\n                                                                            \"c\": {\n                                                                              \"c\": {\n                                                                                \"c\": {\n                                                                                  \"c\": {\n                                                                                    \"x\": 1\n                                                                                  }\n                                                                                }\n                                                                              }\n                                                                            }\n                                                                          }\n                                                                        }\n                                                                      }\n                                                                    }\n                                                                  }\n                                                                }\n                                                              }\n                                                            }\n                                                          }\n                                                        }\n                                                      }\n                                                    }\n                                                  }\n                                                }\n                                              }\n                                            }\n                                          }\n                                        }\n                                      }\n                                    }\n                                  }\n                                }\n                              }\n                            }\n                          }\n                        }\n                      }\n                    }\n                  }\n                }\n              }\n            }\n          }\n        }\n      }\n    }\n  }\n}"
+  },
+  {
+   "name": "a root null",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": null
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - root: expected object, got null\n\nReceived arguments:\nnull"
+  },
+  {
+   "name": "a root list",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": []
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - root: expected object, got array\n\nReceived arguments:\n[]"
+  },
+  {
+   "name": "a root string",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "string"
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": "x"
+    }
+   ],
+   "result": "x"
+  },
+  {
+   "name": "an empty schema",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {}
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "a": 1
+     }
+    }
+   ],
+   "result": {
+    "a": 1
+   }
+  },
+  {
+   "name": "a property named a~1 is reported under its own name",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a~1": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "a~1": [
+       1
+      ]
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - a~1: expected string, got array\n\nReceived arguments:\n{\n  \"a~1\": [\n    1\n  ]\n}"
+  },
+  {
+   "name": "a property named a/b is reported under its own name",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a/b": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "a/b": [
+       1
+      ]
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - a/b: expected string, got array\n\nReceived arguments:\n{\n  \"a/b\": [\n    1\n  ]\n}"
+  },
+  {
+   "name": "a property named ~01 under a property named ~1",
+   "args": [
+    {
+     "name": "echo",
+     "description": "d",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "~1": {
+        "type": "object",
+        "properties": {
+         "~01": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "toolCall",
+     "id": "c1",
+     "name": "echo",
+     "arguments": {
+      "~1": {
+       "~01": [
+        1
+       ]
+      }
+     }
+    }
+   ],
+   "throws": "Validation failed for tool \"echo\":\n  - ~1.~01: expected string, got array\n\nReceived arguments:\n{\n  \"~1\": {\n    \"~01\": [\n      1\n    ]\n  }\n}"
+  }
+ ]
+}

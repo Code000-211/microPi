@@ -1,0 +1,245 @@
+// Ports upstream pi-tui column slicing and overlay-segment extraction.
+//
+// Mirrors:
+//   - sliceByColumn       utils.ts:1263
+//   - sliceWithWidth      utils.ts:1268
+//   - extractSegments     utils.ts:1014
+
+package widthx
+
+import (
+	"strings"
+)
+
+// SliceResult is the return shape of SliceWithWidth.
+type SliceResult struct {
+	Text  string
+	Width int
+}
+
+// SliceByColumn extracts a range of visible columns [startCol, startCol+length)
+// from a line. ANSI codes are preserved. If `strict` is true, a wide character
+// that would extend past the end column is excluded.
+//
+// Mirrors upstream `sliceByColumn`.
+func SliceByColumn(line string, startCol, length int, strict bool) string {
+	return SliceWithWidth(line, startCol, length, strict).Text
+}
+
+// SliceWithWidth is like SliceByColumn but also returns the actual visible
+// width of the result. Mirrors upstream `sliceWithWidth`.
+func SliceWithWidth(line string, startCol, length int, strict bool) SliceResult {
+	if length <= 0 {
+		return SliceResult{}
+	}
+	endCol := startCol + length
+	var result, pendingAnsi strings.Builder
+	resultWidth := 0
+	currentCol := 0
+
+	for i := 0; i < len(line); {
+		if n := ExtractAnsi(line, i); n > 0 {
+			code := line[i : i+n]
+			if currentCol >= startCol && currentCol < endCol {
+				// Codes from before the range precede codes at the boundary, keeping the line's order (#10169).
+				if pendingAnsi.Len() > 0 {
+					result.WriteString(pendingAnsi.String())
+					pendingAnsi.Reset()
+				}
+				result.WriteString(code)
+			} else if currentCol < startCol && !strings.HasPrefix(code, "\x1b_") {
+				// APC sequences (cursor markers) are positional one-shot commands, not persistent style
+				// state, so codes before the range carry over only when they are not APC (Pi main 25490ea49).
+				pendingAnsi.WriteString(code)
+			}
+			i += n
+			continue
+		}
+		// Non-ANSI run until next ANSI or end: an escape byte that is no complete code stays in the run.
+		end := i
+		for end < len(line) {
+			e := strings.IndexByte(line[end:], 0x1b)
+			if e < 0 {
+				end = len(line)
+				break
+			}
+			end += e
+			if ExtractAnsi(line, end) > 0 {
+				break
+			}
+			end++
+		}
+		run := line[i:end]
+		broken := false
+		// Printable ASCII always forms one cell of one column per character, so a stretch of it is placed by arithmetic. The last
+		// ASCII character before a non-ASCII byte is left to the grapheme iterator, because a mark, a joiner or a variation selector
+		// after it joins its cluster. (Pi's sliceWithWidth takes the shortcut only for a text that is printable ASCII throughout.)
+		if n := printableASCIIPrefix(run); n > 0 {
+			if n < len(run) {
+				n--
+			}
+			if n > 0 {
+				take := n
+				if currentCol+n >= endCol {
+					take, broken = max(1, endCol-currentCol), true
+				}
+				if first, last := max(0, startCol-currentCol), min(take, endCol-currentCol); first < last {
+					if pendingAnsi.Len() > 0 {
+						result.WriteString(pendingAnsi.String())
+						pendingAnsi.Reset()
+					}
+					result.WriteString(run[first:last])
+					resultWidth += last - first
+				}
+				currentCol += take
+				run = run[n:]
+			}
+		}
+		gs := newGraphemeIter(run)
+		for !broken && gs.Next() {
+			seg := gs.Str()
+			w := graphemeWidthFast(seg)
+			inRange := currentCol >= startCol && currentCol < endCol
+			fits := !strict || currentCol+w <= endCol
+			if inRange && fits {
+				if pendingAnsi.Len() > 0 {
+					result.WriteString(pendingAnsi.String())
+					pendingAnsi.Reset()
+				}
+				result.WriteString(seg)
+				resultWidth += w
+			}
+			currentCol += w
+			if currentCol >= endCol {
+				broken = true
+				break
+			}
+		}
+		i = end
+		if broken {
+			break
+		}
+	}
+	return SliceResult{Text: result.String(), Width: resultWidth}
+}
+
+// SegmentsResult is the return shape of ExtractSegments.
+type SegmentsResult struct {
+	Before      string
+	BeforeWidth int
+	After       string
+	AfterWidth  int
+}
+
+// ExtractSegments extracts the "before" and "after" segments around an
+// overlay region in a single pass over `line`. SGR/hyperlink styling that
+// was active just before the overlay's start column is prepended to the
+// "after" segment so the overlay does not visually break style continuity.
+//
+// `beforeEnd`   = first column NOT in "before" segment
+// `afterStart`  = first column of "after" segment
+// `afterLen`    = number of columns in "after" segment (0 = before-only)
+// `strictAfter` = exclude wide char at the end that would overrun afterEnd
+//
+// Mirrors upstream `extractSegments`. The shared pooled tracker in upstream
+// is replaced here by a fresh local tracker per call: the function is
+// already at the inner loop of overlay compositing and a stack-allocated
+// tracker is essentially free.
+func ExtractSegments(line string, beforeEnd, afterStart, afterLen int, strictAfter bool) SegmentsResult {
+	var before, after strings.Builder
+	beforeWidth, afterWidth := 0, 0
+	pendingAnsiBefore := ""
+	afterStarted := false
+	afterEnd := afterStart + afterLen
+	tr := &AnsiCodeTracker{}
+
+	currentCol := 0
+
+	for i := 0; i < len(line); {
+		if n := ExtractAnsi(line, i); n > 0 {
+			code := line[i : i+n]
+			tr.Process(code)
+			switch {
+			case currentCol < beforeEnd:
+				pendingAnsiBefore += code
+			case currentCol >= afterStart && currentCol < afterEnd && (afterStarted || strings.HasPrefix(code, "\x1b_")):
+				// SGR codes are only kept once "after" started (its styling is already prepended). A zero-width APC marker such
+				// as CursorMarker is not tracked styling, so it stays at the boundary too.
+				after.WriteString(code)
+			}
+			i += n
+			continue
+		}
+
+		end := i
+		for end < len(line) {
+			if ExtractAnsi(line, end) > 0 {
+				break
+			}
+			end++
+		}
+		run := line[i:end]
+		gs := newGraphemeIter(run)
+		shouldBreak := false
+		for gs.Next() {
+			seg := gs.Str()
+			w := graphemeWidthFast(seg)
+			switch {
+			case currentCol < beforeEnd && currentCol+w <= beforeEnd:
+				// A wide grapheme straddling beforeEnd stays out of "before",
+				// as upstream: including it made the composited row overrun
+				// the overlay's start column.
+				if pendingAnsiBefore != "" {
+					before.WriteString(pendingAnsiBefore)
+					pendingAnsiBefore = ""
+				}
+				before.WriteString(seg)
+				beforeWidth += w
+			case currentCol >= afterStart && currentCol < afterEnd:
+				fits := !strictAfter || currentCol+w <= afterEnd
+				if fits {
+					if !afterStarted {
+						after.WriteString(tr.ActiveCodes())
+						afterStarted = true
+					}
+					after.WriteString(seg)
+					afterWidth += w
+				}
+			}
+			currentCol += w
+			if afterLen <= 0 {
+				if currentCol >= beforeEnd {
+					shouldBreak = true
+					break
+				}
+			} else if currentCol >= afterEnd {
+				shouldBreak = true
+				break
+			}
+		}
+		i = end
+		if shouldBreak {
+			break
+		}
+	}
+
+	return SegmentsResult{
+		Before:      before.String(),
+		BeforeWidth: beforeWidth,
+		After:       after.String(),
+		AfterWidth:  afterWidth,
+	}
+}
+
+// graphemeWidthFast returns upstream graphemeWidth(seg) for one cluster.
+func graphemeWidthFast(seg string) int { return GraphemeWidth(seg) }
+
+// printableASCIIPrefix is how many bytes at the start of s are printable ASCII (0x20 to 0x7e).
+func printableASCIIPrefix(s string) int {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e {
+			return i
+		}
+	}
+	return len(s)
+}

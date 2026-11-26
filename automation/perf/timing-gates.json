@@ -1,0 +1,21 @@
+[
+  {"package": "./ai", "tests": ["TestSSEIdleTrackerScanIsNotAPerByteLoop", "TestOpenAIStreamRecordsInOneValueAreLinear", "TestOpenAIStreamSplitRecordIsLinear", "TestAQuotedStringMissCostsTheSameInALargeCache", "TestUnmanagedProducerSnapshotsDoNotRevalidateTheArgumentAtEveryPush"]},
+  {"package": "./bench/sessionscale/cmd/sessionscale", "tests": ["TestResumeMemoryAndPromptCostFollowTheContext"]},
+  {"package": "./coding/extension", "tests": ["TestScalingTrackedUnsubscribeIsConstantTime"]},
+  {"package": "./coding/extension/host/subprocess", "tests": ["TestMessageUpdateDeltaCostDoesNotGrowWithTheText", "TestPushProxy_RenderNeverBlocks"]},
+  {"package": "./coding/extension/host/subprocess", "goos": "windows", "tests": ["TestNodeConnectsToExtensionPipeWithoutWaiting"]},
+  {"package": "./durable/codemode", "tests": ["TestJoinAdjacentTextIsLinearAtTheItemLimit"]},
+  {"package": "./durable/core", "tests": ["TestSortU32CostsLogLinearInTheWatchCount"]},
+  {"package": "./durable/core/jv", "tests": ["TestAppendString200KBudget", "TestKeysOfManyIndexKeysAreSortedInLogLinearTime"]},
+  {"package": "./env", "goos": "linux", "tests": ["TestConnectionAbortStopsWaitingForAStartThatDoesNotFinish", "TestConnectionAbortSettlesASentRequestTheDaemonDoesNotAnswer", "TestRemoteExecOnAHostThatDoesNotAnswer", "TestRemoteFileOperationsStopWaitingForTheConnectionWhenAborted"]},
+  {"package": "./extensions/sdk/json", "tests": ["TestAppendString200KBudget"]},
+  {"package": "./internal/codingagent", "tests": ["TestPiSharedFilesConcurrentWriters", "TestScanToolCallCountSkipsEscapedTextInLinearTime", "TestTreeSelectorOpensWithinPiTimeOnTheOwnerShape", "TestFrameCostOverUnchangedTranscriptDoesNotGrowWithItsLines", "TestScalingModelsJSONProviderComposition"]},
+  {"package": "./internal/codingagent/compaction", "tests": ["TestCollectEntriesForBranchSummaryWithinPiTimeOnTheOwnerShape", "TestJSLengthCountsASCIIByWord"]},
+  {"package": "./internal/jsstring", "tests": ["TestLengthCountsASCIIByWord", "TestStringifyChain200KBudget", "TestMarshalJSONString200KBudget", "TestUnescapeForStringifyCopiesSpans"]},
+  {"package": "./internal/lazyregexp", "tests": ["TestCompilingManyDotsDoesNotWalkTheClasses"]},
+  {"package": "./internal/truncate", "tests": ["TestTailWindowAppendCostDoesNotGrowWithTheWindow"]},
+  {"package": "./mcp", "tests": ["TestStdioSplitterLargeMessageScalesLinearly"]},
+  {"package": "./test/extension-conformance", "tests": ["TestExtensionPayloadScalesLinearly", "TestExtensionRoundTripLatencyOpenLoop", "TestExtensionSoak"]},
+  {"package": "./test/integration", "tags": "integration", "tests": ["TestExt_CachedBinaryUsedOnSecondStartup"]},
+  {"package": "./tui", "tests": ["TestMarkdownUnbrokenLinearScaling", "TestTreeSelectLargeNavigationFast"]}
+]

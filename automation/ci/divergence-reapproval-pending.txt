@@ -1,0 +1,8 @@
+# Records whose approval does not bind their current text, one per line: D<N> <class> <reason>.
+# The binding (text-sha256 on the SCRUTINIZED:approved line) starts from the text of the day of the one-off stamp.
+# These records were left unbound because their normative text changed after the first commit that carried their bare,
+# copied marker, or because they have no such marker yet (class new). The list records no approval and no past approval:
+# only the owner removes an entry, with `make divergence-approve ID=D<N>`, which writes the date and the hash on the
+# approval line. A lane that changes the normative text of a record adds it here with a class and a reason and says so in
+# its pull request. Sorted by class: behaviour, scope, remove-when, owner-field, editorial, new. Within a class the
+# generator listed them in reading order: tokens-changed, large-insert, medium, owner-statement-after, small.

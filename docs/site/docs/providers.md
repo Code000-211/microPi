@@ -1,0 +1,467 @@
+# Providers
+
+PiG speaks to inference providers through the provider registry shared with its Pi compatibility model. Each built-in provider has a Go implementation under `ai/` that handles authentication, request shaping, and stream parsing. Extensions can register additional providers through the public extension API. See [Extensions](/docs/latest/extensions).
+
+Most hosted providers accept an API key, and some also accept a browser or device sign-in through OAuth. Amazon Bedrock and Google Vertex AI can also use ambient cloud credentials. Run `/login` or `pig login --list` to see the sign-in methods for each provider.
+
+## Built-in providers
+
+Extensions written in Go, Rust or Python reach Provider objects across a process boundary, so some of Pi's in-heap Provider behavior is not available to them (D78). Registered native Provider methods are callable across processes. Go, Rust and Python `getProvider` cannot retrieve every built-in or composed raw Provider object and report the unavailable carrier as an error. A registered configuration that such an extension reads is a snapshot, not a live alias of the author's object, so property writes do not synchronize. Node extensions in one process keep Pi's behavior. Normal model selection, authentication, refresh, cancellation and registration cleanup are unchanged.
+
+PiG ships the same built-in chat providers and classifier models as Pi 1.6.0. `typesafe` has only classifier models, and `cloudflare-workers-ai`, `openai`, `opencode`, `openrouter` and `vercel-ai-gateway` list them beside their chat models. The provider key is the first part of a `provider/model` spec. The wire column lists the APIs that the provider's built-in chat models use.
+
+| Provider key | Name | Wire | Credential |
+|---|---|---|---|
+| `amazon-bedrock` | Amazon Bedrock | `bedrock-converse-stream` | AWS credential chain or `AWS_BEARER_TOKEN_BEDROCK`. See [Amazon Bedrock](#amazon-bedrock). |
+| `ant-ling` | Ant Ling | `openai-completions` | `ANT_LING_API_KEY` |
+| `anthropic` | Anthropic | `anthropic-messages` | `ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, workload identity federation, or OAuth. See [Anthropic workload identity federation](#anthropic-workload-identity-federation). |
+| `azure` | Azure | `azure-openai-responses`, `openai-completions` | `AZURE_OPENAI_API_KEY` plus an endpoint. See [Azure OpenAI](#azure-openai). |
+| `baseten` | Baseten | `openai-completions` | `BASETEN_API_KEY` |
+| `cerebras` | Cerebras | `openai-completions` | `CEREBRAS_API_KEY` |
+| `cloudflare-ai-gateway` | Cloudflare AI Gateway | `anthropic-messages`, `openai-completions`, `openai-responses` | `CLOUDFLARE_API_KEY`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_GATEWAY_ID` |
+| `cloudflare-workers-ai` | Cloudflare Workers AI | `openai-completions` | `CLOUDFLARE_API_KEY` and `CLOUDFLARE_ACCOUNT_ID` |
+| `deepseek` | DeepSeek | `openai-completions` | `DEEPSEEK_API_KEY` |
+| `fireworks` | Fireworks | `anthropic-messages`, `openai-completions` | `FIREWORKS_API_KEY` |
+| `github-copilot` | GitHub Copilot | `anthropic-messages`, `openai-completions`, `openai-responses` | OAuth via `pig login github-copilot`, or `COPILOT_GITHUB_TOKEN` |
+| `google` | Google Gemini | `google-generative-ai` | `GEMINI_API_KEY` |
+| `google-vertex` | Google Vertex AI | `google-vertex` | `GOOGLE_CLOUD_API_KEY` or Application Default Credentials. See [Google Vertex AI](#google-vertex-ai). |
+| `groq` | Groq | `openai-completions` | `GROQ_API_KEY` |
+| `huggingface` | Hugging Face | `openai-completions` | `HF_TOKEN` |
+| `kimi-coding` | Kimi For Coding | `anthropic-messages` | `KIMI_API_KEY` or OAuth |
+| `meta` | Meta | `openai-responses` | `META_API_KEY` or OAuth |
+| `minimax` | MiniMax | `anthropic-messages` | `MINIMAX_API_KEY` |
+| `minimax-cn` | MiniMax (China) | `anthropic-messages` | `MINIMAX_CN_API_KEY` |
+| `mistral` | Mistral | `mistral-conversations` | `MISTRAL_API_KEY` |
+| `moonshotai` | Moonshot AI | `openai-completions` | `MOONSHOT_API_KEY` |
+| `moonshotai-cn` | Moonshot AI (China) | `openai-completions` | `MOONSHOT_API_KEY` |
+| `nvidia` | NVIDIA NIM | `openai-completions` | `NVIDIA_API_KEY` |
+| `openai` | OpenAI | `openai-responses` | `OPENAI_API_KEY` |
+| `openai-codex` | OpenAI Codex (ChatGPT subscription) | `openai-codex-responses` | OAuth via `pig login openai-codex` |
+| `opencode` | OpenCode Zen | `anthropic-messages`, `google-generative-ai`, `openai-completions`, `openai-responses` | `OPENCODE_API_KEY` |
+| `opencode-go` | OpenCode Go | `anthropic-messages`, `openai-completions`, `openai-responses` | `OPENCODE_API_KEY` |
+| `openrouter` | OpenRouter | `anthropic-messages`, `openai-completions` | `OPENROUTER_API_KEY` or OAuth |
+| `qwen-token-plan` | Qwen Token Plan (Team) | `openai-completions` | `QWEN_TOKEN_PLAN_TEAM_API_KEY` |
+| `qwen-token-plan-cn` | Qwen Token Plan (Team, China) | `openai-completions` | `QWEN_TOKEN_PLAN_TEAM_CN_API_KEY` |
+| `qwen-token-plan-individual` | Qwen Token Plan (Individual) | `openai-completions` | `QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY` |
+| `qwen-token-plan-individual-cn` | Qwen Token Plan (Individual, China) | `openai-completions` | `QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY` |
+| `radius` | Radius | `pi-messages` | `RADIUS_API_KEY` or OAuth. See [Radius](#radius). |
+| `together` | Together AI | `openai-completions` | `TOGETHER_API_KEY` |
+| `vercel-ai-gateway` | Vercel AI Gateway | `anthropic-messages` | `AI_GATEWAY_API_KEY` |
+| `xai` | xAI | `openai-responses` | `XAI_API_KEY` or OAuth |
+| `xiaomi` | Xiaomi MiMo | `openai-completions` | `XIAOMI_API_KEY` |
+| `xiaomi-token-plan-ams` | Xiaomi MiMo Token Plan (Amsterdam) | `openai-completions` | `XIAOMI_TOKEN_PLAN_AMS_API_KEY` |
+| `xiaomi-token-plan-cn` | Xiaomi MiMo Token Plan (China) | `openai-completions` | `XIAOMI_TOKEN_PLAN_CN_API_KEY` |
+| `xiaomi-token-plan-sgp` | Xiaomi MiMo Token Plan (Singapore) | `openai-completions` | `XIAOMI_TOKEN_PLAN_SGP_API_KEY` |
+| `zai` | ZAI Coding Plan (Global) | `openai-completions` | `ZAI_API_KEY` |
+| `zai-coding-cn` | ZAI Coding Plan (China) | `openai-completions` | `ZAI_CODING_CN_API_KEY` |
+
+`pig --list-models` shows only the providers that have a credential. `pig --list-models <search>` filters that list.
+
+To add an endpoint that is not in this table, such as a local Ollama, LM Studio or vLLM server, declare it in `~/.pig/agent/models.json`. See [Custom providers](/docs/latest/custom-provider).
+
+## Use an API key from the environment
+
+Set the provider's variable before you start PiG:
+
+```bash
+export GEMINI_API_KEY=...
+pig --model google/gemini-2.5-flash
+```
+
+Each provider in the table above reads the variable in its credential column. Use `GEMINI_API_KEY` for `google`. PiG does not treat `GOOGLE_API_KEY` as a `google` credential: `pig auth check`, `/login` and `--list-models` ignore it, as Pi does.
+
+`anthropic` reads three variables. `ANTHROPIC_AUTH_TOKEN` is sent as an `Authorization: Bearer` token and takes precedence over the other two. `ANTHROPIC_OAUTH_TOKEN` is used as an API key and takes precedence over `ANTHROPIC_API_KEY`. Subscription tokens (`sk-ant-oat`) are sent with the Claude Code identity, and subscription auth shows a warning at session start.
+
+### Anthropic workload identity federation
+
+When no key, stored credential, `ANTHROPIC_AUTH_TOKEN` or authorization header is available, `anthropic` can authenticate with workload identity federation. Set `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and `ANTHROPIC_IDENTITY_TOKEN_FILE`. `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID` are optional.
+
+PiG reads the identity token (a JWT) from the file on every exchange, so a rotated token is picked up. It exchanges the token for an access token with a `jwt-bearer` grant at `<base URL>/v1/oauth/token` and sends the access token as `Authorization: Bearer`. PiG keeps the access token and refreshes it before it expires. After a 401 the next request exchanges again. The token endpoint must use `https`; `http` is accepted only for `localhost`, `127.0.0.1` and `::1`. An identity token over 16 KiB is rejected before the request. An exchange failure is the request's error, and no message request is sent. Error bodies keep only the `error`, `error_description` and `error_uri` fields.
+
+Federation applies to the `anthropic` provider only. Other `anthropic-messages` providers still require a key or an authorization header.
+
+When Anthropic rejects the strict tool set of a request for grammar size, tool count or union limits, PiG sends the request once more with every `strict: "prefer"` tool non-strict. A `strict: "require"` tool keeps the error. Pi 1.6.0 does the same; Pi 1.1.0 failed every turn ([Pi #10409](https://github.com/earendil-works/pi/issues/10409)).
+
+Anthropic Messages requests differ from Pi 1.6.0 in two places:
+
+- A CRLF that a proxy splits across two network chunks does not end the line early. Pi aborts the turn with `Could not parse Anthropic SSE event message_start` (D121, Pi #10390).
+- An explicit `anthropic-beta` header, from a model's `headers` or the request, no longer makes a managed-effort request fail with `Extra inputs are not permitted`: PiG sends each managed field only with its beta (D130, Pi #10759).
+
+`github-copilot` reads only `COPILOT_GITHUB_TOKEN`. A general `GITHUB_TOKEN` is not a Copilot credential.
+
+`PI_CACHE_RETENTION` sets the prompt cache retention that PiG passes to the provider.
+
+Mistral requests include `prompt_cache_key` and an automatic `x-affinity` header when the request has a session ID and cache retention is not `none`. Explicit affinity headers remain unchanged, including an empty header. Replayed assistant messages use `prefix: false`; they are completed turns, not completion prefixes. The request timeout covers only the wait for the response headers, so a long stream is not aborted after 60 seconds. A request that gets no headers in time fails with `Mistral response headers timed out after <N>ms`. Pi 1.6.0 does the same; Pi 1.1.0 applied the timeout to the whole request ([Pi #10609](https://github.com/earendil-works/pi/issues/10609)).
+
+Google Gemini and Vertex requests encode the system instruction as user-role content, matching Pi's Google SDK. They omit the tool-calling mode when no explicit choice or strict tool schema requires it. Explicit `none` and `any` choices take precedence over strict `VALIDATED` mode. For Gemini 2.x models, PiG sends the images of a run of tool results after the last function response of the run, so all function responses of one model turn stay in one user turn. Pi sends each image right after its result, which Gemini 2.x rejects after parallel tool calls (D115).
+
+## Authentication
+
+Provider authentication can require several replies. Bedrock supports a bearer token, an AWS profile, or the existing AWS credential chain. Vertex supports an API key, Application Default Credentials, or a service-account file, with project and location prompts. Cloudflare requests an account ID and, for AI Gateway, a gateway ID after the key. Provider-scoped settings are stored in the credential's `env` object, not in the chat transcript.
+
+API keys are stored as entered. Leading and trailing spaces are preserved. An explicitly empty stored Cloudflare key does not fall back to `CLOUDFLARE_API_KEY`. An empty Vertex key does not select `GOOGLE_CLOUD_API_KEY`; Vertex still checks its cloud credentials. Use `/logout` to remove a stored credential and return to environment-only authentication. Provider searches include authentication method names. A provider without credentials is labelled `not configured`. A credential for another authentication type is labelled `API key configured`, `subscription configured`, or `account configured` in the provider list. OAuth sign-ins backed by a subscription are labelled `subscription`; other OAuth sign-ins, such as Radius and OpenRouter, are labelled `account`.
+
+PiG stores credentials in `~/.pig/agent/auth.json`. Agent startup creates a missing file containing `{}` with owner-only permissions (mode `0600` on POSIX; an owner-only DACL on Windows, D68). Startup leaves existing contents and permissions unchanged. Stored credentials take precedence over environment fallback; a runtime API key can override them for the current process.
+
+`auth.json` can contain API keys and OAuth tokens. Keep it private and do not commit it.
+
+Interactive login prompts marked as secret use PiG's `maskSecretInput` setting (default `true`). **Mask secret input** in `/settings` shows dots, a character count and the last four characters while typing, then retains only the masked preview after submission. Inputs shorter than five characters show no suffix. Set `maskSecretInput` to `false` to restore Pi 1.6.0's plain-text behavior. This configurable feature is recorded as divergence D80. Ordinary text and manual-code prompts remain visible. Credentials still belong in `auth.json` or the provider's credential store; the setting protects dialog and authentication-diagnostic output, not credential storage.
+
+### Interactive login and logout
+
+Run `/login <provider>` with a provider ID or display name to configure that provider. Argument completion shows each provider's supported methods. A provider with one method opens that flow directly. A provider with several methods opens its own method selector. An unmatched argument opens a searchable provider list.
+
+Run `/login` without an argument to choose an authentication method first. The last option, **Sign in with Radius**, starts the Radius sign-in directly and shows its status. Press Escape in its provider list to return to the method selector. Press Escape at a sign-in method prompt, such as Anthropic's, Radius's, Amazon Bedrock's or Google Vertex AI's, or close a provider's setup note, to return to the menu the login was started from. Keep answering the prompts inside the login dialog until it reports completion. Escape in a key or text prompt aborts the login and leaves existing credentials unchanged. Pi reports this cancellation as `Failed to save API key for <Name>: This operation was aborted`.
+
+Run `/logout` to remove a stored API-key or OAuth credential. The list excludes environment-only credentials. A successful logout also removes the provider's `--api-key` override for the current run. If stored-credential deletion fails or is cancelled, the override remains available. Logout does not change environment variables or `models.json`. If no credentials are stored, PiG reports that there is nothing to remove instead of opening an empty picker.
+
+A matching login option reports its credential source, such as `stored` or an environment variable. The logout list marks the stored credentials it can remove as `configured`. These labels describe different states.
+
+OpenAI-compatible HTTP errors retain Pi's status and provider error body. Completion errors use the status directly. Responses errors include the provider's API-error prefix.
+
+### Load an API key from a command
+
+To use a secret manager without writing the key to disk, set a stored key to a command that starts with `!`:
+
+```json
+{
+  "anthropic": {
+    "type": "api_key",
+    "key": "!security find-generic-password -ws 'anthropic'"
+  }
+}
+```
+
+PiG runs the command when the key is first needed and uses its standard output as the key.
+
+### Provider settings in a credential
+
+A stored API-key credential can include an `env` object. Its values take precedence over the process environment for that provider. Model Runtime streaming and extension model-auth lookups carry these values to the provider request:
+
+```json
+{
+  "cloudflare-workers-ai": {
+    "type": "api_key",
+    "key": "...",
+    "env": {
+      "CLOUDFLARE_ACCOUNT_ID": "account-id"
+    }
+  }
+}
+```
+
+### OAuth providers
+
+On Windows, PiG passes browser login URLs directly to the Windows URL handler without a command shell. URL parameters and shell metacharacters remain part of the URL.
+
+Device-code login shows the verification URL, user code, and waiting status without opening a browser. Open the displayed link yourself. Browser authorization URL events still open the default browser.
+
+Built-in OAuth targets are `anthropic`, `github-copilot`, `kimi-coding`, `meta`, `openai-codex`, `openrouter`, `radius`, and `xai`. Each provider owns its flow. For example, GitHub Copilot uses device authorization, while callback-based providers can open a localhost callback server. Anthropic's browser sign-in listens on `127.0.0.1:53692` so the port can be forwarded; when that port cannot be bound, it uses a free loopback port and the sign-in URL and token exchange follow the port it bound. The Sign in with ChatGPT and OpenAI Codex sign-ins name PiG (`PiG` and `pig`) to OpenAI; a model header named `originator` or `User-Agent`, set in `models.json` or on a request, replaces the Codex default. Tokens are persisted to `auth.json` unless the provider owns another store, and supported providers refresh them when required.
+
+Anthropic login asks for **Browser login (default)** or **Copy code login (headless)**. Browser login listens for the callback on the local machine and also accepts the pasted redirect URL. Copy code login works when the browser runs on another machine: sign in through the printed URL, then paste the code Anthropic shows (`code#state`). Escape in the login dialog reports `Failed to login to Anthropic: This operation was aborted`.
+
+Anthropic login cancels and waits for its contextual manual-code prompt when authorization succeeds or fails. `PI_OAUTH_CALLBACK_HOST` selects its callback listener host; the authorization request retains the localhost redirect URI.
+
+A failed Copilot refresh reports an explicit reauthentication instruction:
+
+```
+github-copilot: refresh failed - run 'pig login' to re-authenticate
+```
+
+### `pig login` shapes
+
+```
+pig login                 # interactive picker
+pig login <provider>      # specific provider
+pig login --list          # list the targets without reading credentials
+pig logout <provider>     # remove credentials for one provider
+```
+
+`pig logout` does not unset environment variables or revoke the credential at the provider.
+
+### Credential commands
+
+`pig auth` resolves credentials the way a model request does and writes them for external clients. Each command needs `--provider <provider>`, `--model <model>`, or both.
+
+```
+pig auth check --provider openai --json      # ready / not_ready / invalid, exit 0 / 1 / 2
+pig auth print-api-key --provider openai     # API key on stdout
+pig auth print-bearer-token --provider openai-codex --min-expiry 1h
+```
+
+Credential-printing commands write secrets to stdout. `auth check` prints a credential only with `--credentials`.
+
+Use `pig auth check` to confirm that PiG sees a credential before you start a session.
+
+#### Worked example: from no credential to ready
+
+Every output below was printed by PiG in a fresh home directory (`HOME` and `PIG_HOME` both empty) with no network. The key values are made up. The commands never contact a provider, so none of this proves that a key is accepted by OpenAI, only that PiG finds one.
+
+**1. Nothing configured.**
+
+```bash
+pig auth check --provider openai --json; echo "exit status: $?"
+```
+
+```text
+{"status":"not_ready","provider":"openai","reason":"credentials_not_configured"}
+exit status: 1
+```
+
+PiG created `~/.pig/agent/auth.json` containing `{}` (mode `-rw-------`) on this first run, as [Authentication](#authentication) says.
+
+**2. Set the environment variable.**
+
+```bash
+OPENAI_API_KEY=sk-test-123 pig auth check --provider openai --json; echo "exit status: $?"
+OPENAI_API_KEY=sk-test-123 pig auth check --provider openai
+OPENAI_API_KEY=sk-test-123 pig auth print-api-key --provider openai
+```
+
+```text
+{"status":"ready","provider":"openai","authType":"api_key"}
+exit status: 0
+ready
+sk-test-123
+```
+
+`auth check` without `--json` prints one word. It does not print the key. `print-api-key` does, to standard output, so do not run it where the output is logged.
+
+**3. The wrong variable for the provider.**
+
+```bash
+GOOGLE_API_KEY=x pig auth check --provider google; echo "exit status: $?"
+```
+
+```text
+not_ready
+exit status: 1
+```
+
+`google` reads `GEMINI_API_KEY`, not `GOOGLE_API_KEY` (see [Use an API key from the environment](#use-an-api-key-from-the-environment)).
+
+**4. A stored key that is a command, with an environment key also set.** Put this in `~/.pig/agent/auth.json`:
+
+```json
+{"openai":{"type":"api_key","key":"!echo key-from-command"}}
+```
+
+```bash
+OPENAI_API_KEY=sk-env pig auth print-api-key --provider openai
+pig auth check --provider openai --json --credentials
+```
+
+```text
+key-from-command
+{"status":"ready","provider":"openai","authType":"api_key","credentials":"key-from-command"}
+```
+
+The stored credential won over `OPENAI_API_KEY`, and PiG ran the command to get the key. `--credentials` is what puts the key in the JSON.
+
+**5. A command that fails.** With `"key":"!false"`:
+
+```bash
+pig auth print-api-key --provider openai; echo "exit status: $?"
+pig auth check --provider openai --json
+```
+
+```text
+Error: No usable API key is configured
+exit status: 1
+{"status":"not_ready","provider":"openai","reason":"credentials_not_configured"}
+```
+
+A command that exits non-zero counts as no stored key. PiG does not report an invalid credential. It then looks at the environment: with `OPENAI_API_KEY=sk-env` set, `auth print-api-key` printed `sk-env` and `auth check` said `ready`, and with it unset the output is the one above. If you see `not_ready` for a stored command key, run the command by hand.
+
+**6. Remove it.**
+
+```bash
+pig logout openai; pig logout openai
+```
+
+```text
+Logged out from openai. Credentials removed from auth.json
+Logged out from openai. Credentials removed from auth.json
+```
+
+Both runs print the same line and exit 0, including the second, when nothing was stored. `auth.json` is `{}` again. `logout` does not touch `OPENAI_API_KEY`.
+
+**7. `invalid`.** `invalid` (exit status 2) means PiG could not even evaluate the credential, for example because `models.json` is broken:
+
+```bash
+echo '{ broken' > ~/.pig/agent/models.json
+pig auth check --provider openai --json; echo "exit status: $?"
+```
+
+```text
+{"status":"invalid","provider":"openai","reason":"invalid_state"}
+exit status: 2
+```
+
+Fix or remove `models.json` and run the check again. A missing `--provider` and `--model` is a usage error: `Error: Auth checks require --provider <provider> or --model <model>`, exit status 2. An unknown provider is `{"status":"not_ready","provider":"nosuch","reason":"provider_not_found"}`, exit status 1 (`coding/cli/auth_check.go:62-77`).
+
+An OAuth login can wait for device authorization or a browser callback. This wait belongs to the provider flow. PiG does not start a model Session while `pig login` runs.
+
+## Cloud providers
+
+The providers below need more than one setting, or can use credentials from their cloud platform.
+
+### Azure OpenAI
+
+Set an API key and either a base URL or a resource name:
+
+```bash
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_BASE_URL=https://your-resource.ai.azure.com
+# Or:
+export AZURE_OPENAI_RESOURCE_NAME=your-resource
+```
+
+| Variable | Effect |
+|---|---|
+| `AZURE_OPENAI_API_KEY` | API key. |
+| `AZURE_OPENAI_BASE_URL` | Azure OpenAI or Foundry endpoint. `.openai.azure.com`, `.cognitiveservices.azure.com`, and `.ai.azure.com` hosts are normalized to `/openai/v1`. |
+| `AZURE_OPENAI_RESOURCE_NAME` | Alternative to `AZURE_OPENAI_BASE_URL`; builds `https://<resource>.openai.azure.com/openai/v1`. |
+| `AZURE_OPENAI_API_VERSION` | API version. Default `v1`. |
+| `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` | Optional comma-separated `model=deployment` map for Azure deployments. It applies to both APIs. |
+
+The `azure` provider serves the OpenAI Responses API and, for Foundry deployments, Chat Completions. The built-in `azure/deepseek-v4-pro` uses Chat Completions. Add other Foundry models to the `azure` provider in `models.json` with `"api": "openai-completions"` and a `"baseUrl"` on the provider or the model, because the built-in Azure models have none. Without one, the `azure` entry of `models.json` is rejected with `"baseUrl" is required when defining custom models.`
+
+The provider ID was `azure-openai-responses` in Pi before 1.0.3. The API ID and the `AZURE_OPENAI_*` variables are unchanged. PiG does not migrate old entries. Rename the provider key in `auth.json` (or run `/login` again), in `models.json`, and in `settings.json` (`defaultProvider`, `enabledModels` patterns, and `modelThinkingLevels` keys). A session that used the old provider falls back to another model when resumed, and its prompt cache is not reused.
+
+### Amazon Bedrock
+
+Bedrock uses a bearer token or the standard AWS SDK credential chain:
+
+```bash
+# Named profile
+export AWS_PROFILE=your-profile
+
+# IAM keys
+export AWS_ACCESS_KEY_ID=AKIA...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # for temporary credentials
+
+# Bedrock bearer token
+export AWS_BEARER_TOKEN_BEDROCK=...
+
+# Region, when the profile or SDK configuration does not supply one
+export AWS_REGION=us-west-2    # AWS_DEFAULT_REGION also works
+```
+
+ECS task credentials and IRSA work through the standard `AWS_CONTAINER_CREDENTIALS_*` and `AWS_WEB_IDENTITY_TOKEN_FILE` variables.
+
+Claude Opus 5 uses adaptive thinking and supports native `xhigh` effort on Bedrock. PiG recognizes the model ID or the display name of an application inference profile and adds prompt-cache points for supported Claude models. For GovCloud model IDs, GovCloud ARNs, or a configured `us-gov-` region, PiG omits `thinking.display`, which the GovCloud schema rejects.
+
+Bedrock Converse requests merge adjacent messages of the same role into one message. A prompt sent after an abort during tool execution, or after a dropped assistant turn, therefore does not fail with a role-alternation error. Pi 1.6.0 sends the two user messages side by side (D116).
+
+### Cloudflare AI Gateway
+
+The gateway needs a token, an account ID, and a gateway ID:
+
+```bash
+export CLOUDFLARE_API_KEY=...
+export CLOUDFLARE_ACCOUNT_ID=...
+export CLOUDFLARE_GATEWAY_ID=...
+```
+
+The account and gateway IDs can come from the process environment or from the credential's `env` object in `auth.json`.
+
+### Cloudflare Workers AI
+
+Workers AI needs a token and an account ID:
+
+```bash
+export CLOUDFLARE_API_KEY=...
+export CLOUDFLARE_ACCOUNT_ID=...
+```
+
+### Google Vertex AI
+
+Use a Google Cloud API key:
+
+```bash
+export GOOGLE_CLOUD_API_KEY=...
+```
+
+To use Application Default Credentials instead, set a project and a location, then sign in:
+
+```bash
+export GOOGLE_CLOUD_PROJECT=your-project   # GCLOUD_PROJECT also works
+export GOOGLE_CLOUD_LOCATION=us-central1
+gcloud auth application-default login
+```
+
+To use a service-account key file, set `GOOGLE_APPLICATION_CREDENTIALS` with the project and location.
+
+### Radius
+
+Radius is a gateway that speaks Pi's own message protocol, `pi-messages`: PiG posts the conversation to `<baseUrl>/messages` and reads the reply as a stream of Pi events. `/login` → **Sign in with Radius** (or **Sign in with an account** → **Radius**) offers a browser sign-in (a callback on `127.0.0.1:1456`) or a device code for signing in from another machine. You can also paste a key with **Sign in with an API key** or set `RADIUS_API_KEY`. After a Radius sign-in, `/login` offers to configure the Radius MCP server in the global `mcp.json` with `"auth": { "provider": "radius" }`; answering **Yes** writes the entry and runs `/reload`. Nothing is asked when a global server for the Radius MCP URL already uses the Radius login.
+
+PiG ships Radius's published model list until it knows the gateway's own. With credentials configured, PiG fetches the gateway's current list from `<gateway>/v1/config` in the background when interactive or RPC mode starts and after you sign in with `/login`, and caches it in `~/.pig/agent/models-store.json`. Once PiG has the gateway's list, that list replaces the published one, so models an organization owner disabled are not listed. Print mode and `--list-models` use the cached list. `PI_OFFLINE` (any value) or `PIG_OFFLINE` (`1`, `true` or `yes`) turns the fetch off. Without Radius credentials, PiG contacts the gateway only while you sign in.
+
+To use another Radius gateway, add a provider with `"oauth": "radius"` to `models.json`. `baseUrl` is required; PiG drops a trailing `v1` path segment to find the gateway. The published model list applies only to the default gateway.
+
+```json
+{
+  "providers": {
+    "radius-dev": { "name": "Radius (dev)", "baseUrl": "http://localhost:8788", "oauth": "radius" }
+  }
+}
+```
+
+Any backend that implements `pi-messages` works as a `models.json` provider with `"api": "pi-messages"`, a `baseUrl` and an `apiKey`.
+
+### OpenRouter
+
+Authenticate with `/login openrouter` or `OPENROUTER_API_KEY`.
+
+With a key, PiG lists only the OpenRouter chat models that key may use, with the key's context size, max output and prices. These come from OpenRouter's `/models/user` endpoint and reflect guardrails and provider restrictions set in OpenRouter. Image and classifier models are not filtered. A model that OpenRouter lists without a limit keeps the limit of PiG's catalog, and a router model such as `openrouter/auto`, whose price OpenRouter reports as negative, has a price of 0.
+
+PiG refreshes the list together with the other model catalogs. The last list is saved and used offline. After switching keys outside `/login`, the previous key's list stays until the next refresh. When a refresh fails, PiG keeps the saved list.
+
+Regional endpoints filter models to their region. To use one, set the base URL of the provider in `models.json`:
+
+```json
+{
+  "providers": {
+    "openrouter": { "baseUrl": "https://us.openrouter.ai/api/v1" }
+  }
+}
+```
+
+If the base URL rejects the key at `/models/user` or does not have that endpoint, for example a proxy configured as the OpenRouter base URL, PiG lists every OpenRouter model.
+
+## Stream and replay differences from Pi
+
+These differences apply to several providers:
+
+- A tool call that a provider streams without an id gets a unique `<name>_<epoch ms>_<counter>` id when its block ends. Replay omits a tool call with a blank name or a still-empty id, together with its results. Pi replays them, and every later turn fails (D120, Pi #10299). OpenAI Responses calls with an empty `call_id` get the same treatment (D129).
+- After a model switch, a reasoning Chat Completions target that requires `reasoning_content` (DeepSeek, Kimi, MiMo and similar) receives another model's plain-text thinking as `reasoning_content`. Pi appends it to `content` (D126, Pi #6167).
+- OpenRouter's signature-only `reasoning.text` delta for Claude is kept and replayed with its reasoning block. Pi drops it (D122, Pi #9534).
+- `httpIdleTimeoutMs` restarts on each stream event, not on each byte. A stream that sends only keepalive comments or pings ends with an error after the timeout. Pi waits indefinitely (D131, Pi #10761, #10762).
+- A single server-sent-event line may be up to 512 MiB, the limit Node's string length gives Pi (D134).
+
+## Provider resolution
+
+`--model`, `/model`, `Ctrl+P` and the spec forms of the extension `setModel()` call resolve a model spec as Pi does. A model ID may contain a slash, for example `openrouter/openai/gpt-5.5`, and cycling keeps the full ID. The Go function `coding.BuildModel` reads a spec without a `/` as `openai/<id>`, so pass provider-qualified specs from Go code.
+
+## Provider extensions
+
+Anthropic Messages requests retain the selected model's reasoning capability, thinking-level map, and output limit. A newly supplied model can use `compat.forceAdaptiveThinking` without an entry in the built-in catalog.
+
+Extensions can add inference providers at register time. PiG validates incoming model configuration before replacing registered model data. Set `api` when registering `streamSimple`. For a new model, supply `api` at the provider or model level. A rejected registration leaves the existing registry entry and native Provider owner intact.
+
+The host retains provider configurations until a registry binds. Binding applies them in order and reports each failed entry with its owning extension path. Later registration and removal take effect immediately. The host owns lifecycle: providers registered by an extension are unregistered automatically on shutdown, reload failure, or quarantine fission. When a reload replaces an extension whose new register declares the same provider name, the registration is preserved across the swap so streaming completions are not interrupted.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `Missing bearer or basic authentication` | No API key in env, no token in `auth.json` | `pig login <provider>` or export the env var. |
+| `pig auth check --provider google` prints `not_ready` | Only `GOOGLE_API_KEY` is set | Set `GEMINI_API_KEY`. |
+| `Bad credentials` (Copilot 401) | OAuth token expired or revoked | `pig login github-copilot`. |
+| Model selector shows nothing | No providers have valid auth | Login or set an env var; check `/login`. |
+| A Go helper builds the wrong model | Bare ID passed to `coding.BuildModel` | Pass `provider/model`; see [Models](/docs/latest/models). |
+
+See [upstream Pi's provider documentation](https://pi.dev/docs/latest/providers) for the reference implementation.

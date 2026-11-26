@@ -1,0 +1,138 @@
+package ai
+
+import "testing"
+
+func TestOverflowUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name, errorMessage, provider string
+		contextWindow                int
+		want                         bool
+	}{
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:33
+		{"detects explicit Ollama prompt-too-long errors", "400 `prompt too long; exceeded max context length by 100918 tokens`", "ollama", 32768, true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:38
+		{"detects z.ai prompt-too-long errors", `400 {"code":"1261","message":"Prompt too long"}`, "zai", 1048576, true},
+		// .upstream/v0.99.2/packages/ai/test/overflow.test.ts:44 (#10208)
+		{"detects z.ai CN endpoint prompt-exceeds-max-length errors", `400 {"code":"1261","message":"Prompt exceeds max length"}`, "zai", 1048576, true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:44
+		{"detects Together AI context length errors", "400 The input (516368 tokens) is longer than the model's context length (262144 tokens).", "ollama", 262144, true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:51
+		{"detects LiteLLM-wrapped OpenAI maximum context length errors", "Error: 503 litellm.ServiceUnavailableError: litellm.MidStreamFallbackError: litellm.APIConnectionError: APIConnectionError: OpenAIException - Requested token count exceeds the model's maximum context length of 131072 tokens.", "ollama", 131072, true},
+		// Pi 36ae26b4 overflow.test.ts:94 (#11492)
+		{"detects LiteLLM pre-call ContextWindowExceededError", "400: {\"message\":\"litellm.ContextWindowExceededError: litellm.BadRequestError: litellm._pre_call_checks: Context Window exceeded for given call. No models have context window large enough for this call.\\nModel=Qwen3.8-Flash-Next, Max Input Tokens=262144, Got=265262\\nmodel=Qwen3.8-Flash-Next. context_window_fallbacks=None. fallbacks=[].\"}", "ollama", 262144, true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:58
+		{"detects OpenAI-compatible parenthesized maximum context length errors", "Error: 400 Input length (265330) exceeds model's maximum context length (262144).", "ollama", 262144, true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:65
+		{"detects OpenRouter Poolside maximum allowed input length errors", "Provider returned error: Input length 131393 exceeds the maximum allowed input length of 131040 tokens.", "ollama", 131072, true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:72
+		{"detects DS4 configured context size errors/plain", "400 Prompt has 256468 tokens, but the configured context size is 256000 tokens", "ollama", 256000, true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:79
+		{"detects DS4 configured context size errors/commas", "Prompt has 5,958,968 tokens, but the configured context size is 256,000 tokens", "ollama", 256000, true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:84
+		{"does not treat generic non-overflow Ollama errors as overflow", "500 `model runner crashed unexpectedly`", "ollama", 32768, false},
+		// .upstream/v1.3.0+73f8de80/packages/ai/test/overflow.test.ts:125 (Pi 73f8de80: HTTP 413 is request-size overflow for every provider, a bodyless 400 only for Cerebras)
+		{"only treats bodyless 400 errors as overflow for Cerebras/cerebras", "400 status code (no body)", "cerebras", 131072, true},
+		{"only treats bodyless 400 errors as overflow for Cerebras/opencode-go", "400 status code (no body)", "opencode-go", 1000000, false},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:97
+		{"does not treat Bedrock throttling 'Too many tokens' as overflow", "Throttling error: Too many tokens, please wait before trying again.", "ollama", 200000, false},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:104
+		{"does not treat Bedrock service unavailable as overflow", "Service unavailable: The service is temporarily unavailable.", "ollama", 200000, false},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:109
+		{"does not treat generic rate limit errors as overflow", "Rate limit exceeded, please retry after 30 seconds.", "ollama", 200000, false},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:114
+		{"does not treat HTTP 429 style errors as overflow", "Too many requests. Please slow down.", "ollama", 200000, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			message := AssistantMessage{API: APIOpenAICompletions, Provider: tc.provider, Model: "qwen3.5:35b", StopReason: StopReasonError, ErrorMessage: tc.errorMessage}
+			if got := IsContextOverflow(message, tc.contextWindow); got != tc.want {
+				t.Fatalf("IsContextOverflow = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOverflowLengthStopsUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name                                        string
+		input, cacheRead, cacheWrite, output, limit int
+		recoverable, want                           bool
+		api                                         API
+		provider, model                             string
+	}{
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:148
+		{name: "detects Xiaomi-style overflow (length stop with zero output and filled context)", input: 58, cacheRead: 1048512, limit: 1048576, want: true, provider: "xiaomi", model: "mimo-v2.6-pro"},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:159
+		{name: "treats a length stop below the desired output limit as recoverable", input: 3, cacheRead: 253584, cacheWrite: 25554, output: 16, limit: 128000, recoverable: true, want: true, api: APIOpenAIResponses, provider: "openai", model: "gpt-5.6-sol"},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:172
+		{name: "does not recover a length stop that reached the desired output limit", input: 4062, output: 1024, limit: 1024, recoverable: true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:177
+		{name: "treats zero-output length stops as recoverable without context metadata", input: 100, limit: 128000, recoverable: true, want: true},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:182
+		{name: "does not treat normal length stops with output as context overflow", input: 1000, output: 4096, limit: 200000},
+		// .upstream/v0.87.1/packages/ai/test/overflow.test.ts:187
+		{name: "does not treat zero-output length stops far below context as context overflow", input: 100, limit: 200000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api, provider, model := tc.api, tc.provider, tc.model
+			if api == "" {
+				api = APIOpenAICompletions
+			}
+			if provider == "" {
+				provider = "test-provider"
+			}
+			if model == "" {
+				model = "test-model"
+			}
+			message := AssistantMessage{API: api, Provider: provider, Model: model, StopReason: StopReasonLength, Usage: Usage{Input: tc.input, CacheRead: tc.cacheRead, CacheWrite: tc.cacheWrite, Output: tc.output, TotalTokens: tc.input + tc.cacheRead + tc.cacheWrite + tc.output}}
+			got := IsContextOverflow(message, tc.limit)
+			if tc.recoverable {
+				got = IsRecoverableLength(message, tc.limit)
+			}
+			if got != tc.want {
+				t.Fatalf("classification = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Ports packages/ai/test/overflow.test.ts (Pi 73f8de80): the 413 pattern is provider-agnostic, so one Copilot-prefixed string and one
+// non-Copilot string cover both branches of the regex, and the bare forms cover the raw SDK output.
+func TestOverflowRequestSizeUpstream(t *testing.T) {
+	for _, errorMessage := range []string{
+		`github-copilot API error (413): {"message":"failed to parse request","code":""}`, // formatProviderError prefix
+		"custom-provider API error (413): Payload Too Large",                              // any provider, not just Copilot
+		`413 {"error":{"message":"failed to parse request","code":""}}`,                   // raw SDK error
+		"413", // bare status at end of string
+	} {
+		t.Run("detects provider-independent request-size overflow: "+errorMessage, func(t *testing.T) {
+			// The request can exceed the byte limit even with zero usage and a large token window.
+			message := overflowErrorMessage(errorMessage, "ollama")
+			if !IsContextOverflow(message, 1_000_000) || !IsContextOverflow(message, 0) {
+				t.Fatal("HTTP 413 is not request-size overflow")
+			}
+		})
+	}
+	for _, errorMessage := range []string{
+		`github-copilot API error (400): {"message":"failed to parse request","code":""}`,           // other status, same body
+		"custom-provider API error (429): Too many requests",                                        //
+		`github-copilot API error (400): {"message":"failed to parse request: invalid value 413"}`,  // 413 in the body only
+		"custom-provider API error (400): upstream mentioned OpenAI API error (413): invalid input", // 413 not at start
+		"custom-provider API error (4130): invalid input",                                           // 413 is a prefix, not the status
+		"4130 failed to parse request",                                                              // bare 4130 is not 413
+	} {
+		t.Run("does not mistake unrelated errors for request-size overflow: "+errorMessage, func(t *testing.T) {
+			if IsContextOverflow(overflowErrorMessage(errorMessage, "ollama"), 0) {
+				t.Fatal("classified as overflow")
+			}
+		})
+	}
+	t.Run("limits HTTP-status matching to failed responses", func(t *testing.T) {
+		message := overflowErrorMessage(`OpenAI API error (413): {"message":"failed to parse request"}`, "ollama")
+		for _, stop := range []StopReason{StopReasonAborted, StopReasonStop} {
+			message.StopReason = stop
+			if IsContextOverflow(message, 0) {
+				t.Fatalf("stopReason %s classified as overflow", stop)
+			}
+		}
+	})
+}

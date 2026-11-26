@@ -1,0 +1,1912 @@
+// pig: Go-native port of pi-coding-agent.
+//
+// Distinct binary name and config root from upstream pi to avoid PATH
+// collisions and shared-config corruption. See codingagent.ConfigRoot()
+// for the on-disk layout (defaults to ~/.pig, override with $PIG_HOME).
+//
+// Usage:
+//
+//	pig [options] [prompt]
+//
+// Options:
+//
+//	--model <provider/model>    Model to use (default: from settings)
+//	--agent <name>              Agent definition to load from <config>/agents/
+//	--print <prompt>            Print mode: send prompt and print response, then exit
+//	--no-extensions             Disable all extensions
+//	-e <path>                   Load extension (can be repeated)
+//	--skill <name>              Load a skill
+//	--cwd <dir>                 Working directory (default: current dir)
+//	--agent-dir <dir>           Agent config directory (default: <config>/agent)
+//	--version                   Print version and exit
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/installchange"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/nodepath"
+	"github.com/MichaelKinsy/PiG/internal/nodeurl"
+
+	"golang.org/x/term"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/cellpack"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/fusepack"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
+	"github.com/MichaelKinsy/PiG/coding/extension/pigsdk"
+	piglet "github.com/MichaelKinsy/PiG/coding/piglet"
+	"github.com/MichaelKinsy/PiG/coding/pigletbuild/binarypiglet"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/clihook"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/timings"
+	"github.com/MichaelKinsy/PiG/internal/frontendpack"
+	_ "github.com/MichaelKinsy/PiG/internal/memprofrate" // pig additive (D627): its init turns heap-profile sampling off
+	"github.com/MichaelKinsy/PiG/internal/nativeplatform"
+	"github.com/MichaelKinsy/PiG/internal/packagemanager"
+	"github.com/MichaelKinsy/PiG/internal/pigstrip"
+	"github.com/MichaelKinsy/PiG/internal/procpolicy"
+	"github.com/MichaelKinsy/PiG/internal/profiling"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
+	"github.com/MichaelKinsy/PiG/internal/termuxenv"
+	"github.com/MichaelKinsy/PiG/tui"
+)
+
+// PigVersion is pig's own release line. UpstreamVersion is the pi build this
+// build targets (a release tag, or a pinned commit as 1.1.0+42a3497d), and
+// UpstreamPackageVersion the version that build's package.json files report.
+// The literals live in internal/coding/pigversion/pigversion.go, generated
+// from .upstream/pin;
+// coding/upstream.go aliases it, so the parity runner (and this constant)
+// can import it without depending on package main.
+const (
+	MicroPiVersion  = coding.MicroPiVersion
+	PigVersion      = coding.PigVersion
+	UpstreamVersion = coding.UpstreamVersion
+	// UpstreamPackageVersion is what Pi's own `--version` and user agent report.
+	UpstreamPackageVersion = coding.UpstreamPackageVersion
+	Version                = coding.Version
+
+	startupSDKLockTimeout = 2 * time.Second
+)
+
+// Build is the git commit/tag, set via -ldflags at build time.
+var Build = "dev"
+
+func buildIdentity() string {
+	if Build != "dev" {
+		return Build
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return Build
+	}
+	return resolveBuildIdentity(Build, info.Main.Version)
+}
+
+func resolveBuildIdentity(linkerBuild, moduleVersion string) string {
+	if linkerBuild != "dev" {
+		return linkerBuild
+	}
+	if moduleVersion == "" || moduleVersion == "(devel)" {
+		return linkerBuild
+	}
+	return moduleVersion
+}
+
+// pig divergence (D39): PigletBinaryVersion is the baked release identity.
+var PigletBinaryVersion string
+
+// selfUpdateVersion uses the baked release version when present.
+func selfUpdateVersion() string {
+	if codingagent.PigletBinaryRelease != "" {
+		return codingagent.PigletBinaryRelease
+	}
+	return MicroPiVersion
+}
+
+// cliVersionString is the `upi --version` output.
+func cliVersionString() string {
+	return fmt.Sprintf("µPi %s (PiG %s)", MicroPiVersion, Version)
+}
+
+// versionString returns upi's self-identification string for help
+// and diagnostics banners.
+func versionString() string {
+	return fmt.Sprintf("upi %s (PiG %s) [%s %s/%s build=%s]",
+		MicroPiVersion, Version, runtime.Version(), runtime.GOOS, runtime.GOARCH, buildIdentity())
+}
+
+func detailedVersionString() string {
+	return fmt.Sprintf("µPi: %s\npig: %s\nupstream pi: %s\ngo: %s\nplatform: %s/%s\nbuild: %s",
+		MicroPiVersion, PigVersion, UpstreamVersion, runtime.Version(), runtime.GOOS, runtime.GOARCH, buildIdentity())
+}
+
+// ─── Extension Loading ────────────────────────────────────────────────────────
+
+// ─── Resource Loading ────────────────────────────────────────────────────────────
+
+// loadSkills loads ordered skill inputs, validates descriptions, and returns
+// first-wins definitions with their diagnostics for the interactive listing: each
+// input's load and validation warnings, then the name collisions (skills.ts loadSkills
+// returns [...allDiagnostics, ...collisionDiagnostics], which only interactive mode shows).
+// A missing named skill remains an error.
+func loadSkills(skillInputs []string, noSkills bool) ([]*codingagent.SkillDef, []extension.ResourceDiagnostic, error) {
+	if noSkills || len(skillInputs) == 0 {
+		return nil, nil, nil
+	}
+	var skillDefs []*codingagent.SkillDef
+	var warnings []extension.ResourceDiagnostic
+	for _, input := range skillInputs {
+		if input == "" {
+			continue
+		}
+		if _, err := os.Stat(input); err == nil {
+			loaded, err := codingagent.LoadSkills(codingagent.LoadSkillsOptions{AgentDir: codingagent.DefaultAgentDir(), SkillPaths: []string{input}})
+			if err != nil {
+				return skillDefs, nil, err
+			}
+			warnings = append(warnings, loaded.Diagnostics...)
+			skillDefs = append(skillDefs, loaded.Skills...)
+			continue
+		}
+		def, err := codingagent.LoadSkill(codingagent.DefaultSkillsDir(), input)
+		if err != nil {
+			return skillDefs, nil, fmt.Errorf("--skill %q: %w", input, err)
+		}
+		for _, diagnostic := range codingagent.SkillDiagnostics(def) {
+			warnings = append(warnings, extension.ResourceDiagnostic{Type: extension.DiagnosticWarning, Message: diagnostic, Path: def.FilePath})
+		}
+		if jsstring.Trim(def.Description) != "" {
+			skillDefs = append(skillDefs, def)
+		}
+	}
+	defs, collisions := codingagent.DeduplicateSkillsWithDiagnostics(skillDefs)
+	return defs, append(warnings, collisions...), nil
+}
+
+// ─── Initial Message ──────────────────────────────────────────────────────────
+
+// readPipedStdin returns piped stdin content, trimmed. It returns "" when
+// stdin is a terminal or the content is blank. Mirrors upstream main.ts
+// readPipedStdin (`data.trim() || undefined`).
+//
+// The read waits for end of input, so a writer that never closes the pipe
+// keeps it waiting, as upstream's does (Pi #10415). Only --no-stdin skips
+// the read; an idle pipe cannot be told from a slow producer. A termination
+// signal ends the wait:
+// upstream reads stdin before print mode registers its signal handlers, so
+// the signal's default action stops the process mid-read. It returns ctx's
+// error when ctx ends first.
+func readPipedStdin(ctx context.Context) (string, error) {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", nil
+	}
+	read := make(chan string, 1)
+	go func() {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			read <- ""
+			return
+		}
+		read <- strings.TrimSpace(string(data))
+	}()
+	select {
+	case content := <-read:
+		return content, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// buildInitialMessage combines stdin content, @file text, and the first CLI
+// message into the initial prompt, and returns the remaining CLI messages,
+// which are sent one by one after it. Mirrors upstream cli/initial-message.ts:
+// the parts are concatenated in order with no separator, and image files are
+// returned as separate content blocks.
+func buildInitialMessage(messages []string, fileText string, fileImages []ai.ImageContent, stdinContent string) (string, []ai.ImageContent, []string) {
+	var parts []string
+	if stdinContent != "" {
+		parts = append(parts, stdinContent)
+	}
+	if fileText != "" {
+		parts = append(parts, fileText)
+	}
+	if len(messages) > 0 {
+		parts = append(parts, messages[0])
+		messages = messages[1:]
+	}
+	var images []ai.ImageContent
+	if len(fileImages) > 0 {
+		images = fileImages
+	}
+	return strings.Join(parts, ""), images, slices.Clone(messages)
+}
+
+// prepareInitialMessage processes @file arguments without resizing and builds the initial prompt. Session selects the resize profile after extension hooks select the request model.
+func prepareInitialMessage(cwd string, messages, fileArgs []string, stdinContent string) (string, []ai.ImageContent, []string, error) {
+	if len(fileArgs) == 0 {
+		initial, images, rest := buildInitialMessage(messages, "", nil, stdinContent)
+		return initial, images, rest, nil
+	}
+	// upstream: packages/coding-agent/src/main.ts:prepareInitialMessage
+	processed, err := codingagent.ProcessCLIFileArguments(fileArgs, cwd, codingagent.ProcessFileOptions{AutoResizeImages: new(false)})
+	if err != nil {
+		return "", nil, nil, err
+	}
+	initial, images, rest := buildInitialMessage(messages, processed.Text, processed.Images, stdinContent)
+	return initial, images, rest, nil
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+func runPigPreSessionCommand(args []string) int {
+	// pig additive (D92): the Piglet builder and `pig docs` are shims a Piglet Binary can compile out.
+	if code := runPigletBuilderCommand(args); code >= 0 {
+		return code
+	}
+	for _, run := range []func([]string, io.Writer, io.Writer) int{
+		runDocsCommand,
+		pigsdk.RunCommand,
+		piglet.RunCommand,
+	} {
+		if code := run(args, os.Stdout, os.Stderr); code >= 0 {
+			return code
+		}
+	}
+	return -1
+}
+
+// pigletBinary is what the running executable says about its baked Piglet. The production path passes runningPigletBinary();
+// tests pass their own value, so the guard and the overlay resolution run unchanged without package state to swap.
+type pigletBinary struct {
+	// Is reports whether the executable is a Piglet Binary.
+	Is bool
+	// Name is the baked Piglet's name; it is read only to word a refusal.
+	Name func() string
+	// OverlayBase is the baked Piglet as the base of an overlay when the Binary accepts overlays (D202), else nil. It is read
+	// only when a Piglet was selected.
+	OverlayBase func() *piglet.OverlayBase
+}
+
+func runningPigletBinary() pigletBinary {
+	return pigletBinary{Is: binarypiglet.IsPigletBinary(), Name: binarypiglet.Name, OverlayBase: binarypiglet.OverlayBase}
+}
+
+// pigletBinaryOverlayRefusal returns the refusal for a Piglet requested from a Piglet Binary that does not accept
+// overlays, or "" when the run may go on. A Piglet Binary is bound to one immutable composition when its Piglet set
+// build.closed (D202); then running another Piglet is out of scope, so it names the Binary and points at the setting and at
+// raw pig.
+func pigletBinaryOverlayRefusal(flags map[string]any, binary pigletBinary) string {
+	if !binary.Is || !pigletWasRequested(flags) || binary.OverlayBase() != nil {
+		return ""
+	}
+	return fmt.Sprintf("pig: this Piglet Binary (%s) was built with build.closed: true, so it runs only its built-in Piglet and does not accept --piglet overlays (nor PIG_PIGLET_PATH or PIG_PIGLET_NAME); rebuild its Piglet without build.closed to accept them, or run the Piglet with stock pig (pig --piglet <name|path>)", binary.Name())
+}
+
+// pigletBinarySystemPromptRefusal returns the refusal for --system-prompt on a Piglet Binary, or "" when the run may go on. A Piglet
+// Binary built with build.closed (D202) keeps its baseline system prompt; every other Piglet Binary takes the flag as stock pig does.
+func pigletBinarySystemPromptRefusal(baked, acceptsOverlays bool, systemPrompt string) string {
+	if !baked || acceptsOverlays || systemPrompt == "" {
+		return ""
+	}
+	return "pig: this Piglet Binary was built with build.closed: true, so its baseline system prompt cannot be replaced; use --append-system-prompt for an additive prompt"
+}
+
+// enforcePigletBinaryScope fails closed when a Piglet Binary is asked to run a
+// different Piglet than the one it was built with and does not accept overlays.
+func enforcePigletBinaryScope(flags map[string]any) {
+	if message := pigletBinaryOverlayRefusal(flags, runningPigletBinary()); message != "" {
+		fmt.Fprintln(os.Stderr, message)
+		exitProcess(1)
+	}
+}
+
+// resolvePiglet reads the piglet from --piglet flag or
+// PIG_PIGLET_NAME/PIG_PIGLET_PATH env vars. Returns nil if no piglet.
+// This is called early in startup: before model resolution, extension
+// loading, and discovery: so that piglet fields can drive those steps.
+// requestedPigletName is the name or path --piglet, PIG_PIGLET_PATH or PIG_PIGLET_NAME selects, in resolvePiglet's order, or "".
+func requestedPigletName(unknownFlags map[string]any) string {
+	if v, ok := unknownFlags["piglet"].(string); ok && strings.TrimSpace(v) != "" {
+		return v
+	}
+	if os.Getenv("PIG_PIGLET_PATH") != "" {
+		return ""
+	}
+	return os.Getenv("PIG_PIGLET_NAME")
+}
+
+func resolvePiglet(unknownFlags map[string]any, trustOverride *bool) (*piglet.Piglet, bool) {
+	return resolvePigletOn(unknownFlags, trustOverride, runningPigletBinary())
+}
+
+// resolvePigletOn is resolvePiglet for the given Piglet Binary identity.
+func resolvePigletOn(unknownFlags map[string]any, trustOverride *bool, binary pigletBinary) (*piglet.Piglet, bool) {
+	// pig additive (D202): a Piglet Binary that accepts overlays resolves the selected Piglet on top of its baked one. A run that
+	// selects no Piglet does no overlay work.
+	var base *piglet.OverlayBase
+	if binary.Is && pigletWasRequested(unknownFlags) {
+		base = binary.OverlayBase()
+	}
+	// Find the piglet path from flag or env.
+	var pigletPath string
+	if v, ok := unknownFlags["piglet"]; ok {
+		s, valid := v.(string)
+		if !valid || strings.TrimSpace(s) == "" {
+			fmt.Fprintln(os.Stderr, "warning: --piglet requires a name or path")
+			return nil, false
+		}
+		pigletPath = s
+	}
+
+	// A path (a separator or a .yaml/.yml name) is used as given; a bare name is searched in the workspace (only when the project is trusted), the
+	// user's Piglets and the system's. A bare name is never a file in the working directory: a checkout could plant one. Resolve's descriptive
+	// "not found in search paths" error is surfaced instead of parsing the bare name.
+	if pigletPath != "" {
+		resolved, rerr := piglet.ResolveWithTrust(pigletPath, trustOverride)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "warning: piglet %q: %v\n", pigletPath, rerr)
+			return nil, false
+		}
+		pigletPath = resolved
+	}
+
+	// Check env vars if no flag.
+	if pigletPath == "" {
+		if p := os.Getenv("PIG_PIGLET_PATH"); p != "" {
+			pigletPath = p
+		} else if name := os.Getenv("PIG_PIGLET_NAME"); name != "" {
+			resolved, err := piglet.ResolveWithTrust(name, trustOverride)
+			if err == nil {
+				pigletPath = resolved
+			} else if base != nil {
+				// An overlay that does not resolve never falls back to the Binary's own Piglet; the caller reports the Piglet as not loaded, as for stock pig.
+				return nil, false
+			}
+		}
+	}
+
+	if pigletPath == "" {
+		// A Piglet Binary's baked Piglet has precedence over host/platform
+		// defaults and cannot be replaced by an ambient /opt piglet.
+		if p := binarypiglet.Default(); p != nil {
+			return p, true
+		}
+		// The ambient Piglet is no selection: it is never laid over a Binary's Piglet.
+		base = nil
+		if pigletPath = piglet.AmbientPigletPath(); pigletPath == "" {
+			return nil, false
+		}
+	}
+
+	workspace, _ := os.Getwd()
+	if value, ok := unknownFlags["workspace"]; ok {
+		configured, valid := value.(string)
+		if !valid || strings.TrimSpace(configured) == "" {
+			fmt.Fprintln(os.Stderr, "warning: --workspace requires a directory")
+			return nil, false
+		}
+		workspace = configured
+	}
+	resolution, err := piglet.ResolveEffectiveWithOptions(pigletPath, piglet.ResolveOptions{Workspace: workspace, Base: base})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: piglet %s: %v\n", pigletPath, err)
+		return nil, false
+	}
+	// An overlay on a Piglet Binary is still the Binary's Piglet: its closure is verified and its baseline holds.
+	return resolution.Piglet, base != nil
+}
+
+func inlinePigletSystemPrompt(p *piglet.Piglet) {
+	if p == nil || p.SystemPrompt == nil || p.SystemPrompt.File == "" {
+		return
+	}
+	promptPath := p.SystemPrompt.File
+	if !filepath.IsAbs(promptPath) {
+		promptPath = filepath.Join(filepath.Dir(p.SourcePath()), promptPath)
+	}
+	if data, err := os.ReadFile(promptPath); err == nil {
+		p.SystemPrompt = &piglet.PromptRef{Text: string(data)}
+	} else {
+		fmt.Fprintf(os.Stderr, "warning: piglet %s: system prompt %s: %v\n", p.Name, p.SystemPrompt.File, err)
+	}
+}
+
+// resolvePigletExtConfigs resolves a piglet's extension origins to
+// subprocess.ExtConfig entries. An extension that does not resolve stays in the
+// result as an unresolved config, so the host reports it as an extension load
+// failure beside the ones that loaded, as Pi's loadExtensions records every
+// failed extension in path order (loader.ts:684-696) and main.ts reports each
+// one (main.ts:799-802). The configs keep the Piglet's declaration order.
+// Returns nil if no extensions have origins.
+func resolvePigletExtConfigs(p *piglet.Piglet) []subprocess.ExtConfig {
+	// ResolveExtensions yields one resolved extension or one error for each
+	// entry with origins, in declaration order.
+	resolved, errs := piglet.ResolveExtensions(p)
+	var configs []subprocess.ExtConfig
+	for _, ext := range p.Extensions {
+		if len(ext.Origins) == 0 {
+			continue
+		}
+		if len(resolved) > 0 && resolved[0].Entry.Name == ext.Name {
+			r := resolved[0]
+			resolved = resolved[1:]
+			cfg, _, err := subprocess.ResolveExtConfigWithIdentity(r.Path, r.Entry.Name)
+			if err != nil {
+				cfg = subprocess.UnresolvedExtConfig(r.Path, err)
+			}
+			configs = append(configs, cfg)
+			continue
+		}
+		if len(errs) > 0 {
+			configs = append(configs, unresolvedPigletExtConfig(p, ext.Name, errs[0]))
+			errs = errs[1:]
+		}
+	}
+	return configs
+}
+
+// unresolvedPigletExtConfig reports an extension whose origins did not resolve
+// at the Piglet file. Its name stays unique per entry, so merging the startup
+// configs keeps one failure for each unresolved extension.
+func unresolvedPigletExtConfig(p *piglet.Piglet, name string, err error) subprocess.ExtConfig {
+	path := pigletExtensionFailurePath(p)
+	cfg := subprocess.UnresolvedExtConfig(path, err)
+	cfg.Name = path + "#" + name
+	return cfg
+}
+
+// pigletExtensionFailurePath names the Piglet file for an extension that has no
+// resolved path to report.
+func pigletExtensionFailurePath(p *piglet.Piglet) string {
+	if path := p.SourcePath(); path != "" {
+		return path
+	}
+	return p.Name
+}
+
+// undoBinaryStrip removes the runtime strip entries the Binary recorded from its baked Piglet at startup; entries a strip build
+// tag compiled out stay, since their shims recorded them first.
+var undoBinaryStrip = func() {}
+
+// droppedBinaryMembers names the extensions compiled into the Binary (fused, or embedded as prebuilt cells) that an overlay
+// removed with extends.remove.extensions, so the Binary does not start them. It is process-fixed like pigstrip's state and nil
+// unless an overlay was resolved.
+//
+// pig additive (D202): an overlay removes a baked member as an extends child removes an inherited one.
+var droppedBinaryMembers map[string]bool
+
+// setDroppedBinaryMembers records which compiled-in extensions the active Piglet no longer declares, when it is an overlay.
+func setDroppedBinaryMembers(p *piglet.Piglet) {
+	droppedBinaryMembers = nil
+	if p == nil {
+		return
+	}
+	if _, overlay := p.OverlayOf(); !overlay {
+		return
+	}
+	kept := make(map[string]bool, len(p.Extensions))
+	for _, ext := range p.Extensions {
+		kept[ext.Name] = true
+	}
+	drop := func(name string) {
+		if !kept[name] {
+			if droppedBinaryMembers == nil {
+				droppedBinaryMembers = map[string]bool{}
+			}
+			droppedBinaryMembers[name] = true
+		}
+	}
+	for _, cfg := range fusepack.FusedConfigs() {
+		drop(cfg.Name)
+	}
+	for _, cell := range cellpack.LoadedCells() {
+		for _, ext := range cell.Extensions {
+			drop(ext.Name)
+		}
+	}
+}
+
+// overlayRemovedFrontend reports whether the active Piglet is an overlay that removed the frontend the Binary compiled in.
+func overlayRemovedFrontend(p *piglet.Piglet) bool {
+	if p == nil {
+		return false
+	}
+	_, overlay := p.OverlayOf()
+	return overlay && !p.HasFrontend()
+}
+
+func fusedConfigsForPiglet(p *piglet.Piglet) []subprocess.ExtConfig {
+	if p == nil || len(p.Extensions) == 0 {
+		return nil
+	}
+	wanted := make(map[string]struct{}, len(p.Extensions))
+	for _, ext := range p.Extensions {
+		wanted[ext.Name] = struct{}{}
+	}
+	var out []subprocess.ExtConfig
+	for _, cfg := range fusepack.FusedConfigs() {
+		if _, ok := wanted[cfg.Name]; ok {
+			out = append(out, cfg)
+		}
+	}
+	return out
+}
+
+// withoutDroppedMembers removes the members an overlay removed from the embedded cells, and the cells left with none.
+func withoutDroppedMembers(cells []subprocess.EmbeddedCell) []subprocess.EmbeddedCell {
+	if len(droppedBinaryMembers) == 0 {
+		return cells
+	}
+	out := make([]subprocess.EmbeddedCell, 0, len(cells))
+	for _, cell := range cells {
+		cell.Extensions = slices.DeleteFunc(slices.Clone(cell.Extensions), func(ext subprocess.EmbeddedExtension) bool { return droppedBinaryMembers[ext.Name] })
+		if len(cell.Extensions) > 0 {
+			out = append(out, cell)
+		}
+	}
+	return out
+}
+
+func embeddedCellsFromCellpack(cells []cellpack.LoadedCell) []subprocess.EmbeddedCell {
+	out := make([]subprocess.EmbeddedCell, 0, len(cells))
+	for _, cell := range cells {
+		exts := make([]subprocess.EmbeddedExtension, len(cell.Extensions))
+		for i, ext := range cell.Extensions {
+			exts[i] = subprocess.EmbeddedExtension{Name: ext.Name, Hash: ext.Hash, Source: ext.Source}
+		}
+		out = append(out, subprocess.EmbeddedCell{Language: cell.Language, Key: cell.Key, Strategy: cell.Strategy, BinaryPath: cell.BinaryPath, Extensions: exts})
+	}
+	return out
+}
+
+// pigletModelSpec returns a model spec string from the piglet's model
+// config, or "" if not set. The returned spec follows the standard
+// "provider/name" convention and can be passed to resolveModel().
+func pigletModelSpec(p *piglet.Piglet) string {
+	if p == nil || p.Model == nil {
+		return ""
+	}
+	name := p.Model.Name
+	if name == "" {
+		return ""
+	}
+	if p.Model.Provider != "" && !strings.Contains(name, "/") {
+		return p.Model.Provider + "/" + name
+	}
+	return name
+}
+
+// applyPigletPreStart applies Piglet defaults needed before model/session setup.
+func applyPigletPreStart(p *piglet.Piglet, flags *Args) {
+	if p == nil {
+		return
+	}
+
+	// Apply the piglet's system prompt as the base prompt (like
+	// --system-prompt) unless the user passed one explicitly. resolvePiglet
+	// inlines a file: reference to Text, so this is path-independent.
+	if flags.SystemPrompt == "" && p.SystemPrompt != nil && p.SystemPrompt.Text != "" {
+		flags.SystemPrompt = p.SystemPrompt.Text
+	}
+}
+
+func pigletAmbientSources(p *piglet.Piglet, kind string) *[]string {
+	if p == nil {
+		return nil
+	}
+	empty := []string{}
+	if p.Discovery == nil {
+		return &empty
+	}
+	if kind == "extensions" {
+		return &p.Discovery.Extensions
+	}
+	return &p.Discovery.Skills
+}
+
+func runRetiredCommand(args []string) int {
+	if len(args) == 0 || args[0] != "resource" {
+		return -1
+	}
+	fmt.Fprintln(os.Stderr, "pig: unknown command resource; use `pig config` to change Resource filters or `pig status --json` to inspect Resources")
+	return 2
+}
+
+// isReadOnlyConfigRootError reports whether err says the config root cannot be written: a read-only file system or a
+// permission denial.
+func isReadOnlyConfigRootError(err error) bool {
+	return errors.Is(err, syscall.EROFS) || errors.Is(err, fs.ErrPermission)
+}
+
+// reportVerifyCacheError tells the user that a passing Piglet Binary check could not be remembered, so the next start
+// checks it in full again. A config root this user cannot write is a deployment choice such as a read-only image, so the
+// miss is silent there and `pig diagnose` reports the read-only root; every other write error warns.
+func reportVerifyCacheError(stderr io.Writer, cacheErr error) {
+	// pig divergence (D157): a read-only config root costs each start a full check without a warning on every start.
+	if cacheErr == nil || isReadOnlyConfigRootError(cacheErr) {
+		return
+	}
+	_, _ = fmt.Fprintf(stderr, "pig: warning: %v\n", cacheErr)
+	_, _ = fmt.Fprintln(stderr, "pig: startup will continue; the next start verifies this Piglet Binary in full again")
+}
+
+// stageExtensionSDKsAtStartup stages the embedded extension SDKs into this build's own directories. A failure warns, because extensions that
+// need the SDK then fail to build, except on a config root this user may not write: that is a deployment choice such as a read-only image. This
+// build reads only its own staged directories, so nothing another build staged can be used in their place; a Go or Rust build reports the
+// missing SDK, and `pig diagnose` reports the SDKs as not staged.
+func stageExtensionSDKsAtStartup(ctx context.Context, configRoot string, stderr io.Writer, timeout time.Duration) {
+	reportExtensionSDKStageFailure(stderr, stageExtensionSDKsFor(ctx, configRoot, timeout))
+}
+
+// stageExtensionSDKsFor stages the embedded extension SDKs, waiting at most timeout for another process's stage lock, and returns the failure a
+// caller reports: nil on success and on a config root this user cannot write.
+func stageExtensionSDKsFor(ctx context.Context, configRoot string, timeout time.Duration) error {
+	stageCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := pigsdk.EnsureSyncedContext(stageCtx, configRoot)
+	// pig divergence (D157): a config root that cannot be written (EROFS, EACCES, EPERM) is not reported. Pi warns on every start of such a root
+	// through its own settings lock (`Invalid settings file ... EACCES`), and the stage is PiG's own addition.
+	if isReadOnlyConfigRootError(err) {
+		return nil
+	}
+	return err
+}
+
+// reportExtensionSDKStageFailure writes the startup warning for a failed SDK stage; a nil err writes nothing.
+func reportExtensionSDKStageFailure(stderr io.Writer, err error) {
+	if err == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(stderr, "pig: warning: extension SDK staging failed: %v\n", err)
+	_, _ = fmt.Fprintln(stderr, "pig: startup will continue; extensions that need the SDK may fail to build; run 'pig diagnose' for detail")
+}
+
+// MainOptions are the options of [Main] (main.ts MainOptions).
+type MainOptions struct {
+	// ExtensionFactories are the compiled-in extensions an embedding program adds after the built-in ones (main.ts:575). Only the program's own main passes them (docs/specs/extension-factory-trust.md).
+	ExtensionFactories []extension.InlineExtension
+}
+
+// processCwd is process.cwd(). It is a variable so that a test can make the working directory fail the way Pi's deleted-cwd.test.ts
+// stubs process.cwd().
+var processCwd = nodepath.Cwd
+
+// Main runs the pig command line for args, the arguments after the program name, as Pi's main(args, options) does (main.ts:573). The default and experimental executables call it with args and no options.
+func Main(args []string, options *MainOptions) {
+	// The first thing of every mode and command: the Node extension runtime and every child process (bash tool, package commands, subagents)
+	// read only PI_TELEMETRY, so it holds PiG's resolved choice before anything can start one (TestMainExportsTheResolvedTelemetryBeforeAnyCommand).
+	exportTelemetryOverride()
+	// pig additive (D174): at most procpolicy.Cap Ps unless the environment sets GOMAXPROCS; set before anything reads the width.
+	procpolicy.Apply()
+	// Upstream's theme.bold, italic, underline, inverse and strikethrough are chalk calls: they draw only when chalk's stdout color level is above zero.
+	tui.SetChalkModifiers(chalkStdoutColor())
+	// The pig command serves the test-only test-faux provider under PIG_TEST_FAUX=1; an embedder that leaves the call out does not link it.
+	coding.EnableTestFauxProvider()
+	// Every command of pig may load an extension, whose views the host then builds: a session's host, a renderer of a host without a UI bridge, preview-login, validation.
+	enableViews()
+	// upstream: packages/coding-agent/src/main.ts:574 resetTimings(); PI_TIMING=1 prints the report before the mode runs.
+	timings.ResetTimings()
+	// main.ts:575: the built-in extensions, then the program's own.
+	var programExtensions []extension.InlineExtension
+	if options != nil {
+		programExtensions = options.ExtensionFactories
+	}
+	commandRuntime := packageCommandRuntimeOptions{extensionFactories: slices.Concat(builtInExtensions, programExtensions)}
+	// PIG_PROFILE (internal/profiling) is read once here. Unset, it costs one lookup.
+	stopMetrics := profiling.Start()
+	// pig additive (D22): the session's documentation lease lives until exit; give it back before the exit record counts the process's descriptors.
+	stopProfiles = func() {
+		releaseDocsLeases()
+		stopMetrics()
+	}
+	// Pi's process 'exit' handler also runs when Node exits on an uncaught exception or the event loop drains (tui.ts exitRestoreHandler, 9df819de, #11170).
+	// Deferred first, so it runs last: after the other cleanups, on return and on a panic unwinding through Main, before the runtime prints the panic.
+	defer tui.RestoreTerminalOnExit()
+	defer stopProfiles()
+	defer nativeplatform.ShutdownClipboard()
+	defer exitOnRenderOverflow()
+	defer exitOnConfigRootFailure()
+	defer codingagent.FlushSettingsWrites()
+
+	termuxenv.Configure()
+	// pig additive (D95): record the executable before anything can replace it, so an error can report that this process runs a replaced install.
+	installchange.Record()
+	binaryPath := guardBinaryIdentity()
+	setupCli()
+
+	// pig divergence (D39): publish update ownership before command dispatch.
+	codingagent.PigletBinaryRelease = PigletBinaryVersion
+	codingagent.InstalledPigVersion = PigVersion
+
+	// pig additive (D18): a Piglet Binary verifies its baked closure and
+	// signature before any command or session behavior. Stock Pig has no baked
+	// closure, so this is a no-op there.
+	if cacheErr, err := binarypiglet.Verify(); err != nil {
+		fmt.Fprintf(os.Stderr, "pig: Piglet Binary verification failed: %v\n", err)
+		exitProcess(1)
+	} else {
+		reportVerifyCacheError(os.Stderr, cacheErr)
+	}
+	// pig additive (D92): a Piglet Binary records its baked strip list in pigstrip before command dispatch, so its subcommands
+	// see the strip its session sees.
+	if binarypiglet.IsPigletBinary() {
+		if p := binarypiglet.Default(); p != nil {
+			pigstrip.SetPiglet(p.Name)
+			undoBinaryStrip = p.Strip.Record()
+		}
+	}
+
+	// pig additive (D653): a fused member's CLI hook owns the command line before PiG parses any of it (extensions/sdk/clihook).
+	var ownPrintOutput bool
+	if hook := clihook.Registered(); hook != nil {
+		res := hook(clihook.Env{Args: args, Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr, Getenv: os.Getenv, Chdir: os.Chdir,
+			StdinTTY: term.IsTerminal(int(os.Stdin.Fd())), StdoutTTY: term.IsTerminal(int(os.Stdout.Fd()))})
+		if res.Handled {
+			exitProcess(res.Exit)
+		}
+		args = res.Args
+		ownPrintOutput = res.OwnPrintOutput
+		if res.Retry != nil {
+			// pig additive (D653): the member's retry defaults; settings.json `retry` still overrides each field.
+			codingagent.SetDefaultRetryConfig(codingagent.RetryConfig{Enabled: true, MaxRetries: res.Retry.MaxRetries,
+				BaseDelayMs: res.Retry.BaseDelayMs, MaxAgentDelayMs: res.Retry.MaxAgentDelayMs})
+			var decider ai.RetryDecider
+			if decide := res.Retry.Decide; decide != nil {
+				decider = func(attempt, maxAttempts int, response ai.AssistantMessage) ai.RetryDecision {
+					failure := clihook.RetryFailure{
+						Attempt:      attempt,
+						MaxRetries:   maxAttempts,
+						ErrorMessage: response.ErrorMessage,
+					}
+					if response.FailureResponse != nil {
+						failure.Status = response.FailureResponse.Status
+						failure.Headers = response.FailureResponse.Headers
+						failure.StreamStarted = response.FailureResponse.StreamStarted
+					}
+					d := decide(failure)
+					return ai.RetryDecision{Retry: d.Retry, DelayMs: d.DelayMs}
+				}
+			}
+			codingagent.SetDefaultRetryDecider(decider, res.Retry.Silent)
+		}
+		if res.HTTPIdleTimeoutMs != nil {
+			codingagent.SetDefaultHTTPIdleTimeoutMs(res.HTTPIdleTimeoutMs)
+		}
+	}
+
+	// Subcommands run before a Piglet Binary initializes session extensions.
+	if len(args) > 0 {
+		if code := runAuthCommand(args); code >= 0 {
+			exitProcess(code)
+		}
+	}
+	// Upstream main clears an earlier npm self-update's quarantine on every
+	// Windows start after the auth command.
+	if runtime.GOOS == "windows" {
+		codingagent.CleanupWindowsSelfUpdateQuarantine(codingagent.GetPackageDir())
+	}
+	// main.ts:594-605 process.cwd(): the physical directory, not os.Getwd's $PWD, which may reach it through a symlink. A deleted working
+	// directory is reported in one line before any command, --version and --help included (88ffcdc7, #11511); any other failure is
+	// reported as it is.
+	initialCWD, err := processCwd()
+	if errors.Is(err, fs.ErrNotExist) {
+		printCLIError("The current working directory no longer exists. Change to an existing directory and try again.")
+		exitProcess(1)
+	}
+	if err != nil {
+		printCLIError("get cwd: %v", err)
+		exitProcess(1)
+	}
+	if len(args) > 0 {
+		if code := runLoginCommand(args); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runStatusCommand(args); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runSetupCommand(args, os.Stdout, os.Stderr); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runVerifyCommand(args, os.Stdout, os.Stderr); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runPackageCommand(args, commandRuntime); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runBuildCommand(args, os.Stdout, os.Stderr); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runACPCommand(args, os.Stdout, os.Stderr); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runExtensionCommand(args); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runExtensionsCommand(args); code >= 0 {
+			exitProcess(code)
+		}
+		if code := runRetiredCommand(args); code >= 0 {
+			exitProcess(code)
+		}
+		switch args[0] {
+		case "config":
+			exitProcess(runConfigCommand(args[1:], commandRuntime))
+		case "mcp":
+			if code := runMcpCommand(args); code >= 0 {
+				exitProcess(code)
+			}
+		case "doctor":
+			runDoctor(os.Stdout, binaryPath, args[1:])
+			exitProcess(0)
+		case "diagnose":
+			runDiagnose(os.Stdout, binaryPath)
+			exitProcess(0)
+		case "provider-bridge":
+			exitProcess(runProviderBridge(os.Stdin, os.Stdout))
+		case "version":
+			fmt.Println(detailedVersionString())
+			exitProcess(0)
+		}
+		if code := runPigPreSessionCommand(args); code >= 0 {
+			exitProcess(code)
+		}
+	}
+
+	flags := parseArgs(args)
+	trace.Mark("flags-parsed")
+	if reportArgDiagnostics(os.Stderr, flags.Diagnostics, chalkStdoutColor()) {
+		exitProcess(1)
+	}
+	timings.Time("parseArgs")
+
+	// Pi routes version output before Session validation (main.ts:619-622).
+	if flags.Version {
+		fmt.Println(cliVersionString())
+		exitProcess(0)
+	}
+
+	// pig additive (D202): a Piglet Binary built with build.closed runs only the extensions its signed closure lists.
+	if message := pigletBinaryExtensionFlagRefusal(currentPigletBinary(), flags.Extensions); message != "" {
+		fmt.Fprintln(os.Stderr, message)
+		exitProcess(1)
+	}
+
+	// A Piglet Binary embeds prebuilt cells and may link fused extensions. Register
+	// both only when starting a session (after --version); stock Pig carries empty registries.
+	if err := cellpack.Register(); err != nil {
+		fmt.Fprintf(os.Stderr, "pig: Piglet Binary cells: %v\n", err)
+	}
+	fusepack.Register()
+
+	// pig additive (D18): verify the baked extension closure before startup.
+	fusedNames := make([]string, 0)
+	for _, cfg := range fusepack.FusedConfigs() {
+		fusedNames = append(fusedNames, cfg.Name)
+	}
+	packedNames := make([]string, 0)
+	for _, cell := range cellpack.LoadedCells() {
+		for _, ext := range cell.Extensions {
+			packedNames = append(packedNames, ext.Name)
+		}
+	}
+	if err := binarypiglet.VerifyRegisteredClosure(fusedNames, packedNames); err != nil {
+		fmt.Fprintf(os.Stderr, "pig: %v\n", err)
+		exitProcess(1)
+	}
+
+	exportOfflineMode(flags.Offline)
+
+	// --list-models is handled after extensions load (below), so
+	// extension-contributed providers appear in the catalog, matching upstream
+	// which lists against the extension-populated modelRuntime.
+
+	// --export: export session file to HTML and exit.
+	// Mirrors upstream main.ts:459-466.
+	if flags.Export != "" {
+		outputPath := ""
+		if len(flags.Messages) > 0 {
+			outputPath = flags.Messages[0]
+		}
+		// pig additive (D92): HTML export is a shim a Piglet Binary can compile out.
+		runExportFlag(flags.Export, outputPath)
+	}
+
+	runMode := processAppMode(flags)
+	if flags.Listen != "" {
+		// pig additive (D232): a --listen server runs many sessions, so it ends D174's cap of 2 Ps: sessions that start together do their server-side work on every P.
+		procpolicy.Release()
+	}
+	// pig additive (D232): a --listen server skips D175's GOGC 400 start, because resident memory across many sessions is its objective.
+	if policy, ok := gcPolicyFor(runMode, flags.Listen); ok {
+		// pig additive (D175): print, json and rpc runs collect at GOGC 400 unless the environment sets GOGC, and at 100 again past 64 MiB live.
+		// pig additive (D621): an interactive run keeps a heap goal of at least 16 MiB, at GOGC 150 until 8 MiB are live and at 100 from then on, unless the environment sets GOGC or GOMEMLIMIT; its watcher ends at 100 after 2 seconds without a collection.
+		stopGCPolicy = policy.Apply()
+		// Deferred after stopProfiles, so it runs first: the exit record counts no watcher.
+		defer stopGCPolicy()
+	}
+	// pig additive (D232): a --listen server skips the rpc cap of 1 P, because one process runs many sessions.
+	if runMode == appModeRPC && flags.Listen == "" {
+		// pig additive (D174): an rpc run schedules on procpolicy.RPCCap Ps unless the environment sets GOMAXPROCS.
+		procpolicy.ApplyRPC()
+	}
+
+	// Non-interactive startup reserves stdout except for plain runtime metadata (Pi main.ts:129-130,638-642).
+	if runMode != appModeInteractive && !isPlainRuntimeMetadataCommand(flags) {
+		if err := codingagent.TakeOverStdout(); err != nil {
+			printCLIError("%v", err)
+			exitProcess(1)
+		}
+	}
+
+	// upstream: packages/coding-agent/src/main.ts:main rejects @file arguments in RPC mode after taking over stdout, before validateForkFlags.
+	if flags.Mode == "rpc" && len(flags.FileArgs) > 0 {
+		printCLIError("@file arguments are not supported in RPC mode")
+		exitProcess(1)
+	}
+
+	// Upstream main.ts runs validateForkFlags after --version and --export.
+	if reportArgDiagnostics(os.Stderr, validateForkFlags(flags), chalkStdoutColor()) {
+		exitProcess(1)
+	}
+	// validateSessionIdFlags (main.ts:315-334): the conflicting flags are named before the id's format is checked, and both follow --export.
+	// upstream: main.ts validateSessionIdFlags returns only when parsed.sessionId === undefined, so an explicitly empty id fails the format check.
+	if flags.SessionIDSet {
+		var conflicts []string
+		if flags.Session != "" {
+			conflicts = append(conflicts, "--session")
+		}
+		if flags.Continue {
+			conflicts = append(conflicts, "--continue")
+		}
+		if flags.Resume {
+			conflicts = append(conflicts, "--resume")
+		}
+		if len(conflicts) > 0 {
+			printCLIError("--session-id cannot be combined with %s", strings.Join(conflicts, ", "))
+			exitProcess(1)
+		}
+		if !isValidSessionID(flags.SessionID) {
+			printCLIError("Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end with an alphanumeric character")
+			exitProcess(1)
+		}
+	}
+
+	// Set up context with signal handling.
+	//
+	// SIGTERM and SIGHUP dispose the runtime before cancelling. Print/JSON
+	// leave SIGINT to the default process action; interactive mode owns D51.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	if runtime.GOOS != "windows" {
+		signal.Notify(sigCh, syscall.SIGHUP)
+	}
+	if flags.Listen != "" {
+		// pig additive (D232): Ctrl+C ends a --listen server like SIGTERM, so the sessions shut down and the socket file is removed.
+		signal.Notify(sigCh, os.Interrupt)
+	}
+	defer signal.Stop(sigCh)
+	go func() {
+		noteTerminationSignal(<-sigCh)
+		// Give extensions their cleanup event before cancelling: the root
+		// context owns the extension subprocesses, so cancelling it kills the
+		// very processes that would receive session_shutdown. Upstream's
+		// signal-triggered shutdown likewise disposes the runtime first.
+		tools.KillTrackedDetachedChildren()
+		runTerminationShutdownHook()
+		cancel()
+	}()
+
+	// A required Piglet environment must own the whole coding-agent process,
+	// so resolve and enter it before services, model, extensions, or tools start.
+	var activePiglet *piglet.Piglet
+	var activePigletBaked bool
+	enforcePigletBinaryScope(flags.UnknownFlags)
+	activePiglet, activePigletBaked = resolvePiglet(flags.UnknownFlags, flags.ProjectTrustOverride)
+	exportActivePigletSource(activePiglet, activePigletBaked)
+	// pig additive (D23): an active Piglet adds the Piglets topic to the docs section of the system prompt.
+	prompts.SetPigletDocsTopic(activePiglet != nil)
+	// pig additive (D202): a Piglet Binary that is not built closed takes --system-prompt as stock pig does, so the flag replaces the
+	// Piglet's own prompt; a closed Piglet Binary keeps its baseline.
+	activePigletOpen := activePigletBaked && runningPigletBinary().OverlayBase() != nil
+	if message := pigletBinarySystemPromptRefusal(activePigletBaked, activePigletOpen, flags.SystemPrompt); message != "" {
+		fmt.Fprintln(os.Stderr, message)
+		exitProcess(1)
+	}
+	if activePiglet == nil && pigletWasRequested(flags.UnknownFlags) {
+		fmt.Fprintln(os.Stderr, "pig: the requested Piglet could not be loaded")
+		exitProcess(1)
+	}
+	handled, exitCode, environmentErr := runPigletAgentEnvironment(ctx, activePiglet, flags, initialCWD)
+	if environmentErr != nil {
+		fmt.Fprintf(os.Stderr, "pig: %v\n", environmentErr)
+		exitProcess(1)
+	}
+	if handled {
+		exitProcess(exitCode)
+	}
+	inlinePigletSystemPrompt(activePiglet)
+	setDroppedBinaryMembers(activePiglet)
+	if _, overlay := activePiglet.OverlayOf(); overlay {
+		// The overlay's strip list replaces the one the Binary recorded at startup, so a runtime entry the overlay removed is enabled.
+		undoBinaryStrip()
+	}
+	applyPigletStrip(activePiglet, &flags)
+	if activePiglet != nil && (activePiglet.AgentEnv == nil || piglet.ActiveAgentEnvironmentIdentity() != "") {
+		resolvedSecrets, err := piglet.ResolveRequiredSecrets(ctx, activePiglet)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "pig: Piglet secrets: %v\n", err)
+			exitProcess(1)
+		}
+		resolvedSecrets.Clear()
+	}
+
+	// pig does not use undici's default 300s body/header timeouts. Our
+	// streaming HTTP clients are built on Go's net/http with no overall client
+	// timeout and ResponseHeaderTimeout explicitly disabled for long-lived SSE
+	// streams; provider-specific deadlines still come from context cancellation.
+
+	// Resolve directories.
+	// Working directory is process.cwd() (no CLI override; matches upstream).
+	cwd := initialCWD
+	agentDir := codingagent.AgentDir()
+	agentDirForModelOverride = agentDir
+
+	// pig additive (D102): an interactive session leaves a marker that only a clean end removes, so an exit nothing else
+	// recorded is reported at the next start.
+	if processAppMode(flags) == appModeInteractive {
+		//portlint:allow clock the session-marker reconciliation compares file times with the real wall clock at startup; cmd/pig has no clock seam for it and Pi has no counterpart (D102)
+		codingagent.ReconcileSessionMarkers(agentDir, time.Now())
+		codingagent.BeginSessionMarker(agentDir, Version, initialCWD)
+		defer codingagent.EndSessionMarker()
+	}
+
+	// pig divergence (D88): first-time setup runs on an interactive start when settings.json does not exist yet; observed
+	// before anything this run writes creates it.
+	firstTimeSetup := shouldRunFirstTimeSetup(processAppMode(flags), codingagent.AgentDirConfigured(), agentDir)
+
+	// Run one-shot config migrations before loading services/resources so
+	// renamed directories (e.g. commands/ → prompts/) are visible on the
+	// current startup path. Mirrors upstream startup ordering.
+	migratedProviders, deprecationWarnings, err := codingagent.RunMigrations(cwd, agentDir)
+	if err != nil {
+		printCLIError("%v", err)
+		exitProcess(1)
+	}
+	timings.Time("runMigrations")
+
+	// Bootstrap global proxy settings before constructing any provider clients; Session-local settings are resolved after Session selection.
+	startupSettingsManager := codingagent.NewSettingsManager(cwd, agentDir)
+	if err := ai.ApplyHTTPProxySettings(startupSettingsManager.GetGlobalSettings().HTTPProxy); err != nil {
+		printCLIError("%v", err)
+		exitProcess(1)
+	}
+	startupSettingsDiagnostics := codingagent.CollectSettingsDiagnostics(startupSettingsManager)
+	sessionDir, err := resolveSessionDir(flags.SessionDir, startupSettingsManager)
+	if err != nil {
+		printCLIError("%v", err)
+		exitProcess(1)
+	}
+	// Pi runs first-time setup on its own screen before any runtime service, then applies --theme over the saved settings
+	// (main.ts:672-680).
+	if firstTimeSetup && !flags.Help && flags.ListModels == "" && !flags.ListModelsAll {
+		_, setupErr := codingagent.ShowFirstTimeSetup(startupSettingsManager, startupUIOptions(flags, false, initialCWD, agentDir, startupSettingsManager))
+		if setupErr != nil {
+			printCLIError("first-time setup: %v", setupErr)
+		}
+		timings.Time("firstTimeSetup")
+	}
+	startupUIOpts := startupUIOptions(flags, processAppMode(flags) == appModeInteractive, initialCWD, agentDir, startupSettingsManager)
+	// Pi createSessionManager selects in-memory modes before considering the resume picker.
+	if flags.Resume && !flags.NoSession && !flags.Help && flags.ListModels == "" && !flags.ListModelsAll {
+		if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+			exitProcess(0)
+		}
+		manager := newSessionManagerWithDir(initialCWD, sessionDir)
+		selected, ok, selectErr := codingagent.SelectStartupSession(
+			func(options codingagent.SessionListOptions) ([]codingagent.SessionInfo, error) {
+				return manager.ListCurrentSessions(options)
+			},
+			func(options codingagent.SessionListOptions) ([]codingagent.SessionInfo, error) {
+				return manager.ListAllSessions(options)
+			},
+			startupUIOpts,
+		)
+		if selectErr != nil {
+			printCLIError("select session: %v", selectErr)
+			exitProcess(1)
+		}
+		if !ok {
+			// Upstream main.ts:422 console.log(chalk.dim(...)): faint only when
+			// chalk's stdout color level is non-zero.
+			msg := "No session selected"
+			if chalkColorLevel(environMap(os.Environ()), args, true) > 0 {
+				msg = codingagent.ChalkApply("\x1b[2m", "\x1b[22m", msg)
+			}
+			_, _ = fmt.Fprintln(os.Stdout, msg)
+			exitProcess(0)
+		}
+		flags.Resume = false
+		flags.Session = selected
+	}
+	// initialCWD is process.cwd() (nodepath.Cwd).
+	startupSession, err := resolveStartupSessionSelectionIn(flags, canonicalProcessCWD(initialCWD), sessionDir)
+	if err != nil {
+		_, missing := errors.AsType[*sessionNotFoundError](err)
+		_, exists := errors.AsType[*sessionAlreadyExistsError](err)
+		_, fileURL := errors.AsType[*thrownURLError](err)
+		if missing || exists || fileURL {
+			color := chalkColorLevel(environMap(os.Environ()), args, term.IsTerminal(int(os.Stdout.Fd()))) > 0
+			fmt.Fprintln(os.Stderr, formatStartupSessionError(err, color))
+		} else {
+			printCLIError("%v", err)
+		}
+		exitProcess(1)
+	}
+	if crossProject := startupSession.crossProject; crossProject != nil {
+		confirmed, confirmErr := confirmCrossProjectSession(os.Stdin, os.Stdout, crossProject.cwd)
+		if confirmErr != nil {
+			printCLIError("confirm cross-project session: %v", confirmErr)
+			exitProcess(1)
+		}
+		if !confirmed {
+			_, _ = fmt.Fprintln(os.Stdout, chalkDim("Aborted."))
+			exitProcess(0)
+		}
+		manager := newSessionManagerWithDir(startupSession.runtimeCWD, sessionDir)
+		forked, forkErr := manager.ForkFromFile(crossProject.path)
+		if forkErr != nil {
+			printCLIError("%v", forkErr)
+			exitProcess(1)
+		}
+		startupSession.forkPath = forked.Path()
+		startupSession.crossProject = nil
+	}
+	if issue := startupSession.missingCWD; issue != nil {
+		if processAppMode(flags) != appModeInteractive {
+			fmt.Fprintf(os.Stderr, "%s\n", issue.Error())
+			exitProcess(1)
+		}
+		options := issue.options()
+		labels := make([]string, len(options))
+		for i, option := range options {
+			labels[i] = option.Label
+		}
+		selected, ok, selectErr := codingagent.ShowStartupSelector(issue.prompt(), labels, startupUIOpts)
+		if selectErr != nil {
+			printCLIError("select session cwd: %v", selectErr)
+			exitProcess(1)
+		}
+		if !ok || selected < 0 || selected >= len(options) {
+			exitProcess(0)
+		}
+		choice := options[selected].Value
+		if choice == "" {
+			exitProcess(0)
+		}
+		if applyErr := startupSession.applyMissingCWDChoice(choice, &flags, sessionDir); applyErr != nil {
+			printCLIError("%v", applyErr)
+			exitProcess(1)
+		}
+	}
+	cwd = startupSession.runtimeCWD
+	// upstream: packages/coding-agent/src/main.ts:autoTrustOnReloadCwd
+	autoTrustOnReloadCwd := ""
+	if flags.ProjectTrustOverride == nil && !codingagent.HasTrustRequiringProjectResources(cwd) {
+		autoTrustOnReloadCwd = cwd
+	}
+	sessionDir = startupSession.sessionDir
+	// Session selection and its effects precede name normalization and validation (Pi main.ts:680-701).
+	sessionName, nameErr := sessionNameFromFlags(flags)
+	if nameErr != nil {
+		printCLIError("%v", nameErr)
+		exitProcess(1)
+	}
+	if applied, nameErr := startupSession.applyName(sessionName); nameErr != nil {
+		printCLIError("set session name: %v", nameErr)
+		exitProcess(1)
+	} else if applied {
+		sessionName = ""
+	}
+	flags.Name = sessionName
+	// pig additive (D211): the active Piglet decides whether an untrusted project loads its context files.
+	flags.ContextFilesTrustedOnly = activePiglet.WithholdsUntrustedContextFiles()
+	// pig additive (D614): the active Piglet decides whether the TUI draws the views extensions mount.
+	flags.TerminalViewClient = activePiglet.TerminalViewClient()
+	// pig additive (D614): the active Piglet decides whether an interactive session serves its view carrier on a Unix socket. Stock PiG has no Piglet key, so nothing listens.
+	flags.ViewEndpoint = activePiglet.ViewEndpointSocket()
+	timings.Time("createSessionManager")
+	// The builder is Pi's createRuntime closure: every mode builds its first Session
+	// and every replacement Session from the same process-fixed inputs.
+	builder := &cliRuntimeBuilder{
+		mode: processAppMode(flags), packages: newPackageRun(processAppMode(flags)), flags: flags, agentDir: agentDir, launchCWD: initialCWD,
+		activePiglet: activePiglet, activePigletBaked: activePigletBaked, activePigletOpen: activePigletOpen,
+		shadowedPiglet:  piglet.ShadowedWorkspacePiglet(requestedPigletName(flags.UnknownFlags), flags.ProjectTrustOverride),
+		settingsManager: startupSettingsManager, settingsDiagnostics: startupSettingsDiagnostics,
+		startupUIOptions: startupUIOpts, trustStore: codingagent.NewProjectTrustStore(agentDir),
+		trustByCWD: map[string]bool{}, extensionFactories: programExtensions,
+		stageExtensionSDKs: func() error {
+			// Staged before the first extension load that starts an extension, including the pre-trust load, so out-of-tree `-e` builds and packed
+			// cells resolve the SDKs on a clean host with no PiG checkout. A run that loads no extension reads no SDK, so it neither hashes nor
+			// writes one. A failure is not fatal, but it must be visible, because it is otherwise untraceable from the running process.
+			return stageExtensionSDKsFor(ctx, codingagent.ConfigRoot(), startupSDKLockTimeout)
+		},
+	}
+	if flags.Listen != "" {
+		// pig additive (D232): with --listen-share-extensions the server's Hosts share cell processes through one registry and its builds run one at a time. Otherwise every session's Host spawns its own processes, as a process per session would, and sessions build concurrently.
+		if flags.ListenShareExtensions {
+			builder.buildMu = &sync.Mutex{}
+			builder.cellRegistry = subprocess.NewCellRegistry()
+		}
+	}
+	startupExtensions := &startupExtensionSet{}
+	stopStartupExtensions = startupExtensions.close
+	defer startupExtensions.close()
+	defer stopAutomaticExtensionCacheGC()
+	// pig additive (D92): the docs bundle is a shim a Piglet Binary can compile out.
+	prepareDocsBundle()
+	if mode := processAppMode(flags); mode == appModeInteractive || mode == appModeRPC {
+		// A user's `!` command and an RPC client's bash command read files with no tool call before them.
+		writeDocsBundle()
+	}
+	buildInput := cliBuildInput{CWD: cwd, Startup: true, StartupExtensions: startupExtensions}
+	build, err := builder.buildResources(ctx, buildInput)
+	if err != nil {
+		reportCLIStartupFailure(err)
+		exitProcess(1)
+	}
+	extensionDiagnostics := build.ExtensionDiagnostics
+	// pig additive (D109): extensions written for an older SDK are upgraded here, before piped input is read. When every one of them builds, this process loads the resources again: the Session selection, its fork and name, and the project trust answer stay as they were made.
+	if len(build.SDKDrift) > 0 && !flags.Help && flags.ListModels == "" && !flags.ListModelsAll {
+		interactive := processAppMode(flags) == appModeInteractive && term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))
+		if startupUpgrade(ctx, build.SDKDrift, interactive, build.Services.SettingsManager().GetExtensionsAutoUpgrade()) {
+			startupExtensions.close()
+			*startupExtensions = startupExtensionSet{}
+			build.Services.Close()
+			if build, err = builder.buildResources(ctx, buildInput); err != nil {
+				reportCLIStartupFailure(err)
+				exitProcess(1)
+			}
+			extensionDiagnostics = build.ExtensionDiagnostics
+		}
+	}
+
+	// Resolve model
+	// Piglet model acts as a fallback: --model flag > piglet.model > settings.defaultModel
+	if err := startupSession.loadSession(flags); err != nil {
+		printCLIError("open selected session: %v", err)
+		exitProcess(1)
+	}
+	buildInput.Manager = startupSession.manager
+	// Pi main.ts:822-828: an existing session is one with messages, so a new or empty Session at a --session path still takes --models.
+	buildInput.Continuing = startupSession.manager != nil && len(startupSession.manager.BuildSessionContext().Messages) > 0
+	timings.Time("createRuntime")
+	if err := builder.buildSession(ctx, build, buildInput); err != nil {
+		reportCLIStartupFailure(err)
+		exitProcess(1)
+	}
+	timings.Time("createAgentSessionRuntime")
+	flags = build.Flags
+	modelErr := build.ModelErr
+	// Pi bacd45b9c (#11973, #11264): the model scope warnings are diagnostics of the runtime, after the extension diagnostics and before buildSessionOptions' diagnostics. The factory does not print them: it runs again on /new, /resume and /fork while the interactive TUI draws on the terminal. The runtime holds them and its mode reports each once (TakeUnreportedDiagnostics).
+	timings.Time("resolveModelScope")
+	startupDiagnostics := build.runtimeDiagnostics()
+
+	// upstream: main.ts applies the runtime settings' httpProxy and HTTP idle timeout after createAgentSessionRuntime, before help, --list-models and every mode.
+	if err := configureHTTPDispatcherFromSettings(build.Services.SettingsManager()); err != nil {
+		printCLIError("configure HTTP dispatcher: %v", err)
+		exitProcess(1)
+	}
+
+	// Metadata reports the startup settings diagnostics and the runtime diagnostics, such as the warning of a package that could not be installed, and never their failure status (main.ts, Pi 6dfb54678).
+	metadataDiagnostics := codingagent.DeduplicateDiagnostics(slices.Concat(startupSettingsDiagnostics, startupDiagnostics))
+	if flags.Help {
+		codingagent.WriteDiagnosticsToStderr(metadataDiagnostics)
+		// upstream: cli/args.ts printHelp styles with chalk.bold, whose level is chalk's stdout supports-color level (FORCE_COLOR, --no-color, TERM, CI), not only whether stdout is a terminal.
+		printHelp(os.Stdout, chalkStdoutColor(), extensionHelpFlags(build.Extensions)...)
+		exitProcess(0)
+	}
+	if flags.ListModels != "" || flags.ListModelsAll {
+		codingagent.WriteDiagnosticsToStderr(metadataDiagnostics)
+		// main.ts:951 leaves a rejection of listModels uncaught: Node reports the error and exits with status 1.
+		if err := listModels(ctx, build.Services.ModelRuntime(), build.Services.Registry().ModelRegistry, flags.ListModels); err != nil {
+			fmt.Fprintln(os.Stderr, uncaughtListModelsError(err))
+			exitProcess(1)
+		}
+		exitProcess(0)
+	}
+	// RPC owns stdin as JSONL. Other modes read piped input before runtime diagnostics, and metadata commands above never consume it.
+	// pig divergence (D150): --no-stdin skips the read, which Pi always performs.
+	var stdinContent string
+	if flags.Mode != "rpc" && !flags.NoStdin {
+		trace.Mark("stdin-read-start")
+		stdinContent, err = readPipedStdin(ctx)
+		if err != nil {
+			if sig := receivedTerminationSignal.Load(); sig != 0 {
+				exitProcess(128 + int(sig))
+			}
+			printCLIError("read stdin: %v", err)
+			exitProcess(1)
+		}
+		trace.Mark("stdin-read-done")
+	}
+	timings.Time("readPipedStdin")
+	initialMessage, initialImages, extraMessages, messageErr := prepareInitialMessage(initialCWD, flags.Messages, flags.FileArgs, stdinContent)
+	if messageErr != nil {
+		// processFileArguments does not catch fileURLToPath's throw, so Node reports it as an uncaught error.
+		if urlErr, ok := errors.AsType[*nodeurl.Error](messageErr); ok {
+			fmt.Fprintln(os.Stderr, urlErr.Thrown())
+		} else {
+			printCLIError("%v", messageErr)
+		}
+		exitProcess(1)
+	}
+	timings.Time("prepareInitialMessage")
+	// main.ts:898 applies the configured theme in every mode before the run starts; the interactive controller applies its own at construction. Print, JSON and RPC runs draw tool output and exports with it.
+	if processAppMode(flags) != appModeInteractive {
+		initTheme(configuredThemeName(build.Services.SettingsManager()), false)
+	}
+	timings.Time("initTheme")
+	// main.ts:970-973 prints the deprecated-extension-directory warnings of an interactive start and waits for a key before the TUI starts.
+	if processAppMode(flags) == appModeInteractive {
+		if err := showDeprecationWarnings(os.Stdout, os.Stdin, deprecationWarnings); err != nil {
+			printCLIError("%v", err)
+			exitProcess(1)
+		}
+	}
+	// Only an error diagnostic stops startup; warnings are reported and startup goes on (main.ts:908-916).
+	hasRuntimeErrors := modelErr != nil || slices.ContainsFunc(extensionDiagnostics, func(diagnostic codingagent.AgentSessionRuntimeDiagnostic) bool { return diagnostic.Type == "error" })
+	if hasRuntimeErrors {
+		reportExtensionLoadFailures(startupDiagnostics)
+		if len(build.SDKDrift) > 0 {
+			fmt.Fprint(os.Stderr, sdkDriftNotice(build.SDKDrift))
+		}
+		exitProcess(1)
+	}
+	timings.Time("createAgentSession")
+	stopModelServices = build.Services.Close
+	services := build.Services
+	settings := build.Settings
+	model, noModelWarning := build.Model, build.ModelFallbackMessage
+	subprocHost, subprocBridge := build.Host, build.Bridge
+	projectTrusted := build.ProjectTrusted
+	skillDefs := build.skills()
+	slr := build.SkillLoad
+	promptPaths, themePaths, skillInputs := build.PromptPaths, build.ThemePaths, build.SkillInputs
+	skillScopes := build.SkillScopes
+	resourceFlags := build.ResourceFlags
+	startupSourceResolver := build.SourceResolver
+	reloadBuiltinExtensions, builtinExts := build.ReloadBuiltinExtensions, build.BuiltinExtensions
+	explicitBuiltins := build.ExplicitBuiltinPaths
+	agentToolNames := build.AgentToolNames
+	allowed, activeBuiltin, excludedTools, skipBuiltinTools := build.Allowed, build.ActiveBuiltin, build.ExcludedTools, build.SkipBuiltinTools
+	projectCtxFiles, resolvedPrompts := build.ContextFiles, build.ResolvedPrompts
+	// pig additive (D211): print, JSON and RPC runs have no transcript to hold the notice, so it goes to stderr.
+	if runMode != appModeInteractive && !loadsProjectContextFiles(flags, projectTrusted) && !flags.NoContextFiles {
+		if withheld := codingagent.WithheldProjectContextFiles(build.CWD, agentDir); len(withheld) > 0 {
+			fmt.Fprintln(os.Stderr, codingagent.ContextFilesWithheldMessage(withheld))
+		}
+	}
+	systemPrompt, systemPromptOptions := build.SystemPrompt, build.SystemPromptOptions
+	// No agent-defined beforeToolCall hooks: agent persona system is
+	// a pig-extension concern, not built into core.
+	var beforeToolCall []agent.BeforeToolCallHook
+
+	// Quiet startup banner so the user always knows which binary launched.
+	// Suppressed in --print mode and when quietStartup is true; "header" keeps
+	// it (interactive-mode.ts:996, shouldShowStartupHeader at 1409-1412).
+	// --verbose overrides quietStartup (mirrors upstream args.ts:239).
+	// pig divergence (D2): banner says "PiG", not "pi": separate binary
+	// and config root avoid collisions with upstream pi.
+	showBanner := !flags.Print && flags.Mode != "rpc" && (settings.QuietStartup != codingagent.QuietStartupTrue || flags.Verbose)
+	var loginOperationalLines []string
+	if showBanner {
+		identityLine := fmt.Sprintf("PiG %s • config=%s • bin=%s",
+			Version, codingagent.ConfigRoot(), binaryPath)
+		startupHints := codingagent.StartupKeybindHints(codingagent.NewKeybindingsManager(agentDir))
+		loginOperationalLines = append(loginOperationalLines, identityLine, "", startupHints)
+	}
+	_ = resourceFlags
+	_ = slr
+	_ = skillInputs
+
+	// upstream: packages/coding-agent/src/main.ts:932-936
+	startupBenchmark := truthyEnvFlag(os.Getenv("PI_STARTUP_BENCHMARK"))
+	if startupBenchmark && processAppMode(flags) != appModeInteractive {
+		printCLIError("PI_STARTUP_BENCHMARK only supports interactive mode")
+		exitProcess(1)
+	}
+
+	if flags.Remote != "" {
+		_ = os.Setenv("PI_REMOTE", flags.Remote)
+	}
+	// RPC mode takes over protocol stdin/stdout with the already-loaded runtime.
+	if flags.Mode == "rpc" {
+		resumePath := startupSession.resumePath
+		if startupSession.forkPath != "" {
+			resumePath = startupSession.forkPath
+		}
+		// The runtime holds the startup diagnostics, and the mode writes them to stderr once it has created the runtime and takes them (c47ad0432bb8). --listen has no Pi counterpart: it reports them when the server starts, and the first connection, which serves this build, does not report them again.
+		if flags.Listen != "" {
+			codingagent.WriteDiagnosticsToStderr(startupDiagnostics)
+		}
+		timings.PrintTimings()
+		startAutomaticExtensionCacheGC(ctx)
+		if flags.Listen != "" {
+			// pig additive (D232): --listen serves one rpc session per connection.
+			exitProcess(runRPCListen(ctx, flags, activePiglet, rpcModeResources{
+				Builder: builder, Build: build, SessionManager: startupSession.manager, ResumePath: resumePath,
+			}))
+		}
+		exitProcess(runRPCMode(ctx, flags, activePiglet, rpcModeResources{
+			Builder: builder, Build: build, SessionManager: startupSession.manager, ResumePath: resumePath,
+		}))
+	}
+
+	// Startup session selection already ran before cwd-bound services. Headless
+	// modes reuse the selected file; the interactive path below does the same.
+	printResumePath := startupSession.resumePath
+	if startupSession.forkPath != "" {
+		printResumePath = startupSession.forkPath
+	}
+
+	// Print mode
+	// Mirrors upstream main.ts resolveAppMode: --print, --mode json, or a
+	// stdin or stdout that is not a terminal runs print mode.
+	if processAppMode(flags) != appModeInteractive {
+		// The runtime holds the startup diagnostics; startPrintMode writes them once it has created the runtime and takes them (c47ad0432bb8).
+		if subprocHost != nil {
+			defer subprocHost.Shutdown("quit")
+		}
+		// The print/JSON prompt comes from positional args, @files, and stdin.
+		// --print is a bare boolean (upstream semantics); the prompt is in
+		// initialMessage, which may be empty (upstream then sends nothing).
+		mode := "text"
+		if processAppMode(flags) == appModeJSON {
+			mode = "json"
+		}
+		// Print and JSON mode expand prompt templates as upstream
+		// AgentSession.prompt does, so they load them as RPC mode does.
+		host := builder.printHost(ctx, build, &printStartup{
+			Manager: startupSession.manager, ResumePath: printResumePath, SessionName: sessionName,
+			SessionDir: sessionDir, NoSession: flags.NoSession, SessionID: flags.SessionID, CWDOverride: flags.sessionCwdOverride,
+		})
+		timings.PrintTimings()
+		startAutomaticExtensionCacheGC(ctx)
+		if exitCode, err := startPrintMode(ctx, host, printModeOptions{Mode: mode, Messages: extraMessages, InitialMessage: initialMessage, InitialImages: initialImages, ownOutput: ownPrintOutput}); err != nil {
+			// A run stopped by a termination signal reports 128+signum and
+			// stays quiet, matching upstream's print-mode signal handlers.
+			if signalErr, ok := errors.AsType[*signalExitError](err); ok {
+				exitProcess(signalErr.ExitCode())
+			}
+			if !errors.Is(err, errPrintModeHandled) {
+				printCLIError("%v", err)
+			}
+			exitProcess(exitCode)
+		}
+		// pig additive (D653): a fused member's status after a print run that succeeded in PiG's terms; a failed run keeps PiG's 1.
+		if code, ok := clihook.ExitCode(); ok && code != 0 {
+			exitProcess(code)
+		}
+		return
+	}
+
+	// Interactive mode reuses the startup-selected Session. Bare --resume still
+	// defers to the in-TUI picker until the shared U4 startup selector lands.
+	resumePath := startupSession.resumePath
+	forkPath := startupSession.forkPath
+
+	// The Session comes from the runtime factory, and /new, /resume, /fork,
+	// /clone and /import replace it through the same factory, as Pi's
+	// interactive mode does with runtimeHost.
+	trace.Mark("pre-runtime")
+
+	settingsManager := services.SettingsManager()
+
+	// Create or reopen the Session with the resolved CLI thinking override before binding interactive presentation.
+	startOpts := startupSession.startOptions(flags)
+	interactiveInputs := builder.interactiveInputs(build, startOpts)
+	// The first construction carries the model fallback message startup resolved; its diagnostics are the build's (cliSessionInputs.Diagnostics).
+	interactiveInputs.ModelFallbackMessage = noModelWarning
+	sessionFactory := newCLISessionFactory(ctx, interactiveInputs, build, func(ctx context.Context, options coding.CreateAgentSessionRuntimeOptions) (cliSessionInputs, *cliBuild, error) {
+		next, err := builder.rebuild(ctx, options)
+		if err != nil {
+			return cliSessionInputs{}, nil, err
+		}
+		return builder.interactiveInputs(next, coding.SessionStartOptions{}), next, nil
+	})
+	defer sessionFactory.Close()
+	terminateSessionExtensions = sessionFactory.TerminateProcesses
+	trace.Mark("pre-session")
+	startManager, err := coding.SessionManagerFor(services, interactiveInputs.Start)
+	if err != nil {
+		printCLIError("construct session: %v", err)
+		exitProcess(1)
+	}
+	// upstream: main.ts:707-714 names a new Session on its manager before createAgentSessionRuntime records the start model and thinking level (sdk.ts:453-458); initial metadata emits no session_info_changed.
+	if sessionName != "" {
+		if _, err := startManager.AppendSessionInfo(sessionName); err != nil {
+			printCLIError("set session name: %v", err)
+			exitProcess(1)
+		}
+	}
+	rt, err := coding.CreateAgentSessionRuntime(ctx, sessionFactory.Factory(), coding.CreateAgentSessionRuntimeOptions{
+		CWD: cwd, AgentDir: agentDir, SessionManager: startManager,
+	})
+	if err != nil {
+		printCLIError("construct session: %v", err)
+		exitProcess(1)
+	}
+	defer func() { _ = rt.Close() }()
+	stopModelServices = func() { rt.Services().Close() }
+	codingSess := rt.Session()
+	trace.Mark("session-created")
+	displayResumePath := resumePath
+	if forkPath != "" {
+		displayResumePath = forkPath
+	}
+	requestAuthRuntime, err := codingagent.NewRequestAuthRuntime(ctx, codingagent.RequestAuthRuntimeOptions{
+		Credentials: services.Auth(),
+		AgentDir:    agentDir,
+	})
+	if err != nil {
+		printCLIError("construct request auth runtime: %v", err)
+		exitProcess(1)
+	}
+	interactiveRegistryAllowed, _ := toolRegistryFilters(flags)
+	iopts := codingagent.InteractiveModeOptions{
+		ContextUsage: func() (*int, int) {
+			usage := rt.Session().ContextUsage()
+			if usage == nil {
+				return nil, 0
+			}
+			return usage.Tokens, usage.ContextWindow
+		},
+		CWD:                    cwd,
+		AgentDir:               agentDir,
+		SessionDir:             sessionDir,
+		Model:                  model,
+		BackgroundJobs:         codingSess.BackgroundJobs(),
+		Remote:                 codingSess.Remote(),
+		ModelFallbackMessage:   noModelFallbackMessage(codingSess, rt.ModelFallbackMessage()),
+		MigratedProviders:      migratedProviders,
+		AutoTrustOnReloadCwd:   autoTrustOnReloadCwd,
+		StartupDiagnostics:     rt.TakeUnreportedDiagnostics(),
+		Settings:               settings,
+		SettingsManager:        settingsManager,
+		SystemPrompt:           systemPrompt,
+		SystemPromptOptions:    systemPromptOptions,
+		AllowedTools:           allowed,
+		ToolRegistryAllowed:    interactiveRegistryAllowed,
+		ActiveBuiltinTools:     activeBuiltin,
+		InitialActiveToolNames: build.InitialActiveToolNames,
+		ExcludedTools:          excludedTools,
+		NoBuiltinTools:         skipBuiltinTools,
+		PromptPaths:            promptPaths,
+		CLIPromptTemplatePaths: additionalPromptTemplatePaths(resourceFlags),
+		ThemePaths:             themePaths,
+		NoPromptTemplates:      flags.NoPromptTemplates,
+		NoThemes:               flags.NoThemes,
+		UnknownFlags:           build.ExtensionFlagValues,
+		BeforeToolCall:         beforeToolCall,
+		InitialMessage:         initialMessage,
+		InitialImages:          initialImages,
+		InitialMessages:        extraMessages,
+		AppVersion:             UpstreamPackageVersion,
+		// A frame comes due between the stream's wake-ups; the runtime's timer would draw it up to a millisecond late (codingagent kernelFrameTimer).
+		KernelFrameDeadline: true,
+		// pig additive (D91): a Piglet Binary's fused frontend member.
+		// pig additive (D202): an overlay that removes the frontend slot starts the Binary without it.
+		Frontend: frontendpack.SelectedIf(!overlayRemovedFrontend(activePiglet)),
+		PackageUpdateChecker: func() []string {
+			updates := packagemanager.NewPackageManager(packagemanager.PackageManagerOptions{CWD: cwd, SettingsManager: services.SettingsManager()}).CheckForAvailableUpdates()
+			names := make([]string, 0, len(updates))
+			for _, u := range updates {
+				names = append(names, u.DisplayName)
+			}
+			return names
+		},
+		// pig divergence (D39): standalone-binary self-update notice at startup.
+		// pig additive (D92): self-update is a shim a Piglet Binary can compile out; nil there.
+		BinaryUpdateChecker:        binaryUpdateChecker(),
+		ResourceSourceInfoProvider: resourceSourceInfoProvider(cwd, agentDir, services.SettingsManager(), flags, startupSourceResolver.Resolve),
+		ReloadResourceProvider:     reloadResourceSnapshotProvider(cwd, agentDir, services.SettingsManager(), resourceFlags, skillScopes),
+		ExtensionWarnings:          build.ExtensionWarnings,
+		Verbose:                    flags.Verbose,
+		Skills:                     skillDefs,
+		SkillDiagnostics:           slr.Diagnostics,
+		RebuildSystemPrompt:        systemPromptRebuilder(cwd, agentDir, projectTrusted, flags, agentToolNames),
+		BridgeExtensionTools:       coding.BridgeNewRunnerTools,
+		SkillPaths:                 skillInputs,
+		NoSkills:                   flags.NoSkills,
+		ContextFiles:               projectCtxFiles,
+		ContextFilesTrustedOnly:    flags.ContextFilesTrustedOnly,
+		SystemPromptSourcePaths:    resolvedPrompts.sourcePaths,
+		SessionHandle:              codingSess,
+		ResumePath:                 displayResumePath,
+		ModelBuilder: func(spec string) (*ai.Model, error) {
+			return coding.BuildModel(spec, services)
+		},
+		DefaultModelPerProvider: codingagent.DefaultModelPerProvider(),
+		ModelBinder:             codingSess.ModelRuntime().BindModelObject,
+		ModelLookup:             codingSess.ModelRuntime().GetModel,
+		ModelCatalog:            codingSess.ModelRuntime().GetModels,
+		ModelClassify:           codingSess.ModelRuntime().Classify,
+		ModelGenerateImages:     codingSess.ModelRuntime().GenerateImages,
+		RequestAuthRuntime:      requestAuthRuntime,
+		ModelRegistry:           services.Registry().ModelRegistry,
+		ExtensionRunner:         codingSess.ExtensionRunner(),
+		ExtensionContext:        rt.ExtensionContext(),
+		ReplacementResources: func(session codingagent.InteractiveSessionHandle) codingagent.InteractiveReplacement {
+			current := session.(*coding.Session)
+			next, _ := sessionFactory.StateFor(current)
+			auth, err := codingagent.NewRequestAuthRuntime(ctx, codingagent.RequestAuthRuntimeOptions{Credentials: next.Services.Auth(), AgentDir: agentDir})
+			if err != nil {
+				auth = requestAuthRuntime
+			}
+			return builder.interactiveReplacement(next, current, auth)
+		},
+		BuiltinExtensions:       builtinExts,
+		ExplicitBuiltinPaths:    explicitBuiltins,
+		ReloadBuiltinExtensions: reloadBuiltinExtensions,
+		OfflineMode:             packagemanager.IsOfflineModeEnabled(),
+		StartupMark:             trace.Mark,
+		LoginHeaderOptions: codingagent.LoginHeaderOptions{
+			OperationalLines: loginOperationalLines,
+			TrueColor:        tui.SupportsTrueColor(),
+		},
+		LoginVisible: showBanner,
+	}
+	// pig-specific: wire subprocess extensions after struct init.
+	// Must check concrete pointer before assigning to interface fields
+	// to avoid typed-nil interface trap: a nil *subprocess.UIBridge
+	// assigned to SubprocessUIBridge interface is non-nil (Go semantics),
+	// causing panic on SetInvalidate call.
+	if subprocBridge != nil {
+		iopts.SubprocessUIBridge = subprocBridge
+	}
+	iopts.TerminalViewClient = flags.TerminalViewClient
+	iopts.ViewEndpoint = flags.ViewEndpoint
+	if subprocHost != nil {
+		iopts.SubprocessHost = subprocHost
+		// /reload recompiles these, and it is the command reached for after
+		// rebuilding pig, so stage the embedded SDKs first for the same reason
+		// startup does.
+		iopts.StageExtensionSDKs = func() error {
+			return pigsdk.EnsureSynced(codingagent.ConfigRoot())
+		}
+	}
+	// Pi main.ts:943-944 forwards parsed.tuiMode and parsed.useTheme, including an empty theme name.
+	iopts.TuiMode = flags.TuiMode
+	iopts.InitialThemeSetting = flags.UseTheme
+	iopts.TerminateExtensionProcesses = sessionFactory.TerminateProcesses
+	interactive := codingagent.NewInteractiveMode(interactiveRuntime{rt}, iopts)
+	// main.ts: the TUI draws from here on, so an install is no longer announced on stderr.
+	builder.packages.stopAnnouncing()
+	// SIGTERM must reach extensions before the root context is cancelled.
+	setTerminationShutdownHook(func() {
+		// A quit by keys that waits for its dispose has stopped the TUI: the signal ends the process at once, as Pi's does after its stop().
+		interactive.ExitIfQuitting(128 + int(receivedTerminationSignal.Load()))
+		interactive.ShutdownFromSignal()
+		// Pi's signal shutdown awaits runtimeHost.dispose(), which waits for a started OAuth refresh to be saved. Main cancels the root context, which owns the extension processes, as soon as this hook returns.
+		//portlint:allow ctxbackground Pi's signal shutdown awaits dispose() with no signal (interactive-mode.ts shutdown); this signal hook has no caller context
+		_ = rt.SettleCredentialWrites(context.Background())
+	})
+	defer setTerminationShutdownHook(nil)
+
+	if startupBenchmark {
+		runStartupBenchmark(ctx, interactive, rt.Close)
+		return
+	}
+
+	trace.Mark("pre-interactive")
+	timings.PrintTimings()
+	startAutomaticExtensionCacheGC(ctx)
+	if err := interactive.Run(ctx); err != nil {
+		if errors.Is(err, codingagent.ErrInteractiveCrashed) {
+			exitProcess(1)
+		}
+		printCLIError("%v", err)
+		exitProcess(1)
+	}
+}
+
+// startupBenchmarkMode is the part of interactive mode the startup benchmark drives.
+type startupBenchmarkMode interface {
+	Init(ctx context.Context) error
+	Stop(fullscreenExitOutput ...codingagent.FullscreenExitOutput) error
+}
+
+// runStartupBenchmark initializes interactive mode, gives the terminal input reader 150 ms to consume the terminal's query
+// replies, and stops it without entering the input loop. It then disposes the session runtime, as a normal interactive quit does after it stops
+// the TUI, so extensions receive session_shutdown and release what they hold.
+//
+// Pi disposes the runtime right after interactiveMode.stop() and before the timings print.
+// The error path disposes too, where the process would otherwise exit without session_shutdown.
+//
+// upstream: packages/coding-agent/src/main.ts:964-978 (startupBenchmark)
+func runStartupBenchmark(ctx context.Context, interactive startupBenchmarkMode, dispose func() error) {
+	err := interactive.Init(ctx)
+	if err == nil {
+		trace.Mark("interactiveMode.init")
+		timings.Time("interactiveMode.init")
+		time.Sleep(150 * time.Millisecond) // upstream: packages/coding-agent/src/main.ts:main
+	}
+	if stopErr := interactive.Stop(); stopErr != nil {
+		err = errors.Join(err, stopErr)
+	}
+	if disposeErr := dispose(); disposeErr != nil {
+		err = errors.Join(err, disposeErr)
+	}
+	timings.PrintTimings()
+	if err != nil {
+		printCLIError("%v", err)
+		exitProcess(1)
+	}
+}
+
+// toPromptContextFiles converts codingagent.ContextFile to the shape
+// expected by prompts.Options.ContextFiles.
+func toPromptContextFiles(cfs []codingagent.ContextFile) []struct{ Path, Content string } {
+	out := make([]struct{ Path, Content string }, len(cfs))
+	for i, cf := range cfs {
+		out[i] = struct{ Path, Content string }{Path: cf.Path, Content: cf.Content}
+	}
+	return out
+}
+
+// resolveCLIResourceFlags resolves local -e, --skill, --prompt-template and
+// --theme paths as main.ts:548-550 does: resolvePath(value, cwd) with no trim.
+// An invalid file: URL is an error, as fileURLToPath throws and startup fails.
+func resolveCLIResourceFlags(flags Args, launchCWD string) (Args, error) {
+	resolve := func(paths []string) ([]string, error) {
+		out := make([]string, len(paths))
+		for i, path := range paths {
+			out[i] = path
+			if codingagent.IsLocalPath(path) {
+				resolved, err := resolvepath.Resolve(path, launchCWD)
+				if err != nil {
+					return nil, err
+				}
+				out[i] = resolved
+			}
+		}
+		return out, nil
+	}
+	var err error
+	if flags.Extensions, err = resolve(flags.Extensions); err != nil {
+		return flags, err
+	}
+	if flags.Skills, err = resolve(flags.Skills); err != nil {
+		return flags, err
+	}
+	if flags.PromptTemplates, err = resolve(flags.PromptTemplates); err != nil {
+		return flags, err
+	}
+	if flags.Themes, err = resolve(flags.Themes); err != nil {
+		return flags, err
+	}
+	return flags, nil
+}
+
+func resolveSessionDir(flagValue string, sm *codingagent.SettingsManager) (string, error) {
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	envName := codingagent.ENV_SESSION_DIR
+	if codingagent.UsePiDirs() {
+		envName = "PI_CODING_AGENT_SESSION_DIR"
+	}
+	if envValue := os.Getenv(envName); envValue != "" {
+		return codingagent.ExpandTildePath(envValue), nil
+	}
+	if sm != nil {
+		return sm.GetSessionDir()
+	}
+	return "", nil
+}
+
+// configureHTTPDispatcherFromSettings applies the runtime settings to the ai
+// package: httpProxy, httpIdleTimeoutMs onto the net/http idle dispatcher, and
+// retry.provider maxRetries/maxRetryDelayMs onto the provider retry transport.
+func configureHTTPDispatcherFromSettings(sm *codingagent.SettingsManager) error {
+	if sm == nil {
+		return ai.ConfigureHTTPDispatcher(ai.DefaultHTTPIdleTimeoutMs)
+	}
+	if err := ai.ApplyHTTPProxySettings(sm.GetGlobalSettings().HTTPProxy); err != nil {
+		return err
+	}
+	// upstream: main.ts configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs()); retry.provider.timeoutMs is only the request timeoutMs (sdk.ts buildRequestOptions).
+	timeoutMs, err := sm.GetHttpIdleTimeoutMs()
+	if err != nil {
+		return err
+	}
+	if err := ai.ConfigureHTTPDispatcher(timeoutMs); err != nil {
+		return err
+	}
+	// retry.provider.maxRetries / maxRetryDelayMs drive the provider retry
+	// transport (upstream sdk.ts passes both into retryProviderRequest).
+	pr := sm.GetProviderRetrySettings()
+	maxRetries := 0 // unset: provider-retry.ts:109 `options.maxRetries ?? 0`
+	if pr.MaxRetries != nil {
+		maxRetries = *pr.MaxRetries
+	}
+	return ai.ConfigureProviderRetry(maxRetries, pr.MaxRetryDelayMs)
+}
+
+func newSessionManagerWithDir(cwd, sessionDir string) *codingagent.SessionManager {
+	if sessionDir != "" {
+		return codingagent.NewSessionManagerWithDir(cwd, sessionDir)
+	}
+	return codingagent.NewSessionManager(cwd)
+}
+
+// isValidSessionID validates session ID format.
+// Mirrors upstream assertValidSessionId (session-manager.ts).
+var validSessionIDPattern = lazyregexp.New(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`)
+
+func isValidSessionID(id string) bool {
+	return validSessionIDPattern.MatchString(id)
+}
+
+// exportOfflineMode mirrors upstream main.ts, which normalizes --offline or a
+// truthy PI_OFFLINE to PI_OFFLINE=1 and PI_SKIP_VERSION_CHECK=1 in the process
+// environment. Pi extensions read PI_OFFLINE (pi-auto-update skips its
+// `pi update` run) and inherit this environment, so PiG's own PIG_OFFLINE
+// alias sets it too.
+func exportOfflineMode(flagOffline bool) {
+	if flagOffline || truthyEnvFlag(os.Getenv("PI_OFFLINE")) || truthyEnvFlag(strings.TrimSpace(os.Getenv("PIG_OFFLINE"))) {
+		_ = os.Setenv("PI_OFFLINE", "1")
+		_ = os.Setenv("PI_SKIP_VERSION_CHECK", "1")
+	}
+}
+
+// exportTelemetryOverride gives the resolved telemetry override to the processes that read Pi's name: the Node extension runtime runs Pi's
+// own isInstallTelemetryEnabled, which reads only PI_TELEMETRY, so PI_TELEMETRY becomes what PiG decided (PIG_TELEMETRY when it is set,
+// even beside a PI_TELEMETRY of the opposite value). PIG_TELEMETRY itself stays in the environment as it was.
+// pig divergence (D2): PIG_TELEMETRY is PiG's name beside Pi's PI_TELEMETRY and wins when both are set ("Product name in messages").
+func exportTelemetryOverride() {
+	if value, ok := codingagent.InstallTelemetryEnvOverride(); ok { //perf:ok cold: read once per process start (Main)
+		_ = os.Setenv("PI_TELEMETRY", value)
+	}
+}
+
+// truthyEnvFlag mirrors upstream main.ts isTruthyEnvFlag: "1", "true" or
+// "yes", case-insensitively.
+func truthyEnvFlag(value string) bool {
+	lower := strings.ToLower(value)
+	return value == "1" || lower == "true" || lower == "yes"
+}
+
+// noModelFallbackMessage is the message interactive mode shows through its option: the login guidance of a runtime without any model. A fallback to another model is a diagnostic of the runtime, so it is not shown twice (main.ts:1023-1024).
+func noModelFallbackMessage(session *coding.Session, message string) string {
+	if session.Model() != nil {
+		return ""
+	}
+	return message
+}

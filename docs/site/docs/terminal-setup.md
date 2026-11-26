@@ -1,0 +1,296 @@
+# Terminal setup
+
+PiG runs in any terminal. Some features need terminal support, and PiG turns each one on only when it detects that support. This page lists what PiG detects, and what to change when a key or an image does not work. The terminal setup is the same as for Pi 1.6.0 ([Pi's terminal guide](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/terminal-setup.md)), apart from the differences named below.
+
+## Troubleshooting
+
+| Symptom | Where to look |
+|---|---|
+| `Shift+Enter` submits instead of adding a line | The section for your terminal below. Inside tmux, see [tmux](#tmux). |
+| `Alt+Enter` does not queue a follow-up | [WezTerm](#wezterm), [Alacritty](#alacritty) or [Windows Terminal](#windows-terminal) |
+| Scrolling in fullscreen mode is slow | [iTerm2](#iterm2) |
+| Links show no hover preview in fullscreen mode | [Ghostty](#ghostty) |
+| An input method window appears in the wrong place | [IME candidate window](#ime-candidate-window) |
+| A key works outside PiG but not inside it | [Keys that do not respond](#keys-that-do-not-respond) |
+| herdr does not show PiG's state | [herdr](#herdr) |
+
+Use `/hotkeys` to list the keys PiG has bound. `Ctrl+J` always inserts a new line, so you can use it in any terminal where `Shift+Enter` does not arrive.
+
+## What PiG detects
+
+PiG detects image, true-color, and hyperlink capabilities from environment variables, except for the tmux hyperlink check below. Keyboard negotiation and automatic theme detection also use terminal queries.
+
+| Terminal | Images | True color | Hyperlinks |
+|---|---|---|---|
+| Kitty | yes | yes | yes |
+| Ghostty | yes | yes | yes |
+| WezTerm | yes | yes | yes |
+| iTerm2 | yes | yes | yes |
+| Warp | yes | yes | yes |
+| VS Code | no | yes | yes |
+| Alacritty | no | yes | yes |
+| Zed | no | yes | yes |
+| Rex | yes | yes | yes |
+| Windows Terminal | no | yes | yes |
+| JetBrains | no | yes | no |
+| Apple Terminal | no | with `COLORTERM` | no |
+| herdr | yes | with `COLORTERM` | yes |
+
+Inside `tmux` or `screen`, PiG turns images off. The multiplexer sits between PiG and the terminal, so what the outer terminal accepts is not evidence that the pane accepts it. Hyperlinks stay off in `screen`. In `tmux`, PiG asks tmux whether the attached client forwards hyperlinks and uses them only when it does.
+
+PiG reads `TERM_PROGRAM`, `TERM` and `COLORTERM` first. It also accepts `KITTY_WINDOW_ID`, `GHOSTTY_RESOURCES_DIR`, `WEZTERM_PANE`, `ITERM_SESSION_ID`, `WARP_SESSION_ID` and `WT_SESSION` as evidence, because some terminals set only these. A terminal it does not recognize gets true color only with `COLORTERM=truecolor` or `COLORTERM=24bit`, and no images or hyperlinks.
+
+To correct detection, set `PI_HYPERLINKS`, `PI_IMAGE_PROTOCOL` or `PI_TRUE_COLOR` (see [environment variables](/docs/latest/environment-variables)), or the matching `terminal.*` setting (see [settings](/docs/latest/settings)). The setting wins.
+
+## Automatic theme detection
+
+Without an explicit theme, PiG queries the terminal's default background with OSC 11. An automatic light/dark theme pair also queries the terminal's color-scheme preference. PiG consumes replies to its background queries before editor or extension input. A late OSC 11 reply does not replace a completed fallback or settle a newer query. A color reply that arrives in several pieces waits for its terminator, so its digits are not typed into the editor and its BEL terminator does not open the external editor as `Ctrl+G`. Pi fixed this later; Pi 1.1.0 could type such a reply.
+
+## Keys that do not respond
+
+A terminal sends a key to PiG only if it does not use the key itself. When a binding does nothing, the terminal usually consumed the key.
+
+Check first whether the key works outside PiG. If the terminal has a command bound to it, unbind the command or bind the PiG action to a different key. See [keybindings](/docs/latest/keybindings).
+
+If `Alt+key` input arrives as `Escape` followed by the key, for example over a slow SSH link, raise `PI_TUI_ESC_TIMEOUT` (milliseconds; default `100` over SSH and `10` otherwise).
+
+### tmux
+
+`tmux` must send extended keys, or modified keys such as `shift+enter` and `ctrl+enter` arrive as their unmodified form. PiG warns at startup when it finds the wrong setting. See [tmux](/docs/latest/tmux) for the full setup.
+
+Add both lines to `~/.tmux.conf` and restart tmux:
+
+```tmux
+set -g extended-keys on
+set -g extended-keys-format csi-u
+```
+
+`extended-keys-format xterm` also sends modified keys, but in a format that carries less information. PiG warns about it and works better with `csi-u`.
+
+PiG does not warn when it cannot query tmux, because a sandbox that blocks the query is not evidence of a wrong setting.
+
+### Apple Terminal
+
+PiG enables enhanced key reporting when available. If Terminal.app still sends plain Return for `shift+enter`, PiG asks macOS whether Shift is held and treats the key as `shift+enter`. This works only when PiG runs on the same Mac as Terminal.app. Over SSH, PiG cannot see the local modifier state.
+
+### Termux
+
+Termux reports its window size differently from a desktop terminal. PiG detects Termux with `TERMUX_VERSION` and does not repaint the whole buffer when the window changes, because the repaint costs more than it corrects there. See [Termux](/docs/latest/termux).
+
+## Terminal-specific setup
+
+PiG asks the terminal for the Kitty keyboard protocol at startup and falls back to xterm `modifyOtherKeys`. Either one lets PiG tell `Shift+Enter` and `Alt+Enter` apart from `Enter`. The entries below cover terminals that need a change to send those keys.
+
+### Kitty
+
+Kitty supports the Kitty keyboard protocol. It needs no setup.
+
+### iTerm2
+
+The regular layout needs no setup.
+
+In fullscreen mode (the default; `--tui-mode regular` or the `tuiMode` setting selects the regular layout), PiG captures the mouse, so iTerm2 sends wheel events to PiG instead of scrolling its own history. Fast trackpad gestures can then scroll only one line at a time. To change this, open **iTerm2 > Settings > Advanced**, find **Trackpad scrolls fast?** and set it to **No**. The setting applies to all of iTerm2.
+
+### Ghostty
+
+If `Alt+Backspace` does not delete a word, add this line to Ghostty's configuration file:
+
+```text
+keybind = alt+backspace=text:\x1b\x7f
+```
+
+The file is `~/Library/Application Support/com.mitchellh.ghostty/config` on macOS and `~/.config/ghostty/config` on Linux.
+
+Remove a `keybind = shift+enter=text:\n` line if another tool added it. That line makes `Shift+Enter` send a raw line feed, which is the same byte as `Ctrl+J`. It appears to work in PiG, but PiG and tmux no longer receive a real `Shift+Enter`.
+
+In fullscreen mode, PiG captures the mouse, so Ghostty does not underline links or preview their URLs on hover. Links are still clickable. Hold the modifier that Ghostty uses to bypass mouse capture to get its own link handling.
+
+### WezTerm
+
+WezTerm reports `Shift+Enter` without setup. To use the Kitty keyboard protocol, set `enable_kitty_keyboard` in `~/.wezterm.lua`:
+
+```lua
+local wezterm = require 'wezterm'
+local config = wezterm.config_builder()
+config.enable_kitty_keyboard = true
+return config
+```
+
+On macOS, WezTerm uses `Option+Enter` for its own fullscreen toggle. To send it to PiG as `Alt+Enter`, add this entry to `config.keys`:
+
+```lua
+config.keys = {
+  {
+    key = 'Enter',
+    mods = 'ALT',
+    action = wezterm.action.SendString('\x1b[13;3u'),
+  },
+}
+```
+
+### Alacritty
+
+Alacritty reports `Shift+Enter`. On macOS, `Option+Enter` can arrive as a plain `Enter`. Add this binding to `~/.config/alacritty/alacritty.toml` and restart Alacritty:
+
+```toml
+[[keyboard.bindings]]
+key = "Enter"
+mods = "Alt"
+chars = "\u001b[13;3u"
+```
+
+### VS Code
+
+If `Shift+Enter` submits in the integrated terminal, add this entry to VS Code's `keybindings.json`:
+
+```json
+{
+  "key": "shift+enter",
+  "command": "workbench.action.terminal.sendSequence",
+  "args": { "text": "\u001b[13;2u" },
+  "when": "terminalFocus"
+}
+```
+
+The file is in `~/Library/Application Support/Code/User/` on macOS, `~/.config/Code/User/` on Linux and `%APPDATA%\Code\User\` on Windows.
+
+### Zed
+
+Add these bindings to Zed's `keymap.json`. They send `Shift+Enter` (new line), `Ctrl+-` (undo) and `Ctrl+Alt+]` (jump backward to a character) to PiG:
+
+```json
+{
+  "context": "Terminal",
+  "bindings": {
+    "shift-enter": ["terminal::SendText", "\u001b[13;2u"],
+    "ctrl--": ["terminal::SendText", "\u001b[45;5u"],
+    "ctrl-alt-]": ["terminal::SendText", "\u001b[93;7u"]
+  }
+}
+```
+
+### Windows Terminal
+
+On Windows and in WSL, PiG uses Windows defaults for some keys. For example, `Ctrl+Q` queues a follow-up, because Windows Terminal uses `Alt+Enter` for fullscreen. See [keybindings](/docs/latest/keybindings).
+
+To send `Shift+Enter`, open Windows Terminal's `settings.json` (**Settings > Open JSON file**) and add this object to the `actions` array:
+
+```json
+{
+  "command": { "action": "sendInput", "input": "\u001b[13;2u" },
+  "keys": "shift+enter"
+}
+```
+
+Close every Windows Terminal window and start it again.
+
+To queue follow-ups with `Alt+Enter` instead, make Windows Terminal send the key the same way with `\u001b[13;3u`, then bind `app.message.followUp` to `alt+enter` in `~/.pig/agent/keybindings.json`.
+
+### xfce4-terminal and Terminator
+
+These terminals cannot report modified `Enter` keys. `Shift+Enter` and `Ctrl+Enter` bindings do not work there. Use `Ctrl+J` for a new line, or use a terminal with extended key support such as Kitty, Ghostty, WezTerm, iTerm2 or Windows Terminal.
+
+### IntelliJ IDEA
+
+The IntelliJ terminal cannot tell `Shift+Enter` from `Enter`. Use `Ctrl+J` for a new line, or run PiG in another terminal.
+
+### herdr
+
+PiG reports its state to [herdr](https://herdr.dev) as its own agent, through herdr's [third-party agent path](https://herdr.dev/docs/add-herdr-support/). Pigpen's herdr extension reports with `pane.report_agent` under the source `pig` and the agent `pig`. It includes the session's path and id, so herdr can resume a PiG session, and it releases the pane when PiG quits. Install it from Pigpen, or use the `herdr` or `pig-with-batteries` Piglet.
+
+herdr's built-in Pi integration (`herdr integration install pi`) is a different thing. It also runs in PiG, and herdr acknowledges every report it sends, but herdr keeps those reports only for a pane whose foreground process is named `pi`. PiG's executable is named `pig`, so herdr discards them and lists no agent.
+
+Until Pigpen's herdr extension is published, either of these makes the Pi integration work with PiG, with the integration file unchanged:
+
+```bash
+HERDR_AGENT=pi pig
+```
+
+or run PiG under the name `pi`:
+
+```bash
+ln -s "$(command -v pig)" ~/.local/bin/pi
+pi
+```
+
+`HERDR_AGENT` is herdr's documented hint for wrappers. herdr reads it from the environment of the process you launch, on Linux and macOS, so set it on the command and not inside a running session. Do not export it for the whole shell, because herdr then treats every process in the pane as `pi`.
+
+### IME candidate window
+
+PiG draws its own cursor. Some input methods, for example CJK input in the IntelliJ terminal or in WezTerm under WSL, then place their candidate window in the wrong position. Show the terminal's cursor so the input method can follow it:
+
+```bash
+PI_HARDWARE_CURSOR=1 pig
+```
+
+The `showHardwareCursor` setting does the same. With either one, PiG shows only the terminal's cursor and does not also draw its own reverse-video cursor, as in Pi 1.6.0. Pi 1.1.0 drew both.
+
+## Images
+
+PiG shows images when the terminal accepts the Kitty graphics protocol or the iTerm2 protocol. In every other terminal PiG writes the file path instead, so no information is lost.
+
+Images are off inside `tmux` and `screen`. To see images, run PiG outside the multiplexer, or set `PI_IMAGE_PROTOCOL` when you know the multiplexer forwards them.
+
+In herdr (`TERM_PROGRAM=herdr`), PiG shows images with the Kitty graphics protocol, as Pi 1.6.0 does. Pi 1.1.0 showed no images there. When a pane sets `HERDR_ENV=1`, PiG shows images only if herdr also sets `HERDR_KITTY_GRAPHICS=1` (D44).
+
+## Capability overrides
+
+Set `PI_HYPERLINKS`, `PI_IMAGE_PROTOCOL`, or `PI_TRUE_COLOR` to override capability detection. The matching `terminal.hyperlinks`, `terminal.images`, and `terminal.trueColor` settings take precedence over environment variables. See [settings](/docs/latest/settings).
+
+Use `terminal.showImages` or `/settings` to hide images without changing protocol detection.
+
+## Closing an interactive session
+
+On Unix, `SIGTERM` and `SIGHUP` request shutdown even when `/scoped-models`, `/settings`, or another selector has focus. PiG runs extension shutdown handlers before restoring the terminal. No additional keypress is needed to dismiss a selector during shutdown.
+
+## Display problems
+
+| Symptom | Cause | What to do |
+|---|---|---|
+| PiG exits with `Rendered line N exceeds terminal width` | a component wrote a row wider than the terminal | fix the component to truncate its rows to the render width; the crash log lists every rendered row with its width |
+| colors look wrong | the terminal reports no true color | set `COLORTERM=truecolor` if the terminal supports it |
+| a stray `[?62;22c` appears | the terminal answered a capability query late | PiG consumes this answer; report it with the terminal name |
+| in fullscreen mode, rows show text that belongs elsewhere after the transcript scrolls | the terminal does not move rows inside a scroll region correctly | set `PIG_TUI_SCROLL_ROWS=0`, and report it with the terminal name |
+
+In fullscreen mode, when the transcript grows or scrolls, PiG moves the rows that only moved with a scroll region and draws only the rows that changed. Pi draws every row that changed (D205). The screen is the same, and PiG writes a fraction of the bytes to the terminal, which matters most through tmux or ssh. PiG does this only when `TERM` names a terminal with scroll regions and PiG is not inside Zellij; with `TERM` unset, `dumb`, `unknown` or `vt52` it draws every changed row, as Pi does. Set `PIG_TUI_SCROLL_ROWS=0` to draw every changed row, as Pi does.
+
+In fullscreen mode PiG can send the terminal only what a frame changes on the screen, through its screen writer (D624); Pi sends every row a frame writes. The screen writer is opt-in in 0.8.0: set `"terminal": {"screenWriter": "writer"}` in the global settings file, or `PIG_TUI_SCREEN_WRITER=writer`; with neither, the terminal is sent the bytes Pi sends. With the writer on, a row that already shows what the frame writes is not written. A row whose text changes is written from its first cell through its last changed cell where that leaves the terminal the line Pi's bytes leave it, and whole otherwise. A frame that changes nothing is not written, and the rows the frames rewrote are written whole once 250 ms pass without a frame. On the recorded streams the writer sends 89 % of the bytes of a long streamed answer and 20 % of those of a file write, which matters most through tmux or ssh. A program that reads PiG's raw output (`script`, `tmux pipe-pane`, a CI log) reads other bytes than Pi's for the same frames. The setting is read when PiG starts; `PIG_TUI_SCREEN_WRITER=pi` sends the terminal the bytes Pi sends whatever the setting says. Regular mode is sent the bytes as they are written. `PIG_TUI_SCREEN_WRITER_LOG=path` records every write as it came and as it was sent, for bug reports. The file holds the screen's bytes, typed text included.
+
+While a reply streams in fullscreen mode, PiG can begin the next frame sooner than Pi does (D625). It is off: by default PiG begins a frame no sooner than 16 ms after the one before it began, as Pi does. Set `"terminal": {"framePacing": "adaptive"}` in the global settings file, or `PIG_FRAME_PACING=adaptive` for one run, to turn it on; both are read when PiG starts. It takes effect only with the screen writer selected as well (above), which is opt-in too. Without the screen writer, interactive mode shows this warning once at start, and PiG begins frames 16 ms apart, as Pi does: `Warning: Adaptive frame pacing (terminal.framePacing, PIG_FRAME_PACING) has no effect without the screen writer (terminal.screenWriter "writer"): frames keep Pi's 16 ms interval.` With both on, PiG waits four times what the last frame took to draw and write, at least 10 ms and at most 16 ms: a fast stream is drawn up to 100 times a second instead of 62, and a frame that took 4 ms or more is followed by Pi's interval. A frame shows what Pi's frame would show at that moment; a key press and the last frame of a reply are never held back. Measured on the benchmark host with the screen writer on and the terminal declared as Alacritty (medians of 10 runs, adaptive against Pi's interval): on a long streamed answer the median time between two visible changes is 9.7 ms against 15.6 ms and the 99th percentile 11.9 ms against 17.1 ms; while a file of 50 KB or 200 KB is written the median is 13.4 ms against 15.6 ms and the 95th percentile 15.7 ms against 16.0 ms, the 99th percentile is 18.9 ms against 16.5 to 17.9 ms for 50 KB and 16.8 ms against 16.3 ms for 200 KB, the longest pause differs by no more than two runs at Pi's interval differ, and PiG uses 4 to 7 % more CPU time, most of it for drawing 15 % more frames. A frame that would change nothing on the screen is not sent, and PiG looks again up to three times in the next 6 ms before it returns to Pi's interval, so a reply that streams where the screen does not show it is drawn as often as Pi draws it; an update that cannot change a collapsed file-write card asks for no frame at all. With it on, PiG does this only when all of these hold, and otherwise begins frames 16 ms apart, as Pi does: the screen writer is on (above); a reply is streaming and no compaction is running; no extension has a dialog, overlay, header, footer, editor or widget on the screen, and the transcript holds no tool card, message or entry that an extension draws; PiG is not inside tmux, GNU screen, Zellij or herdr; and the environment names one of these terminals, whose releases show a frame at once at its end (synchronized updates, mode 2026):
+
+| Terminal | Named by | Frames begin sooner |
+|---|---|---|
+| kitty | `KITTY_WINDOW_ID`, or `TERM_PROGRAM=kitty` | always (mode 2026 since kitty 0.22.0; kitty states no version) |
+| Ghostty | `TERM` containing `ghostty`, `GHOSTTY_RESOURCES_DIR`, or `TERM_PROGRAM=ghostty` | unless `TERM_PROGRAM_VERSION` is below `1.0.0` |
+| WezTerm | `WEZTERM_PANE`, or `TERM_PROGRAM=WezTerm` | unless `TERM_PROGRAM_VERSION` is below `20210814` |
+| Warp | `WARP_SESSION_ID`, `WARP_TERMINAL_SESSION_UUID`, or `TERM_PROGRAM=WarpTerminal` | unless `TERM_PROGRAM_VERSION` is below `v0.2025.01.15.08.02` |
+| iTerm2 | `ITERM_SESSION_ID`, or `TERM_PROGRAM=iTerm.app` | unless `TERM_PROGRAM_VERSION` is below `3.5.0` |
+| Alacritty | `TERM` starting with `alacritty`, `ALACRITTY_WINDOW_ID`, or `TERM_PROGRAM=alacritty` | always (mode 2026 since Alacritty 0.13.0; Alacritty states no version) |
+| VS Code terminal | `TERM_PROGRAM=vscode` | only when `TERM_PROGRAM_VERSION` is `1.108` or later |
+
+When `TERM_PROGRAM` is set, it alone names the terminal: a name that is not in the table, such as `Apple_Terminal`, gets Pi's interval whatever else the environment holds, and a `TERM_PROGRAM_VERSION` that is missing or does not begin with a number counts as no version. Every other terminal gets Pi's interval. Windows Terminal is among them: nothing in its environment tells a release that has mode 2026 from one that does not. A kitty or Alacritty older than the release named gets the same frames up to 100 times a second and, having no synchronized updates, shows their cells as they arrive, as it does with the frames Pi writes. `PIG_FRAME_PACING=pi` returns one run to Pi's interval when the setting is `"adaptive"`.
+
+When a terminal sends a device-attributes reply in several slow reads, PiG waits for the reply's final byte and does not pass the fragments to the editor. Pi 1.6.0 can type the rest of the reply, such as `24;28;32;42c`, into the editor (D143, [Pi #10657](https://github.com/earendil-works/pi/issues/10657)). A typed `ESC[?` then waits for the next key instead of 150 ms.
+
+Set `PIG_RENDER_DEBUG` to any value to write render diagnostics. Use it when you report a display problem. Set `PI_TUI_WRITE_LOG` to a file or directory to record the bytes PiG writes to the terminal, as in Pi.
+
+As in Pi, a row wider than the terminal is fatal only when it reaches a differential render. PiG then writes `pi-tui-crash.log` to the agent directory (the system temp directory when there is none) with the terminal width, the offending row and its width, and every rendered row, restores the terminal, prints the error with the log path, and exits with status 1. The first render, a forced full render, and the full render after a resize emit an over-wide row unchanged.
+
+## Program status
+
+PiG reports its state with the [Program Status Protocol (OSC 7501)](https://www.superlogical.com/rex/docs/build/program-status), so terminals and agent dashboards can show whether it is working, waiting for you, done, or failed:
+
+| State | When |
+|---|---|
+| `working` | An agent run or compaction is in progress. The message is the session name. |
+| `blocked` | An extension dialog or login waits for you. The message is the dialog title. |
+| `done` | A run finished. The message is the session name. |
+| `error` | A run ended with an error that is not retried. The message is the first line of the error. |
+| `idle` | PiG started, or you cancelled the run. |
+
+Reports never contain prompts or model output. The `app` value is `pig`, where Pi sends `pi`, because PiG uses its own command identity (D2). PiG sends reports only after the terminal answers the protocol's support query; tmux and screen do not forward them. Set `PI_PROGRAM_STATUS=1` to send reports without asking, or `PI_PROGRAM_STATUS=0` to turn them off. A Piglet frontend member receives the same states instead of the terminal (D91).
+
+## Related
+
+- [Keybindings](/docs/latest/keybindings) lists the actions and their default keys.
+- [Settings](/docs/latest/settings) lists the files and settings PiG reads.

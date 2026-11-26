@@ -1,0 +1,1940 @@
+package mcpext
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf16"
+
+	"github.com/MichaelKinsy/PiG/internal/handleryield"
+	"github.com/MichaelKinsy/PiG/internal/jsloop"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/nodepath"
+	"github.com/MichaelKinsy/PiG/mcp"
+	"github.com/MichaelKinsy/PiG/mcp/oauth"
+)
+
+// Ports packages/coding-agent/src/extensions/mcp/index.ts.
+//
+// Built-in MCP integration.
+//
+// Connects the servers from `mcp.json` and the servers extensions register with
+// `pi.registerMcpServer()` when a session starts, and servers registered later
+// right away. A server in `mcp.json` takes precedence over a registered server
+// of the same name. Connections run in the background: the first prompt waits
+// only for servers with `direct` tools, and codemode scripts, `tool_search`,
+// and the resource tools wait for the servers they need when they run. Tools
+// are registered as `mcp__<server>__<tool>`. By default
+// (`"exposure": "codemode"`) the tools are only callable from codemode scripts,
+// which keeps MCP tools out of the model's tool declarations and the codemode
+// description: scripts find the tools with `searchTools()` and the server
+// instructions with `describeNamespace()`. The codemode tool is activated for
+// that unless `autoEnableCodemode` is false. `"deferred"` declares the tools to
+// the model once the `tool_search` tool loads them, and activates `tool_search`
+// instead of codemode. `"exposure": "direct"`
+// declares them to the model right away, and `"hidden"` makes them unreachable.
+// `toolExposure` overrides the exposure of single tools. Servers with resources
+// are reached through Codex's `list_mcp_resources`,
+// `list_mcp_resource_templates`, and `read_mcp_resource` tools (resources.go).
+//
+// Every call runs through pi's tool pipeline, so `tool_call`/`tool_result`
+// hooks and permission extensions apply to MCP tools the same way they do to
+// built-in tools.
+//
+// Problems found at startup (config errors, failed connections, servers that
+// need a sign-in) are reported once. Upstream's `/mcp` command opens a manager
+// to sign in, reconnect, enable or disable servers, and change their exposure;
+// the last two are saved to the `mcp.json` that defines the server, or apply to
+// the current session for registered servers. [Extension.RunCommand] is that
+// command and [Extension.Manage] its manager, shown in a view the [McpUi] implements (package mcptui).
+
+// Host is the part of the extension API the MCP extension uses. The runner
+// implements it; a Piglet that leaves the extension out never needs it.
+type Host interface {
+	// RegisterTool registers a tool, replacing an earlier registration of the
+	// name. Tools with `direct` exposure are activated on registration.
+	RegisterTool(definition extension.ToolDefinition)
+	// RegisterTools registers tools as one change: the Session's tools change once, to include all of them, as after the
+	// synchronous run of registerTool calls in Pi's registerTools (extensions/mcp/index.ts:387-463).
+	RegisterTools(definitions []extension.ToolDefinition)
+	// GetAllTools returns every registered tool.
+	GetAllTools() []extension.ToolInfo
+	GetActiveTools() []string
+	SetActiveTools(names []string)
+	// GetMcpServers returns the servers extensions registered.
+	GetMcpServers() []extension.RegisteredMcpServer
+}
+
+// EventContext is the extension context an event handler receives.
+type EventContext struct {
+	// Context is the handler's context, which carries the extension context (extension.FromContext). A zero EventContext has none.
+	Context context.Context
+	// Cwd is the working directory of the session, for stdio servers.
+	Cwd string
+	// ProviderToken is the current token of a pi provider of the session's model registry, for servers with
+	// `auth.provider`. It returns "" when the provider has none.
+	ProviderToken func(ctx context.Context, provider string) string
+	// IsProjectTrusted reports whether project configuration may be read.
+	IsProjectTrusted func() bool
+	// Notify shows a message to the user. Level is "info", "warning", or "error".
+	Notify func(message, level string)
+}
+
+// yield reports that the handler stops running synchronously, as Pi's handler reaches an await (handleryield), and returns the channel
+// that closes when the handler's context ends: nil for an EventContext without one.
+func (c EventContext) yield() <-chan struct{} {
+	if c.Context == nil {
+		return nil
+	}
+	handleryield.Report(c.Context)
+	return c.Context.Done()
+}
+
+// notify shows a message. A panic in Notify propagates, as a throw from ctx.ui.notify does in upstream.
+func (c EventContext) notify(message, level string) {
+	if c.Notify == nil {
+		return
+	}
+	c.Notify(message, level)
+}
+
+// notifyLoadFailure shows the "MCP failed to load" message of the loading chain, whose upstream catch ignores a throwing notify.
+func (c EventContext) notifyLoadFailure(message string) {
+	// upstream: packages/coding-agent/src/extensions/mcp/index.ts:"MCP failed to load" (try/catch around ctx.ui.notify)
+	defer func() { _ = recover() }() // The session may have been disposed meanwhile, which makes ctx stale.
+	c.notify(message, "error")
+}
+
+// Options configure the extension.
+type Options struct {
+	// LoadConfig defaults to reading `mcp.json` from the agent directory and the trusted project. Its context carries the extension context (extension.FromContext), as a handler's does.
+	LoadConfig func(ctx context.Context) LoadedMcpConfig
+	// CreateTransport defaults to stdio and streamable HTTP transports built from the server config.
+	CreateTransport TransportFactory
+	// Credentials defaults to `mcp-auth.json` in the agent directory.
+	Credentials *McpOAuthCredentialStore
+	// LogPath is the file server log messages are appended to. Defaults to `mcp.log` in the agent directory.
+	LogPath string
+	// OpenURL opens the OAuth authorization URL. Defaults to doing nothing; the host supplies the platform browser.
+	OpenURL func(url string)
+	// CopyToClipboard copies the OAuth authorization URL when `app.message.copy` is pressed on the sign-in screen.
+	// Defaults to nil, which ignores the key; the host supplies the system clipboard.
+	CopyToClipboard func(text string) error
+	// UpdateConfig saves `/mcp` changes to the server's config file: its project Override when set, else its
+	// Source. Defaults to editing that `mcp.json`.
+	UpdateConfig func(entry McpServerEntry, patch McpServerConfigPatch) error
+	// StartupWaitMs is how many milliseconds the first prompt waits for servers that are still connecting at startup. Their tools
+	// become available when they connect. Nil waits 10000 ms; 0 does not wait for a server that is not yet ready
+	// (index.ts:90, 294 `options.startupWaitMs ?? DEFAULT_STARTUP_WAIT_MS`).
+	StartupWaitMs *int
+	// RefuseConfigFiles, when set, is the refusal message of a host that does not accept `mcp.json`.
+	RefuseConfigFiles string
+	// AgentDir and ConfigDirName locate the configuration and the credentials.
+	AgentDir      string
+	ConfigDirName string
+	// ClientName and ClientVersion identify this client to servers.
+	ClientName    string
+	ClientVersion string
+	// Terminal adds the terminal presentation (tool renderers, the `/mcp` manager view). Nil is headless.
+	Terminal *Terminal
+}
+
+const (
+	// defaultStartupWaitMs is the startup wait of an Options without StartupWaitMs.
+	// upstream: packages/coding-agent/src/extensions/mcp/index.ts:DEFAULT_STARTUP_WAIT_MS
+	defaultStartupWaitMs = 10_000
+	// CodemodeToolName and ToolSearchToolName are the tools that reach MCP tools that are not declared.
+	CodemodeToolName   = "codemode"
+	ToolSearchToolName = "tool_search"
+)
+
+// server is a configured server. Disabled servers have no connection.
+type server struct {
+	entry McpServerEntry
+	// connection is read by the UI goroutine (describeState, lists) while a background start stores it, so it is atomic.
+	connection atomic.Pointer[Connection]
+	// registeredConfig is, for servers extensions registered, the config as
+	// registered, to detect re-registrations.
+	registeredConfig string
+	// message is the result of the last `/mcp` action that failed, shown in the manager.
+	message string
+	// attempt identifies the current connection attempt; disabling or replacing it invalidates earlier work.
+	attempt *attemptToken
+	// ready is closed when the connection started for the server connected or failed.
+	ready chan struct{}
+	// closing is closed when the cleanup of a detached connection finished; a replacement waits for it before
+	// opening a transport.
+	closing chan struct{}
+}
+
+// attemptToken is the identity of one connection attempt (a JavaScript `Symbol()`).
+type attemptToken struct{ _ byte }
+
+func (s *server) enabled() bool { return s.entry.Config.Enabled == nil || *s.entry.Config.Enabled }
+
+func exposureOf(entry McpServerEntry) extension.McpExposure {
+	if entry.Config.Exposure != "" {
+		return entry.Config.Exposure
+	}
+	return extension.McpExposureCodemode
+}
+
+// configuredExposures are the exposures the server's tools can have, known from its config before it connects.
+func configuredExposures(entry McpServerEntry) map[extension.McpExposure]bool {
+	exposures := map[extension.McpExposure]bool{exposureOf(entry): true}
+	for _, pattern := range entry.Config.ToolExposure.Keys() {
+		exposure, _ := entry.Config.ToolExposure.Get(pattern)
+		exposures[exposure] = true
+	}
+	return exposures
+}
+
+// hasDirectTools reports whether some of the server's tools are declared to the model, so the first prompt waits for them.
+func hasDirectTools(entry McpServerEntry) bool {
+	return configuredExposures(entry)[extension.McpExposureDirect]
+}
+
+// hasIndirectTools reports whether some of the server's tools are reached through codemode or tool_search.
+func hasIndirectTools(entry McpServerEntry) bool {
+	exposures := configuredExposures(entry)
+	return exposures[extension.McpExposureCodemode] || exposures[extension.McpExposureDeferred]
+}
+
+func firstLine(text string) string {
+	line, _, _ := strings.Cut(text, "\n")
+	return line
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, word)
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
+
+// McpServersSection is the name of the system prompt section that lists the servers whose tools are not declared.
+//
+// Ports packages/coding-agent/src/extensions/mcp/index.ts (MCP_SERVERS_SECTION).
+const McpServersSection = "mcp_servers"
+
+// MaxServersSectionChars is the size of the whole `mcp_servers` section in UTF-16 code units. Descriptions shrink to
+// fit; when the server lines alone do not fit, the last servers are left out and counted in a closing line.
+//
+// Ports packages/coding-agent/src/extensions/mcp/index.ts (MAX_SERVERS_SECTION_CHARS).
+const MaxServersSectionChars = 4096
+
+// McpServerListing is what the `mcp_servers` section needs of a server.
+type McpServerListing struct {
+	Entry McpServerEntry
+	// Instructions are the server instructions of a connected server.
+	Instructions string
+}
+
+// maxServerDescriptionChars is the size of a server description in the section, as Codex allows for deferred namespaces.
+// upstream: packages/coding-agent/src/extensions/mcp/index.ts:MAX_SERVER_DESCRIPTION_CHARS
+const maxServerDescriptionChars = 250
+
+// serversSectionIntro is the first line of the `mcp_servers` section. It explains only the ways of reaching tools that
+// the listed servers use.
+// upstream: packages/coding-agent/src/extensions/mcp/index.ts:serversSectionIntro
+func serversSectionIntro(reaches map[string]bool) string {
+	intro := "MCP servers whose tools are not declared to you."
+	if reaches["codemode"] {
+		intro += " Call the tools of `codemode` servers from codemode scripts."
+	}
+	if reaches["tool_search"] {
+		intro += " Load the tools of `tool_search` servers with `tool_search`."
+	}
+	return intro
+}
+
+// jsLength is JavaScript's string length: UTF-16 code units.
+func jsLength(text string) int {
+	n := 0
+	for _, r := range text {
+		n += utf16.RuneLen(r)
+	}
+	return n
+}
+
+// truncateChars is `truncate` of index.ts: text of at most max UTF-16 code units, else its start cut to max-1 units, without trailing white space, and an ellipsis.
+func truncateChars(text string, max int) string {
+	if jsLength(text) <= max {
+		return text
+	}
+	if max <= 1 {
+		return ""
+	}
+	return strings.TrimRightFunc(jsstring.SliceHead(text, max-1), isJSWhitespace) + "…"
+}
+
+// RenderServersSection is the `mcp_servers` section: every enabled server with codemode or deferred tools, with how its
+// tools are reached and a one-line summary. The model learns of the servers from it, since neither codemode nor
+// tool_search lists them. It reports false when there are no such servers.
+//
+// Ports packages/coding-agent/src/extensions/mcp/index.ts (renderServersSection).
+func RenderServersSection(servers []McpServerListing) (string, bool) {
+	var listed []McpServerListing
+	for _, server := range servers {
+		if server.Entry.Config.Enabled == nil || *server.Entry.Config.Enabled {
+			if hasIndirectTools(server.Entry) {
+				listed = append(listed, server)
+			}
+		}
+	}
+	if len(listed) == 0 {
+		return "", false
+	}
+	sortx.Stable(listed, func(a, b McpServerListing) int { return localecompare.Compare(a.Entry.Name, b.Entry.Name) })
+	heads := make([]string, len(listed))
+	reaches := map[string]bool{}
+	for i, server := range listed {
+		reach := "tool_search"
+		if configuredExposures(server.Entry)[extension.McpExposureCodemode] {
+			reach = "codemode"
+		}
+		reaches[reach] = true
+		heads[i] = fmt.Sprintf("- %s (%s)", mcp.McpNamespace(server.Entry.Name), reach)
+	}
+	intro := serversSectionIntro(reaches)
+	omitted := func(count int) []string {
+		if count <= 0 {
+			return nil
+		}
+		return []string{fmt.Sprintf("- … %d more server%s; find their tools with searchTools()", count, pluralSuffix(count))}
+	}
+	// Characters of the intro, the first `kept` server lines without descriptions, and the omission line.
+	size := func(kept int) int {
+		return jsLength(strings.Join(slices.Concat([]string{intro}, heads[:kept], omitted(len(listed)-kept)), "\n"))
+	}
+	kept := len(listed)
+	for kept > 0 && size(kept) > MaxServersSectionChars {
+		kept--
+	}
+	// Each description also takes a ": " separator.
+	perServer := 0
+	if kept > 0 {
+		perServer = min(maxServerDescriptionChars, (MaxServersSectionChars-size(kept))/kept-2)
+	}
+	lines := make([]string, kept)
+	for i, server := range listed[:kept] {
+		summary := ""
+		if perServer > 0 {
+			summary = truncateChars(mcp.McpServerSummary(server.Entry.Config.Description, server.Instructions), perServer)
+		}
+		lines[i] = heads[i]
+		if summary != "" {
+			lines[i] += ": " + summary
+		}
+	}
+	return strings.Join(slices.Concat([]string{intro}, lines, omitted(len(listed)-kept)), "\n"), true
+}
+
+func pluralSuffix(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// Extension is the MCP integration of one session. Its event methods are what
+// upstream registers with `pi.on(...)`. It is safe for concurrent use.
+type Extension struct {
+	host    Host
+	options Options
+
+	mu                sync.Mutex
+	servers           []*server
+	configuredEntries []McpServerEntry
+	configErrors      []string
+	// projectConfig is the trusted project's `mcp.json`, where `/mcp` saves project overrides of global servers.
+	projectConfig      string
+	overridden         []string
+	autoEnableCodemode bool
+	warnedUnreachable  bool
+	pending            chan struct{}
+	waitedForStartup   bool
+	// session is the lifetime of the current session: it ends on session_shutdown, and before the first
+	// session_start (registrations before that are read on session_start). Work captures it when it starts and
+	// drops late results once it ended. Work that outlives the command that started it also stops with it and is
+	// registered in background, so shutdown can wait for its cleanup.
+	session    context.Context
+	endSession context.CancelFunc
+	sessionCwd string
+	// providerToken resolves the tokens of `auth.provider` servers from the session's model registry.
+	providerToken func(ctx context.Context, provider string) string
+	credentials   *McpOAuthCredentialStore
+	serverLog     *McpServerLog
+	listeners     map[int]func()
+	nextListener  int
+	// tokensAtSignIn holds the stored tokens of servers waiting for a sign-in,
+	// as they were when the sign-in was needed. `pi mcp login` in another
+	// process (for example run by the agent) changes them.
+	tokensAtSignIn map[*Connection]string
+	// background is the work registered with [Extension.track]: connections opening or closing, manager
+	// actions, and sign-ins.
+	background backgroundTasks
+
+	toolMu sync.Mutex
+	// toolOwners maps a tool name to the `<server>\0<tool>` it was assigned to, so names stay unique and stable.
+	toolOwners map[string]string
+	// serverTools are the tool names currently offered by each server.
+	serverTools map[string]*toolSet
+	// lanes keep the calls to each server in call order (see jsloop.Lane).
+	lanes map[string]*jsloop.Lane
+	// definitions is the last definition registered under each tool name, to re-register withdrawn tools as hidden.
+	definitions map[string]extension.ToolDefinition
+	// resourceToolsExposure is the exposure the resource tools were last registered with.
+	resourceToolsExposure   extension.McpExposure
+	resourceToolsRegistered bool
+}
+
+// New returns the extension for host.
+func New(host Host, options Options) *Extension {
+	session, endSession := context.WithCancel(context.Background())
+	endSession()
+	return &Extension{
+		session:            session,
+		endSession:         endSession,
+		host:               host,
+		options:            options,
+		autoEnableCodemode: true,
+		credentials:        options.Credentials,
+		listeners:          map[int]func(){},
+		tokensAtSignIn:     map[*Connection]string{},
+		toolOwners:         map[string]string{},
+		serverTools:        map[string]*toolSet{},
+		lanes:              map[string]*jsloop.Lane{},
+		definitions:        map[string]extension.ToolDefinition{},
+	}
+}
+
+// Subscribe registers a function called whenever the servers or their state
+// change. The returned function removes it.
+func (e *Extension) Subscribe(listener func()) (unsubscribe func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.nextListener++
+	id := e.nextListener
+	e.listeners[id] = listener
+	return func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		delete(e.listeners, id)
+	}
+}
+
+func (e *Extension) emitChange() {
+	e.mu.Lock()
+	ids := make([]int, 0, len(e.listeners))
+	for id := range e.listeners {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	listeners := make([]func(), len(ids))
+	for i, id := range ids {
+		listeners[i] = e.listeners[id]
+	}
+	e.mu.Unlock()
+	for _, listener := range listeners {
+		listener()
+	}
+}
+
+func (e *Extension) findServerLocked(name string) *server {
+	for _, s := range e.servers {
+		if s.entry.Name == name {
+			return s
+		}
+	}
+	return nil
+}
+
+func (e *Extension) findServer(name string) *server {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.findServerLocked(name)
+}
+
+// registeredServers are the servers extensions registered, except names
+// `mcp.json` defines, which take precedence.
+func (e *Extension) registeredServers() (registered []*server, overriddenNames []string) {
+	e.mu.Lock()
+	configured := slices.Clone(e.configuredEntries)
+	e.mu.Unlock()
+	for _, reg := range e.host.GetMcpServers() {
+		if i := slices.IndexFunc(configured, func(entry McpServerEntry) bool {
+			return mcp.McpNamespace(entry.Name) == mcp.McpNamespace(reg.Name)
+		}); i >= 0 {
+			overriddenNames = append(overriddenNames, fmt.Sprintf(`"%s" registered by %s is overridden by "%s" in %s`, reg.Name, reg.ExtensionPath, configured[i].Name, configured[i].Source))
+			continue
+		}
+		config, _ := json.Marshal(reg.Config)
+		registered = append(registered, &server{
+			entry:            McpServerEntry{Name: reg.Name, Config: reg.Config, Source: reg.ExtensionPath, Scope: "extension"},
+			registeredConfig: string(config),
+		})
+	}
+	return registered, overriddenNames
+}
+
+func (e *Extension) getCredentials() *McpOAuthCredentialStore {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.credentials == nil {
+		e.credentials = NewMcpOAuthCredentialStore(e.options.AgentDir)
+	}
+	return e.credentials
+}
+
+func (e *Extension) getServerLog() *McpServerLog {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.serverLog == nil {
+		path := e.options.LogPath
+		if path == "" {
+			path = filepath.Join(e.options.AgentDir, "mcp.log")
+		}
+		e.serverLog = NewMcpServerLog(path)
+	}
+	return e.serverLog
+}
+
+// ---------------------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------------------
+
+func (e *Extension) currentEntry(connection *Connection) McpServerEntry {
+	if s := e.findServer(connection.Entry.Name); s != nil {
+		return s.entry
+	}
+	return connection.Entry
+}
+
+// toolSet is a JavaScript Set of tool names: it iterates in insertion order. A nil set is empty.
+type toolSet struct {
+	order []string
+	in    map[string]bool
+}
+
+func newToolSet() *toolSet { return &toolSet{in: map[string]bool{}} }
+
+func (s *toolSet) add(name string) {
+	if !s.in[name] {
+		s.in[name] = true
+		s.order = append(s.order, name)
+	}
+}
+
+func (s *toolSet) has(name string) bool { return s != nil && s.in[name] }
+
+func (s *toolSet) names() []string {
+	if s == nil {
+		return nil
+	}
+	return slices.Clone(s.order)
+}
+
+// registerTools registers the tools a connection offers. It is the connection's
+// OnTools callback.
+func (e *Extension) registerTools(connection *Connection) {
+	name := connection.Entry.Name
+	entry := e.currentEntry(connection)
+	namespace := extension.ToolNamespace{
+		Name: mcp.McpNamespace(name),
+		// `describeNamespace("docs")` finds `mcp__docs` (Pi 1.2.0 extensions/mcp/index.ts:392-394, 24382bed).
+		Aliases:      []string{name},
+		Description:  strings.TrimFunc(entry.Config.Description, isJSWhitespace),
+		Instructions: connection.Instructions(),
+	}
+
+	e.toolMu.Lock()
+	previous := e.serverTools[name]
+	current := newToolSet()
+	// Like Codex, all tools whose names sanitize to the same name get the hash suffix, so which one would keep the plain
+	// name does not depend on the order of the list.
+	plainCount := map[string]int{}
+	seen := map[string]bool{}
+	for _, tool := range connection.Tools() {
+		if !seen[tool.Name] {
+			seen[tool.Name] = true
+			plainCount[mcp.CreateMcpToolName(name, tool.Name, nil)]++
+		}
+	}
+	assignName := func(tool, owner string) string {
+		toolName := mcp.CreateMcpToolName(name, tool, func(candidate string) bool {
+			existing, taken := e.toolOwners[candidate]
+			return (taken && existing != owner) || current.has(candidate) ||
+				plainCount[candidate] > 1
+		})
+		e.toolOwners[toolName] = owner
+		current.add(toolName)
+		return toolName
+	}
+	var register []extension.ToolDefinition
+	for _, tool := range connection.Tools() {
+		definition := CreateMcpToolDefinition(McpToolOptions{
+			Server:    name,
+			Tool:      tool,
+			Name:      assignName(tool.Name, name+"\x00"+tool.Name),
+			Exposure:  extension.GetMcpToolExposure(entry.Config, tool.Name),
+			Namespace: namespace,
+			Timeout:   int(connection.Timeout().Milliseconds()),
+			GetClient: func(context.Context) (McpToolCaller, error) { return e.currentClient(name, tool.Name) },
+			Lane:      e.lane(name),
+			Renderers: e.renderers(),
+			ReadableResources: func() bool {
+				return slices.ContainsFunc(e.serversWithResources(), func(s *server) bool { return s.entry.Name == name })
+			},
+		})
+		e.definitions[definition.Name] = definition
+		register = append(register, definition)
+	}
+	e.serverTools[name] = current
+	// Tools cannot be unregistered, so tools the server dropped are re-registered as hidden. When
+	// the server offers them again they are registered with their configured exposure above.
+	for _, toolName := range previous.names() {
+		if definition, ok := e.definitions[toolName]; ok && !current.has(toolName) {
+			hidden := definition
+			hidden.Exposure = extension.ToolExposureHidden
+			register = append(register, hidden)
+		}
+	}
+	e.toolMu.Unlock()
+	e.registerWithResourceTools(register)
+}
+
+// registerWithResourceTools registers definitions and the resource tools' new registration, if they changed, as one change: Pi's
+// registerTools and its disable path run their registerTool calls and syncResourceTools() in one synchronous turn
+// (extensions/mcp/index.ts:441-463), so no prompt sees part of them.
+func (e *Extension) registerWithResourceTools(definitions []extension.ToolDefinition) {
+	resources, wasDirect, changed := e.resourceToolChange()
+	if changed {
+		definitions = append(definitions, resources...)
+	}
+	e.host.RegisterTools(definitions)
+	if changed && wasDirect {
+		e.deactivateResourceTools(resources)
+	}
+}
+
+// currentClient resolves the connection a prepared call uses when it executes. A call can outlive the definition's
+// connection while the readiness hook waits for a disable and re-enable, so the replacement is resolved at execution
+// time.
+// upstream: packages/coding-agent/src/extensions/mcp/index.ts:registerTools (getClient)
+func (e *Extension) currentClient(serverName, toolName string) (McpToolCaller, error) {
+	e.mu.Lock()
+	current := e.findServerLocked(serverName)
+	var client *Connection
+	var entry McpServerEntry
+	if current != nil && current.enabled() {
+		client, entry = current.connection.Load(), current.entry
+	}
+	e.mu.Unlock()
+	if current == nil || !current.enabled() {
+		return nil, fmt.Errorf(`MCP server "%s" is disabled.`, serverName)
+	}
+	if client == nil {
+		return nil, fmt.Errorf(`MCP server "%s" is still starting.`, serverName)
+	}
+	if extension.GetMcpToolExposure(entry.Config, toolName) == extension.McpExposureHidden ||
+		(client.State() == StateConnected && !slices.ContainsFunc(client.Tools(), func(offered mcp.Tool) bool { return offered.Name == toolName })) {
+		return nil, fmt.Errorf(`MCP tool "%s/%s" is no longer available.`, serverName, toolName)
+	}
+	return client, nil
+}
+
+// hideTools makes a disabled server's tools unreachable.
+func (e *Extension) hideTools(name string) {
+	e.toolMu.Lock()
+	var register []extension.ToolDefinition
+	for _, toolName := range e.serverTools[name].names() {
+		if definition, ok := e.definitions[toolName]; ok {
+			hidden := definition
+			hidden.Exposure = extension.ToolExposureHidden
+			register = append(register, hidden)
+		}
+	}
+	e.serverTools[name] = newToolSet()
+	e.toolMu.Unlock()
+	e.registerWithResourceTools(register)
+}
+
+// serversWithResources are the enabled servers with resources whose exposure
+// is not `hidden`, which the resource tools reach.
+func (e *Extension) serversWithResources() []*server {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []*server
+	for _, s := range e.servers {
+		if s.connection.Load() != nil && s.connection.Load().HasResources() && s.enabled() && exposureOf(s.entry) != extension.McpExposureHidden {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (e *Extension) resourceServers() []McpResourceServer {
+	var out []McpResourceServer
+	for _, s := range e.serversWithResources() {
+		out = append(out, s.connection.Load())
+	}
+	return out
+}
+
+// syncResourceTools registers the resource tools with the widest exposure of
+// the servers they reach: `direct` when one of them is direct, and so on. They
+// are hidden when no server has resources.
+func (e *Extension) syncResourceTools() {
+	e.registerWithResourceTools(nil)
+}
+
+// resourceToolChange records the resource tools' next exposure and returns their definitions for it, whether they were direct
+// before, and whether the registration changes at all.
+func (e *Extension) resourceToolChange() (definitions []extension.ToolDefinition, wasDirect, changed bool) {
+	exposures := map[extension.McpExposure]bool{}
+	for _, s := range e.serversWithResources() {
+		exposures[exposureOf(s.entry)] = true
+	}
+	next := extension.McpExposureHidden
+	for _, candidate := range []extension.McpExposure{extension.McpExposureDirect, extension.McpExposureCodemode, extension.McpExposureDeferred} {
+		if exposures[candidate] {
+			next = candidate
+			break
+		}
+	}
+	e.toolMu.Lock()
+	if e.resourceToolsRegistered && next == e.resourceToolsExposure {
+		e.toolMu.Unlock()
+		return nil, false, false
+	}
+	if !e.resourceToolsRegistered && next == extension.McpExposureHidden {
+		e.toolMu.Unlock()
+		return nil, false, false
+	}
+	wasDirect = e.resourceToolsRegistered && e.resourceToolsExposure == extension.McpExposureDirect
+	e.resourceToolsExposure, e.resourceToolsRegistered = next, true
+	e.toolMu.Unlock()
+	return CreateMcpResourceToolDefinitions(ResourceToolsOptions{Exposure: next, Servers: e.resourceServers}), wasDirect, true
+}
+
+// deactivateResourceTools removes the resource tools from the active tools when they stop being direct.
+func (e *Extension) deactivateResourceTools(definitions []extension.ToolDefinition) {
+	names := map[string]bool{}
+	for _, definition := range definitions {
+		names[definition.Name] = true
+	}
+	var active []string
+	for _, name := range e.host.GetActiveTools() {
+		if !names[name] {
+			active = append(active, name)
+		}
+	}
+	e.host.SetActiveTools(active)
+}
+
+// ensureDiscoveryActive: tools that are not declared to the model are reached
+// through the codemode tool (scripts call them) or the tool_search tool (it
+// declares them). Either reaches every such tool. It activates the one the
+// tools' exposure asks for: codemode for `codemode` unless
+// `autoEnableCodemode` is false, tool_search for `deferred`.
+func (e *Extension) ensureDiscoveryActive(ctx EventContext) {
+	// From the config, so the tool is active before the servers connect. Resource tools share
+	// their server's exposure.
+	exposures := map[extension.McpExposure]bool{}
+	e.mu.Lock()
+	servers := slices.Clone(e.servers)
+	autoEnable := e.autoEnableCodemode
+	e.mu.Unlock()
+	for _, s := range servers {
+		if s.enabled() {
+			for exposure := range configuredExposures(s.entry) {
+				exposures[exposure] = true
+			}
+		}
+	}
+	needsCodemode := exposures[extension.McpExposureCodemode]
+	needsToolSearch := exposures[extension.McpExposureDeferred]
+	if !needsCodemode && !needsToolSearch {
+		return
+	}
+	// Only a tool of these names that declares ReachesTools can reach MCP tools; another extension's tool of the
+	// same name without it is never activated.
+	all := e.host.GetAllTools()
+	hasReachingTool := func(name string) bool {
+		return slices.ContainsFunc(all, func(tool extension.ToolInfo) bool { return tool.Name == name && tool.ReachesTools != nil })
+	}
+	hasCodemode := hasReachingTool(CodemodeToolName)
+	hasToolSearch := hasReachingTool(ToolSearchToolName)
+	active := e.host.GetActiveTools()
+	var activate []string
+	if needsCodemode && hasCodemode && autoEnable && !slices.Contains(active, CodemodeToolName) {
+		activate = append(activate, CodemodeToolName)
+	}
+	if needsToolSearch && hasToolSearch && !slices.Contains(active, ToolSearchToolName) {
+		activate = append(activate, ToolSearchToolName)
+	}
+	if len(activate) > 0 {
+		e.host.SetActiveTools(append(slices.Clone(active), activate...))
+	}
+	reachable := append(slices.Clone(active), activate...)
+	if hasCodemode && slices.Contains(reachable, CodemodeToolName) {
+		return
+	}
+	if hasToolSearch && slices.Contains(reachable, ToolSearchToolName) {
+		return
+	}
+	e.mu.Lock()
+	warned := e.warnedUnreachable
+	e.warnedUnreachable = true
+	e.mu.Unlock()
+	if warned {
+		return
+	}
+	reason := ""
+	if needsCodemode && hasCodemode && !autoEnable {
+		reason = " (autoEnableCodemode is false)"
+	}
+	ctx.notify(fmt.Sprintf("MCP tools are only reachable from the codemode or tool_search tool, but neither is active%s; they cannot be called.", reason), "warning")
+}
+
+// ---------------------------------------------------------------------------------------
+// Connections
+// ---------------------------------------------------------------------------------------
+
+func (e *Extension) storedTokens(connection *Connection) string {
+	url := connection.OAuthURL()
+	if url == "" {
+		return "null"
+	}
+	e.mu.Lock()
+	credentials := e.credentials
+	e.mu.Unlock()
+	if credentials == nil {
+		return "null"
+	}
+	tokens := credentials.Tokens(connection.Name(), url)
+	if tokens == nil {
+		return "null"
+	}
+	data, _ := json.Marshal(tokens)
+	return string(data)
+}
+
+func (e *Extension) onConnectionChange(connection *Connection) {
+	state := connection.State()
+	e.mu.Lock()
+	_, tracked := e.tokensAtSignIn[connection]
+	e.mu.Unlock()
+	if state != StateNeedsAuth {
+		e.mu.Lock()
+		delete(e.tokensAtSignIn, connection)
+		e.mu.Unlock()
+	} else if !tracked {
+		tokens := e.storedTokens(connection)
+		e.mu.Lock()
+		e.tokensAtSignIn[connection] = tokens
+		e.mu.Unlock()
+	}
+	e.emitChange()
+}
+
+// reconnectSignedIn reconnects servers that need a sign-in when their
+// credentials were stored since.
+func (e *Extension) reconnectSignedIn(ctx EventContext) {
+	e.mu.Lock()
+	var signedIn []*Connection
+	for connection, tokens := range e.tokensAtSignIn {
+		if e.storedTokensLocked(connection) != tokens {
+			signedIn = append(signedIn, connection)
+		}
+	}
+	for _, connection := range signedIn {
+		delete(e.tokensAtSignIn, connection)
+	}
+	e.mu.Unlock()
+	if len(signedIn) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	for _, connection := range signedIn {
+		wg.Go(func() { _ = connection.Reconnect(context.Background()) })
+	}
+	wg.Wait()
+	e.ensureDiscoveryActive(ctx)
+}
+
+// storedTokensLocked is storedTokens with e.mu held.
+func (e *Extension) storedTokensLocked(connection *Connection) string {
+	url := connection.OAuthURL()
+	if url == "" || e.credentials == nil {
+		return "null"
+	}
+	tokens := e.credentials.Tokens(connection.Name(), url)
+	if tokens == nil {
+		return "null"
+	}
+	data, _ := json.Marshal(tokens)
+	return string(data)
+}
+
+// attemptCurrentLocked reports whether work started for attempt still applies: its session did not end, the server
+// was not disabled, replaced, or removed meanwhile. The caller holds e.mu.
+func (e *Extension) attemptCurrentLocked(session context.Context, s *server, attempt *attemptToken) bool {
+	return session.Err() == nil && s.attempt == attempt && s.enabled() && slices.Contains(e.servers, s)
+}
+
+// createConnection creates the server's connection, or returns nil when isCurrent reports that the attempt no longer applies.
+func (e *Extension) createConnection(s *server, isCurrent func() bool) (*Connection, error) {
+	e.mu.Lock()
+	cwd := e.sessionCwd
+	e.mu.Unlock()
+	createTransport := e.options.CreateTransport
+	if createTransport == nil {
+		createTransport = CreateDefaultTransport
+	}
+	connection, err := NewConnection(ConnectionOptions{
+		Entry:           s.entry,
+		Cwd:             cwd,
+		CreateTransport: createTransport,
+		Credentials:     e.getCredentials(),
+		ProviderToken: func(ctx context.Context, provider string) string {
+			e.mu.Lock()
+			token := e.providerToken
+			e.mu.Unlock()
+			if token == nil {
+				return ""
+			}
+			return token(ctx, provider)
+		},
+		Log: e.getServerLog(),
+		OnTools: func(connection *Connection) {
+			if isCurrent() {
+				e.registerTools(connection)
+			}
+		},
+		OnChange: func(connection *Connection) {
+			if isCurrent() {
+				e.onConnectionChange(connection)
+				return
+			}
+			e.mu.Lock()
+			delete(e.tokensAtSignIn, connection)
+			e.mu.Unlock()
+		},
+		ClientName:    e.options.ClientName,
+		ClientVersion: e.options.ClientVersion,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !isCurrent() {
+		return nil, nil
+	}
+	e.mu.Lock()
+	s.connection.Store(connection)
+	e.mu.Unlock()
+	e.emitChange()
+	return connection, nil
+}
+
+// startConnection connects the server in the background on a goroutine the extension owns and drains in
+// [Extension.SessionShutdown]. The server's ready channel, set before it returns, is closed when the server connected
+// or failed; failures show in its state. It starts after `after` (nil: at once), unless the server was disabled,
+// replaced, or the session ended meanwhile. The returned channel is the ready channel.
+//
+// Ports packages/coding-agent/src/extensions/mcp/index.ts (startConnection).
+func (e *Extension) startConnection(ctx EventContext, s *server, after <-chan struct{}) <-chan struct{} {
+	ready := make(chan struct{})
+	attempt := &attemptToken{}
+	e.mu.Lock()
+	session := e.session
+	s.attempt = attempt
+	s.ready = ready
+	e.mu.Unlock()
+	isCurrent := func() bool {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return e.attemptCurrentLocked(session, s, attempt)
+	}
+	e.background.Go(func() {
+		defer close(ready)
+		if after != nil {
+			<-after
+		}
+		if !isCurrent() {
+			return
+		}
+		connection, err := e.createConnection(s, isCurrent)
+		if err != nil {
+			ctx.notifyLoadFailure("MCP failed to load: " + err.Error())
+			return
+		}
+		if connection == nil || !isCurrent() {
+			return
+		}
+		_, _ = connection.GetClient(context.Background())
+	})
+	return ready
+}
+
+// waitForServers waits for the latest connection attempts of the servers, including ones queued while waiting, or
+// until ctx ends.
+//
+// Ports packages/coding-agent/src/extensions/mcp/index.ts (waitForServers).
+func (e *Extension) waitForServers(ctx context.Context, waiting []*server) {
+	type attempt struct {
+		server *server
+		ready  chan struct{}
+	}
+	live := func(s *server) bool { return s.enabled() && slices.Contains(e.servers, s) }
+	for {
+		var attempts []attempt
+		e.mu.Lock()
+		for _, s := range waiting {
+			if live(s) && s.ready != nil {
+				attempts = append(attempts, attempt{s, s.ready})
+			}
+		}
+		e.mu.Unlock()
+		if len(attempts) == 0 || ctx.Err() != nil {
+			return
+		}
+		for _, a := range attempts {
+			select {
+			case <-a.ready:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		e.mu.Lock()
+		unchanged := true
+		for _, a := range attempts {
+			if live(a.server) && a.ready != a.server.ready {
+				unchanged = false
+			}
+		}
+		e.mu.Unlock()
+		if unchanged {
+			return
+		}
+	}
+}
+
+// describeState is the short state for lists and the startup report. withError
+// appends the first line of a failure.
+func describeState(s *server, withError bool) string {
+	if !s.enabled() {
+		return "disabled"
+	}
+	connection := s.connection.Load()
+	if connection == nil {
+		return "starting"
+	}
+	switch state := connection.State(); state {
+	case StateNeedsAuth:
+		return "needs sign-in"
+	case StateFailed:
+		if withError {
+			message := connection.Error()
+			if message == "" {
+				message = "unknown error"
+			}
+			return "failed: " + firstLine(message)
+		}
+		return "failed"
+	case StateConnected:
+		resources := ""
+		if connection.HasResources() {
+			resources = " · resources"
+		}
+		return "connected · " + plural(len(connection.Tools()), "tool") + resources
+	case StateConnecting:
+		return "connecting…"
+	default:
+		return string(state)
+	}
+}
+
+// reportProblems is one message for everything that needs the user after
+// startup, or only for `only`, servers that connected later.
+func (e *Extension) reportProblems(ctx EventContext, only []*server) {
+	var lines []string
+	e.mu.Lock()
+	servers := slices.Clone(e.servers)
+	if only == nil {
+		for _, err := range e.configErrors {
+			lines = append(lines, "config: "+err)
+		}
+	} else {
+		servers = only
+	}
+	e.mu.Unlock()
+	for _, s := range servers {
+		if s.connection.Load() == nil {
+			continue
+		}
+		if state := s.connection.Load().State(); state == StateNeedsAuth || state == StateFailed {
+			lines = append(lines, s.entry.Name+": "+describeState(s, true))
+		}
+	}
+	if len(lines) == 0 {
+		return
+	}
+	indented := make([]string, len(lines))
+	for i, line := range lines {
+		indented[i] = "  " + line
+	}
+	ctx.notify("MCP servers need attention:\n"+strings.Join(indented, "\n")+"\nRun /mcp to fix.", "warning")
+}
+
+// saveConfig saves a config change; it returns an error message when the file
+// could not be updated. Changes to registered servers only apply to the
+// current session. inProject adds a project override.
+// upstream: packages/coding-agent/src/extensions/mcp/index.ts:saveConfig
+func (e *Extension) saveConfig(s *server, patch McpServerConfigPatch, inProject bool) string {
+	e.mu.Lock()
+	entry := s.entry
+	override := entry.Override
+	if inProject {
+		override = e.projectConfig
+	}
+	e.mu.Unlock()
+	if override != "" {
+		entry.Override = override
+	}
+	if entry.Scope != "extension" {
+		update := e.options.UpdateConfig
+		if update == nil {
+			update = func(entry McpServerEntry, patch McpServerConfigPatch) error {
+				if entry.Override != "" {
+					return UpdateMcpServerConfig(entry.Override, entry.Name, patch, UpdateMcpServerConfigOptions{Override: true})
+				}
+				return UpdateMcpServerConfig(entry.Source, entry.Name, patch, UpdateMcpServerConfigOptions{})
+			}
+		}
+		if err := update(entry, patch); err != nil {
+			target := entry.Source
+			if entry.Override != "" {
+				target = entry.Override
+			}
+			return fmt.Sprintf("Could not update %s: %s", target, err)
+		}
+	}
+	config := entry.Config
+	if patch.Enabled != nil {
+		config.Enabled = patch.Enabled
+	}
+	if patch.Exposure != "" {
+		config.Exposure = patch.Exposure
+	}
+	entry.Config = config
+	e.mu.Lock()
+	s.entry = entry
+	e.mu.Unlock()
+	return ""
+}
+
+// ---------------------------------------------------------------------------------------
+// Actions for the `/mcp` command, the manager, and `pi mcp`
+// ---------------------------------------------------------------------------------------
+
+// ServerView is a snapshot of one configured server.
+type ServerView struct {
+	Entry McpServerEntry
+	// Connection is nil for a disabled server.
+	Connection *Connection
+	Enabled    bool
+	// Message is the result of the last action that failed.
+	Message string
+}
+
+// Servers returns the configured servers, in order.
+func (e *Extension) Servers() []ServerView {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	views := make([]ServerView, len(e.servers))
+	for i, s := range e.servers {
+		views[i] = ServerView{Entry: s.entry, Connection: s.connection.Load(), Enabled: s.enabled(), Message: s.message}
+	}
+	return views
+}
+
+// Notices are the config errors and overridden registrations, for the manager.
+func (e *Extension) Notices() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var notices []string
+	for _, err := range e.configErrors {
+		notices = append(notices, "config: "+err)
+	}
+	for _, line := range e.overridden {
+		notices = append(notices, "overridden: "+line)
+	}
+	return notices
+}
+
+// DescribeState is the short state of a server, for lists.
+func (e *Extension) DescribeState(name string, withError bool) string {
+	s := e.findServer(name)
+	if s == nil {
+		return ""
+	}
+	return describeState(s, withError)
+}
+
+// SignInPrompt is [McpSignInPrompt].
+type SignInPrompt = McpSignInPrompt
+
+// SignIn signs in to a server through the browser flow and reconnects. It
+// returns a message describing a failure, or "" on success. Ending ctx (the
+// caller's cancellation) or the session stops the sign-in.
+func (e *Extension) SignIn(ctx context.Context, name string, prompt McpSignInPrompt) string {
+	s := e.findServer(name)
+	if s == nil {
+		return fmt.Sprintf(`No MCP server named "%s".`, name)
+	}
+	e.mu.Lock()
+	connection := s.connection.Load()
+	session := e.session
+	e.mu.Unlock()
+	if connection == nil || connection.OAuthURL() == "" {
+		return fmt.Sprintf(`MCP server "%s" does not use OAuth.`, name)
+	}
+	url := connection.OAuthURL()
+	store, err := e.getCredentials().ForServer(name, url)
+	if err != nil {
+		return "Sign-in failed: " + err.Error()
+	}
+	settings, err := connection.OAuthSettings()
+	if err != nil {
+		return "Sign-in failed: " + err.Error()
+	}
+	// The sign-in stops with the session as well as with ctx.
+	signal, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(session, cancel)()
+	exit := e.background.enter()
+	err = SignInMcpServer(signal, SignInOptions{
+		ServerURL: url, Store: store, Settings: settings, Challenge: connection.Challenge(), Prompt: prompt, AppName: e.options.ClientName,
+	})
+	exit()
+	if err != nil {
+		if _, cancelled := errors.AsType[*oauth.McpSignInCancelledError](err); cancelled {
+			return "Sign-in cancelled."
+		}
+		return "Sign-in failed: " + err.Error()
+	}
+	// The challenge that asked for this sign-in (for example for more scope) is answered.
+	connection.ClearChallenge()
+	if err := connection.Reconnect(ctx); err != nil {
+		return "Signed in, but " + err.Error()
+	}
+	return ""
+}
+
+// SignOut removes a server's stored credentials and disconnects it. It
+// returns whether credentials were stored.
+func (e *Extension) SignOut(name string) (bool, error) {
+	s := e.findServer(name)
+	if s == nil {
+		return false, nil
+	}
+	e.mu.Lock()
+	connection := s.connection.Load()
+	e.mu.Unlock()
+	if connection == nil || connection.OAuthURL() == "" {
+		return false, nil
+	}
+	// upstream: packages/coding-agent/src/extensions/mcp/index.ts signOut awaits the credential removal before the
+	// connection signs out, so a removal that throws leaves the connection signed in.
+	removed, err := e.getCredentials().Remove(name, connection.OAuthURL())
+	if err != nil {
+		return false, err
+	}
+	connection.SignOut()
+	return removed, nil
+}
+
+// Reconnect connects a server again. It returns a message describing a
+// failure, or "" on success.
+func (e *Extension) Reconnect(ctx context.Context, name string) string {
+	return e.beginReconnect(name)(ctx)
+}
+
+// beginReconnect starts a reconnect and returns what waits for it: the reconnect queues behind the server's current
+// connection attempt, and tool calls wait for it through the server's ready channel. The start runs synchronously;
+// the returned function blocks until the reconnect settled.
+func (e *Extension) beginReconnect(name string) func(ctx context.Context) string {
+	s := e.findServer(name)
+	if s == nil {
+		return func(context.Context) string { return fmt.Sprintf(`No MCP server named "%s".`, name) }
+	}
+	e.mu.Lock()
+	connection := s.connection.Load()
+	if connection == nil {
+		e.mu.Unlock()
+		return func(context.Context) string { return fmt.Sprintf(`MCP server "%s" is disabled.`, name) }
+	}
+	previous := s.ready
+	ready := make(chan struct{})
+	s.ready = ready
+	e.mu.Unlock()
+	return func(ctx context.Context) string {
+		defer close(ready)
+		if previous != nil {
+			<-previous
+		}
+		if err := connection.Reconnect(ctx); err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+}
+
+// SetEnabled enables or disables a server and saves the choice, as a project
+// override with inProject (upstream's optional `inProject`, default false). It
+// returns an error message when the config could not be saved; connection
+// errors show in the state.
+func (e *Extension) SetEnabled(ctx EventContext, name string, enabled bool, inProject ...bool) string {
+	return e.beginSetEnabled(ctx, name, enabled, len(inProject) > 0 && inProject[0])()
+}
+
+// beginSetEnabled changes a server's enabled state and returns what waits for the connection to open or close. The
+// change runs synchronously; the returned function blocks until the connection settled. A replacement connection
+// waits for the cleanup of the one it replaces before it opens a transport.
+func (e *Extension) beginSetEnabled(ctx EventContext, name string, enabled, inProject bool) func() string {
+	s := e.findServer(name)
+	if s == nil {
+		return func() string { return fmt.Sprintf(`No MCP server named "%s".`, name) }
+	}
+	if failed := e.saveConfig(s, McpServerConfigPatch{Enabled: &enabled}, inProject); failed != "" {
+		return func() string { return failed }
+	}
+	if enabled {
+		e.mu.Lock()
+		closing := s.closing
+		e.mu.Unlock()
+		ready := e.startConnection(ctx, s, closing)
+		return func() string {
+			<-ready
+			return ""
+		}
+	}
+	e.mu.Lock()
+	connection := s.connection.Load()
+	s.attempt = nil
+	s.connection.Store(nil)
+	if connection != nil {
+		// A reconnect may already have detached its old client while shutting its transport down. Closing the
+		// connection alone does not wait for that reconnect.
+		ready := s.ready
+		closing := make(chan struct{})
+		s.closing = closing
+		e.background.Go(func() {
+			defer close(closing)
+			connection.Close()
+			if ready != nil {
+				<-ready
+			}
+		})
+	}
+	closing := s.closing
+	e.mu.Unlock()
+	e.hideTools(name)
+	e.emitChange()
+	return func() string {
+		if closing != nil {
+			<-closing
+		}
+		e.mu.Lock()
+		if s.closing == closing {
+			s.closing = nil
+		}
+		e.mu.Unlock()
+		return ""
+	}
+}
+
+// SetExposure changes a server's exposure and saves the choice. It returns an
+// error message when the config could not be saved.
+func (e *Extension) SetExposure(name string, exposure extension.McpExposure) string {
+	s := e.findServer(name)
+	if s == nil {
+		return fmt.Sprintf(`No MCP server named "%s".`, name)
+	}
+	if failed := e.saveConfig(s, McpServerConfigPatch{Exposure: exposure}, false); failed != "" {
+		return failed
+	}
+	e.mu.Lock()
+	connection := s.connection.Load()
+	e.mu.Unlock()
+	if connection != nil && connection.State() == StateConnected {
+		e.registerTools(connection)
+	}
+	e.syncResourceTools()
+	// Tools no longer exposed directly leave the declared set; direct tools are activated on registration.
+	indirect := map[string]bool{}
+	for _, tool := range e.host.GetAllTools() {
+		if tool.Exposure != "" && tool.Exposure != extension.ToolExposureDirect {
+			indirect[tool.Name] = true
+		}
+	}
+	e.toolMu.Lock()
+	owned := e.serverTools[name]
+	e.toolMu.Unlock()
+	var active []string
+	for _, toolName := range e.host.GetActiveTools() {
+		if !owned.has(toolName) || !indirect[toolName] {
+			active = append(active, toolName)
+		}
+	}
+	e.host.SetActiveTools(active)
+	e.emitChange()
+	return ""
+}
+
+// SetMessage records the result of a failed action for the manager.
+func (e *Extension) SetMessage(name, message string) {
+	if s := e.findServer(name); s != nil {
+		e.mu.Lock()
+		s.message = message
+		e.mu.Unlock()
+	}
+}
+
+// EnsureDiscoveryActive activates the tool that reaches the connected servers'
+// tools that are not declared, after a `/mcp` action.
+func (e *Extension) EnsureDiscoveryActive(ctx EventContext) { e.ensureDiscoveryActive(ctx) }
+
+// Pending waits for the startup connections, or returns at once when there
+// are none.
+func (e *Extension) Pending() {
+	e.mu.Lock()
+	pending := e.pending
+	e.mu.Unlock()
+	if pending != nil {
+		<-pending
+	}
+}
+
+// noServersMessage is the servers menu's empty text and the plain status without servers. It names the global config
+// as resolve(getAgentDir(), "mcp.json"), so a relative agent directory resolves against the working directory and, on
+// Windows, a rooted one takes the working directory's drive. The CLI joins the path instead (cli.ts:488). When the
+// working directory cannot be read the agent directory is joined unresolved.
+// upstream: packages/coding-agent/src/extensions/mcp/index.ts:697,864
+func (e *Extension) noServersMessage() string {
+	path, err := nodepath.Resolve(e.options.AgentDir, "mcp.json")
+	if err != nil {
+		path = filepath.Join(e.options.AgentDir, "mcp.json")
+	}
+	return fmt.Sprintf("No MCP servers configured. Add them to %s or %s/mcp.json.", path, e.options.ConfigDirName)
+}
+
+// FormatStatus is the plain status of every server, for `/mcp` without a
+// terminal manager.
+func (e *Extension) FormatStatus() string {
+	e.mu.Lock()
+	servers := slices.Clone(e.servers)
+	configErrors := slices.Clone(e.configErrors)
+	overridden := slices.Clone(e.overridden)
+	e.mu.Unlock()
+	if len(servers) == 0 && len(configErrors) == 0 && len(overridden) == 0 {
+		return e.noServersMessage()
+	}
+	var lines []string
+	for _, s := range servers {
+		name := s.entry.Name
+		exposure := exposureOf(s.entry)
+		connection := s.connection.Load()
+		if connection != nil && connection.State() == StateNeedsAuth {
+			lines = append(lines, fmt.Sprintf("%s: needs sign-in, run /mcp login %s (%s)", name, name, exposure))
+			continue
+		}
+		tools := ""
+		if connection != nil && connection.State() == StateConnected {
+			tools = fmt.Sprintf(", %d tools", len(connection.Tools()))
+		}
+		var state string
+		switch {
+		case !s.enabled():
+			state = "disabled"
+		case connection != nil && connection.State() == StateDisconnected:
+			state = "disconnected, reconnects on next call"
+		case connection != nil:
+			state = string(connection.State())
+		default:
+			state = "starting"
+		}
+		errText := ""
+		if connection != nil && connection.Error() != "" && connection.State() != StateConnected {
+			errText = "\n    " + strings.ReplaceAll(connection.Error(), "\n", "\n    ")
+		}
+		lines = append(lines, fmt.Sprintf("%s: %s%s (%s)%s", name, state, tools, exposure, errText))
+	}
+	for _, err := range configErrors {
+		lines = append(lines, "config error: "+err)
+	}
+	for _, line := range overridden {
+		lines = append(lines, "overridden: "+line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ---------------------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------------------
+
+func (e *Extension) loadConfig(ctx EventContext) LoadedMcpConfig {
+	if e.options.LoadConfig != nil {
+		if ctx.Context == nil {
+			return e.options.LoadConfig(context.Background())
+		}
+		return e.options.LoadConfig(ctx.Context)
+	}
+	trusted := false
+	if ctx.IsProjectTrusted != nil {
+		trusted = ctx.IsProjectTrusted()
+	}
+	return LoadMcpConfig(LoadOptions{AgentDir: e.options.AgentDir, Cwd: ctx.Cwd, ProjectTrusted: trusted, ConfigDirName: e.options.ConfigDirName})
+}
+
+// acceptedConfig is the configuration the session uses: [Extension.loadConfig]'s, except that a host that refuses `mcp.json` (D202, a closed
+// Piglet Binary) starts none of its servers and reports why when there were any.
+func (e *Extension) acceptedConfig(ctx EventContext) LoadedMcpConfig {
+	loaded := e.loadConfig(ctx)
+	if e.options.RefuseConfigFiles != "" && len(loaded.Servers) > 0 {
+		return LoadedMcpConfig{Errors: []string{e.options.RefuseConfigFiles}}
+	}
+	return loaded
+}
+
+// SessionStart is the `session_start` handler. It loads the configuration and
+// connects the enabled servers on a goroutine the extension owns and drains in
+// [Extension.SessionShutdown]; the first prompt waits for them in
+// [Extension.BeforeAgentStart].
+func (e *Extension) SessionStart(ctx EventContext) {
+	loaded := e.acceptedConfig(ctx)
+	e.mu.Lock()
+	e.configErrors = loaded.Errors
+	e.projectConfig = loaded.ProjectConfig
+	e.autoEnableCodemode = loaded.AutoEnableCodemode == nil || *loaded.AutoEnableCodemode
+	e.warnedUnreachable = false
+	e.waitedForStartup = false
+	e.sessionCwd = ctx.Cwd
+	e.providerToken = ctx.ProviderToken
+	e.endSession()
+	e.session, e.endSession = context.WithCancel(context.Background())
+	session := e.session
+	e.configuredEntries = loaded.Servers
+	e.mu.Unlock()
+	registered, overridden := e.registeredServers()
+	e.mu.Lock()
+	e.overridden = overridden
+	e.servers = nil
+	for _, entry := range loaded.Servers {
+		e.servers = append(e.servers, &server{entry: entry})
+	}
+	e.servers = append(e.servers, registered...)
+	var enabled []*server
+	for _, s := range e.servers {
+		if s.enabled() {
+			enabled = append(enabled, s)
+		}
+	}
+	e.mu.Unlock()
+	e.emitChange()
+	// Codemode or tool_search is activated from the config: the first prompt does not wait for servers whose tools
+	// are not declared to the model, and scripts or searches wait for them.
+	e.ensureDiscoveryActive(ctx)
+	if len(enabled) == 0 {
+		e.reportProblems(ctx, nil)
+		return
+	}
+	readies := make([]<-chan struct{}, len(enabled))
+	for i, s := range enabled {
+		readies[i] = e.startConnection(ctx, s, nil)
+	}
+	pending := make(chan struct{})
+	e.mu.Lock()
+	e.pending = pending
+	e.mu.Unlock()
+	e.background.Go(func() {
+		defer close(pending)
+		for _, ready := range readies {
+			<-ready
+		}
+		if session.Err() == nil {
+			e.reportStartupProblems(ctx)
+		}
+	})
+}
+
+// reportStartupProblems runs reportProblems at the end of the startup chain. Upstream's `.catch` on that chain also
+// receives a throw from reportProblems' notify and shows it as "MCP failed to load", ignoring a second throw.
+func (e *Extension) reportStartupProblems(ctx EventContext) {
+	defer func() {
+		// upstream: packages/coding-agent/src/extensions/mcp/index.ts:"MCP failed to load" (.catch after reportProblems)
+		if recovered := recover(); recovered != nil {
+			ctx.notifyLoadFailure("MCP failed to load: " + recoveredMessage(recovered))
+		}
+	}()
+	e.reportProblems(ctx, nil)
+}
+
+// recoveredMessage is upstream's errorMessage for a recovered panic value: an error's message, else its text.
+func recoveredMessage(recovered any) string {
+	if err, ok := recovered.(error); ok {
+		return err.Error()
+	}
+	return fmt.Sprint(recovered)
+}
+
+// waitForDirectServers makes the first prompt wait for servers whose tools are declared to the model, so they are
+// declared in its first request, but not indefinitely: a slow or hanging server must not hold up the prompt. Other
+// servers are waited for when a script or search needs them ([Extension.ToolCall]).
+func (e *Extension) waitForDirectServers(ctx EventContext) {
+	e.mu.Lock()
+	if e.waitedForStartup {
+		e.mu.Unlock()
+		return
+	}
+	e.waitedForStartup = true
+	wait := defaultStartupWaitMs * time.Millisecond
+	if ms := e.options.StartupWaitMs; ms != nil {
+		wait = time.Duration(*ms) * time.Millisecond
+	}
+	var ready []chan struct{}
+	for _, s := range e.servers {
+		if s.enabled() && hasDirectTools(s.entry) && s.ready != nil {
+			ready = append(ready, s.ready)
+		}
+	}
+	e.mu.Unlock()
+	if len(ready) == 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for _, ch := range ready {
+		select {
+		case <-ch:
+			continue // a ready server settles Promise.all before an expired timer fires (index.ts:1047-1052)
+		default:
+		}
+		select {
+		case <-ch:
+		case <-timer.C:
+			ctx.notify("MCP servers are still connecting; their tools become available once connected.", "info")
+			return
+		}
+	}
+}
+
+// BeforeAgentStart is the `before_agent_start` handler. The first prompt waits for the servers with direct tools
+// ([Extension.waitForDirectServers]). Every prompt lists the servers in the `mcp_servers` section as they are when it
+// starts; the session appends the section to the conversation when it changed, for example after a server connected.
+func (e *Extension) BeforeAgentStart(ctx EventContext, options *extension.BuildSystemPromptOptions) {
+	e.waitForDirectServers(ctx)
+	if options == nil {
+		return
+	}
+	e.mu.Lock()
+	listing := make([]McpServerListing, len(e.servers))
+	for i, s := range e.servers {
+		listing[i] = McpServerListing{Entry: s.entry}
+		if s.connection.Load() != nil {
+			listing[i].Instructions = s.connection.Load().Instructions()
+		}
+	}
+	e.mu.Unlock()
+	section, ok := RenderServersSection(listing)
+	setPromptSection(options, McpServersSection, section, ok)
+}
+
+// setPromptSection sets the section of a per-run collection (`sections[name] = value`: a new name goes last, an
+// existing one keeps its place) or, without a value, deletes it (`delete sections[name]`).
+func setPromptSection(options *extension.BuildSystemPromptOptions, name, value string, present bool) {
+	if options.Sections == nil {
+		if !present {
+			return
+		}
+		options.Sections = &ai.OrderedSections{}
+	}
+	sections := *options.Sections
+	index := slices.IndexFunc(sections, func(section ai.PromptSection) bool { return section.Name == name })
+	switch {
+	case present && index >= 0:
+		sections[index].Value = &value
+	case present:
+		sections = append(sections, ai.PromptSection{Name: name, Value: &value})
+	case index >= 0:
+		sections = slices.Delete(sections, index, index+1)
+	}
+	*options.Sections = sections
+}
+
+// reachesServer reports whether a call that reaches reach (see ToolDefinition.ReachesTools) needs the server: it
+// reaches every tool, or one of its words contains the server's namespace.
+//
+// Ports packages/coding-agent/src/extensions/mcp/index.ts (reachesServer).
+func reachesServer(reach extension.ToolReach, server string) bool {
+	if reach.All {
+		return true
+	}
+	namespace := mcp.McpNamespace(server)
+	return slices.ContainsFunc(reach.Words, func(word string) bool { return strings.Contains(word, namespace) })
+}
+
+// ToolCall is the `tool_call` handler. A tool that reaches other tools (ReachesTools) waits for the servers it may
+// reach, so their tools are registered before it runs: a codemode script for the servers it names, or for every server
+// when it searches or enumerates tools, and tool_search for every server. The resource tools reach every server, so
+// they wait for all of them. Direct MCP calls wait only for their own server, including a reconnect still closing its
+// old transport. It returns when the servers settled or ctx ends. input is the call's input as JSON in its member
+// order (extension.CustomToolCallEvent.InputJSON), which a tool's ReachesTools reads as upstream's reachesTools reads
+// event.input.
+//
+// Ports packages/coding-agent/src/extensions/mcp/index.ts (pi.on("tool_call")).
+func (e *Extension) ToolCall(ctx context.Context, toolName string, input json.RawMessage) {
+	var tool *extension.ToolInfo
+	for _, candidate := range e.host.GetAllTools() {
+		if candidate.Name == toolName {
+			tool = &candidate
+			break
+		}
+	}
+	if tool == nil {
+		return
+	}
+	// Readiness can be pending while the display state is still connected: a reconnect first closes the old
+	// transport, then opens a new one. Settled attempts return at once.
+	e.mu.Lock()
+	var readyServers []*server
+	for _, s := range e.servers {
+		if s.enabled() && s.ready != nil {
+			readyServers = append(readyServers, s)
+		}
+	}
+	e.mu.Unlock()
+	if len(readyServers) == 0 {
+		return
+	}
+	var waiting []*server
+	switch {
+	case tool.ReachesTools != nil:
+		// Pi passes the call's input object (index.ts:1199); the tool reads the members it needs.
+		reach := tool.ReachesTools(input)
+		for _, s := range readyServers {
+			if reachesServer(reach, s.entry.Name) {
+				waiting = append(waiting, s)
+			}
+		}
+	case resourceToolNames[tool.Name]:
+		waiting = readyServers
+	default:
+		// A direct MCP call waits only for its own server, including a reconnect still closing its old transport.
+		e.toolMu.Lock()
+		owner, _, _ := strings.Cut(e.toolOwners[toolName], "\x00")
+		e.toolMu.Unlock()
+		for _, s := range readyServers {
+			if s.entry.Name == owner {
+				waiting = append(waiting, s)
+			}
+		}
+	}
+	e.waitForServers(ctx, waiting)
+}
+
+// resourceToolNames are the tools that reach the resources of every server.
+var resourceToolNames = map[string]bool{ListMcpResourcesTool: true, ListMcpResourceTemplatesTool: true, ReadMcpResourceTool: true}
+
+// TurnStart is the `turn_start` handler. It picks up sign-ins done outside the
+// session, such as `pi mcp login` run by the agent.
+func (e *Extension) TurnStart(ctx EventContext) {
+	e.mu.Lock()
+	waiting := len(e.tokensAtSignIn) > 0
+	e.mu.Unlock()
+	if waiting {
+		e.reconnectSignedIn(ctx)
+	}
+}
+
+// McpServersChange is the `mcp_servers_change` handler. Servers registered or
+// unregistered during the session connect or disconnect right away.
+func (e *Extension) McpServersChange(ctx EventContext) {
+	e.mu.Lock()
+	session := e.session
+	e.mu.Unlock()
+	if session.Err() != nil {
+		return
+	}
+	registered, overridden := e.registeredServers()
+	next := map[string]*server{}
+	for _, s := range registered {
+		next[s.entry.Name] = s
+	}
+	e.mu.Lock()
+	e.overridden = overridden
+	// Unregistered servers and re-registered ones with a new config are dropped; the latter come back below.
+	var removed []*server
+	for _, s := range e.servers {
+		if s.entry.Scope != "extension" {
+			continue
+		}
+		if n, ok := next[s.entry.Name]; !ok || n.registeredConfig != s.registeredConfig {
+			removed = append(removed, s)
+		}
+	}
+	e.servers = slices.DeleteFunc(e.servers, func(s *server) bool { return slices.Contains(removed, s) })
+	e.mu.Unlock()
+	for _, s := range removed {
+		e.hideTools(s.entry.Name)
+	}
+	var added []*server
+	e.mu.Lock()
+	for _, s := range registered {
+		if e.findServerLocked(s.entry.Name) == nil {
+			added = append(added, s)
+		}
+	}
+	e.servers = append(e.servers, added...)
+	e.mu.Unlock()
+	e.emitChange()
+	e.ensureDiscoveryActive(ctx)
+	// Pi's handler awaits here for the first time (index.ts:1236): what precedes ran inside the registration that fired the event
+	// (runner.ts:465-468), and the Runner's listener goes on at this report.
+	done := ctx.yield()
+	var closing sync.WaitGroup
+	for _, s := range removed {
+		e.mu.Lock()
+		connection := s.connection.Load()
+		e.mu.Unlock()
+		if connection != nil {
+			closing.Go(connection.Close)
+		}
+	}
+	closing.Wait()
+	var connecting []*server
+	for _, s := range added {
+		if s.enabled() {
+			connecting = append(connecting, s)
+		}
+	}
+	if session.Err() != nil || len(connecting) == 0 {
+		return
+	}
+	readies := make([]<-chan struct{}, len(connecting))
+	for i, s := range connecting {
+		readies[i] = e.startConnection(ctx, s, nil)
+	}
+	for _, ready := range readies {
+		select {
+		case <-ready:
+		case <-done:
+			// The Runner that dispatched the event was invalidated, which makes ctx stale: the connections stay under the session,
+			// which closes them when it ends.
+			return
+		}
+	}
+	if session.Err() != nil {
+		// The session ended meanwhile: close what connected.
+		var wg sync.WaitGroup
+		for _, s := range connecting {
+			e.mu.Lock()
+			connection := s.connection.Load()
+			e.mu.Unlock()
+			if connection != nil {
+				wg.Go(connection.Close)
+			}
+		}
+		wg.Wait()
+		return
+	}
+	e.reportProblems(ctx, connecting)
+}
+
+// SessionShutdown is the `session_shutdown` handler: it ends the session, which
+// stops running sign-ins, closes every connection and waits for the extension's
+// background work.
+func (e *Extension) SessionShutdown() { e.sessionShutdown(context.Background()) } //portlint:allow ctxbackground Pi's session_shutdown handler takes no signal (extensions/mcp/index.ts:1252)
+
+// sessionShutdown is SessionShutdown for a dispatch that hears when the handler stops running synchronously. Pi's
+// handler awaits Promise.all over the background actions and the connections it closes (index.ts:1249-1255): with any of
+// them pending its event loop turns there, and with none it settles within microtasks.
+func (e *Extension) sessionShutdown(ctx context.Context) {
+	e.mu.Lock()
+	e.endSession()
+	var closing []*Connection
+	for _, s := range e.servers {
+		if s.connection.Load() != nil {
+			closing = append(closing, s.connection.Load())
+		}
+	}
+	e.servers = nil
+	e.mu.Unlock()
+	e.emitChange()
+	if len(closing) > 0 || e.background.running() {
+		handleryield.Report(ctx)
+	}
+	var wg sync.WaitGroup
+	for _, connection := range closing {
+		wg.Go(connection.Close)
+	}
+	wg.Wait()
+	e.background.Wait()
+}
+
+// lane returns the call lane of a server. The caller holds toolMu.
+func (e *Extension) lane(server string) *jsloop.Lane {
+	lane := e.lanes[server]
+	if lane == nil {
+		lane = &jsloop.Lane{}
+		e.lanes[server] = lane
+	}
+	return lane
+}
+
+// Terminal is the terminal presentation of the extension: the renderers of MCP tool calls, the resolver for tools of a
+// server that is not connected yet, and the `/mcp` manager view. A nil Terminal (the default of [Options]) leaves the
+// extension headless: tools have no renderers and `/mcp` has no manager view. Package mcptui supplies the terminal one.
+type Terminal struct {
+	// Renderers returns the renderers of calls to the MCP tool labeled `server/tool`.
+	Renderers func(label string) *extension.ToolRenderers
+	// ToolRendererResolver renders calls to MCP tools before their server connected (a resumed session).
+	ToolRendererResolver extension.ToolRendererResolver
+	// ShowManager runs manage in the manager view until it returns.
+	ShowManager func(ctx context.Context, ui extension.UIContext, events EventContext, copyToClipboard func(text string) error, manage func(McpUi) error) error
+}
+
+// renderers is the tool renderer factory of the terminal presentation, or nil when headless.
+func (e *Extension) renderers() func(label string) *extension.ToolRenderers {
+	if e.options.Terminal == nil {
+		return nil
+	}
+	return e.options.Terminal.Renderers
+}
+
+// NewHeadless is the headless entry point: it returns the extension for host with no terminal presentation, whatever
+// options.Terminal says. Connections, discovery, sign-in, tool registration and execution, and the session lifecycle
+// work as in [New]; tools have no renderers and `/mcp` has no manager view. This package imports neither package tui
+// nor mcptui directly. It still links tui through coding/extension (see docs/design/extension-api-tui-split.md), so an
+// embedder that must not link tui at all uses package mcp, which has no such dependency.
+func NewHeadless(host Host, options Options) *Extension {
+	options.Terminal = nil
+	return New(host, options)
+}

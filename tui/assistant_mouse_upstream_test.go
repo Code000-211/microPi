@@ -1,0 +1,66 @@
+package tui
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+// .upstream/v0.87.1/packages/coding-agent/src/modes/interactive/components/assistant-message.ts:164
+// Pi: packages/coding-agent/src/modes/interactive/components/assistant-message.ts:58 (AssistantMessageComponent.setHideThinkingBlock).
+func TestAssistantThinkingClicksThroughTerminal(t *testing.T) {
+	h := newAltHarness(t, 80, 24, TuiAltScreenOptions{})
+	block := NewAssistantMessageComponent(nil, false, nil, "", nil, nil, "", "")
+	content := []AssistantSegment{{Thinking: true, Text: "first reasoning"}, {Text: "answer"}, {Thinking: true, Text: "second reasoning"}}
+	block.SetContent(content)
+	h.tui.Add(block)
+	h.start()
+	// Pi's alternate screen consumes zone marks internally rather than writing them (tui-alt-screen.ts:1670); the Main Screen strips them (tui-main-screen.ts doRender).
+	var output bytes.Buffer
+	regular := NewWithOutput(&output, 80, 24)
+	zoneBlock := NewAssistantMessageComponent(nil, false, nil, "", nil, nil, "", "")
+	zoneBlock.SetContent(content)
+	if rendered := strings.Join(zoneBlock.Render(80), "\n"); !strings.Contains(rendered, "\x1b]133;A\x07") || !strings.Contains(rendered, "\x1b]133;B\x07\x1b]133;C\x07") {
+		t.Fatal("assistant component no longer produces its zone markers")
+	}
+	regular.Add(zoneBlock)
+	regular.Render()
+	if strings.Contains(output.String(), "\x1b]133;") || !strings.Contains(output.String(), "first reasoning") {
+		t.Fatalf("Main Screen output = %q, want the text without zone markers", output.String())
+	}
+	h.send("\x1b[<0;2;2M", "\x1b[<0;2;2m")
+	if h.viewportHas("first reasoning") || !h.viewportHas("Thinking...") || !h.viewportHas("second reasoning") {
+		t.Fatalf("terminal thinking visibility = %q", h.viewport())
+	}
+	block.SetContent(content)
+	h.render()
+	if h.viewportHas("first reasoning") {
+		t.Fatal("streaming update lost the individual override")
+	}
+	block.SetHideThinkingBlock(true)
+	block.SetHideThinkingBlock(false)
+	h.render()
+	if !h.viewportHas("first reasoning") || !h.viewportHas("second reasoning") {
+		t.Fatal("global thinking toggle did not clear individual overrides")
+	}
+	for _, event := range []TuiMouseEvent{
+		componentMouseEvent(MouseClick, 1, 0),
+		componentMouseEvent(MouseClick, 1, 3),
+		componentMouseEvent(MousePress, 1, 1),
+	} {
+		if result := DispatchMouseEvent(block, event); result != nil {
+			t.Fatalf("non-thinking click handled: %+v", event)
+		}
+	}
+}
+
+func BenchmarkAssistantThinkingClick(b *testing.B) {
+	block := NewAssistantMessageComponent(nil, false, nil, "", nil, nil, "", "")
+	block.SetContent([]AssistantSegment{{Thinking: true, Text: strings.Repeat("reasoning ", 10000)}})
+	block.Render(80)
+	event := componentMouseEvent(MouseClick, 1, 1)
+	b.ReportAllocs()
+	for b.Loop() {
+		DispatchMouseEvent(block, event)
+	}
+}

@@ -1,0 +1,150 @@
+package ai
+
+import (
+	"context"
+	"encoding/json"
+	"slices"
+)
+
+// Mirrors upstream .upstream/current/packages/ai/src/utils/oauth/types.ts.
+
+// OAuthCredentials holds the tokens returned by an OAuth flow.
+type OAuthCredentials struct {
+	Extra   map[string]json.RawMessage `json:"-"`
+	Refresh string                     `json:"refresh"`
+	Access  string                     `json:"access"`
+	// Expires is the truncated integer projection of expires in Unix milliseconds. ExpiresMillis returns Pi's exact JavaScript number, including a fraction or an absent property.
+	// Expiry decisions must use ExpiresMillis. SetExpiresMillis stores a fraction; assigning Expires replaces any retained exact value.
+	Expires int64 `json:"expires"`
+	// ProjectID is used by Google Cloud Code Assist / Antigravity OAuth.
+	// Other provider-owned fields are retained in Extra.
+	ProjectID string `json:"projectId,omitempty"`
+	// AccountID is the provider account associated with the access token.
+	AccountID string `json:"accountId,omitempty"`
+	// Scope is the granted scope returned by flows that report one (Radius).
+	Scope string `json:"scope,omitempty"`
+
+	expiry credentialExpiry
+	order  credentialKeyOrder
+}
+
+// The member order of the credential literals Pi's providers build (pi-ai auth/oauth/*.ts), which auth.json keeps: anthropic and meta write refresh before access, the others access before refresh, and each adds the members of its own after expires.
+var (
+	refreshFirstCredentialMembers = []string{"type", "refresh", "access", "expires"}
+	copilotCredentialMembers      = append(slices.Clone(refreshFirstCredentialMembers), "enterpriseUrl", "availableModelIds")
+	accessFirstCredentialMembers  = []string{"type", "access", "refresh", "expires"}
+	codexCredentialMembers        = append(slices.Clone(accessFirstCredentialMembers), "accountId")
+	chatgptCredentialMembers      = append(slices.Clone(accessFirstCredentialMembers), "clientId", "scopes")
+	radiusCredentialMembers       = append(slices.Clone(accessFirstCredentialMembers), "scope")
+)
+
+// OAuthPrompt describes an interactive prompt during the OAuth flow.
+type OAuthPrompt struct {
+	Message     string
+	Placeholder string
+	AllowEmpty  bool
+}
+
+// OAuthAuthInfo is the URL + instructions presented to the user.
+type OAuthAuthInfo struct {
+	URL          string
+	Instructions string
+}
+
+// OAuthDeviceCodeInfo is the user code + verification URL presented during a
+// device-code (RFC 8628) login flow. Mirrors upstream OAuthDeviceCodeInfo
+// (types.ts:26-31).
+type OAuthDeviceCodeInfo struct {
+	UserCode        string
+	VerificationURI string
+	// OpenBrowserOnConfirm offers best-effort browser opening on user confirmation; nil (Pi's undefined) means true, and clients may ignore it.
+	OpenBrowserOnConfirm *bool
+	// CopyCodeOnConfirm offers copying UserCode on user confirmation, replacing the clipboard; nil (Pi's undefined) means true.
+	CopyCodeOnConfirm *bool
+	IntervalSeconds   float64
+	ExpiresInSeconds  float64
+}
+
+// OAuthSelectOption is one selectable choice in an OAuth flow.
+type OAuthSelectOption struct {
+	ID    string
+	Label string
+}
+
+// OAuthSelectPrompt describes an interactive selection prompt during the OAuth flow.
+type OAuthSelectPrompt struct {
+	Message string
+	Options []OAuthSelectOption
+}
+
+// OAuthLoginCallbacks groups the callbacks used during an OAuth login flow.
+type OAuthLoginCallbacks struct {
+	OnAuth                   func(info OAuthAuthInfo)
+	OnDeviceCode             func(info OAuthDeviceCodeInfo)
+	OnPrompt                 func(prompt OAuthPrompt) (string, error)
+	OnPromptContext          func(context.Context, OAuthPrompt) (string, error)
+	OnProgress               func(message string)
+	OnManualCodeInput        func() (string, error)
+	OnManualCodeInputContext func(context.Context) (string, error)
+	// OnManualCodePromptContext asks for a pasted code with the flow's own manual_code message and placeholder. Nil falls back to OnManualCodeInputContext, then OnManualCodeInput.
+	OnManualCodePromptContext func(context.Context, AuthManualCodePrompt) (string, error)
+	OnSelect                  func(prompt OAuthSelectPrompt) (string, error)
+	OnSelectContext           func(context.Context, OAuthSelectPrompt) (string, error)
+	// GetDeviceID returns the stable ID of this app installation. It comes from LoginOptions.GetDeviceID; nil means the
+	// app supplies none.
+	GetDeviceID func() string
+	// AgentName comes from LoginOptions.AgentName; nil means the flow's own default name.
+	AgentName *string
+}
+
+// OAuthCredentialStatus describes a stored credential owned by a registered
+// OAuth provider outside auth.json. AuthType is "oauth" or "api_key" and Source
+// is rendered by the login selector (for example "stored").
+type OAuthCredentialStatus struct {
+	AuthType string
+	Source   string
+}
+
+// OAuthCredentialStore is an optional extension hook for OAuth providers whose
+// credentials live outside auth.json. Built-in upstream providers do not need
+// it; product extensions can implement it to keep their existing credential
+// stores while still participating in the generic /login and /logout surfaces.
+type OAuthCredentialStore interface {
+	OAuthCredentialStatus() (OAuthCredentialStatus, bool)
+	StoreOAuthCredentials(creds OAuthCredentials) (path string, err error)
+	DeleteOAuthCredentials() (deleted bool, err error)
+}
+
+// OAuthProviderInterface is the contract for an OAuth provider.
+type OAuthProviderInterface interface {
+	// ID returns the provider identifier (e.g. "anthropic").
+	ID() string
+	// Name returns the human-readable provider name.
+	Name() string
+	// UsesCallbackServer returns true if the flow uses a local HTTP callback.
+	UsesCallbackServer() bool
+	// Login runs the OAuth authorization flow.
+	Login(callbacks OAuthLoginCallbacks) (OAuthCredentials, error)
+	// RefreshToken refreshes expired credentials.
+	RefreshToken(creds OAuthCredentials) (OAuthCredentials, error)
+	// GetAPIKey extracts the bearer token from credentials.
+	GetAPIKey(creds OAuthCredentials) string
+}
+
+// OAuthSubscriptionProvider marks an OAuth login billed by a subscription.
+// Mirrors upstream OAuth provider isSubscription.
+type OAuthSubscriptionProvider interface {
+	IsSubscription() bool
+}
+
+// IsOAuthSubscriptionProvider reports whether the provider's OAuth login is a
+// subscription login. Mirrors upstream ModelRuntime.isUsingSubscription's
+// auth.oauth?.isSubscription === true test.
+func IsOAuthSubscriptionProvider(providerID string) bool {
+	provider, ok := GetOAuthProvider(providerID)
+	if !ok {
+		return false
+	}
+	subscription, ok := provider.(OAuthSubscriptionProvider)
+	return ok && subscription.IsSubscription()
+}

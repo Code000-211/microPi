@@ -1,0 +1,128 @@
+[
+  {
+    "reference": "node_modules/undici/lib/core/connect.js",
+    "manifest": "packages/coding-agent/package.json",
+    "package": "undici",
+    "version": "8.12.4",
+    "source": "test/parity/dependency-sources/undici/8.12.4/lib/core/connect.js",
+    "sha256": "266125b72199c68f93c6277b1c1e4455c3cc32803fbbce4842d74169cf4bb428",
+    "integrity": "sha512-8Mx+uNKKER2bA4AdtedkqRbwUCIJFr2nJckXRe5yrDqzePqwLP7VNcctN8/XdmDSbF7mS+jJKIszlL+vbam1VA=="
+  },
+  {
+    "reference": "node_modules/@anthropic-ai/sdk/lib/credentials/types.mjs",
+    "manifest": "packages/ai/package.json",
+    "package": "@anthropic-ai/sdk",
+    "version": "0.129.0",
+    "source": "test/parity/dependency-sources/@anthropic-ai/sdk/0.129.0/lib/credentials/types.mjs",
+    "sha256": "611b406723f6c5965b1ec832c7aff49850cac8f6b3bf0c0eb2b8711f52772394",
+    "integrity": "sha512-MH7LB20kNpGLUpPTe2OG5XvL/KhX8HUO9XyBaFjgFk6TLS4Xjt0VPIuMKywe7POKKPslX+QxSlVok9e+8kG5Nw=="
+  },
+  {
+    "reference": "node_modules/@anthropic-ai/sdk/lib/credentials/oidc-federation.mjs",
+    "manifest": "packages/ai/package.json",
+    "package": "@anthropic-ai/sdk",
+    "version": "0.129.0",
+    "source": "test/parity/dependency-sources/@anthropic-ai/sdk/0.129.0/lib/credentials/oidc-federation.mjs",
+    "sha256": "076aedf8993c689ea2898b75f15518b6ff2ee79012420dc6281b45b0cf114146",
+    "integrity": "sha512-MH7LB20kNpGLUpPTe2OG5XvL/KhX8HUO9XyBaFjgFk6TLS4Xjt0VPIuMKywe7POKKPslX+QxSlVok9e+8kG5Nw=="
+  },
+  {
+    "reference": "node_modules/typebox/build/system/settings/settings.mjs",
+    "manifest": "packages/coding-agent/package.json",
+    "package": "typebox",
+    "version": "1.3.27",
+    "source": "test/parity/dependency-sources/typebox/1.3.27/build/system/settings/settings.mjs",
+    "sha256": "d5d2395001e8990a3c23a105440db862bbb9989d7038176e511c009adf60a97d",
+    "integrity": "sha512-zu+jc1pcy4UiNThxikUr36f0Rybk9PEeCg/NE6adeWr/SKsdNO4EzZHYRDlv2YCVAfj3Odq3dESSo/jNyoBXzA=="
+  },
+  {
+    "reference": "node_modules/brace-expansion/dist/esm/index.js",
+    "manifest": "packages/coding-agent/package.json",
+    "package": "brace-expansion",
+    "version": "5.0.12",
+    "source": "test/parity/dependency-sources/brace-expansion/5.0.12/dist/esm/index.js",
+    "sha256": "eea9a18920e1cde68f0068c36c040541ad6e93b0bb89eaab38c8ab49925b90a8",
+    "integrity": "sha512-YovQ3rzhaLMIrDjNDMkNS01tea93qhEhG5xy8f6+R0l+dw3Ki+5sCoIoI942iuLZTHWogWktgwVDhU09iNEimQ=="
+  },
+  {
+    "reference": "node_modules/@smithy/core/dist-cjs/submodules/retry/index.js",
+    "manifest": "package-lock.json",
+    "package": "@smithy/core",
+    "version": "3.33.3",
+    "source": "test/parity/dependency-sources/@smithy/core/3.33.3/dist-cjs/submodules/retry/index.js",
+    "sha256": "e00b49dad152a3ff9b3b59ab990341adaf7a1213d1801fdc191982e76610feb3",
+    "integrity": "sha512-CsOeKq/9kA3y6VJHt+/+VTCtBaxJ4OTFpgrjIUhPpDIKxBci1k2bJaQASF2h/ELWrulGp+t97DZ0mevfAD8idg=="
+  },
+  {
+    "reference": "node_modules/minimatch/dist/esm/assert-valid-pattern.js",
+    "manifest": "packages/coding-agent/package.json",
+    "package": "minimatch",
+    "version": "11.0.3",
+    "source": "test/parity/dependency-sources/minimatch/11.0.3/dist/esm/assert-valid-pattern.js",
+    "sha256": "90e8d3327d573b9d2391edf03dc7d50c1c0b468d720a4c0fb4a08a36ee5c50dc",
+    "integrity": "sha512-iny/40PEGkNJQ5/Pv6z3nm6FbRAby32GeZRjCUJk2WnNDbgPSTcdI+DDvLqsgBdD4cD5sMtMheqPPnehCCa8Nw=="
+  },
+  {
+    "reference": "node_modules/minimatch/dist/esm/index.js",
+    "manifest": "packages/coding-agent/package.json",
+    "package": "minimatch",
+    "version": "11.0.3",
+    "source": "test/parity/dependency-sources/minimatch/11.0.3/dist/esm/index.js",
+    "sha256": "b238ca70371b1f192817ae9516afaacb566d1df2a7a85e47c6c24f41f1707864",
+    "integrity": "sha512-iny/40PEGkNJQ5/Pv6z3nm6FbRAby32GeZRjCUJk2WnNDbgPSTcdI+DDvLqsgBdD4cD5sMtMheqPPnehCCa8Nw=="
+  },
+  {
+    "reference": "node_modules/@isaacs/nonrecursive-glob-match/dist/esm/index.js",
+    "manifest": "package-lock.json",
+    "package": "@isaacs/nonrecursive-glob-match",
+    "version": "1.0.3",
+    "source": "test/parity/dependency-sources/@isaacs/nonrecursive-glob-match/1.0.3/dist/esm/index.js",
+    "sha256": "973928f7ba6c7a0b6f4de1975f8b0a35e7f9085fca65051ab22762b340156efb",
+    "integrity": "sha512-SI7kyKHq4XXDRozw+r9GlRZkia1ZkFrpLW98r2IC2Bpr8YkFGE3fvjzmxCG0x78A++69HmDNrDvSMYBZmHGpKA=="
+  },
+  {
+    "reference": "node_modules/@isaacs/nonrecursive-glob-match/dist/esm/parse-class.js",
+    "manifest": "package-lock.json",
+    "package": "@isaacs/nonrecursive-glob-match",
+    "version": "1.0.3",
+    "source": "test/parity/dependency-sources/@isaacs/nonrecursive-glob-match/1.0.3/dist/esm/parse-class.js",
+    "sha256": "26995e1481cf6853c33a541ebf30ee198e9d3796b15441f1cfdc128e3dbd0ab5",
+    "integrity": "sha512-SI7kyKHq4XXDRozw+r9GlRZkia1ZkFrpLW98r2IC2Bpr8YkFGE3fvjzmxCG0x78A++69HmDNrDvSMYBZmHGpKA=="
+  },
+  {
+    "reference": "node-deps/minimatch/index.js",
+    "manifest": ".node-version",
+    "package": "node",
+    "version": "24.22.2",
+    "source": "test/parity/dependency-sources/node/24.22.2/deps/minimatch/index.js",
+    "sha256": "f96315be454e1579bb685f035b015aca6c33d7275f03707f74d6c82089250c30",
+    "integrity": "sha256-b2f5443a34a38d863e87c0f5f80c03630fc16917dfe16f26c1cec44c0b542959"
+  },
+  {
+    "reference": "node_modules/lovely-mermaid/src/graph.ts",
+    "manifest": "packages/coding-agent/package.json",
+    "package": "lovely-mermaid",
+    "version": "0.3.3",
+    "source": "test/parity/dependency-sources/lovely-mermaid/0.3.3/src/graph.ts",
+    "sha256": "eda26efdea444ee39d6cc0fe69f7d9a651c1c5657639a27ac76d7d0fbbdf1c4c",
+    "integrity": "sha512-EMLJS934qwt2MLO/a5o+T/89HGbuXZPwmCpHIhHO+DVrm+y5tHlEHgpZzlC2o4yW/rFPHRFO9xSMafzqH4wH5A=="
+  },
+  {
+    "reference": "node_modules/lovely-mermaid/src/labels.ts",
+    "manifest": "packages/coding-agent/package.json",
+    "package": "lovely-mermaid",
+    "version": "0.3.3",
+    "source": "test/parity/dependency-sources/lovely-mermaid/0.3.3/src/labels.ts",
+    "sha256": "9d9c2e4585ce2d055c4fa3c757c5945d2c41ef09def7ad72b891c51ef4ac3b36",
+    "integrity": "sha512-EMLJS934qwt2MLO/a5o+T/89HGbuXZPwmCpHIhHO+DVrm+y5tHlEHgpZzlC2o4yW/rFPHRFO9xSMafzqH4wH5A=="
+  },
+  {
+    "reference": "node_modules/lovely-mermaid/src/diagrams/pie.ts",
+    "manifest": "packages/coding-agent/package.json",
+    "package": "lovely-mermaid",
+    "version": "0.3.3",
+    "source": "test/parity/dependency-sources/lovely-mermaid/0.3.3/src/diagrams/pie.ts",
+    "sha256": "f59c20313b94a0f9d6d2a9534cab1eaccf623d3e4abd9b7dc4c59d7f00862653",
+    "integrity": "sha512-EMLJS934qwt2MLO/a5o+T/89HGbuXZPwmCpHIhHO+DVrm+y5tHlEHgpZzlC2o4yW/rFPHRFO9xSMafzqH4wH5A=="
+  }
+]

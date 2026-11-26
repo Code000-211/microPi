@@ -1,0 +1,99 @@
+// Ports the Pi case "gives tools and hooks the Harness's models" of packages/durable/test/harness-tools.test.ts
+// (src/harness/types.ts HookApi.models and ToolExecutionApi.models, tool.ts `models: runtime.models`). See
+// harness_tasks_test.go for the Go mappings that apply to every case.
+
+package harness
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/durable"
+)
+
+// TestToolsAndHooksSeeTheHarnessModels mirrors packages/durable/test/harness-tools.test.ts:115 ("gives tools and hooks the
+// Harness's models"): ToolExecutionApi.models and HookApi.models are HarnessOptions.models.
+func TestToolsAndHooksSeeTheHarnessModels(t *testing.T) {
+	setup := chatSetup(t)
+	var seen []durable.Models
+	addTool(t, setup.Registry, tlTool("echo", func(_ context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+		seen = append(seen, api.Models())
+		return tlNoContent(context.Background(), nil, api)
+	}))
+	addHooks(t, setup.Registry, ToolTask.Erased(), &ToolHooks{BeforeTool: func(_ context.Context, _ ToolHookCall, api HookApi) (*BeforeToolResult, error) {
+		seen = append(seen, api.Models())
+		return nil, nil
+	}})
+	run := tlRun(t, setup, []ai.FauxResponseStep{tlCallsStep(tlCall{"echo", map[string]any{}, "c1"}), tlDone()}, nil)
+	if run.status != durable.SubmissionDone {
+		t.Fatalf("status %s, want done", run.status)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("%d models reads, want one from the hook and one from the tool", len(seen))
+	}
+	// A view of the host's Models that adds the Harness identity, shared by tools and hooks (harness-tools.test.ts: `seen[0]` is `seen[1]`).
+	if seen[0] != seen[1] {
+		t.Fatalf("tools and hooks read different views %v and %v of the Harness's models, want one shared view", seen[0], seen[1])
+	}
+	for index, models := range seen {
+		lister, ok := models.(ai.ModelsLister)
+		if !ok || len(lister.GetModels()) == 0 || len(lister.GetModels()) != len(setup.Models.GetModels()) {
+			t.Fatalf("read %d returned %v, want a view of the Harness's models %v", index, models, setup.Models)
+		}
+		if models.GetModel("faux", "faux-1") != setup.Models.GetModel("faux", "faux-1") {
+			t.Fatalf("read %d returned a view with other models than the Harness's", index)
+		}
+	}
+	mustClose(t, run.harness)
+}
+
+// TestToolResultRecordsTheSpanFromTheCallsFirstRun mirrors packages/durable/test/harness-tools.test.ts:461 ("records each
+// result's span from the call's first run, hooks included, also for calls that did not execute"; src/harness/tool.ts settle):
+// the duration spans the hooks and the tool's own work, a tool that throws still has one, and a call a beforeTool hook
+// blocked has the hook's time.
+func TestToolResultRecordsTheSpanFromTheCallsFirstRun(t *testing.T) {
+	setup := chatSetup(t)
+	work := func(_ context.Context, _ any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+		time.Sleep(30 * time.Millisecond) // the tool's simulated work is what the duration measures
+		return tlNoContent(context.Background(), nil, api)
+	}
+	addTool(t, setup.Registry, tlTool("slow", work))
+	addTool(t, setup.Registry, tlTool("thrower", func(ctx context.Context, args any, api durable.ToolExecutionApi) (durable.ToolExecutionResult, error) {
+		_, _ = work(ctx, args, api)
+		return durable.ToolExecutionResult{}, errors.New("boom")
+	}))
+	addHooks(t, setup.Registry, ToolTask.Erased(), &ToolHooks{BeforeTool: func(_ context.Context, call ToolHookCall, _ HookApi) (*BeforeToolResult, error) {
+		time.Sleep(100 * time.Millisecond) // hook time is not execute time
+		if call.ID == "blocked" {
+			return &BeforeToolResult{Block: new("no")}, nil
+		}
+		return nil, nil
+	}})
+	run := tlRun(t, setup, []ai.FauxResponseStep{
+		tlCallsStep(tlCall{"slow", map[string]any{}, "slow"}, tlCall{"thrower", map[string]any{}, "thrower"}, tlCall{"slow", map[string]any{}, "blocked"}),
+		tlDone(),
+	}, nil)
+	byId := map[string]ai.ToolResultMessage{}
+	for _, result := range tlResults(run.entries) {
+		byId[result.ToolCallID] = result
+	}
+	for _, id := range []string{"slow", "thrower"} {
+		duration := byId[id].DurationMs
+		if duration == nil {
+			t.Fatalf("%s: recorded no durationMs, want at least 125", id)
+		}
+		if *duration < 125 {
+			t.Fatalf("%s: durationMs %d, want at least 125: the 100 ms hook time and the 30 ms execution", id, *duration)
+		}
+	}
+	if !byId["thrower"].IsError {
+		t.Fatal("the thrower's result is not an error")
+	}
+	if duration := byId["blocked"].DurationMs; duration == nil || *duration < 95 {
+		t.Fatalf("a blocked call has durationMs %v, want at least 95: the hook's time", duration)
+	}
+	mustClose(t, run.harness)
+}

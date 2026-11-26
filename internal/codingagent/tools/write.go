@@ -1,0 +1,282 @@
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+	"unicode/utf8"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/checks"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/filetracking"
+	"github.com/MichaelKinsy/PiG/internal/nodefs"
+)
+
+// ─── Write Tool ───────────────────────────────────────────────────────────────
+
+const writeRefusalMaxChars = 30000
+
+func unreadWriteRefusal(path, existing string) string {
+	runes := []rune(existing)
+	shown := existing
+	cut := ""
+	if len(runes) > writeRefusalMaxChars {
+		shown = string(runes[:writeRefusalMaxChars])
+		cut = fmt.Sprintf("\n[cut at %d of %d characters: read the rest if it matters]", writeRefusalMaxChars, len(runes))
+	}
+	return fmt.Sprintf("Not written: %s exists and was not read, so writing would replace what is below unseen. It counts as read now: write again to replace it, or edit it.\n\n%s%s", path, shown, cut)
+}
+
+type writeParams struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// WriteOperations delegates file creation. Each callback completes before the mutation queue advances.
+// Ports packages/coding-agent/src/core/tools/write.ts.
+type WriteOperations struct {
+	WriteFile    func(string, string) error
+	Mkdir        func(string) error
+	ReadExisting func(string) (string, bool, error)
+}
+
+// WriteTool creates or overwrites files.
+type WriteTool struct {
+	CWD        string
+	Queue      *FileMutationQueue // serialises concurrent writes
+	Operations *WriteOperations
+	Tracker    *filetracking.Tracker
+	Checks     *checks.BackgroundChecks
+}
+
+func (t *WriteTool) operations() WriteOperations {
+	if t.Operations != nil {
+		return *t.Operations
+	}
+	return WriteOperations{WriteFile: writeFileString, Mkdir: func(path string) error { return os.MkdirAll(path, 0o755) }}
+}
+
+// writeFileString is os.WriteFile(path, []byte(content), 0o644) without copying content: File.WriteString writes the string's bytes.
+func writeFileString(path, content string) error {
+	f, err := nodefs.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString(content)
+	if closeErr := f.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+// unreadString is a string member decoded for its type only. It fails exactly where decoding into a string fails (any JSON value but a
+// string or null) without unquoting the text, so a reservation that needs only the path does not copy the content.
+type unreadString struct{}
+
+func (*unreadString) UnmarshalJSON(raw []byte) error {
+	if raw[0] == '"' || string(raw) == "null" {
+		return nil
+	}
+	return errors.New("tools: value is not a string")
+}
+
+// writeReservation is writeParams for ReserveMutationOrder: it decodes the path and checks the content's type.
+type writeReservation struct {
+	Path    string       `json:"path"`
+	Content unreadString `json:"content"`
+}
+
+func (t *WriteTool) Name() string  { return "write" }
+func (t *WriteTool) Label() string { return "" }
+
+func (t *WriteTool) Schema() ai.ToolSchema { return t.schema(false) }
+
+// BorrowedSchema is Schema with the parameters shared, not copied: the caller reads them and never modifies them.
+func (t *WriteTool) BorrowedSchema() ai.ToolSchema { return t.schema(true) }
+
+func (t *WriteTool) schema(borrow bool) ai.ToolSchema {
+	return toolSchemaWithParameters(ai.ToolSchema{
+		Name:                "write",
+		Description:         "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+		ConstrainedSampling: strictToolSampling(),
+		PromptGuidelines: []string{
+			"Use write only for new files or complete rewrites.",
+		},
+	}, `{"type":"object","required":["path","content"],"properties":{
+		"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},
+		"content":{"type":"string","description":"Content to write to the file"}
+	}}`, borrow)
+}
+
+// ExecutionMode is parallel: upstream's write definition sets no
+// executionMode, and the file mutation queue serialises writes to one file.
+func (t *WriteTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
+
+// RegistersInFileMutationQueue implements agent.RegistersInFileMutationQueue: the parallel dispatcher registers this call in the queue after the extension
+// tools before it in the batch started, as Pi runs their synchronous prefixes first.
+func (t *WriteTool) RegistersInFileMutationQueue() bool { return true }
+
+// PrepareArguments implements agent.ArgumentPreparer, normalizing file_path -> path.
+func (t *WriteTool) PrepareArguments(raw json.RawMessage) (json.RawMessage, error) {
+	return NormalizeToolArguments(raw, FilePathAlias), nil
+}
+
+// ReserveMutationOrder implements agent.QueueOrderable: the parallel
+// dispatcher calls this synchronously, in tool-call order, before spawning
+// this call's goroutine, so this write's place in the shared file mutation
+// queue is fixed before goroutine scheduling can reorder it. Returns
+// ok=false whenever Execute would not reach the queue either (invalid
+// params), so no reservation is ever left un-awaited.
+func (t *WriteTool) ReserveMutationOrder(rawParams json.RawMessage) (*agent.MutationTicket, bool) {
+	if t.Queue == nil {
+		return nil, false
+	}
+	var p writeReservation
+	if err := json.Unmarshal(NormalizeToolArguments(rawParams, FilePathAlias), &p); err != nil {
+		return nil, false
+	}
+	path, err := resolvePath(t.CWD, p.Path)
+	if err != nil {
+		return nil, false
+	}
+	ticket, err := t.Queue.Reserve(path)
+	if err != nil {
+		return nil, false
+	}
+	return &agent.MutationTicket{Wait: ticket.Wait, Release: ticket.Release}, true
+}
+
+// Execute mirrors upstream write.ts execute: inside the file mutation queue
+// create the parent directories and write the file, checking for an abort
+// after each step.
+func (t *WriteTool) Execute(ctx context.Context, _ string, rawParams json.RawMessage, _ agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
+	var p writeParams
+	if err := json.Unmarshal(NormalizeToolArguments(rawParams, FilePathAlias), &p); err != nil {
+		return agent.AgentToolResult{}, fmt.Errorf("write: invalid params: %w", err)
+	}
+	cwd, err := toolCWD(ctx, t.CWD)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+	path, err := resolvePath(cwd, p.Path)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+
+	ops := t.operations()
+	var failure string
+	if err := runQueued(ctx, t.Queue, path, func() error {
+		if ctx.Err() != nil {
+			failure = "Operation aborted"
+			return nil
+		}
+		if t.Tracker != nil {
+			if t.Operations == nil {
+				if existingInfo, statErr := os.Stat(path); statErr == nil {
+					if ctx.Err() != nil {
+						failure = "Operation aborted"
+						return nil
+					}
+					mtimeMs := float64(existingInfo.ModTime().UnixNano()) / 1e6
+					if !t.Tracker.StateTracker().HasBeenRead(path) {
+						existingBytes, readErr := os.ReadFile(path)
+						if ctx.Err() != nil {
+							failure = "Operation aborted"
+							return nil
+						}
+						if readErr == nil {
+							existing := string(existingBytes)
+							if !utf8.Valid(existingBytes) {
+								existing = string([]rune(existing))
+							}
+							t.Tracker.OnFileRead(path, existing, mtimeMs, cwd, existingBytes, true)
+							failure = unreadWriteRefusal(p.Path, existing)
+							return nil
+						}
+					}
+					var currentContent *string
+					if tracked, ok := t.Tracker.StateTracker().GetTrackedState(path); ok && (tracked.ContentComplete || t.Tracker.StateTracker().NeedsContentCompare(path, mtimeMs)) && existingInfo.Size() < 10<<20 {
+						if existingBytes, readErr := os.ReadFile(path); readErr == nil {
+							s := string(existingBytes)
+							currentContent = &s
+						}
+					}
+					if ctx.Err() != nil {
+						failure = "Operation aborted"
+						return nil
+					}
+					if err := t.Tracker.AssertCanModifyExistingFile(path, &mtimeMs, currentContent); err != nil {
+						failure = err.Error()
+						return nil
+					}
+				}
+			} else if ops.ReadExisting != nil {
+				existing, exists, readErr := ops.ReadExisting(path)
+				if ctx.Err() != nil {
+					failure = "Operation aborted"
+					return nil
+				}
+				if readErr == nil && exists {
+					if !t.Tracker.StateTracker().HasBeenRead(path) {
+						t.Tracker.OnFileRead(path, existing, float64(time.Now().UnixMilli()), cwd, []byte(existing), true)
+						failure = unreadWriteRefusal(p.Path, existing)
+						return nil
+					}
+					if err := t.Tracker.AssertCanModifyExistingFile(path, nil, &existing); err != nil {
+						failure = err.Error()
+						return nil
+					}
+				}
+			}
+		}
+		if err := ops.Mkdir(filepath.Dir(path)); err != nil {
+			failure = NodeFSError(err, "mkdir", filepath.Dir(path))
+			return nil
+		}
+		if ctx.Err() != nil {
+			failure = "Operation aborted"
+			return nil
+		}
+		if err := ops.WriteFile(path, p.Content); err != nil {
+			failure = NodeFSError(err, "open", path)
+			return nil
+		}
+		if ctx.Err() != nil {
+			failure = "Operation aborted"
+			return nil
+		}
+		if t.Tracker != nil {
+			afterMtimeMs := float64(time.Now().UnixMilli())
+			if t.Operations == nil {
+				if m, ok := statMtimeMs(path); ok {
+					afterMtimeMs = m
+				}
+			}
+			t.Tracker.OnFileModified(filetracking.FileModifiedParams{
+				AbsolutePath: path,
+				NewContent:   p.Content,
+				NewMtimeMs:   afterMtimeMs,
+			})
+		}
+		if t.Checks != nil {
+			t.Checks.OnEdited(path)
+		}
+		return nil
+	}); err != nil {
+		// runQueued/Queue.With failed before the callback ever ran (for
+		// example canonicalKey rejecting a symlink cycle): nothing was
+		// written, so this must not be reported as a success. Mirrors
+		// upstream write.ts awaiting withFileMutationQueue and propagating
+		// its rejection instead of assuming the write happened.
+		return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: err.Error()}}, Details: map[string]any{}, IsError: true, Thrown: true}, nil
+	}
+	if failure != "" {
+		return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: failure}}, Details: map[string]any{}, IsError: true, Thrown: true}, nil
+	}
+	return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "Successfully wrote to " + p.Path}}}, nil
+}

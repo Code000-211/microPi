@@ -1,0 +1,448 @@
+package ai
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/bodyreadhook"
+	"github.com/MichaelKinsy/PiG/internal/tlsdistrust"
+)
+
+type fetchTransport struct{ client *http.Client }
+
+func (transport fetchTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	client := transport.client
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if _, standard := base.(*http.Transport); standard && request.URL.Opaque != "" {
+		copy := *client
+		copy.Transport = originFormTransport{base: base}
+		client = &copy
+	}
+	return client.Do(request)
+}
+
+type originFormTransport struct{ base http.RoundTripper }
+
+func (transport originFormTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport.base.RoundTrip(originFormRequest(request))
+}
+
+// originFormRequest preserves the raw WHATWG path and query, without the fragment, when a standard Go transport serializes a request, without changing the URL observed by a caller-supplied fetch function.
+func originFormRequest(request *http.Request) *http.Request {
+	prefix := "//" + request.URL.Host
+	if !strings.HasPrefix(request.URL.Opaque, prefix+"/") {
+		return request
+	}
+	copy := new(*request)
+	url := *request.URL
+	// The request target leaves out the fragment, which net/url cannot hold apart from an opaque path.
+	url.Opaque, _, _ = strings.Cut(strings.TrimPrefix(url.Opaque, prefix), "#")
+	copy.URL = &url
+	return copy
+}
+
+// providerHTTPClient replaces only HTTP execution, keeping the provider's retry and transport-error policy. The caller-owned client decides redirects. Neither client nor the process default is mutated.
+func providerHTTPClient(configured, fetch *http.Client) *http.Client {
+	if fetch == nil {
+		return configured
+	}
+	client := *configured
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	transport := &nodeFetchTransport{base: fetchTransport{client: fetch}}
+	if retry, ok := configured.Transport.(*retryTransport); ok {
+		transport.base = &providerRequestTransport{base: transport.base}
+		wrapped := *retry
+		wrapped.base = transport
+		client.Transport = &wrapped
+	} else {
+		client.Transport = transport
+	}
+	return &client
+}
+
+const DefaultHTTPIdleTimeoutMs = 300_000
+
+var configuredHTTPIdleTimeoutMs atomic.Int64
+
+func init() {
+	configuredHTTPIdleTimeoutMs.Store(DefaultHTTPIdleTimeoutMs)
+}
+
+// ConfigureHTTPDispatcher updates the package-global idle timeout used by new
+// streaming HTTP clients. Zero disables the per-read/per-write idle deadline.
+// Mirrors upstream's configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs()).
+func ConfigureHTTPDispatcher(timeoutMs int) error {
+	if timeoutMs < 0 {
+		return fmt.Errorf("Invalid HTTP idle timeout: %d", timeoutMs)
+	}
+	configuredHTTPIdleTimeoutMs.Store(int64(timeoutMs))
+	return nil
+}
+
+// ConfiguredHTTPIdleTimeoutMs returns the currently configured package-global
+// HTTP idle timeout used for new streaming clients.
+func ConfiguredHTTPIdleTimeoutMs() int {
+	return int(configuredHTTPIdleTimeoutMs.Load())
+}
+
+func configuredHTTPIdleTimeout() time.Duration {
+	ms := configuredHTTPIdleTimeoutMs.Load()
+	// A delay past time.Duration's range (about 292 years) never fires in Undici's timers either; ms*time.Millisecond would wrap to an arbitrary deadline.
+	if ms <= 0 || ms > math.MaxInt64/int64(time.Millisecond) {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+type idleTimeoutConn struct {
+	net.Conn
+	timeout func() time.Duration
+	// ready is set by the HTTP transport only after connection establishment, including proxy CONNECT and TLS, completes. Nil keeps standalone wrappers active.
+	ready    *atomic.Bool
+	bodyRead bodyReadOwner
+	// socketRead, when set, reads the dialed socket with net.Conn.Read's results but without a blocking system call entry (socketReader).
+	socketRead func([]byte) (int, error)
+	// failure is how the connection ended, as Node's socket reports it.
+	failure socketFailure
+}
+
+// newIdleTimeoutConn wraps a connection dialed on network for the provider transports.
+func newIdleTimeoutConn(conn net.Conn, network string) *idleTimeoutConn {
+	tracked := &idleTimeoutConn{Conn: conn, timeout: configuredHTTPIdleTimeout, ready: new(atomic.Bool), socketRead: newSocketReader(conn, network)}
+	_, tracked.failure.socket = conn.(syscall.Conn)
+	return tracked
+}
+
+func (c *idleTimeoutConn) Read(p []byte) (int, error) {
+	c.bodyRead.pending()
+	c.setReadDeadline()
+	c.failure.reading.Add(1)
+	n, err := c.read(p)
+	c.failure.readEnded(err)
+	return n, err
+}
+
+// read reads the dialed socket.
+func (c *idleTimeoutConn) read(p []byte) (int, error) {
+	connection, observed := bodyreadhook.BeforeRead(c.Conn)
+	if !observed {
+		if c.socketRead != nil {
+			return c.socketRead(p)
+		}
+		return c.Conn.Read(p)
+	}
+	n, err := c.Conn.Read(p)
+	bodyreadhook.AfterRead(connection, n)
+	return n, err
+}
+
+func (c *idleTimeoutConn) Write(p []byte) (int, error) {
+	c.setWriteDeadline()
+	n, err := c.Conn.Write(p)
+	c.failure.writeEnded(err, c.established())
+	return n, err
+}
+
+// established reports whether connection establishment has completed (GotConn), after which net/http's read loop reads the connection.
+func (c *idleTimeoutConn) established() bool {
+	return c.ready != nil && c.ready.Load()
+}
+
+// Close closes the connection, which ends a write's wait for the read side (socketFailure).
+func (c *idleTimeoutConn) Close() error {
+	err := c.Conn.Close()
+	c.failure.connClosed()
+	return err
+}
+
+// requestWriteBatch bounds the bytes one vectored write of a request body carries, so the write deadline restarts for each batch as it does for each write.
+const requestWriteBatch = 1 << 20
+
+// plainWriter hides ReadFrom, so io.Copy through it does not come back to idleTimeoutConn.ReadFrom.
+type plainWriter struct{ io.Writer }
+
+// ReadFrom sends what net/http copies from a request body. A requestBody held as segments arrives as an io.LimitedReader over its
+// *requestBodyReader (which has a Close of its own, so neither http.NewRequest nor the transport wraps it): its segments go out in vectored
+// writes of up to requestWriteBatch bytes instead of through io.Copy's 32 KiB buffer, which copies them and writes each 32 KiB piece
+// with a system call of its own. The bytes on the connection are the same. Any other body is copied as io.Copy copies it: a reader's
+// WriteTo may reuse its buffer between writes, which the batch would send corrupted.
+func (c *idleTimeoutConn) ReadFrom(r io.Reader) (int64, error) {
+	lr, ok := r.(*io.LimitedReader)
+	if !ok {
+		return io.Copy(plainWriter{c}, r)
+	}
+	body, ok := lr.R.(*requestBodyReader)
+	if !ok {
+		return io.Copy(plainWriter{c}, r)
+	}
+	batch := &requestBatchWriter{conn: c, remaining: lr.N}
+	_, err := body.WriteTo(batch)
+	if err == nil {
+		err = batch.flush()
+	}
+	lr.N = batch.remaining
+	return batch.written, err
+}
+
+// requestBatchWriter queues the segments a requestBodyReader writes and sends them to its connection in vectored writes. The segments are not copied: a requestBody never modifies them, which is why only its reader may write to a batch (Write keeps its argument until the next flush).
+type requestBatchWriter struct {
+	conn      *idleTimeoutConn
+	queue     net.Buffers
+	queued    int
+	remaining int64
+	written   int64
+}
+
+func (w *requestBatchWriter) Write(p []byte) (int, error) {
+	total := len(p)
+	if int64(total) > w.remaining-int64(w.queued) {
+		return 0, io.ErrShortWrite
+	}
+	for len(p) > 0 {
+		piece := p[:min(len(p), requestWriteBatch-w.queued)]
+		w.queue = append(w.queue, piece)
+		w.queued += len(piece)
+		p = p[len(piece):]
+		if w.queued == requestWriteBatch {
+			if err := w.flush(); err != nil {
+				return total - len(p), err
+			}
+		}
+	}
+	return total, nil
+}
+
+// flush writes the queued segments, as one writev system call where the connection has one.
+func (w *requestBatchWriter) flush() error {
+	if w.queued == 0 {
+		return nil
+	}
+	w.conn.setWriteDeadline()
+	send := w.queue
+	n, err := send.WriteTo(w.conn.Conn)
+	w.conn.failure.writeEnded(err, w.conn.established())
+	clear(w.queue)
+	w.queue, w.queued = w.queue[:0], 0
+	w.written += n
+	w.remaining -= n
+	return err
+}
+
+func (c *idleTimeoutConn) setReadDeadline() {
+	if c.ready != nil && !c.ready.Load() {
+		return
+	}
+	timeout := c.timeout()
+	if timeout <= 0 {
+		_ = c.SetReadDeadline(time.Time{})
+		return
+	}
+	_ = c.SetReadDeadline(time.Now().Add(timeout))
+}
+
+func (c *idleTimeoutConn) setWriteDeadline() {
+	if c.ready != nil && !c.ready.Load() {
+		return
+	}
+	timeout := c.timeout()
+	if timeout <= 0 {
+		_ = c.SetWriteDeadline(time.Time{})
+		return
+	}
+	_ = c.SetWriteDeadline(time.Now().Add(timeout))
+}
+
+// streamingHTTPClient builds the provider HTTP/1.1 client with environment proxy routing. Connection establishment has the pinned Undici budget; configurable read/write/header idle deadlines apply after GotConn. There is no overall timeout for long-lived SSE requests; the caller context owns cancellation.
+func streamingHTTPClient() *http.Client {
+	return newStreamingHTTPClient(false)
+}
+
+// newStreamingHTTPClient builds the streaming client wrapped with the provider
+// retry transport (retry.provider.maxRetries / maxRetryDelayMs). The retry
+// policy is inert at the default maxRetries=0. When insecure is true, server
+// TLS certificate verification is skipped. Insecure is an opt-in for
+// OpenAI-compatible endpoints behind self-signed or internal-CA certificates
+// (on-prem gateways); it is never the default and is set only when a provider
+// is explicitly configured insecure.
+func newStreamingHTTPClient(insecure bool) *http.Client {
+	client := baseStreamingHTTPClient(insecure)
+	client.Transport = &retryTransport{base: &nodeFetchTransport{base: &providerRequestTransport{base: &sseIdleTransport{base: client.Transport}}, connectionIdle: true}}
+	return client
+}
+
+// streamingHTTPClientNoRetry builds the streaming client without the provider
+// retry transport, for providers upstream does not wrap with
+// retryProviderRequest. Only mistral-conversations is excluded: retrying it
+// when maxRetries>0 would diverge from upstream, which leaves it on the SDK's
+// own (disabled) retries.
+func streamingHTTPClientNoRetry() *http.Client {
+	client := baseStreamingHTTPClient(false)
+	client.Transport = &nodeFetchTransport{base: &sseIdleTransport{base: client.Transport}, connectionIdle: true}
+	return client
+}
+
+// NodeFetch is Node's global fetch under the configured dispatcher, for code that calls fetch directly (the MCP transports and OAuth requests): a failure before the response headers rejects with TypeError("fetch failed"), an aborted request with "This operation was aborted", a body that drops with "terminated", and the idle timeouts of ConfigureHTTPDispatcher apply. It follows the environment proxy rules of the provider clients.
+type NodeFetch struct{}
+
+// NewNodeFetch returns a fetch that sends each request through the dispatcher configured at that time, sharing its connection pool with the provider clients.
+func NewNodeFetch() *NodeFetch { return &NodeFetch{} }
+
+// Do sends the request. A rejection is the fetch error itself: http.Client's "Post <url>:" decoration around it is not part of what fetch rejects with.
+// The client is resolved per request because fetch uses the global dispatcher current at the call: ConfigureHTTPDispatcher after NewNodeFetch applies, as Pi's
+// configureHttpDispatcher reinstalling the dispatcher (interactive-mode.ts applyRuntimeSettings) does.
+func (f *NodeFetch) Do(request *http.Request) (*http.Response, error) {
+	response, err := streamingHTTPClientNoRetry().Do(request)
+	if requestError, ok := err.(*url.Error); ok { //nolint:errorlint // Only the direct client.Do decoration is stripped.
+		if _, fetchRejection := requestError.Err.(*nodeTransportError); fetchRejection { //nolint:errorlint // The decoration is stripped only from the fetch rejection.
+			err = requestError.Err
+		}
+	}
+	return response, err
+}
+
+// upstream: node_modules/undici/lib/core/connect.js:buildConnector
+const defaultHTTPConnectTimeout = 10 * time.Second
+
+func activateHTTPIdleTimeout(conn net.Conn) {
+	for {
+		switch current := conn.(type) {
+		case *idleTimeoutConn:
+			if current.ready != nil {
+				current.ready.Store(true)
+			}
+			// A pooled connection keeps a read pending while idle, with the deadline set when that read began. Undici's headersTimeout runs from the request, so each request that gets the connection restarts the read deadline; a deadline change applies to the pending read too.
+			current.setReadDeadline()
+			return
+		case *tls.Conn:
+			conn = current.NetConn()
+		case *proxyBufferedConn:
+			conn = current.Conn
+		default:
+			return
+		}
+	}
+}
+
+// dialStreamingTLS uses one connection budget through DNS, TCP and secureConnect. HTTP idleness starts only when the transport publishes GotConn.
+func dialStreamingTLS(ctx context.Context, network, address string, dial func(context.Context, string, string) (net.Conn, error), config *tls.Config, timeout time.Duration) (net.Conn, error) {
+	connectCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := dial(connectCtx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	tracked := newIdleTimeoutConn(conn, network)
+	options := config.Clone()
+	if options == nil {
+		options = tlsdistrust.Harden(nil)
+	}
+	if options.ServerName == "" {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		options.ServerName = host
+	}
+	secure := tls.Client(tracked, options)
+	if err := secure.HandshakeContext(connectCtx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return secure, nil
+}
+
+func streamingDialer(dialer net.Dialer) *net.Dialer {
+	// upstream: packages/coding-agent/src/core/http-dispatcher.ts:DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS
+	dialer.FallbackDelay = 2000 * time.Millisecond
+	return &dialer
+}
+
+// streamingTransportKey is everything a streaming transport is built from.
+type streamingTransportKey struct {
+	insecure              bool
+	idleTimeoutMs         int64
+	httpProxy, httpsProxy string
+}
+
+// streamingTransports holds the current shared transport for each TLS mode, as Pi holds the one global dispatcher configureHttpDispatcher installed last.
+var streamingTransports struct {
+	sync.Mutex
+	current [2]struct {
+		key       streamingTransportKey
+		transport http.RoundTripper
+	}
+}
+
+// baseStreamingHTTPClient returns a client over the shared transport for the current settings. A change of idle timeout or proxy environment replaces it,
+// as configureHttpDispatcher replaces the global dispatcher; the replaced transport closes its idle connections and keeps serving requests already in flight.
+// upstream: packages/coding-agent/src/core/http-dispatcher.ts:configureHttpDispatcher installs one process-wide dispatcher, so providers reuse connections.
+func baseStreamingHTTPClient(insecure bool) *http.Client {
+	key := streamingTransportKey{
+		insecure: insecure, idleTimeoutMs: configuredHTTPIdleTimeoutMs.Load(),
+		httpProxy: proxyEnv("http_proxy", "HTTP_PROXY"), httpsProxy: proxyEnv("https_proxy", "HTTPS_PROXY"),
+	}
+	mode := 0
+	if insecure {
+		mode = 1
+	}
+	streamingTransports.Lock()
+	defer streamingTransports.Unlock()
+	slot := &streamingTransports.current[mode]
+	if slot.transport == nil || slot.key != key {
+		if closer, ok := slot.transport.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+		slot.key, slot.transport = key, newStreamingTransport(insecure)
+	}
+	return &http.Client{Transport: slot.transport}
+}
+
+func newStreamingTransport(insecure bool) http.RoundTripper {
+	dialer := streamingDialer(net.Dialer{
+		KeepAlive: 15 * time.Second,
+	})
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			connectCtx, cancel := context.WithTimeout(ctx, defaultHTTPConnectTimeout)
+			defer cancel()
+			conn, err := dialer.DialContext(connectCtx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			return newIdleTimeoutConn(conn, network), nil
+		},
+		// pig additive (D191): every verified chain is checked against the compromised and removed eMudhra CAs.
+		TLSClientConfig: tlsdistrust.Harden(&tls.Config{
+			//nolint:gosec // G402: opt-in per-provider insecure TLS for self-signed/internal-CA endpoints; never the default.
+			// pig additive (D36): opt-in TLS-skip for self-signed/internal-CA endpoints.
+			InsecureSkipVerify: insecure,
+		}),
+		// A TLS upgrade after proxy CONNECT has its own connector budget, as in Undici. Direct TLS uses DialTLSContext's shared TCP/TLS budget.
+		TLSHandshakeTimeout:   defaultHTTPConnectTimeout,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       120 * time.Second,
+		ResponseHeaderTimeout: configuredHTTPIdleTimeout(),
+		DisableCompression:    false,
+	}
+	transport.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialStreamingTLS(ctx, network, address, dialer.DialContext, transport.TLSClientConfig, defaultHTTPConnectTimeout)
+	}
+	return newProxyTunnelTransport(transport)
+}

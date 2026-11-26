@@ -1,0 +1,1493 @@
+// Command gen-models has two jobs. With -src it reads upstream pi's generated catalog (models.generated.ts or .js and the provider
+// data its shards import) and emits ai/models_generated.go and its companions:
+//
+//	go run ./cmd/gen-models \
+//	  -src .upstream/current/packages/ai/src/models.generated.ts \
+//	  -out ai/models_generated.go
+//
+// Without -src it ports packages/ai/catalog/generate.ts: it fetches models.dev (v2), OpenRouter, Vercel AI Gateway, NVIDIA NIM and
+// Radius, builds every provider's catalog (internal/modelgen/providers) and writes the provider data files (-data-output) and
+// the public catalog JSON (-json-output), byte for byte as Pi's generator writes them.
+//
+// The responses it builds from come from the network, from -record/-replay (a directory of recorded responses), or from a catalog source,
+// the committed recording the repository's catalogs are made of (automation/gen/catalog-source): -record-source fetches live and replaces
+// the source when the run succeeds (make model-catalogs-live), -replay-source runs offline over it and writes the manifest generatedAt the
+// source's fetch time, so a regeneration writes the same bytes on any day.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"cmp"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
+	"flag"
+	"fmt"
+	"go/format"
+	"maps"
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
+)
+
+type modelRow struct {
+	Type             string
+	ID               string
+	Provider         string
+	Name             string
+	API              string
+	BaseURL          string
+	Headers          map[string]string
+	Compat           *ModelCompat
+	ThinkingLevelMap map[string]*string
+	SamplingParams   map[string]any
+	PromptCache      map[string]float64
+	InputLimits      *jsonModelInputLimits
+	ContextWindow    int
+	MaxTokens        int
+	InputCost        float64
+	OutputCost       float64
+	CacheRead        float64
+	CacheWrite       float64
+	Tiers            []jsonCostTier
+	Reasoning        bool
+	Inputs           []string // text/image/audio/video
+	Output           []string // image models: the modalities the model returns
+	Enabled          *bool
+	Lab              string
+	Providers        []jsonCatalogProvider
+	// Record is the entry's JSON as the catalog data spells it, compacted: Pi's model object, member order included.
+	Record string
+}
+
+type vercelGatewayRouting struct {
+	Only  []string `json:"only"`
+	Order []string `json:"order"`
+}
+
+type ModelCompat struct {
+	SupportsDeveloperRole                       *bool                      `json:"supportsDeveloperRole,omitempty"`
+	SupportsReasoningEffort                     *bool                      `json:"supportsReasoningEffort,omitempty"`
+	SupportsStore                               *bool                      `json:"supportsStore,omitempty"`
+	SupportsUsageInStreaming                    *bool                      `json:"supportsUsageInStreaming,omitempty"`
+	MaxTokensField                              string                     `json:"maxTokensField,omitempty"`
+	RequiresToolResultName                      *bool                      `json:"requiresToolResultName,omitempty"`
+	RequiresAssistantAfterToolResult            *bool                      `json:"requiresAssistantAfterToolResult,omitempty"`
+	RequiresNonNullAssistantContent             *bool                      `json:"requiresNonNullAssistantContent,omitempty"`
+	RequiresToolsWithToolHistory                *bool                      `json:"requiresToolsWithToolHistory,omitempty"`
+	PromptCacheKeyMode                          string                     `json:"promptCacheKeyMode,omitempty"`
+	RequiresThinkingAsText                      *bool                      `json:"requiresThinkingAsText,omitempty"`
+	RequiresReasoningContentOnAssistantMessages *bool                      `json:"requiresReasoningContentOnAssistantMessages,omitempty"`
+	ThinkingFormat                              string                     `json:"thinkingFormat,omitempty"`
+	CacheControlFormat                          string                     `json:"cacheControlFormat,omitempty"`
+	SendSessionAffinityHeaders                  *bool                      `json:"sendSessionAffinityHeaders,omitempty"`
+	SupportsStrictMode                          *bool                      `json:"supportsStrictMode,omitempty"`
+	SupportsStrictTools                         *bool                      `json:"supportsStrictTools,omitempty"`
+	SupportsOpenAIGrammarTools                  *bool                      `json:"supportsOpenAIGrammarTools,omitempty"`
+	SupportsExplicitPromptCacheMode             *bool                      `json:"supportsExplicitPromptCacheMode,omitempty"`
+	ReasoningEffortMap                          map[string]string          `json:"reasoningEffortMap,omitempty"`
+	OpenRouterRouting                           map[string]any             `json:"openRouterRouting,omitempty"`
+	VercelGatewayRouting                        *vercelGatewayRouting      `json:"vercelGatewayRouting,omitempty"`
+	ZaiToolStream                               *bool                      `json:"zaiToolStream,omitempty"`
+	SupportsLongCacheRetention                  *bool                      `json:"supportsLongCacheRetention,omitempty"`
+	SendSessionIdHeader                         *bool                      `json:"sendSessionIdHeader,omitempty"`
+	SupportsEagerToolInputStreaming             *bool                      `json:"supportsEagerToolInputStreaming,omitempty"`
+	ForceAdaptiveThinking                       *bool                      `json:"forceAdaptiveThinking,omitempty"`
+	SupportsTemperature                         *bool                      `json:"supportsTemperature,omitempty"`
+	AllowEmptySignature                         *bool                      `json:"allowEmptySignature,omitempty"`
+	SupportsCacheControlOnTools                 *bool                      `json:"supportsCacheControlOnTools,omitempty"`
+	DeferredToolsMode                           string                     `json:"deferredToolsMode,omitempty"`
+	SessionAffinityFormat                       string                     `json:"sessionAffinityFormat,omitempty"`
+	SupportsToolSearch                          *bool                      `json:"supportsToolSearch,omitempty"`
+	SupportsToolReferences                      *bool                      `json:"supportsToolReferences,omitempty"`
+	ChatTemplateArgs                            map[string]any             `json:"chatTemplateArgs,omitempty"`
+	SupportsThinkingTokenBudget                 *bool                      `json:"supportsThinkingTokenBudget,omitempty"`
+	ThinkingTokenBudgetField                    string                     `json:"thinkingTokenBudgetField,omitempty"`
+	SupportsAdditionalTools                     *bool                      `json:"supportsAdditionalTools,omitempty"`
+	SupportsMidConvoEffort                      *bool                      `json:"supportsMidConvoEffort,omitempty"`
+	SupportsMidConvoSystemMessages              *bool                      `json:"supportsMidConvoSystemMessages,omitempty"`
+	SupportsMidConvoToolAdditions               *bool                      `json:"supportsMidConvoToolAdditions,omitempty"`
+	SupportsMidConvoToolChanges                 *bool                      `json:"supportsMidConvoToolChanges,omitempty"`
+	AllowedFallbackModels                       []jsonAllowedFallbackModel `json:"allowedFallbackModels,omitempty"`
+	// ImageInput and SendImageOptInHeader are the System One settings of classifier models (SystemOneCompatSchema).
+	ImageInput           string `json:"imageInput,omitempty"`
+	SendImageOptInHeader *bool  `json:"sendImageOptInHeader,omitempty"`
+}
+
+var (
+	// reBarrelImport matches a per-provider import in the catalog barrel
+	// (models.generated.ts/.js), e.g.
+	//   import { ANTHROPIC_CLASSIFIER_MODELS, ANTHROPIC_IMAGE_MODELS, ANTHROPIC_MODELS } from "./providers/anthropic.models.ts";
+	// The captured path keeps the extension so the same code resolves the
+	// .ts git-tag mirror and the .js npm dist.
+	reBarrelImport = regexp.MustCompile(`^import \{[^}]*\} from "(\./providers/[^"]+\.models\.(?:ts|js))";`)
+
+	// reDataImport matches the provider shard's import of its data file, e.g.
+	//   import values from "./data/anthropic.json" with { type: "json" };
+	reDataImport = regexp.MustCompile(`import\s+values\s+from\s+"(\./data/[^"]+\.json)"`)
+)
+
+// runGeneration runs the generator over live responses, a recording, or a catalog source, and returns the exit status. It owns the
+// scratch directories, so the process exit leaves none behind.
+func runGeneration(options generatorOptions, record, replay, recordSourceDir, replaySourceDir string) int {
+	modes := 0
+	for _, mode := range []string{record, replay, recordSourceDir, replaySourceDir} {
+		if mode != "" {
+			modes++
+		}
+	}
+	if modes > 1 {
+		fmt.Fprintln(os.Stderr, "Error: -record, -replay, -record-source and -replay-source cannot be combined")
+		return 1
+	}
+	var finish func() error
+	switch {
+	case recordSourceDir != "":
+		var cleanup func()
+		var err error
+		if finish, cleanup, err = recordSource(recordSourceDir); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+		defer cleanup()
+	case replaySourceDir != "":
+		cleanup, err := replaySource(replaySourceDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+		defer cleanup()
+	default:
+		if err := configureFixtures(record, replay); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+	}
+	if err := generateModels(options); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return 1
+	}
+	if finish != nil {
+		if err := finish(); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+		fmt.Println("Recorded the catalog source under", recordSourceDir)
+	}
+	return 0
+}
+
+func main() {
+	src := flag.String("src", "", "path to upstream models.generated.ts or .js: emit the Go catalogs from it")
+	out := flag.String("out", "ai/models_generated.go", "output Go file for chat models")
+	imageOut := flag.String("image-out", "", "output Go file for image models (default image_models_generated.go beside -out)")
+	classifierOut := flag.String("classifier-out", "", "output Go file for classifier models (default classifier_models_generated.go beside -out)")
+	providerOut := flag.String("provider-out", "", "output Go file for the barrel's provider ids (default providers_generated.go beside -out)")
+	strict := flag.Bool("strict", false, "generation: fail instead of degrading when upstream data is unexpected")
+	dataOnly := flag.Bool("data-only", false, "generation: regenerate the provider data files of the providers already in -data-output")
+	jsonOnly := flag.Bool("json-only", false, "generation: write only the public catalog JSON (-json-output)")
+	jsonOutput := flag.String("json-output", "", "generation: output directory for the public catalog JSON")
+	dataOutput := flag.String("data-output", "", "generation: directory for the provider data files (<provider>.json and .manifest.json)")
+	pretty := flag.Bool("pretty", false, "generation: indent JSON output")
+	record := flag.String("record", "", "generation: store every upstream response under this directory")
+	replay := flag.String("replay", "", "generation: serve the responses recorded under this directory instead of fetching")
+	recordSourceDir := flag.String("record-source", "", "generation: fetch live and, when the run succeeds, replace the catalog source (responses.tar.gz and meta.json) in this directory")
+	replaySourceDir := flag.String("replay-source", "", "generation: serve the catalog source in this directory instead of fetching; the manifest generatedAt is its fetch time")
+	mergeSourceDir := flag.String("merge-source", "", "take the models named by -merge-ids from one live models.dev fetch into the catalog source in this directory; every other byte of the recording stays")
+	mergeIDs := flag.String("merge-ids", "", "with -merge-source: comma-separated <provider>/<model> ids of the models.dev response")
+	flag.Parse()
+	if *mergeSourceDir != "" {
+		if *src != "" || *strict || *dataOnly || *jsonOnly || *jsonOutput != "" || *dataOutput != "" || *record != "" || *replay != "" || *recordSourceDir != "" || *replaySourceDir != "" {
+			fmt.Fprintln(os.Stderr, "gen-models: -merge-source cannot be combined with another mode")
+			os.Exit(2)
+		}
+		os.Exit(runMergeSource(*mergeSourceDir, *mergeIDs))
+	}
+	if *src == "" {
+		if *strict || *dataOnly || *jsonOnly || *jsonOutput != "" || *dataOutput != "" || *record != "" || *replay != "" || *recordSourceDir != "" || *replaySourceDir != "" {
+			os.Exit(runGeneration(generatorOptions{strict: *strict, dataOnly: *dataOnly, jsonOnly: *jsonOnly, jsonOutputDir: *jsonOutput, dataOutputDir: *dataOutput, pretty: *pretty}, *record, *replay, *recordSourceDir, *replaySourceDir))
+		}
+		fmt.Fprintln(os.Stderr, "gen-models: -src is required")
+		os.Exit(2)
+	}
+	if *strict || *dataOnly || *jsonOnly || *jsonOutput != "" || *dataOutput != "" || *record != "" || *replay != "" || *recordSourceDir != "" || *replaySourceDir != "" {
+		fmt.Fprintln(os.Stderr, "gen-models: -strict, -data-only, -json-only, -json-output, -data-output, -record, -replay, -record-source and -replay-source generate catalog data and cannot be combined with -src")
+		os.Exit(2)
+	}
+	if *imageOut == "" {
+		*imageOut = filepath.Join(filepath.Dir(*out), "image_models_generated.go")
+	}
+	if *classifierOut == "" {
+		*classifierOut = filepath.Join(filepath.Dir(*out), "classifier_models_generated.go")
+	}
+
+	if *providerOut == "" {
+		*providerOut = filepath.Join(filepath.Dir(*out), "providers_generated.go")
+	}
+
+	catalog, err := collectCatalog(*src)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "load:", err)
+		os.Exit(1)
+	}
+	if len(catalog.Chat) == 0 {
+		fmt.Fprintln(os.Stderr, "gen-models: parsed 0 models: refusing to clobber output")
+		os.Exit(1)
+	}
+	if err := emit(*out, *src, catalog.Chat); err != nil {
+		fmt.Fprintln(os.Stderr, "emit:", err)
+		os.Exit(1)
+	}
+	if err := emitImages(*imageOut, *src, catalog.Image); err != nil {
+		fmt.Fprintln(os.Stderr, "emit images:", err)
+		os.Exit(1)
+	}
+	if err := emitClassifiers(*classifierOut, *src, catalog.Classifier); err != nil {
+		fmt.Fprintln(os.Stderr, "emit classifiers:", err)
+		os.Exit(1)
+	}
+	if err := emitProviders(*providerOut, *src, catalog.Providers, catalog.GeneratedAt); err != nil {
+		fmt.Fprintln(os.Stderr, "emit providers:", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "gen-models: wrote %d chat models to %s, %d image models to %s and %d classifier models to %s\n", len(catalog.Chat), *out, len(catalog.Image), *imageOut, len(catalog.Classifier), *classifierOut)
+}
+
+// modelCatalog holds the flattened catalog of every provider shard, each list in barrel order. Providers holds the barrel's
+// provider ids.
+type modelCatalog struct {
+	Chat, Image, Classifier []modelRow
+	Providers               []string
+	// GeneratedAt is the `generatedAt` of the data manifest (providers/data/.manifest.json) in Unix milliseconds; nil when the manifest has no valid time, as providers/all.ts getBuiltinModelDataGeneratedAt returns undefined for NaN.
+	GeneratedAt *float64
+}
+
+// readModelDataGeneratedAt reads `generatedAt` of the data manifest beside the provider data files. The value is the
+// Date.parse of an ISO-8601 time: whole milliseconds since the Unix epoch.
+func readModelDataGeneratedAt(manifestPath string) (*float64, error) {
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	var manifest struct {
+		GeneratedAt string `json:"generatedAt"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("%s: %w", manifestPath, err)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, manifest.GeneratedAt)
+	if err != nil {
+		return nil, nil //nolint:nilnil // an unparseable time is "no generation time", as upstream's NaN check returns undefined
+	}
+	return new(float64(parsed.UnixMilli())), nil
+}
+
+// collectCatalog reads the catalog barrel at src (models.generated.ts or .js) and, for every provider shard it imports,
+// the shard's data/<provider>.json. The rows of each type keep the barrel's provider order and the data's insertion order
+// because upstream exposes catalog order to callers (models.generated.ts, providers/<provider>.models.ts,
+// model-catalog.ts flattenChatModelCatalog, flattenImageModelCatalog and flattenClassifierModelCatalog).
+func collectCatalog(src string) (modelCatalog, error) {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return modelCatalog{}, err
+	}
+	dir := filepath.Dir(src)
+	var catalog modelCatalog
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		m := reBarrelImport.FindStringSubmatch(sc.Text())
+		if m == nil {
+			continue
+		}
+		shardPath := filepath.Join(dir, filepath.FromSlash(m[1]))
+		provider := strings.TrimSuffix(filepath.Base(shardPath), filepath.Ext(shardPath))
+		provider = strings.TrimSuffix(provider, ".models")
+		shard, err := os.ReadFile(shardPath)
+		if err != nil {
+			return modelCatalog{}, err
+		}
+		dm := reDataImport.FindSubmatch(shard)
+		if dm == nil {
+			return modelCatalog{}, fmt.Errorf("provider %s: no data/<provider>.json import", shardPath)
+		}
+		dataPath := filepath.Join(filepath.Dir(shardPath), filepath.FromSlash(string(dm[1])))
+		if catalog.GeneratedAt == nil {
+			generatedAt, err := readModelDataGeneratedAt(filepath.Join(filepath.Dir(dataPath), ".manifest.json"))
+			if err != nil {
+				return modelCatalog{}, err
+			}
+			catalog.GeneratedAt = generatedAt
+		}
+		rows, err := parseDataJSON(dataPath)
+		if err != nil {
+			return modelCatalog{}, fmt.Errorf("provider %s: %w", shardPath, err)
+		}
+		for _, row := range rows {
+			if row.Provider != provider {
+				return modelCatalog{}, fmt.Errorf("provider %s: model %s:%s has provider %q, expected %q", shardPath, row.Type, row.ID, row.Provider, provider)
+			}
+			if fields := unsupportedFields(row); len(fields) > 0 {
+				return modelCatalog{}, fmt.Errorf("provider %s: %s model %s has fields the Go %s model cannot carry: %s", shardPath, row.Type, row.ID, row.Type, strings.Join(fields, ", "))
+			}
+		}
+		catalog.Providers = append(catalog.Providers, provider)
+		catalog.Chat = append(catalog.Chat, flattenModelCatalog(rows, "chat")...)
+		catalog.Image = append(catalog.Image, flattenModelCatalog(rows, "image")...)
+		catalog.Classifier = append(catalog.Classifier, flattenModelCatalog(rows, "classifier")...)
+	}
+	if err := sc.Err(); err != nil {
+		return modelCatalog{}, err
+	}
+	return catalog, nil
+}
+
+// flattenModelCatalog selects the models of one type (model-catalog.ts flattenModelCatalog). Object.fromEntries
+// enumerates canonical array-index ids before every other id, so a numeric model id moves to the front in ascending order.
+func flattenModelCatalog(rows []modelRow, modelType string) []modelRow {
+	var out []modelRow
+	for _, row := range rows {
+		if row.Type == modelType {
+			out = append(out, row)
+		}
+	}
+	indexID := func(row modelRow) (uint64, bool) {
+		n, err := strconv.ParseUint(row.ID, 10, 32)
+		return n, err == nil && n < math.MaxUint32 && strconv.FormatUint(n, 10) == row.ID
+	}
+	slices.SortStableFunc(out, func(a, b modelRow) int {
+		x, xok := indexID(a)
+		y, yok := indexID(b)
+		switch {
+		case xok && yok:
+			return cmp.Compare(x, y)
+		case xok:
+			return -1
+		case yok:
+			return 1
+		}
+		return 0
+	})
+	return out
+}
+
+// jsonModel mirrors every current field of a data/<provider>.json model entry.
+// JSON decoding rejects unknown fields so a future upstream capability cannot
+// silently disappear from the generated Go catalog.
+type jsonModel struct {
+	Type             string                `json:"type"`
+	ID               string                `json:"id"`
+	Name             string                `json:"name"`
+	API              string                `json:"api"`
+	Provider         string                `json:"provider"`
+	BaseURL          string                `json:"baseUrl"`
+	Reasoning        bool                  `json:"reasoning"`
+	Input            []string              `json:"input"`
+	Output           []string              `json:"output"`
+	Cost             *jsonCost             `json:"cost"`
+	PromptCache      map[string]float64    `json:"promptCache"`
+	InputLimits      *jsonModelInputLimits `json:"inputLimits"`
+	ContextWindow    int                   `json:"contextWindow"`
+	MaxTokens        int                   `json:"maxTokens"`
+	Headers          map[string]string     `json:"headers"`
+	Compat           *ModelCompat          `json:"compat"`
+	ThinkingLevelMap map[string]*string    `json:"thinkingLevelMap"`
+	SamplingParams   map[string]any        `json:"samplingParams"`
+	Enabled          *bool                 `json:"enabled"`
+	Lab              string                `json:"lab"`
+	Providers        []jsonCatalogProvider `json:"providers"`
+	// Free is carried by Pi v1.4.0's radius data (data/radius.json, recursive/flint) and read by no Pi code: Pi's catalog passes the JSON
+	// through untyped, so the field is accepted here and stays in the model's record, exactly as in Pi.
+	Free *bool `json:"free"`
+	// record is the compacted entry JSON.
+	record string
+}
+
+type jsonModelInputLimits struct {
+	MaxRequestBytes jsonOptionalInt       `json:"maxRequestBytes"`
+	Images          *jsonModelImageLimits `json:"images"`
+}
+
+type jsonModelImageLimits struct {
+	Resize        *jsonModelImageResize `json:"resize"`
+	MaxPerMessage jsonOptionalInt       `json:"maxPerMessage"`
+	MaxPerRequest jsonOptionalInt       `json:"maxPerRequest"`
+}
+
+type jsonModelImageResize struct {
+	MaxWidth    jsonOptionalInt `json:"maxWidth"`
+	MaxHeight   jsonOptionalInt `json:"maxHeight"`
+	MaxBytes    jsonOptionalInt `json:"maxBytes"`
+	JPEGQuality jsonOptionalInt `json:"jpegQuality"`
+}
+
+type jsonOptionalInt struct {
+	Value   int
+	Present bool
+}
+
+func (value *jsonOptionalInt) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errors.New("must be an integer")
+	}
+	var decoded int
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	value.Value = decoded
+	value.Present = true
+	return nil
+}
+
+// jsonCost is a catalog cost; a nil Tiers is a cost with no tiers member and an empty one a cost with tiers: [].
+type jsonCost struct {
+	Input      float64        `json:"input"`
+	Output     float64        `json:"output"`
+	CacheRead  float64        `json:"cacheRead"`
+	CacheWrite float64        `json:"cacheWrite"`
+	Tiers      []jsonCostTier `json:"tiers,omitzero"`
+}
+
+// jsNumber marshals like JSON.stringify: a number that is not finite is null, and negative zero is 0.
+type jsNumber float64
+
+func (n jsNumber) MarshalJSON() ([]byte, error) {
+	return jsnumber.JSON(float64(n)), nil
+}
+
+// MarshalJSON writes the cost the way JSON.stringify writes it, so a NaN price (an unparsable OpenRouter price string) is null.
+func (c jsonCost) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Input      jsNumber       `json:"input"`
+		Output     jsNumber       `json:"output"`
+		CacheRead  jsNumber       `json:"cacheRead"`
+		CacheWrite jsNumber       `json:"cacheWrite"`
+		Tiers      []jsonCostTier `json:"tiers,omitzero"`
+	}{jsNumber(c.Input), jsNumber(c.Output), jsNumber(c.CacheRead), jsNumber(c.CacheWrite), c.Tiers})
+}
+
+type jsonCostTier struct {
+	InputTokensAbove float64 `json:"inputTokensAbove"`
+	Input            float64 `json:"input"`
+	Output           float64 `json:"output"`
+	CacheRead        float64 `json:"cacheRead"`
+	CacheWrite       float64 `json:"cacheWrite"`
+}
+
+type jsonAllowedFallbackModel struct {
+	Provider string   `json:"provider"`
+	Model    string   `json:"model"`
+	Cost     jsonCost `json:"cost"`
+}
+
+type jsonCatalogProvider struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Credential string `json:"credential"`
+	Source     string `json:"source"`
+}
+
+// parseDataJSON reads one data/<provider>.json: API groups of "<type>:<id>" keyed models. Every model object is decoded
+// strictly so new catalog fields fail generation instead of disappearing from Pig. Identity follows
+// packages/ai/scripts/model-data.ts validateModelValue and validateModelDataDirectory: a known type, a key that is
+// "<type>:<id>", and no key repeated across API groups.
+func parseDataJSON(path string) ([]modelRow, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := decoder.ReadToken()
+	if err != nil {
+		return nil, fmt.Errorf("decode catalog root: %w", err)
+	}
+	if token.Kind() != '{' {
+		return nil, fmt.Errorf("catalog root is %v, want object", token)
+	}
+	var models []jsonModel
+	seen := make(map[string]string)
+	for decoder.PeekKind() != '}' {
+		keyToken, err := decoder.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		api := keyToken.String() // a Token and the bytes ReadValue returns are void after the next call on the decoder
+		encoded, err := decoder.ReadValue()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", api, err)
+		}
+		group, err := decodeJSONModelGroup(encoded, seen) // reads encoded before the decoder moves; keeps none of it
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", api, err)
+		}
+		models = append(models, group...)
+	}
+	if _, err := decoder.ReadToken(); err != nil {
+		return nil, err
+	}
+	rows := make([]modelRow, 0, len(models))
+	for _, jm := range models {
+		row := modelRow{
+			Type:             jm.Type,
+			ID:               jm.ID,
+			Provider:         jm.Provider,
+			Name:             jm.Name,
+			API:              jm.API,
+			BaseURL:          jm.BaseURL,
+			Headers:          jm.Headers,
+			Compat:           normalizeCompat(jm.Compat),
+			ThinkingLevelMap: jm.ThinkingLevelMap,
+			SamplingParams:   jm.SamplingParams,
+			PromptCache:      jm.PromptCache,
+			InputLimits:      jm.InputLimits,
+			ContextWindow:    jm.ContextWindow,
+			MaxTokens:        jm.MaxTokens,
+			Reasoning:        jm.Reasoning,
+			Inputs:           jm.Input,
+			Output:           jm.Output,
+			Enabled:          jm.Enabled,
+			Lab:              jm.Lab,
+			Providers:        jm.Providers,
+			Record:           jm.record,
+		}
+		if jm.Cost != nil {
+			row.InputCost = jm.Cost.Input
+			row.OutputCost = jm.Cost.Output
+			row.CacheRead = jm.Cost.CacheRead
+			row.CacheWrite = jm.Cost.CacheWrite
+			row.Tiers = jm.Cost.Tiers
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// decodeJSONModelGroup decodes one API group. seen maps every "<type>:<id>" key of the file to its API group.
+func decodeJSONModelGroup(data []byte, seen map[string]string) ([]jsonModel, error) {
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := decoder.ReadToken()
+	if err != nil {
+		return nil, fmt.Errorf("decode model group: %w", err)
+	}
+	if token.Kind() != '{' {
+		return nil, fmt.Errorf("model group root is %v, want object", token)
+	}
+	var models []jsonModel
+	for decoder.PeekKind() != '}' {
+		keyToken, err := decoder.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		key := keyToken.String() // a Token and the bytes ReadValue returns are void after the next call on the decoder
+		value, err := decoder.ReadValue()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		encoded := json.RawMessage(bytes.Clone(value)) // the next call on the decoder voids value
+		model, err := decodeJSONModel(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, encoded); err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		model.record = compact.String()
+		if key != model.Type+":"+model.ID {
+			return nil, fmt.Errorf("%s: mismatched type/id identity (model is %s:%s)", key, model.Type, model.ID)
+		}
+		if _, exists := seen[key]; exists {
+			return nil, fmt.Errorf("%s appears in more than one API group", key)
+		}
+		seen[key] = model.API
+		models = append(models, model)
+	}
+	if _, err := decoder.ReadToken(); err != nil {
+		return nil, err
+	}
+	return models, nil
+}
+
+func decodeJSONModel(data []byte) (jsonModel, error) {
+	var model jsonModel
+	if err := rejectNullInputLimits(data); err != nil {
+		return model, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&model); err != nil {
+		return model, err
+	}
+	switch model.Type {
+	case "chat", "image", "classifier":
+	default:
+		return model, fmt.Errorf("model has type %q, expected \"chat\", \"image\", or \"classifier\"", model.Type)
+	}
+	if model.ID == "" || model.Provider == "" || model.API == "" {
+		return model, errors.New("model requires id, provider, and api")
+	}
+	if err := validateModelInputLimits(model.InputLimits); err != nil {
+		return model, err
+	}
+	return model, nil
+}
+
+func validateModelInputLimits(limits *jsonModelInputLimits) error {
+	if limits == nil {
+		return nil
+	}
+	if err := validatePositiveLimit("inputLimits.maxRequestBytes", limits.MaxRequestBytes); err != nil {
+		return err
+	}
+	if limits.Images == nil {
+		return nil
+	}
+	if err := validatePositiveLimit("inputLimits.images.maxPerMessage", limits.Images.MaxPerMessage); err != nil {
+		return err
+	}
+	if err := validatePositiveLimit("inputLimits.images.maxPerRequest", limits.Images.MaxPerRequest); err != nil {
+		return err
+	}
+	if limits.Images.Resize == nil {
+		return nil
+	}
+	resize := limits.Images.Resize
+	for _, field := range []struct {
+		name  string
+		value jsonOptionalInt
+	}{
+		{name: "maxWidth", value: resize.MaxWidth},
+		{name: "maxHeight", value: resize.MaxHeight},
+		{name: "maxBytes", value: resize.MaxBytes},
+		{name: "jpegQuality", value: resize.JPEGQuality},
+	} {
+		if err := validatePositiveLimit("inputLimits.images.resize."+field.name, field.value); err != nil {
+			return err
+		}
+	}
+	if resize.JPEGQuality.Present && resize.JPEGQuality.Value > 100 {
+		return fmt.Errorf("inputLimits.images.resize.jpegQuality must be at most 100")
+	}
+	return nil
+}
+
+func validatePositiveLimit(name string, value jsonOptionalInt) error {
+	if value.Present && value.Value < 1 {
+		return fmt.Errorf("%s must be at least 1", name)
+	}
+	return nil
+}
+
+func rejectNullInputLimits(data []byte) error {
+	var model map[string]json.RawMessage
+	if err := json.Unmarshal(data, &model); err != nil {
+		return err
+	}
+	limitsData, exists := model["inputLimits"]
+	if !exists {
+		return nil
+	}
+	limits, err := decodePresentObject("inputLimits", limitsData)
+	if err != nil {
+		return err
+	}
+	if err := rejectNullFields("inputLimits", limits, "maxRequestBytes"); err != nil {
+		return err
+	}
+	imagesData, exists := limits["images"]
+	if !exists {
+		return nil
+	}
+	images, err := decodePresentObject("inputLimits.images", imagesData)
+	if err != nil {
+		return err
+	}
+	if err := rejectNullFields("inputLimits.images", images, "maxPerMessage", "maxPerRequest"); err != nil {
+		return err
+	}
+	resizeData, exists := images["resize"]
+	if !exists {
+		return nil
+	}
+	resize, err := decodePresentObject("inputLimits.images.resize", resizeData)
+	if err != nil {
+		return err
+	}
+	return rejectNullFields("inputLimits.images.resize", resize, "maxWidth", "maxHeight", "maxBytes", "jpegQuality")
+}
+
+func decodePresentObject(name string, data json.RawMessage) (map[string]json.RawMessage, error) {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil, fmt.Errorf("%s must be an object", name)
+	}
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, fmt.Errorf("%s must be an object: %w", name, err)
+	}
+	return value, nil
+}
+
+func rejectNullFields(parent string, object map[string]json.RawMessage, fields ...string) error {
+	for _, field := range fields {
+		data, exists := object[field]
+		if exists && bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+			return fmt.Errorf("%s.%s must be an integer", parent, field)
+		}
+	}
+	return nil
+}
+
+// normalizeCompat drops an all-empty compat object to nil so a model with no
+// compat overrides emits no ModelCompat literal, matching the line parser.
+func normalizeCompat(c *ModelCompat) *ModelCompat {
+	if c == nil {
+		return nil
+	}
+	if b, err := json.Marshal(c); err != nil || string(b) == "{}" {
+		return nil
+	}
+	return c
+}
+
+func emit(path, src string, rows []modelRow) error {
+	resetCatalogStrings()
+	var b strings.Builder
+	fmt.Fprintf(&b, "// Code generated by cmd/gen-models. DO NOT EDIT.\n")
+	// Always record source as the basename so re-runs from different
+	// working directories produce byte-identical output (required by
+	// TestCodegenByteIdentical).
+	writeSourceHeader(&b, src)
+	fmt.Fprintf(&b, "// Models: %d\n\n", len(rows))
+	b.WriteString("package ai\n\n")
+	b.WriteString("// GeneratedModel is a static catalog entry for one model. Lives in\n")
+	b.WriteString("// generated code so the registry init is just a slice copy. Field\n")
+	b.WriteString("// shape mirrors upstream pi-ai's `Model<api>` discriminated union\n")
+	b.WriteString("// reduced to the fields the pig runtime actually consumes.\n")
+	b.WriteString("type GeneratedModel struct {\n")
+	b.WriteString("\tID                   string\n")
+	b.WriteString("\tProvider             string\n")
+	b.WriteString("\tDisplayName          string\n")
+	b.WriteString("\tAPI                  API\n")
+	b.WriteString("\tBaseURL              string\n")
+	b.WriteString("\tHeaders              map[string]string\n")
+	b.WriteString("\tCompat               *ModelCompat\n")
+	b.WriteString("\tThinkingLevelMap     map[ModelThinkingLevel]*string\n")
+	b.WriteString("\tSamplingParams       map[string]any\n")
+	b.WriteString("\tPromptCache          ModelPromptCache\n")
+	b.WriteString("\tInputLimits         *ModelInputLimits\n")
+	b.WriteString("\tContextWindow        int\n")
+	b.WriteString("\tMaxOutputTokens      int\n")
+	b.WriteString("\tInputCostPerMTokens  float64\n")
+	b.WriteString("\tOutputCostPerMTokens float64\n")
+	b.WriteString("\tCacheReadCost        float64\n")
+	b.WriteString("\tCacheWriteCost       float64\n")
+	b.WriteString("\tTiers                []CostTier\n")
+	b.WriteString("\tReasoning            bool\n")
+	b.WriteString("\tCapabilities         []string\n")
+	b.WriteString("\tEnabled              *bool\n")
+	b.WriteString("\tLab                  string\n")
+	b.WriteString("\tProviders            []ModelCatalogProvider\n")
+	b.WriteString("\t// Record is the entry's JSON as Pi's catalog data spells it: the model object Pi serializes, member order included. A built-in row holds a three-byte reference (NUL, row index high and low byte) to its record in the compressed chunks of catalog_records/; ResolveCatalogRecord returns the JSON, so no read of it may skip that call.\n")
+	b.WriteString("\tRecord string\n")
+	b.WriteString("}\n\n")
+	fmt.Fprintf(&b, "// GeneratedModels is the static catalog (%d entries). generatedCatalog gives its rows the shared maps the tables below hold.\n", len(rows))
+	b.WriteString("var GeneratedModels = generatedCatalog()\n\n")
+	b.WriteString("// generatedRows are the catalog's rows as the linker lays them out: a row's maps are not part of the layout, so generatedCatalog sets them.\n")
+	b.WriteString("var generatedRows = [...]GeneratedModel{\n")
+	for i, r := range rows {
+		b.WriteString("\t{\n")
+		fmt.Fprintf(&b, "\t\tID: %q,\n", r.ID)
+		fmt.Fprintf(&b, "\t\tProvider: %q,\n", r.Provider)
+		fmt.Fprintf(&b, "\t\tDisplayName: %q,\n", r.Name)
+		fmt.Fprintf(&b, "\t\tAPI: %q,\n", r.API)
+		fmt.Fprintf(&b, "\t\tBaseURL: %q,\n", r.BaseURL)
+		if len(r.Headers) > 0 {
+			catalogHeaderMaps.assign(i, pairsLiteral(r.Headers, strconv.Quote))
+		}
+		if r.Compat != nil {
+			compat, err := json.Marshal(r.Compat)
+			if err != nil {
+				return fmt.Errorf("marshal compat for %s/%s: %w", r.Provider, r.ID, err)
+			}
+			fmt.Fprintf(&b, "\t\tCompat: %s,\n", catalogCompats.ref(compatLiteral(string(compat))))
+		}
+		if len(r.ThinkingLevelMap) > 0 {
+			catalogThinkingLevelMaps.assign(i, thinkingLevelPairs(r.ThinkingLevelMap))
+		}
+		if len(r.SamplingParams) > 0 {
+			catalogSamplingParams.assign(i, pairsLiteral(r.SamplingParams, samplingValueLiteral))
+		}
+		if len(r.PromptCache) > 0 {
+			catalogPromptCaches.assign(i, pairsLiteral(r.PromptCache, func(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }))
+		}
+		if r.InputLimits != nil {
+			fmt.Fprintf(&b, "\t\tInputLimits: %s,\n", catalogInputLimits.ref(inputLimitsLiteral(r.InputLimits)))
+		}
+		fmt.Fprintf(&b, "\t\tContextWindow: %d,\n", r.ContextWindow)
+		fmt.Fprintf(&b, "\t\tMaxOutputTokens: %d,\n", r.MaxTokens)
+		fmt.Fprintf(&b, "\t\tInputCostPerMTokens: %s,\n", floatLit(r.InputCost))
+		fmt.Fprintf(&b, "\t\tOutputCostPerMTokens: %s,\n", floatLit(r.OutputCost))
+		fmt.Fprintf(&b, "\t\tCacheReadCost: %s,\n", floatLit(r.CacheRead))
+		fmt.Fprintf(&b, "\t\tCacheWriteCost: %s,\n", floatLit(r.CacheWrite))
+		if r.Tiers != nil {
+			fmt.Fprintf(&b, "\t\tTiers: %s,\n", tiersLiteral(r.Tiers))
+		}
+		fmt.Fprintf(&b, "\t\tReasoning: %t,\n", r.Reasoning)
+		if len(r.Inputs) > 0 {
+			b.WriteString("\t\tCapabilities: []string{")
+			for i, c := range r.Inputs {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "%q", c)
+			}
+			b.WriteString("},\n")
+		}
+		if r.Enabled != nil {
+			fmt.Fprintf(&b, "\t\tEnabled: %s,\n", boolPtrLit(*r.Enabled))
+		}
+		if r.Lab != "" {
+			fmt.Fprintf(&b, "\t\tLab: %q,\n", r.Lab)
+		}
+		if len(r.Providers) > 0 {
+			fmt.Fprintf(&b, "\t\tProviders: %s,\n", catalogProvidersLiteral(r.Providers))
+		}
+		if r.Record != "" {
+			fmt.Fprintf(&b, "\t\tRecord: %q,\n", catalogRecordRef(i))
+		}
+		b.WriteString("\t},\n")
+	}
+	b.WriteString("}\n")
+	b.WriteString(catalogPointerValues())
+	for _, table := range catalogMapTables {
+		if len(table.list) > 0 {
+			b.WriteString(table.declaration())
+		}
+	}
+	b.WriteString(catalogResolver())
+	formatted, err := format.Source([]byte(b.String()))
+	if err != nil {
+		return fmt.Errorf("format generated source: %w", err)
+	}
+	if err := os.WriteFile(path, formatted, 0o644); err != nil {
+		return err
+	}
+	return writeCatalogRecordChunks(filepath.Join(filepath.Dir(path), "catalog_records"), rows)
+}
+
+// unsupportedFields names the model fields a row of its type cannot carry. ImageModel and ClassifierModel hold the base
+// model fields plus output (image) or contextWindow (classifier), and chat models carry no output (model-data.ts:170-172);
+// a field beyond that would disappear from the Go catalog.
+func unsupportedFields(row modelRow) []string {
+	var fields []string
+	add := func(present bool, name string) {
+		if present {
+			fields = append(fields, name)
+		}
+	}
+	if row.Type != "image" {
+		add(len(row.Output) > 0, "output")
+	}
+	if row.Type == "chat" {
+		return fields
+	}
+	add(row.Compat != nil && (row.Type != "classifier" || hasChatCompat(row.Compat)), "compat")
+	add(len(row.ThinkingLevelMap) > 0, "thinkingLevelMap")
+	add(len(row.SamplingParams) > 0, "samplingParams")
+	add(len(row.PromptCache) > 0, "promptCache")
+	add(row.MaxTokens != 0, "maxTokens")
+	add(row.Reasoning, "reasoning")
+	add(row.Enabled != nil, "enabled")
+	add(row.Lab != "", "lab")
+	add(len(row.Providers) > 0, "providers")
+	if row.Type == "image" {
+		add(row.ContextWindow != 0, "contextWindow")
+	}
+	return fields
+}
+
+// hasChatCompat reports whether compat carries a field other than the System One settings a classifier model may hold.
+func hasChatCompat(compat *ModelCompat) bool {
+	rest := *compat
+	rest.ImageInput, rest.SendImageOptInHeader = "", nil
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(rest) != nil || encoded.String() != "{}\n"
+}
+
+// systemOneCompatLiteral is the Go literal of a classifier model's System One compat.
+func systemOneCompatLiteral(compat *ModelCompat) string {
+	var fields []string
+	if compat.ImageInput != "" {
+		fields = append(fields, fmt.Sprintf("ImageInput: SystemOneImageInput(%q)", compat.ImageInput))
+	}
+	if compat.SendImageOptInHeader != nil {
+		fields = append(fields, fmt.Sprintf("SendImageOptInHeader: new(%t)", *compat.SendImageOptInHeader))
+	}
+	return "&SystemOneCompat{" + strings.Join(fields, ", ") + "}"
+}
+
+func emitImages(path, src string, rows []modelRow) error {
+	var b strings.Builder
+	writeCatalogHeader(&b, src, len(rows))
+	fmt.Fprintf(&b, "// GeneratedImageModels is the static image model catalog (%d entries).\n", len(rows))
+	b.WriteString("var GeneratedImageModels = []ImageModel{\n")
+	for _, row := range rows {
+		fmt.Fprintf(&b, "\t{ID: %q, Name: %q, API: ImageAPI(%q), Provider: %q, BaseURL: %q,", row.ID, row.Name, row.API, row.Provider, row.BaseURL)
+		writeBaseModelFields(&b, row)
+		fmt.Fprintf(&b, " Output: %s, Cost: %s},\n", stringSliceLiteral(row.Output), modelCostLiteral(row))
+	}
+	b.WriteString("}\n")
+	return writeGoSource(path, b.String())
+}
+
+// emitProviders writes the catalog barrel's provider ids in barrel order. Object.keys(MODELS) is getBuiltinProviders
+// (providers/all.ts:94-96), and a provider whose shard holds only image or classifier models is still one of its keys.
+func emitProviders(path, src string, providers []string, generatedAt *float64) error {
+	var b strings.Builder
+	b.WriteString("// Code generated by cmd/gen-models. DO NOT EDIT.\n")
+	writeSourceHeader(&b, src)
+	fmt.Fprintf(&b, "// Providers: %d\n\n", len(providers))
+	b.WriteString("package ai\n\n")
+	b.WriteString("// GeneratedProviders lists the catalog barrel's providers in barrel order (providers/all.ts getBuiltinProviders).\n")
+	b.WriteString("var GeneratedProviders = []string{\n")
+	for _, provider := range providers {
+		fmt.Fprintf(&b, "\t%q,\n", provider)
+	}
+	b.WriteString("}\n\n")
+	b.WriteString("// GeneratedModelDataGeneratedAt is the generation time shared by every built-in provider catalog, in Unix milliseconds (providers/all.ts getBuiltinModelDataGeneratedAt); nil when the data manifest carries no valid time.\n")
+	if generatedAt == nil {
+		b.WriteString("var GeneratedModelDataGeneratedAt *float64\n")
+	} else {
+		fmt.Fprintf(&b, "var GeneratedModelDataGeneratedAt = new(float64(%s))\n", strconv.FormatFloat(*generatedAt, 'f', -1, 64))
+	}
+	return writeGoSource(path, b.String())
+}
+
+func emitClassifiers(path, src string, rows []modelRow) error {
+	var b strings.Builder
+	writeCatalogHeader(&b, src, len(rows))
+	fmt.Fprintf(&b, "// GeneratedClassifierModels is the static classifier model catalog (%d entries).\n", len(rows))
+	b.WriteString("var GeneratedClassifierModels = []ClassifierModel{\n")
+	for _, row := range rows {
+		fmt.Fprintf(&b, "\t{ID: %q, Name: %q, API: ClassifierAPI(%q), Provider: %q, BaseURL: %q,", row.ID, row.Name, row.API, row.Provider, row.BaseURL)
+		writeBaseModelFields(&b, row)
+		fmt.Fprintf(&b, " Cost: %s, ContextWindow: %d,", modelCostLiteral(row), row.ContextWindow)
+		if row.Compat != nil {
+			fmt.Fprintf(&b, " Compat: %s,", systemOneCompatLiteral(row.Compat))
+		}
+		b.WriteString("},\n")
+	}
+	b.WriteString("}\n")
+	return writeGoSource(path, b.String())
+}
+
+// writeSourceHeader writes the Source line and, when src belongs to a pi-ai package, the Upstream line that names the
+// package version the catalog was generated from. ai.TestGeneratedCatalogsRecordPinnedUpstream compares that line
+// with pigversion.UpstreamVersion, so a pin bump without regeneration fails.
+func writeSourceHeader(b *strings.Builder, src string) {
+	fmt.Fprintf(b, "// Source: %s\n", basename(src))
+	if version := publishedPackageVersion(src); version != "" {
+		fmt.Fprintf(b, "// Upstream: @earendil-works/pi-ai %s\n", version)
+	}
+}
+
+// publishedPackageVersion returns the version in the pi-ai manifest one directory above src: the published package's
+// dist/../package.json or the upstream mirror's packages/ai/src/../package.json. It returns "" when that manifest is
+// missing or names another package (the models.dev and test sources).
+func publishedPackageVersion(src string) string {
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(src), "..", "package.json"))
+	if err != nil {
+		return ""
+	}
+	var manifest struct{ Name, Version string }
+	if json.Unmarshal(data, &manifest) != nil || manifest.Name != "@earendil-works/pi-ai" {
+		return ""
+	}
+	return manifest.Version
+}
+
+// writeCatalogHeader writes the header shared by every generated catalog file. The source is recorded as its basename so
+// re-runs from different working directories are byte-identical.
+func writeCatalogHeader(b *strings.Builder, src string, models int) {
+	b.WriteString("// Code generated by cmd/gen-models. DO NOT EDIT.\n")
+	writeSourceHeader(b, src)
+	fmt.Fprintf(b, "// Models: %d\n\n", models)
+	b.WriteString("package ai\n\n")
+}
+
+// writeBaseModelFields writes the BaseModel fields image and classifier models share after baseUrl: headers, input, inputLimits.
+func writeBaseModelFields(b *strings.Builder, row modelRow) {
+	if len(row.Headers) > 0 {
+		b.WriteString(" Headers: map[string]string{")
+		for i, key := range slices.Sorted(maps.Keys(row.Headers)) {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(b, "%q: %q", key, row.Headers[key])
+		}
+		b.WriteString("},")
+	}
+	fmt.Fprintf(b, " Input: %s,", stringSliceLiteral(row.Inputs))
+	if row.InputLimits != nil {
+		fmt.Fprintf(b, " InputLimits: %s,", inputLimitsLiteral(row.InputLimits))
+	}
+}
+
+func stringSliceLiteral(values []string) string {
+	quoted := make([]string, len(values))
+	for i, value := range values {
+		quoted[i] = strconv.Quote(value)
+	}
+	return "[]string{" + strings.Join(quoted, ", ") + "}"
+}
+
+func modelCostLiteral(row modelRow) string {
+	return costLiteral(jsonCost{Input: row.InputCost, Output: row.OutputCost, CacheRead: row.CacheRead, CacheWrite: row.CacheWrite, Tiers: row.Tiers})
+}
+
+// costLiteral is a ModelCost literal for cost: one with no tiers member has no Tiers, and one with tiers: [] an empty Tiers.
+func costLiteral(cost jsonCost) string {
+	literal := fmt.Sprintf("ModelCost{Input: %s, Output: %s, CacheRead: %s, CacheWrite: %s", floatLit(cost.Input), floatLit(cost.Output), floatLit(cost.CacheRead), floatLit(cost.CacheWrite))
+	if cost.Tiers != nil {
+		literal += ", Tiers: " + tiersLiteral(cost.Tiers)
+	}
+	return literal + "}"
+}
+
+func writeGoSource(path, source string) error {
+	formatted, err := format.Source([]byte(source))
+	if err != nil {
+		return fmt.Errorf("format generated source: %w", err)
+	}
+	return os.WriteFile(path, formatted, 0o644)
+}
+
+func floatLit(v float64) string {
+	if v == 0 {
+		return "0"
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// tiersLiteral emits an []CostTier literal for a model's request-wide pricing
+// tiers. Callers emit it only for a cost with a tiers member (a non-nil Tiers),
+// so a cost without one keeps a nil Tiers and ModelCost writes no tiers.
+func tiersLiteral(tiers []jsonCostTier) string {
+	var b strings.Builder
+	b.WriteString("[]CostTier{")
+	for _, t := range tiers {
+		fmt.Fprintf(&b, "{InputTokensAbove: %s, InputCostPer1M: %s, OutputCostPer1M: %s, CacheReadCostPer1M: %s, CacheWriteCostPer1M: %s}, ",
+			floatLit(t.InputTokensAbove), floatLit(t.Input), floatLit(t.Output), floatLit(t.CacheRead), floatLit(t.CacheWrite))
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
+func inputLimitsLiteral(limits *jsonModelInputLimits) string {
+	if limits == nil {
+		return "nil"
+	}
+	fields := make([]string, 0, 2)
+	if limits.MaxRequestBytes.Present {
+		fields = append(fields, fmt.Sprintf("MaxRequestBytes: %d", limits.MaxRequestBytes.Value))
+	}
+	if limits.Images != nil {
+		imageFields := make([]string, 0, 3)
+		if limits.Images.Resize != nil {
+			resize := limits.Images.Resize
+			resizeFields := make([]string, 0, 4)
+			for _, field := range []struct {
+				name  string
+				value jsonOptionalInt
+			}{
+				{name: "MaxWidth", value: resize.MaxWidth},
+				{name: "MaxHeight", value: resize.MaxHeight},
+				{name: "MaxBytes", value: resize.MaxBytes},
+				{name: "JPEGQuality", value: resize.JPEGQuality},
+			} {
+				if field.value.Present {
+					resizeFields = append(resizeFields, fmt.Sprintf("%s: %d", field.name, field.value.Value))
+				}
+			}
+			imageFields = append(imageFields, "Resize: &ModelImageResizeOptions{"+strings.Join(resizeFields, ", ")+"}")
+		}
+		if limits.Images.MaxPerMessage.Present {
+			imageFields = append(imageFields, fmt.Sprintf("MaxPerMessage: %d", limits.Images.MaxPerMessage.Value))
+		}
+		if limits.Images.MaxPerRequest.Present {
+			imageFields = append(imageFields, fmt.Sprintf("MaxPerRequest: %d", limits.Images.MaxPerRequest.Value))
+		}
+		fields = append(fields, "Images: &ModelImageInputLimits{"+strings.Join(imageFields, ", ")+"}")
+	}
+	return "&ModelInputLimits{" + strings.Join(fields, ", ") + "}"
+}
+
+func catalogProvidersLiteral(providers []jsonCatalogProvider) string {
+	var b strings.Builder
+	b.WriteString("[]ModelCatalogProvider{")
+	for _, provider := range providers {
+		fmt.Fprintf(&b, "{ID: %q, Name: %q, Credential: %q, Source: %q}, ", provider.ID, provider.Name, provider.Credential, provider.Source)
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
+func allowedFallbackModelsLiteral(models []jsonAllowedFallbackModel) string {
+	var b strings.Builder
+	b.WriteString("[]AnthropicAllowedFallbackModel{")
+	for _, model := range models {
+		fmt.Fprintf(&b, "{Provider: %q, Model: %q, Cost: %s}, ", model.Provider, model.Model, costLiteral(model.Cost))
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
+func compatLiteral(jsonText string) string {
+	var compat ModelCompat
+	if err := json.Unmarshal([]byte(jsonText), &compat); err != nil {
+		return "nil"
+	}
+	var fields []string
+	if compat.SupportsDeveloperRole != nil {
+		fields = append(fields, fmt.Sprintf("SupportsDeveloperRole:%s", boolPtrLit(*compat.SupportsDeveloperRole)))
+	}
+	if compat.SupportsReasoningEffort != nil {
+		fields = append(fields, fmt.Sprintf("SupportsReasoningEffort:%s", boolPtrLit(*compat.SupportsReasoningEffort)))
+	}
+	if compat.SupportsStore != nil {
+		fields = append(fields, fmt.Sprintf("SupportsStore:%s", boolPtrLit(*compat.SupportsStore)))
+	}
+	if compat.SupportsUsageInStreaming != nil {
+		fields = append(fields, fmt.Sprintf("SupportsUsageInStreaming:%s", boolPtrLit(*compat.SupportsUsageInStreaming)))
+	}
+	if compat.MaxTokensField != "" {
+		fields = append(fields, fmt.Sprintf("MaxTokensField:%q", compat.MaxTokensField))
+	}
+	if compat.RequiresToolResultName != nil {
+		fields = append(fields, fmt.Sprintf("RequiresToolResultName:%s", boolPtrLit(*compat.RequiresToolResultName)))
+	}
+	if compat.RequiresAssistantAfterToolResult != nil {
+		fields = append(fields, fmt.Sprintf("RequiresAssistantAfterToolResult:%s", boolPtrLit(*compat.RequiresAssistantAfterToolResult)))
+	}
+	if compat.RequiresNonNullAssistantContent != nil {
+		fields = append(fields, fmt.Sprintf("RequiresNonNullAssistantContent:%s", boolPtrLit(*compat.RequiresNonNullAssistantContent)))
+	}
+	if compat.RequiresToolsWithToolHistory != nil {
+		fields = append(fields, fmt.Sprintf("RequiresToolsWithToolHistory:%s", boolPtrLit(*compat.RequiresToolsWithToolHistory)))
+	}
+	if compat.RequiresThinkingAsText != nil {
+		fields = append(fields, fmt.Sprintf("RequiresThinkingAsText:%s", boolPtrLit(*compat.RequiresThinkingAsText)))
+	}
+	if compat.RequiresReasoningContentOnAssistantMessages != nil {
+		fields = append(fields, fmt.Sprintf("RequiresReasoningContentOnAssistantMessages:%s", boolPtrLit(*compat.RequiresReasoningContentOnAssistantMessages)))
+	}
+	if compat.ThinkingFormat != "" {
+		fields = append(fields, fmt.Sprintf("ThinkingFormat:%q", compat.ThinkingFormat))
+	}
+	if compat.CacheControlFormat != "" {
+		fields = append(fields, fmt.Sprintf("CacheControlFormat:%q", compat.CacheControlFormat))
+	}
+	if compat.SendSessionAffinityHeaders != nil {
+		fields = append(fields, fmt.Sprintf("SendSessionAffinityHeaders:%s", boolPtrLit(*compat.SendSessionAffinityHeaders)))
+	}
+	if compat.SupportsStrictMode != nil {
+		fields = append(fields, fmt.Sprintf("SupportsStrictMode:%s", boolPtrLit(*compat.SupportsStrictMode)))
+	}
+	if compat.SupportsStrictTools != nil {
+		fields = append(fields, fmt.Sprintf("SupportsStrictTools:%s", boolPtrLit(*compat.SupportsStrictTools)))
+	}
+	if compat.SupportsOpenAIGrammarTools != nil {
+		fields = append(fields, fmt.Sprintf("SupportsOpenAIGrammarTools:%s", boolPtrLit(*compat.SupportsOpenAIGrammarTools)))
+	}
+	if compat.SupportsExplicitPromptCacheMode != nil {
+		fields = append(fields, fmt.Sprintf("SupportsExplicitPromptCacheMode:%s", boolPtrLit(*compat.SupportsExplicitPromptCacheMode)))
+	}
+	if len(compat.ReasoningEffortMap) > 0 {
+		fields = append(fields, fmt.Sprintf("ReasoningEffortMap:%#v", compat.ReasoningEffortMap))
+	}
+	if len(compat.OpenRouterRouting) > 0 {
+		fields = append(fields, fmt.Sprintf("OpenRouterRouting:%#v", compat.OpenRouterRouting))
+	}
+	if compat.VercelGatewayRouting != nil && (compat.VercelGatewayRouting.Only != nil || compat.VercelGatewayRouting.Order != nil) {
+		routing := compat.VercelGatewayRouting
+		var parts []string
+		if routing.Only != nil {
+			parts = append(parts, fmt.Sprintf("Only:%#v", routing.Only))
+		}
+		if routing.Order != nil {
+			parts = append(parts, fmt.Sprintf("Order:%#v", routing.Order))
+		}
+		fields = append(fields, "VercelGatewayRouting:&VercelGatewayRouting{"+strings.Join(parts, ",")+"}")
+	}
+	if compat.ZaiToolStream != nil {
+		fields = append(fields, fmt.Sprintf("ZaiToolStream:%s", boolPtrLit(*compat.ZaiToolStream)))
+	}
+	if compat.SupportsLongCacheRetention != nil {
+		fields = append(fields, fmt.Sprintf("SupportsLongCacheRetention:%s", boolPtrLit(*compat.SupportsLongCacheRetention)))
+	}
+	if compat.SendSessionIdHeader != nil {
+		fields = append(fields, fmt.Sprintf("SendSessionIdHeader:%s", boolPtrLit(*compat.SendSessionIdHeader)))
+	}
+	if compat.SupportsEagerToolInputStreaming != nil {
+		fields = append(fields, fmt.Sprintf("SupportsEagerToolInputStreaming:%s", boolPtrLit(*compat.SupportsEagerToolInputStreaming)))
+	}
+	if compat.ForceAdaptiveThinking != nil {
+		fields = append(fields, fmt.Sprintf("ForceAdaptiveThinking:%s", boolPtrLit(*compat.ForceAdaptiveThinking)))
+	}
+	if compat.SupportsTemperature != nil {
+		fields = append(fields, fmt.Sprintf("SupportsTemperature:%s", boolPtrLit(*compat.SupportsTemperature)))
+	}
+	if compat.AllowEmptySignature != nil {
+		fields = append(fields, fmt.Sprintf("AllowEmptySignature:%s", boolPtrLit(*compat.AllowEmptySignature)))
+	}
+	if compat.SupportsCacheControlOnTools != nil {
+		fields = append(fields, fmt.Sprintf("SupportsCacheControlOnTools:%s", boolPtrLit(*compat.SupportsCacheControlOnTools)))
+	}
+	if compat.DeferredToolsMode != "" {
+		fields = append(fields, fmt.Sprintf("DeferredToolsMode:%q", compat.DeferredToolsMode))
+	}
+	if compat.SessionAffinityFormat != "" {
+		fields = append(fields, fmt.Sprintf("SessionAffinityFormat:%q", compat.SessionAffinityFormat))
+	}
+	if compat.PromptCacheKeyMode != "" {
+		fields = append(fields, fmt.Sprintf("PromptCacheKeyMode:%q", compat.PromptCacheKeyMode))
+	}
+	if compat.SupportsToolSearch != nil {
+		fields = append(fields, fmt.Sprintf("SupportsToolSearch:%s", boolPtrLit(*compat.SupportsToolSearch)))
+	}
+	if compat.SupportsToolReferences != nil {
+		fields = append(fields, fmt.Sprintf("SupportsToolReferences:%s", boolPtrLit(*compat.SupportsToolReferences)))
+	}
+	if len(compat.ChatTemplateArgs) > 0 {
+		fields = append(fields, fmt.Sprintf("ChatTemplateArgs:%#v", compat.ChatTemplateArgs))
+	}
+	if compat.SupportsThinkingTokenBudget != nil {
+		fields = append(fields, fmt.Sprintf("SupportsThinkingTokenBudget:%s", boolPtrLit(*compat.SupportsThinkingTokenBudget)))
+	}
+	if compat.ThinkingTokenBudgetField != "" {
+		fields = append(fields, fmt.Sprintf("ThinkingTokenBudgetField:%q", compat.ThinkingTokenBudgetField))
+	}
+	if compat.SupportsAdditionalTools != nil {
+		fields = append(fields, fmt.Sprintf("SupportsAdditionalTools:%s", boolPtrLit(*compat.SupportsAdditionalTools)))
+	}
+	if compat.SupportsMidConvoEffort != nil {
+		fields = append(fields, fmt.Sprintf("SupportsMidConvoEffort:%s", boolPtrLit(*compat.SupportsMidConvoEffort)))
+	}
+	if compat.SupportsMidConvoSystemMessages != nil {
+		fields = append(fields, fmt.Sprintf("SupportsMidConvoSystemMessages:%s", boolPtrLit(*compat.SupportsMidConvoSystemMessages)))
+	}
+	if compat.SupportsMidConvoToolAdditions != nil {
+		fields = append(fields, fmt.Sprintf("SupportsMidConvoToolAdditions:%s", boolPtrLit(*compat.SupportsMidConvoToolAdditions)))
+	}
+	if compat.SupportsMidConvoToolChanges != nil {
+		fields = append(fields, fmt.Sprintf("SupportsMidConvoToolChanges:%s", boolPtrLit(*compat.SupportsMidConvoToolChanges)))
+	}
+	if len(compat.AllowedFallbackModels) > 0 {
+		fields = append(fields, fmt.Sprintf("AllowedFallbackModels:%s", allowedFallbackModelsLiteral(compat.AllowedFallbackModels)))
+	}
+	if len(fields) == 0 {
+		return "nil"
+	}
+	return "&ModelCompat{" + strings.Join(fields, ", ") + "}"
+}
+
+// The catalog's *bool and *string members point at shared package-level values instead of being built by ptrBool and ptrString calls, which run when the process starts. A pointer to a package-level variable or array element is laid out by the linker, so these members cost no start-up work. Nothing writes through them.
+func boolPtrLit(v bool) string {
+	if v {
+		return "&generatedTrue"
+	}
+	return "&generatedFalse"
+}
+
+// catalogStrings interns the strings the catalog points at, in first-use order, for one emit run.
+var catalogStrings struct {
+	index map[string]int
+	list  []string
+}
+
+func resetCatalogStrings() {
+	catalogStrings.index = map[string]int{}
+	catalogStrings.list = nil
+	for _, table := range catalogMapTables {
+		table.index, table.list, table.refs = map[string]int{}, nil, nil
+	}
+}
+
+// The catalog's map members, and its Compat and InputLimits pointers, refer to one shared value per distinct content instead of a literal per model: every map in a package-level initializer is built when the process starts, and most models repeat a few thinking-level, header and sampling maps. Nothing writes through them; the registry copies a model's maps, compat and input limits before handing them out.
+//
+// A map is not laid out by the linker, so a row cannot name one in generatedRows without code that stores it when the process starts, one store for each row that has one. A table of maps therefore holds each distinct map as a list of key and value pairs, which the linker does lay out and generatedMaps builds the maps from, and a list of refs that generatedCatalog walks to give each row its map: a few instructions for all rows, where a store for each row cost kilobytes of code.
+type catalogMapTable struct {
+	name, doc, elem string
+	// pointer means the table's literals are &elem{...} and ref names an element's address.
+	pointer bool
+	// field, keyType and valueType make the table one of maps: field is the row member a map is set on, and keyType and valueType spell the map's.
+	field, keyType, valueType string
+	// own means each row that has a map of the table gets a map of its own, as a map literal on the row would give it; the others share one map for
+	// each distinct content, as Headers and ThinkingLevelMap do.
+	own   bool
+	index map[string]int
+	list  []string
+	// refs are the rows that have a map of the table, in row order, and the element each has.
+	refs []catalogMapRef
+}
+
+// catalogMapRef is a row and the element of a table of maps it has.
+type catalogMapRef struct{ row, element int }
+
+var (
+	catalogHeaderMaps        = &catalogMapTable{name: "generatedHeaders", doc: "the distinct Headers maps", field: "Headers", keyType: "string", valueType: "string"}
+	catalogThinkingLevelMaps = &catalogMapTable{name: "generatedThinkingLevelMaps", doc: "the distinct ThinkingLevelMap maps", field: "ThinkingLevelMap", keyType: "ModelThinkingLevel", valueType: "*string"}
+	catalogSamplingParams    = &catalogMapTable{name: "generatedSamplingParams", doc: "the distinct SamplingParams maps", field: "SamplingParams", keyType: "string", valueType: "any", own: true}
+	catalogPromptCaches      = &catalogMapTable{name: "generatedPromptCaches", doc: "the distinct PromptCache maps", field: "PromptCache", keyType: "string", valueType: "float64", own: true}
+	catalogCompats           = &catalogMapTable{name: "generatedCompats", doc: "the distinct Compat values", elem: "ModelCompat", pointer: true}
+	catalogInputLimits       = &catalogMapTable{name: "generatedInputLimits", doc: "the distinct InputLimits values", elem: "ModelInputLimits", pointer: true}
+	catalogMapTables         = []*catalogMapTable{catalogHeaderMaps, catalogThinkingLevelMaps, catalogSamplingParams, catalogPromptCaches, catalogCompats, catalogInputLimits}
+)
+
+// intern returns the index of literal in the table, adding it in first-use order.
+func (t *catalogMapTable) intern(literal string) int {
+	i, ok := t.index[literal]
+	if !ok {
+		i = len(t.list)
+		t.index[literal] = i
+		t.list = append(t.list, literal)
+	}
+	return i
+}
+
+// ref interns literal, a value literal spelling the table's element type, in first-use order and returns the expression naming its shared value.
+func (t *catalogMapTable) ref(literal string) string {
+	if literal == "nil" {
+		return literal
+	}
+	i := t.intern(literal)
+	if t.pointer {
+		return fmt.Sprintf("&%s[%d]", t.name, i)
+	}
+	return fmt.Sprintf("%s[%d]", t.name, i)
+}
+
+// assign interns literal, the pairs of a map as pairsLiteral spells them, and records that row has the map.
+func (t *catalogMapTable) assign(row int, literal string) {
+	t.refs = append(t.refs, catalogMapRef{row, t.intern(literal)})
+}
+
+// declaration declares the table's shared values. The array's elements elide the element type their literals spell.
+func (t *catalogMapTable) declaration() string {
+	var b strings.Builder
+	if t.pointer {
+		fmt.Fprintf(&b, "\n// %s is %s the catalog refers to.\nvar %s = [...]%s{\n", t.name, t.doc, t.name, t.elem)
+		for _, literal := range t.list {
+			fmt.Fprintf(&b, "\t%s,\n", strings.TrimPrefix(literal, "&"+t.elem))
+		}
+		b.WriteString("}\n")
+		return b.String()
+	}
+	if t.own {
+		fmt.Fprintf(&b, "\n// %sPairs is %s the catalog refers to; generatedCatalog builds a map of its own from one of them for each row.\n", t.name, t.doc)
+	} else {
+		fmt.Fprintf(&b, "\n// %s is %s the catalog refers to; generatedCatalog builds them from %sPairs.\nvar %s [%d]map[%s]%s\n\n", t.name, t.doc, t.name, t.name, len(t.list), t.keyType, t.valueType)
+	}
+	fmt.Fprintf(&b, "var %sPairs = [...][]generatedPair[%s, %s]{\n", t.name, t.keyType, t.valueType)
+	for _, literal := range t.list {
+		fmt.Fprintf(&b, "\t%s,\n", literal)
+	}
+	b.WriteString("}\n")
+	fmt.Fprintf(&b, "\n// %sRefs lists the rows that have one of %s, and the one each has.\nvar %sRefs = [...]generatedMapRef{", t.name, t.name, t.name)
+	for i, ref := range t.refs {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "{%d, %d}", ref.row, ref.element)
+	}
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// catalogResolver is generatedCatalog, which gives the rows their maps.
+func catalogResolver() string {
+	var b strings.Builder
+	b.WriteString("\n// generatedCatalog sets the maps of generatedRows and returns them as the catalog.\nfunc generatedCatalog() []GeneratedModel {\n")
+	for _, table := range catalogMapTables {
+		if table.own && len(table.list) > 0 {
+			fmt.Fprintf(&b, "\tfor _, ref := range %sRefs[:] {\n\t\tgeneratedRows[ref.row].%s = generatedMap(%sPairs[ref.element])\n\t}\n", table.name, table.field, table.name)
+		} else if table.field != "" && len(table.list) > 0 {
+			fmt.Fprintf(&b, "\tgeneratedBuildMaps(%s[:], %sPairs[:])\n\tfor _, ref := range %sRefs[:] {\n\t\tgeneratedRows[ref.row].%s = %s[ref.element]\n\t}\n", table.name, table.name, table.name, table.field, table.name)
+		}
+	}
+	b.WriteString("\treturn generatedRows[:]\n}\n")
+	return b.String()
+}
+
+func stringPtrLit(v string) string {
+	i, ok := catalogStrings.index[v]
+	if !ok {
+		i = len(catalogStrings.list)
+		catalogStrings.index[v] = i
+		catalogStrings.list = append(catalogStrings.list, v)
+	}
+	return fmt.Sprintf("&generatedStrings[%d]", i)
+}
+
+// catalogPointerValues is the declaration of the values the catalog's pointers refer to.
+func catalogPointerValues() string {
+	var b strings.Builder
+	b.WriteString("\n// generatedTrue, generatedFalse and generatedStrings are the values the catalog's pointer members refer to.\nvar generatedTrue, generatedFalse = true, false\n\nvar generatedStrings = [...]string{\n")
+	for _, v := range catalogStrings.list {
+		fmt.Fprintf(&b, "\t%q,\n", v)
+	}
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// pairsLiteral spells m as the pairs of a generatedPair list, in key order, with literal spelling a value.
+func pairsLiteral[V any](m map[string]V, literal func(V) string) string {
+	keys := slices.Sorted(maps.Keys(m))
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("{%q, %s}", key, literal(m[key])))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// samplingValueLiteral spells a JSON sampling value as a Go value of type any: null is nil, and a number is a float64, as encoding/json decodes it.
+func samplingValueLiteral(v any) string {
+	switch v := v.(type) {
+	case nil:
+		return "nil"
+	case float64:
+		return "float64(" + strconv.FormatFloat(v, 'g', -1, 64) + ")"
+	case string:
+		return strconv.Quote(v)
+	case bool:
+		return strconv.FormatBool(v)
+	}
+	return fmt.Sprintf("%#v", v)
+}
+
+// thinkingLevelPairs spells a thinking level map as the pairs of a generatedPair list.
+func thinkingLevelPairs(m map[string]*string) string {
+	return pairsLiteral(m, func(value *string) string {
+		if value == nil {
+			return "nil"
+		}
+		return stringPtrLit(*value)
+	})
+}
+
+func basename(p string) string {
+	if i := strings.LastIndexAny(p, "/\\"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}

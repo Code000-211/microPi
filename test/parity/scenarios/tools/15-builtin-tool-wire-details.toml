@@ -1,0 +1,31 @@
+# Pi 0.87.1's published create*Tool functions are the oracle. Both probes use the same files, parameters and result objects.
+# Only the random bash full-output filename is replaced with OUTPUT_FILE, after checking that the file exists; both probes remove their own file.
+# Object keys are sorted recursively. No result field, string whitespace, empty object, null or omission is removed.
+#
+# Pi main 676af1d77 (#11747, in the pin c23b9ec1; Pi 1.5.0 differed; the divergence record is retired) reads a limit below 1 as 1, floors a fraction and prints a find limit notice only when
+# more results than the limit exist. `ls fractional` (limit 1.5 lists one entry and reports limit 1) and `find limited` (limit 1 with exactly one match prints no notice) are
+# compared against the pin's Pi like every other line; both_contain pins the two complete lines in both outputs so neither engine can drift back to Pi 1.5.0's text.
+name = "15-builtin-tool-wire-details"
+description = "Built-in tool results expose exactly Pi's content and sparse details"
+covers = ["packages/coding-agent/src/core/tools/read.ts", "packages/coding-agent/src/core/tools/write.ts", "packages/coding-agent/src/core/tools/edit.ts", "packages/coding-agent/src/core/tools/bash.ts", "packages/coding-agent/src/core/tools/grep.ts", "packages/coding-agent/src/core/tools/find.ts", "packages/coding-agent/src/core/tools/ls.ts"]
+tags = ["hermetic", "fast"]
+driver = "cli-mode"
+
+[env]
+override_base_args = true
+pig_bin = "/usr/bin/env"
+pi_bin = "/usr/bin/env"
+pig_args = ["bash", "./test/parity/testdata/tool-details-pig.sh"]
+pig_go_tests = ["./internal/codingagent/tools"]
+pi_args = ["node", "./test/parity/testdata/tool-details-pi.mjs"]
+
+[cli]
+cwd = "../../../.."
+timeout_seconds = 60
+
+[assert]
+exit_code = 0
+output_equal = true
+both_contain = ['TOOL_WIRE {"case":"bash over-long last line",', 'TOOL_WIRE {"case":"read",', 'TOOL_WIRE {"case":"bash truncated",', 'TOOL_WIRE {"case":"ls fractional","result":{"content":[{"text":"a.txt\n\n[1 entries limit reached. Use limit=2 for more]","type":"text"}],"details":{"entryLimitReached":1}}}', 'TOOL_WIRE {"case":"find limited","result":{"content":[{"text":"a.txt","type":"text"}]}}']
+runs = 3
+

@@ -1,0 +1,103 @@
+//go:build parity
+
+package runner
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/zstdblob"
+)
+
+// prepareChangelogFixture changes data only: Go embeds the pinned document, as a zstd frame, through a build overlay,
+// while Pi reads a private package view through its own PI_PACKAGE_DIR override (config.ts:389-394,455-456).
+// Builds finish before terminal timing starts. Neither checkout nor installed Pi files are modified.
+func prepareChangelogFixture(ctx context.Context, t *testing.T, sc *Scenario, pig, pi BinaryRef) (BinaryRef, BinaryRef, error) {
+	t.Helper()
+	if sc.ChangelogFixture == "" {
+		return pig, pi, nil
+	}
+	root, err := findRepoRoot()
+	if err != nil {
+		return pig, pi, err
+	}
+	data, err := os.ReadFile(resolveScenarioCWD(sc.SourcePath, sc.ChangelogFixture))
+	if err != nil {
+		return pig, pi, err
+	}
+	tmp := t.TempDir()
+	// The binary embeds CHANGELOG.md.zst (embed.go), so the overlay replaces that file with the fixture's frame.
+	fixture := filepath.Join(tmp, "CHANGELOG.md.zst")
+	if err := os.WriteFile(fixture, zstdblob.EncodeLibrary(data), 0o600); err != nil {
+		return pig, pi, err
+	}
+	overlay, err := json.Marshal(map[string]any{"Replace": map[string]string{filepath.Join(root, "CHANGELOG.md.zst"): fixture}})
+	if err != nil {
+		return pig, pi, err
+	}
+	overlayPath := filepath.Join(tmp, "overlay.json")
+	if err := os.WriteFile(overlayPath, overlay, 0o600); err != nil {
+		return pig, pi, err
+	}
+	pig.Path = filepath.Join(tmp, "pig")
+	//nolint:gosec // G204 (class a): program is literal go; args are a temp overlay path, a temp -o output, and the literal ./cmd/pig.
+	cmd := exec.CommandContext(ctx, "go", "build", "-overlay", overlayPath, "-o", pig.Path, "./cmd/pig")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return pig, pi, fmt.Errorf("build changelog fixture: %w\n%s", err, out)
+	}
+	packageRoot, err := piPackageRoot(pi.Path)
+	if err != nil {
+		return pig, pi, err
+	}
+	packageDir := filepath.Join(tmp, "pi-package")
+	if err := os.Mkdir(packageDir, 0o700); err != nil {
+		return pig, pi, err
+	}
+	entries, err := os.ReadDir(packageRoot)
+	if err != nil {
+		return pig, pi, err
+	}
+	for _, entry := range entries {
+		if entry.Name() == "CHANGELOG.md" {
+			continue
+		}
+		if err := os.Symlink(filepath.Join(packageRoot, entry.Name()), filepath.Join(packageDir, entry.Name())); err != nil {
+			return pig, pi, err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(packageDir, "CHANGELOG.md"), data, 0o600); err != nil {
+		return pig, pi, err
+	}
+	pi.Env = slices.DeleteFunc(slices.Clone(pi.Env), func(value string) bool { return strings.HasPrefix(value, "PI_PACKAGE_DIR=") })
+	pi.Env = append(pi.Env, "PI_PACKAGE_DIR="+packageDir)
+	return pig, pi, nil
+}
+
+// findRepoRoot walks up from CWD looking for go.mod with the pig module path.
+func findRepoRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		modfile := filepath.Join(dir, "go.mod")
+		if data, err := os.ReadFile(modfile); err == nil {
+			if strings.Contains(string(data), "module github.com/MichaelKinsy/PiG") {
+				return dir, nil
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("repo root not found")
+		}
+		dir = parent
+	}
+}

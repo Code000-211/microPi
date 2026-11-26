@@ -1,0 +1,567 @@
+// Ports packages/durable/src/harness/submissions.ts.
+
+package harness
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+
+	chordctx "github.com/MichaelKinsy/PiG/chord/context"
+	"github.com/MichaelKinsy/PiG/durable"
+	"github.com/MichaelKinsy/PiG/durable/session"
+	"github.com/MichaelKinsy/PiG/telemetry"
+)
+
+// commitOnLine runs change on the Session line and returns its typed result.
+func commitOnLine[T any](ctx context.Context, line *session.SessionImpl, scope session.TransactionScope, change func(tx *session.Transaction) (T, error), options ...durable.CommitOptions) (T, error) {
+	var zero T
+	value, err := line.CommitWith(ctx, func(tx *session.Transaction) (any, error) { return change(tx) }, scope, options...)
+	if err != nil {
+		return zero, err
+	}
+	typed, _ := value.(T)
+	return typed, nil
+}
+
+// commitInternal runs change as a scheduler commit on the Session line: its outcome goes to the scheduler only.
+func commitInternal[T any](ctx context.Context, line *session.SessionImpl, change func(tx *session.Transaction) (T, error)) (T, error) {
+	var zero T
+	value, err := line.CommitInternal(ctx, func(tx *session.Transaction) (any, error) { return change(tx) })
+	if err != nil {
+		return zero, err
+	}
+	typed, _ := value.(T)
+	return typed, nil
+}
+
+// readOnLine runs read on the Session line, with the line's gated Storage, and returns its typed result.
+func readOnLine[T any](ctx context.Context, line *session.SessionImpl, read func(storage durable.Storage) (T, error)) (T, error) {
+	var zero T
+	value, err := line.ReadOnLineCtx(ctx, func(storage durable.Storage) (any, error) { return read(storage) })
+	if err != nil {
+		return zero, err
+	}
+	typed, _ := value.(T)
+	return typed, nil
+}
+
+// Submissions is admission, waits, and withdrawal of the durable submissions of one Harness (submissions.ts:21-118).
+type Submissions struct {
+	telemetry telemetry.TelemetryContext
+	line      *session.SessionImpl
+	now       func() float64
+	// queueModes is read at each admission, on the Session line.
+	queueModes func() QueueModes
+	// resume enables task scheduling; submitting or waiting asks for progress. It fails with *durable.ReadOnlySession on a
+	// read-only Harness.
+	resume  func() error
+	waiters Waiters[durable.SubmissionId, durable.SettledSubmissionRecord]
+	// closeMu makes Wait's closed check and waiter registration one step with respect to close, which upstream's single thread gives for free: a waiter registered after RejectAll would never settle.
+	closeMu sync.Mutex
+	closed  bool
+}
+
+// NewSubmissions subscribes to the Session's commits and close.
+// telemetry is the Harness's root adapter, the parent of input admissions; nil is the no-op context.
+func NewSubmissions(line *session.SessionImpl, now func() float64, queueModes func() QueueModes, resume func() error, root telemetry.TelemetryContext) *Submissions {
+	if root == nil {
+		root = telemetry.NoopTelemetryContext
+	}
+	submissions := &Submissions{telemetry: root, line: line, now: now, queueModes: queueModes, resume: resume}
+	line.FollowCommits(func(ctx context.Context, publication session.ObservedCommit) {
+		submissions.observe(publication)
+	})
+	line.SubscribeClose(func() {
+		submissions.closeMu.Lock()
+		submissions.closed = true
+		submissions.closeMu.Unlock()
+		submissions.waiters.RejectAll(closedError(line))
+	})
+	return submissions
+}
+
+// Submit admits a submission in one commit; see AdmitSubmission.
+func (submissions *Submissions) Submit(ctx context.Context, conversationId durable.ConversationId, draft durable.SubmissionDraft) (durable.Submission, error) {
+	return submissions.SubmitUnlessCancelled(ctx, nil, conversationId, draft)
+}
+
+// SubmitUnlessCancelled is Submit for a caller whose cancellation applies only until the job starts (session.ts commit:
+// `context.abortSignal?.throwIfAborted()` as the job begins): ctx carries the commit, so it should not be cancellable, and
+// startCheck, when non-nil, runs as the job starts and rejects it, storing nothing, with the error it returns.
+func (submissions *Submissions) SubmitUnlessCancelled(ctx context.Context, startCheck func() error, conversationId durable.ConversationId, draft durable.SubmissionDraft) (durable.Submission, error) {
+	admission, err := submissions.traced(ctx, conversationId, draft, func(span telemetry.TelemetrySpan) (Admission, error) {
+		return commitOnLine(chordctx.WithTelemetry(ctx, span), submissions.line, session.TransactionScope{}, func(tx *session.Transaction) (Admission, error) {
+			if startCheck != nil {
+				if err := startCheck(); err != nil {
+					return Admission{}, err
+				}
+			}
+			return AdmitSubmission(tx, conversationId, draft, submissions.now(), submissions.queueModes(), span)
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &submissionHandle{id: admission.Id, submissions: submissions}, nil
+}
+
+// Admit admits a submission inside the caller's commit tx, with the rules of Submit. The admission is stored or lost
+// with that commit. It must come before the commit's first table write, another admission's included.
+func (submissions *Submissions) Admit(tx durable.Tx, conversationId durable.ConversationId, draft durable.SubmissionDraft) (durable.SubmissionId, error) {
+	owned, ok := submissions.line.OwnsTransaction(tx)
+	if !ok {
+		return 0, errors.New("The transaction belongs to another Session")
+	}
+	// Enforced on every path: admission reads tables only on some (request IDs, an idle boundary, a steer's trace).
+	if owned.HasTableWrite() {
+		return 0, durable.NewReadAfterWrite("submit(tx, draft)")
+	}
+	admission, err := submissions.traced(owned.Context(), conversationId, draft, func(span telemetry.TelemetrySpan) (Admission, error) {
+		return AdmitSubmission(tx, conversationId, draft, submissions.now(), submissions.queueModes(), span)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return admission.Id, nil
+}
+
+// traced runs one admission in its pi.durable.submit span, asking for progress first, as the run it starts needs it.
+func (submissions *Submissions) traced(ctx context.Context, conversationId durable.ConversationId, draft durable.SubmissionDraft, admit func(span telemetry.TelemetrySpan) (Admission, error)) (Admission, error) {
+	if err := submissions.resume(); err != nil {
+		return Admission{}, err
+	}
+	// Inputs and continues start runs: root traces linked to their callers.
+	startsRun := draft.Type != durable.SubmissionTypeWrite
+	parent := submissions.telemetry
+	if !startsRun {
+		parent = chordctx.Telemetry(ctx)
+	}
+	run := func(span telemetry.TelemetrySpan) (Admission, error) {
+		traced := span != telemetry.NoopTelemetryContext
+		if traced && startsRun {
+			span.AddLink(telemetry.SpanLink{Context: chordctx.Telemetry(ctx)})
+		}
+		admission, err := admit(span)
+		if err != nil {
+			// Error text may contain caller content. Record only the status.
+			span.SetStatus(telemetry.SpanStatus{Status: telemetry.SpanStatusCodeError})
+			return Admission{}, err
+		}
+		if traced {
+			span.SetAttributes(telemetry.SpanAttributes{telemetry.Attr("submission.id", float64(admission.Id)), telemetry.Attr("result", admission.Status)})
+		}
+		return admission, nil
+	}
+	// The no-op parent starts the no-op span and drops the attributes, so none are built for it.
+	if parent == telemetry.NoopTelemetryContext {
+		return run(telemetry.NoopTelemetryContext)
+	}
+	return telemetry.StartTypedSpan(telemetry.CreateTypedSpanStarter(parent, DurableTelemetrySchema), "pi.durable.submit", telemetry.SpanAttributes{
+		telemetry.Attr("submission.type", string(draft.Type)),
+		telemetry.Attr("conversation.id", float64(conversationId)),
+	}, func(span telemetry.TelemetrySpan, _ telemetry.TypedSpanStarter) (Admission, error) {
+		return run(span)
+	})
+}
+
+// Get returns a handle for an existing submission; nil when absent.
+func (submissions *Submissions) Get(ctx context.Context, id durable.SubmissionId) (durable.Submission, error) {
+	record, err := readOnLine(ctx, submissions.line, func(storage durable.Storage) (*durable.SubmissionRecord, error) {
+		return storage.Submission(ctx, id)
+	})
+	if err != nil || record == nil {
+		return nil, err
+	}
+	return &submissionHandle{id: record.Id, submissions: submissions}, nil
+}
+
+// Status returns the committed record of a submission.
+func (submissions *Submissions) Status(ctx context.Context, id durable.SubmissionId) (durable.SubmissionRecord, error) {
+	record, err := readOnLine(ctx, submissions.line, func(storage durable.Storage) (*durable.SubmissionRecord, error) {
+		return storage.Submission(ctx, id)
+	})
+	if err != nil {
+		return durable.SubmissionRecord{}, err
+	}
+	if record == nil {
+		return durable.SubmissionRecord{}, fmt.Errorf("Submission %d does not exist", id)
+	}
+	return *record, nil
+}
+
+// Wait returns the settled record of a submission; cancelling ctx cancels only this wait, including its wait for the
+// listeners of the batches committed before it to enter (their synchronous part ran, or they went on to a wait of the Session),
+// which it resumes its caller after as upstream's drain microtask runs before the code that awaited the promise.
+func (submissions *Submissions) Wait(ctx context.Context, id durable.SubmissionId) (durable.SettledSubmissionRecord, error) {
+	record, err := submissions.waitSettled(ctx, id)
+	if err != nil {
+		return record, err
+	}
+	// pig divergence (D224): a listener that blocks on something the host cannot see, without calling chord.DeliveryEntered, holds
+	// this wait back; Pi's listener awaits.
+	if err := submissions.line.AwaitDeliveriesEntered(ctx); err != nil {
+		return durable.SubmissionRecord{}, err
+	}
+	return record, nil
+}
+
+func (submissions *Submissions) waitSettled(ctx context.Context, id durable.SubmissionId) (durable.SettledSubmissionRecord, error) {
+	if err := submissions.resume(); err != nil {
+		return durable.SettledSubmissionRecord{}, err
+	}
+	// Check and register on the line so no settling publication falls between them.
+	type found struct {
+		record *durable.SubmissionRecord
+		waiter *Waiter[durable.SettledSubmissionRecord]
+	}
+	result, err := readOnLine(ctx, submissions.line, func(storage durable.Storage) (found, error) {
+		record, err := storage.Submission(ctx, id)
+		if err != nil {
+			return found{}, err
+		}
+		if record == nil {
+			return found{}, fmt.Errorf("Submission %d does not exist", id)
+		}
+		if isSettledSubmission(*record) {
+			return found{record: record}, nil
+		}
+		// Close rejects registered waiters synchronously and may begin during the read.
+		submissions.closeMu.Lock()
+		defer submissions.closeMu.Unlock()
+		if submissions.closed {
+			return found{}, closedError(submissions.line)
+		}
+		return found{waiter: submissions.waiters.Add(ctx, submissions.line, id)}, nil
+	})
+	if err != nil {
+		return durable.SubmissionRecord{}, err
+	}
+	if result.record != nil {
+		return *result.record, nil
+	}
+	return result.waiter.Wait()
+}
+
+// Abort withdraws a queued submission and removes its inbox item; placed inputs and settled submissions are reported.
+// conversationId, when given, must own the submission.
+func (submissions *Submissions) Abort(ctx context.Context, id durable.SubmissionId, conversationId *durable.ConversationId) (durable.SubmissionAbortResult, error) {
+	return commitOnLine(ctx, submissions.line, session.TransactionScope{}, func(tx *session.Transaction) (durable.SubmissionAbortResult, error) {
+		record, err := tx.Submission(id)
+		if err != nil {
+			return "", err
+		}
+		if record == nil || (conversationId != nil && record.ConversationId != *conversationId) {
+			return durable.SubmissionNotFound, nil
+		}
+		if record.Status == durable.SubmissionQueued {
+			if err := tx.SettleSubmission(id, durable.SubmissionSettlement{Status: durable.SubmissionUnanswered, Reason: "aborted"}); err != nil {
+				return "", err
+			}
+			if err := RemoveInboxItem(tx, record.ConversationId, id); err != nil {
+				return "", err
+			}
+			return durable.SubmissionAborted, nil
+		}
+		if record.Status == durable.SubmissionPlaced {
+			return durable.SubmissionAlreadyPlaced, nil
+		}
+		return durable.SubmissionSettled, nil
+	})
+}
+
+func (submissions *Submissions) observe(publication session.ObservedCommit) {
+	// A commit held in memory changes documents only.
+	if publication.Memory {
+		return
+	}
+	for _, change := range publication.Changes {
+		write, ok := change.(durable.SubmissionWrite)
+		if !ok || !isSettledSubmission(write.Value) {
+			continue
+		}
+		// Upstream resolves the wait here, inside the observer: it is settled for good, and only the code awaiting it resumes
+		// after the host listeners. A close that seals before the wake does not reject a wait whose submission settled.
+		submissions.line.DeferUntilPublished(submissions.waiters.Settle(write.Value.Id, write.Value))
+	}
+}
+
+type submissionHandle struct {
+	id          durable.SubmissionId
+	submissions *Submissions
+}
+
+func (handle *submissionHandle) Id() durable.SubmissionId { return handle.id }
+
+func (handle *submissionHandle) Status(ctx context.Context) (durable.SubmissionRecord, error) {
+	return handle.submissions.Status(ctx, handle.id)
+}
+
+func (handle *submissionHandle) Wait(ctx context.Context) (durable.SettledSubmissionRecord, error) {
+	return handle.submissions.Wait(ctx, handle.id)
+}
+
+func (handle *submissionHandle) Abort(ctx context.Context) (durable.SubmissionAbortResult, error) {
+	result, err := handle.submissions.Abort(ctx, handle.id, nil)
+	if err != nil {
+		return "", err
+	}
+	if result == durable.SubmissionNotFound {
+		return "", fmt.Errorf("Submission %d does not exist", handle.id)
+	}
+	return result, nil
+}
+
+func isSettledSubmission(record durable.SubmissionRecord) bool {
+	return record.Status == durable.SubmissionDone || record.Status == durable.SubmissionUnanswered
+}
+
+// checkInputEntry rejects an input entry whose kind is not a non-empty string outside the pi. prefix with a TypeError
+// (submissions.ts checkInputEntry).
+func checkInputEntry(entry durable.InputEntry) error {
+	if entry.Kind == "" || strings.HasPrefix(entry.Kind, "pi.") {
+		return &TypeError{Message: "An input entry's kind must be a non-empty string not starting with \"pi.\", got " + entry.Kind}
+	}
+	return nil
+}
+
+// Admission is what AdmitSubmission reports: the submission and how it was admitted ("queued", "placed", or "done"; a
+// stale write reports done).
+type Admission struct {
+	Id     durable.SubmissionId
+	Status string
+}
+
+// injectTrace is `span?.propagation?.inject(span)`: the carrier of the admission span, nil without propagation.
+func injectTrace(span telemetry.TelemetrySpan) telemetry.TelemetryCarrier {
+	if span == nil {
+		return nil
+	}
+	propagation := span.Propagation()
+	if propagation == nil {
+		return nil
+	}
+	return propagation.Inject(span)
+}
+
+// AdmitSubmission admits a submission inside a commit (spec §6, submissions.ts:136-207); both Conversation.Submit forms
+// and conversation-owned compactions share it. A known request ID returns its existing submission without writing. A
+// display-only write (only kind and data) is appended and settled done at once, busy or not, as it changes nothing the
+// model sees; only behind a queued reset it queues, so it lands after the reset instead of before it in the context the
+// reset ends. A busy conversation queues anything else in pi.inbox, or rejects whenBusy reject input and any continue
+// with ConversationBusy; an idle one rejects whenIdle reject input with ConversationIdle. An idle continue places
+// queued items and starts a run with them and itself, placing no entry of its own. An idle conversation with queued
+// items queues it behind them and runs a final boundary. Otherwise idle input places its entry (pi.user, or the
+// input's own) and starts a run, and an idle write appends its entry and settles done, or stale when its head reaches
+// before the active range.
+func AdmitSubmission(tx durable.Tx, conversationId durable.ConversationId, draft durable.SubmissionDraft, now float64, queueModes QueueModes, span telemetry.TelemetrySpan) (Admission, error) {
+	if draft.Type == durable.SubmissionTypeInput && draft.InputEntry != nil {
+		if err := checkInputEntry(*draft.InputEntry); err != nil {
+			return Admission{}, err
+		}
+	}
+	if draft.RequestId != nil {
+		existing, err := tx.SubmissionByRequest(conversationId, *draft.RequestId)
+		if err != nil {
+			return Admission{}, err
+		}
+		if existing != nil {
+			if existing.Type != draft.Type {
+				return Admission{}, fmt.Errorf("Request %s already identifies a submission of type %s", *draft.RequestId, existing.Type)
+			}
+			status := string(existing.Status)
+			if existing.Status == durable.SubmissionUnanswered {
+				status = string(durable.SubmissionDone)
+			}
+			return Admission{Id: existing.Id, Status: status}, nil
+		}
+	}
+	trace := injectTrace(span)
+	if draft.Type == durable.SubmissionTypeWrite && IsDisplayOnly(*draft.Entry) {
+		draftInbox, err := docDraft(tx, InboxDoc, conversationId)
+		if err != nil {
+			return Admission{}, err
+		}
+		inbox, err := decodeDraft[InboxState](draftInbox)
+		if err != nil {
+			return Admission{}, err
+		}
+		if !HasQueuedReset(inbox.Items) {
+			entry, err := tx.AppendEntry(conversationId, *draft.Entry)
+			if err != nil {
+				return Admission{}, err
+			}
+			id := entry.Id
+			record, err := tx.CreateSubmission(durable.SubmissionCreate{Trace: trace, ConversationId: conversationId, RequestId: draft.RequestId, Notify: draft.Notify, Type: durable.SubmissionTypeWrite, Status: durable.SubmissionDone, Entry: &id})
+			if err != nil {
+				return Admission{}, err
+			}
+			return Admission{Id: record.Id, Status: string(durable.SubmissionDone)}, nil
+		}
+	}
+	live, err := docDraft(tx, LiveDoc, conversationId)
+	if err != nil {
+		return Admission{}, err
+	}
+	busy := live.Has("run")
+	if draft.Type == durable.SubmissionTypeInput && draft.WhenBusy == durable.WhenBusySteer && busy && span != nil {
+		if propagation := span.Propagation(); propagation != nil {
+			if owner, ok := runTaskOf(live); ok {
+				run, err := tx.Task(owner)
+				if err != nil {
+					return Admission{}, err
+				}
+				if run != nil && run.Trace != nil {
+					span.AddLink(telemetry.SpanLink{Context: propagation.Extract(run.Trace)})
+				}
+			}
+		}
+	}
+	if busy && draft.Type == durable.SubmissionTypeInput && draft.WhenBusy == durable.WhenBusyReject {
+		return Admission{}, durable.NewConversationBusy(conversationId)
+	}
+	if !busy && draft.Type == durable.SubmissionTypeInput && draft.WhenIdle == durable.WhenIdleReject {
+		return Admission{}, durable.NewConversationIdle(conversationId)
+	}
+	if draft.Type == durable.SubmissionTypeContinue {
+		// Never queued: whether a run can continue depends on how the current one ends. Rejected before any write.
+		if busy {
+			return Admission{}, durable.NewConversationBusy(conversationId)
+		}
+		boundary, err := PrepareBoundary(tx, conversationId, queueModes)
+		if err != nil {
+			return Admission{}, err
+		}
+		record, err := tx.CreateSubmission(durable.SubmissionCreate{Trace: trace, ConversationId: conversationId, RequestId: draft.RequestId, Notify: draft.Notify, Type: durable.SubmissionTypeContinue, Status: durable.SubmissionPlaced})
+		if err != nil {
+			return Admission{}, err
+		}
+		// Items an earlier failed run left queued (afterFailedRun keep) are placed first and join the run. Its history
+		// starts with the failed run's, so afterRun hooks see what that run did.
+		placed, err := ApplyBoundary(tx, boundary, BoundaryFinal, now)
+		if err != nil {
+			return Admission{}, err
+		}
+		first := placed.First
+		if failure := live.Object("runFailure"); failure != nil {
+			if failed, ok := failure.Get("first").(float64); ok {
+				id := durable.EntryId(failed)
+				first = &id
+			}
+		}
+		inputs := append(append([]durable.SubmissionId{}, placed.Users...), record.Id)
+		if err := StartRun(tx, conversationId, live, RunStart{Inputs: inputs, First: first}, nil); err != nil {
+			return Admission{}, err
+		}
+		return Admission{Id: record.Id, Status: string(durable.SubmissionPlaced)}, nil
+	}
+	// A boundary reads the table, so it is prepared before the first table write; a busy one needs none.
+	var boundary *Boundary
+	if !busy {
+		boundary, err = PrepareBoundary(tx, conversationId, queueModes)
+		if err != nil {
+			return Admission{}, err
+		}
+	}
+	queuedItems := false
+	if boundary != nil {
+		items := boundary.Inbox.Array("items")
+		queuedItems = items != nil && items.Len() > 0
+	}
+	if boundary == nil || queuedItems {
+		record, err := tx.CreateSubmission(durable.SubmissionCreate{Trace: trace, ConversationId: conversationId, RequestId: draft.RequestId, Notify: draft.Notify, Type: draft.Type, Status: durable.SubmissionQueued})
+		if err != nil {
+			return Admission{}, err
+		}
+		id := record.Id
+		var item InboxItem
+		if draft.Type == durable.SubmissionTypeWrite {
+			entry, err := durable.ToJsonObject(*draft.Entry)
+			if err != nil {
+				return Admission{}, err
+			}
+			item = InboxItem{Id: id, Mode: InboxWrite, Entry: entry}
+		} else {
+			content, err := durable.ToJsonValue(draft.Content)
+			if err != nil {
+				return Admission{}, err
+			}
+			mode := InboxFollowUp
+			if draft.WhenBusy == durable.WhenBusySteer {
+				mode = InboxSteer
+			}
+			item = InboxItem{Id: id, Mode: mode, Content: content}
+			if draft.InputEntry != nil {
+				if item.Entry, err = pickInputEntry(*draft.InputEntry); err != nil {
+					return Admission{}, err
+				}
+			}
+			if draft.OnAbort == durable.OnAbortKeep {
+				item.OnAbort = durable.OnAbortKeep
+			}
+		}
+		inbox := live
+		if boundary != nil {
+			inbox = boundary.Inbox
+		} else if inbox, err = docDraft(tx, InboxDoc, conversationId); err != nil {
+			return Admission{}, err
+		}
+		if err := pushJSON(inbox.Array("items"), item); err != nil {
+			return Admission{}, err
+		}
+		if boundary == nil {
+			return Admission{Id: id, Status: "queued"}, nil
+		}
+		placed, err := ApplyBoundary(tx, boundary, BoundaryFinal, now)
+		if err != nil {
+			return Admission{}, err
+		}
+		if len(placed.Users) > 0 {
+			if err := StartRun(tx, conversationId, live, RunStart{Inputs: placed.Users, First: placed.First}, nil); err != nil {
+				return Admission{}, err
+			}
+		}
+		if draft.Type == durable.SubmissionTypeWrite {
+			return Admission{Id: id, Status: string(durable.SubmissionDone)}, nil
+		}
+		if len(placed.Users) > 0 && placed.Users[len(placed.Users)-1] == id {
+			return Admission{Id: id, Status: string(durable.SubmissionPlaced)}, nil
+		}
+		return Admission{Id: id, Status: "queued"}, nil
+	}
+	if draft.Type == durable.SubmissionTypeWrite {
+		if IsStale(boundary, *draft.Entry) {
+			reason := "stale"
+			record, err := tx.CreateSubmission(durable.SubmissionCreate{Trace: trace, ConversationId: conversationId, RequestId: draft.RequestId, Notify: draft.Notify, Type: durable.SubmissionTypeWrite, Status: durable.SubmissionUnanswered, Reason: &reason})
+			if err != nil {
+				return Admission{}, err
+			}
+			return Admission{Id: record.Id, Status: string(durable.SubmissionDone)}, nil
+		}
+		entry, err := tx.AppendEntry(conversationId, *draft.Entry)
+		if err != nil {
+			return Admission{}, err
+		}
+		id := entry.Id
+		record, err := tx.CreateSubmission(durable.SubmissionCreate{Trace: trace, ConversationId: conversationId, RequestId: draft.RequestId, Notify: draft.Notify, Type: durable.SubmissionTypeWrite, Status: durable.SubmissionDone, Entry: &id})
+		if err != nil {
+			return Admission{}, err
+		}
+		return Admission{Id: record.Id, Status: string(durable.SubmissionDone)}, nil
+	}
+	entry, err := appendInput(tx, conversationId, draft.Content, draft.InputEntry, now)
+	if err != nil {
+		return Admission{}, err
+	}
+	entryId := entry.Id
+	record, err := tx.CreateSubmission(durable.SubmissionCreate{Trace: trace, ConversationId: conversationId, RequestId: draft.RequestId, Notify: draft.Notify, Type: durable.SubmissionTypeInput, Status: durable.SubmissionPlaced, Entry: &entryId})
+	if err != nil {
+		return Admission{}, err
+	}
+	if err := StartRun(tx, conversationId, live, RunStart{Inputs: []durable.SubmissionId{record.Id}, First: &entryId}, nil); err != nil {
+		return Admission{}, err
+	}
+	return Admission{Id: record.Id, Status: string(durable.SubmissionPlaced)}, nil
+}

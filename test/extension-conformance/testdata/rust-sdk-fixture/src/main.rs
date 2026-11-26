@@ -1,0 +1,10431 @@
+use pig_sdk::kit;
+use pig_sdk::kit::{
+    Box as KitBox, Container, DynamicBorder, EventKind, HStack, Image, Lines, ListItem, Loader,
+    LoaderIndicator, Markdown, SelectItem, SelectList, SettingItem, SettingsList, Spacer,
+    StackEntry, Text, TruncatedText, VStack,
+};
+use pig_sdk::{
+    AutocompleteItem, CommandResult, ConstrainedSampling, Extension, LoginDefinition, MouseEvent,
+    OAuthCredentialStatus, OAuthCredentialStore, OAuthCredentials, OAuthDeviceCodeInfo,
+    OAuthPrompt, OAuthProvider, ProjectTrustDecision, ProjectTrustResult, RemoteComponent,
+    RemoteComponentInvalidate, RemoteComponentResult, SpriteDefinition, TerminalInputResult,
+    TerminalInputSubscription, ToolDefinition, ToolRenderShell, ToolResult, ViewComponent,
+};
+use pig_sdk::{EditorBase, EditorComponent, JsString};
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::{thread, time::Duration};
+
+type RefineCheck = Box<dyn Fn(&Value) -> Result<bool, String> + Send + Sync>;
+type RefineMessage = Box<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
+type SeenRequest = (String, String, Option<String>, String);
+type ToolGuard = fn(&Value) -> bool;
+
+struct FocusedList {
+    items: [&'static str; 3],
+    selected: usize,
+    disposed: Arc<AtomicBool>,
+}
+
+impl RemoteComponent for FocusedList {
+    fn render(&self, width: u32) -> Vec<String> {
+        let mut lines = vec![format!("focused width={width}")];
+        for (index, item) in self.items.iter().enumerate() {
+            let prefix = if index == self.selected { "> " } else { "  " };
+            lines.push(format!("{prefix}{item}"));
+        }
+        lines
+    }
+
+    fn handle_input(&mut self, data: &pig_sdk::JsString) -> Result<RemoteComponentResult, String> {
+        match data.to_string().as_deref() {
+            Ok("\u{1b}[A") => {
+                self.selected = (self.selected + self.items.len() - 1) % self.items.len()
+            }
+            Ok("\u{1b}[B") => self.selected = (self.selected + 1) % self.items.len(),
+            Ok("\u{1b}[6~") => self.selected = (self.selected + 2).min(self.items.len() - 1),
+            Ok("\r" | "\n") => {
+                return Ok(RemoteComponentResult::done(Some(json!(
+                    self.items[self.selected]
+                ))));
+            }
+            Ok("\u{1b}") => return Ok(RemoteComponentResult::done(None)),
+            _ => {}
+        }
+        Ok(RemoteComponentResult::pending())
+    }
+
+    fn dispose(&mut self) {
+        self.disposed.store(true, Ordering::Relaxed);
+    }
+}
+
+struct TimerFocused {
+    frame: Arc<Mutex<u64>>,
+    invalidate: Arc<Mutex<Option<RemoteComponentInvalidate>>>,
+    stop: Arc<AtomicBool>,
+    disposed: Arc<AtomicBool>,
+    detached: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl TimerFocused {
+    fn new() -> (Self, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let frame = Arc::new(Mutex::new(0));
+        let invalidate = Arc::new(Mutex::new(None::<RemoteComponentInvalidate>));
+        let stop = Arc::new(AtomicBool::new(false));
+        let disposed = Arc::new(AtomicBool::new(false));
+        let detached = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let frame = frame.clone();
+            let invalidate = invalidate.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(20));
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    *frame.lock().unwrap() += 1;
+                    let callback = invalidate.lock().unwrap().clone();
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                }
+            })
+        };
+        (
+            Self {
+                frame,
+                invalidate,
+                stop,
+                disposed: disposed.clone(),
+                detached: detached.clone(),
+                worker: Some(worker),
+            },
+            disposed,
+            detached,
+        )
+    }
+}
+
+impl RemoteComponent for TimerFocused {
+    fn render(&self, width: u32) -> Vec<String> {
+        vec![format!(
+            "timer frame={} width={width}",
+            *self.frame.lock().unwrap()
+        )]
+    }
+
+    fn handle_input(&mut self, data: &pig_sdk::JsString) -> Result<RemoteComponentResult, String> {
+        if data == "\r" {
+            return Ok(RemoteComponentResult::done(Some(json!(
+                *self.frame.lock().unwrap()
+            ))));
+        }
+        Ok(RemoteComponentResult::pending())
+    }
+
+    fn set_invalidate(&mut self, invalidate: Option<RemoteComponentInvalidate>) {
+        self.detached.store(invalidate.is_none(), Ordering::Release);
+        *self.invalidate.lock().unwrap() = invalidate;
+    }
+
+    fn dispose(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.disposed.store(true, Ordering::Release);
+    }
+}
+
+/// Dials `addr` ("host:port"), writes "waiting\n" and returns when the peer writes a line.
+fn io_wait(addr: &str) -> std::io::Result<()> {
+    let mut peer = TcpStream::connect(addr)?;
+    peer.write_all(b"waiting\n")?;
+    BufReader::new(peer).read_line(&mut String::new())?;
+    Ok(())
+}
+
+/// The address the session_info_changed handler waits on first; empty when the handler is not armed (io_wait_name).
+static NAME_WAIT_ADDR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Subscribes `handler` to the event `name`. A before_agent_start handler registers with `on_before_agent_start` and receives the event as Pi's object (`BeforeAgentStartEvent::snapshot`).
+fn subscribe(
+    subscriber: &pig_sdk::EventSubscriber,
+    name: &str,
+    handler: impl Fn(&pig_sdk::Context, &mut Value) -> Result<Option<Value>, String>
+    + Send
+    + Sync
+    + 'static,
+) -> pig_sdk::EventSubscription {
+    if name == pig_sdk::EVENT_BEFORE_AGENT_START {
+        return subscriber.on_before_agent_start(move |ctx, event| {
+            let mut data = event.snapshot().map_err(|err| err.to_string())?;
+            handler(ctx, &mut data)
+        });
+    }
+    subscriber.on_event(name, handler)
+}
+
+// isolation_text is the text of a JSON value the isolation probe reports: a string as is, another value as its JSON, a missing one as "None".
+fn isolation_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => "None".to_string(),
+    }
+}
+
+fn conformance_login_definition() -> LoginDefinition {
+    LoginDefinition {
+        brand: vec!["A".repeat(41); 5],
+        hero: vec!["A".repeat(32); 14],
+        mascot: vec!["A".repeat(16); 14],
+        palette: [("A".to_string(), "#123ABC".to_string())]
+            .into_iter()
+            .collect(),
+        name: "Conformance Pig".to_string(),
+        description: "Cross-language login fixture".to_string(),
+        tagline: "One canonical definition across every SDK".to_string(),
+    }
+}
+
+fn conformance_sprite_definition() -> SpriteDefinition {
+    SpriteDefinition {
+        id: "conformance-pig".to_string(),
+        name: "Conformance Pig".to_string(),
+        tagline: "One canonical sprite across every SDK".to_string(),
+        mascot: vec!["A".repeat(16); 14],
+        palette: [("A".to_string(), "#123ABC".to_string())]
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// The component kit's conformance view (D107,
+/// docs/plan/extension-component-kit.md §10). It logs every input and view
+/// event and closes on select with the log joined by ",".
+struct KitProbe {
+    log: Vec<String>,
+}
+
+fn kit_probe_view() -> kit::View {
+    let items = (0..5)
+        .map(|i| {
+            SelectItem::new(format!("k{i}"), format!("Track {i}"))
+                .description(format!("Artist {i}"))
+        })
+        .collect();
+    let grow = StackEntry {
+        grow: Some(1),
+        ..StackEntry::default()
+    };
+    kit::View::new(
+        Container::new()
+            .child(DynamicBorder::new("accent"))
+            .child(Text::new("Kit probe", 2, 0).bg("customMessageBg"))
+            .child(Markdown::new("- one\n- **two**", 1, 0))
+            .child(
+                HStack::new()
+                    .child_with(TruncatedText::new("left side", 0, 0), grow)
+                    .child_with(TruncatedText::new("right", 0, 0), grow)
+                    .gap(1),
+            )
+            .child(Spacer::new(1))
+            .child(SelectList::new("kit-tracks", items, 3).selected_index(2)),
+    )
+    .focus("kit-tracks")
+    .theme("accent", "#d75f00")
+}
+
+impl ViewComponent for KitProbe {
+    fn view(&self, _width: u32) -> kit::View {
+        kit_probe_view()
+    }
+
+    fn handle_input(&mut self, data: &pig_sdk::JsString) -> Result<RemoteComponentResult, String> {
+        self.log.push(format!("input:{}", data.to_string_lossy()));
+        Ok(RemoteComponentResult::pending())
+    }
+
+    fn handle_view_event(&mut self, event: kit::Event) -> Result<RemoteComponentResult, String> {
+        let kind = match event.kind {
+            EventKind::Select => "select",
+            EventKind::Cancel => "cancel",
+            EventKind::SelectionChange => "selectionChange",
+            EventKind::Change => "change",
+            other => kit_event_name(other),
+        };
+        let value = event.item.map(|item| item.value).unwrap_or_default();
+        self.log.push(format!("{kind}:{}:{value}", event.index));
+        if event.kind == EventKind::Select {
+            return Ok(RemoteComponentResult::done(Some(Value::from(
+                self.log.join(","),
+            ))));
+        }
+        Ok(RemoteComponentResult::pending())
+    }
+}
+
+/// The extension mouse row's component: it logs every mouse event it
+/// receives, all of its fields, and closes on a click with the log joined
+/// by ",".
+struct MouseProbe {
+    log: Vec<String>,
+}
+
+impl RemoteComponent for MouseProbe {
+    fn render(&self, _width: u32) -> Vec<String> {
+        ["mouse probe", "row 1", "row 2", "row 3"]
+            .map(str::to_string)
+            .to_vec()
+    }
+
+    fn handle_input(&mut self, _data: &pig_sdk::JsString) -> Result<RemoteComponentResult, String> {
+        Ok(RemoteComponentResult::pending())
+    }
+
+    fn handles_mouse(&self) -> bool {
+        true
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent) -> Result<RemoteComponentResult, String> {
+        let mods: String = [(event.shift, "S"), (event.alt, "A"), (event.ctrl, "C")]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+        self.log.push(format!(
+            "{}/{}/{},{}/{},{}/{}x{}/w{}/c{}/{mods}",
+            event.kind,
+            event.button,
+            event.x,
+            event.y,
+            event.screen_x,
+            event.screen_y,
+            event.width,
+            event.height,
+            event.wheel_delta,
+            event.click_count
+        ));
+        if event.kind == "click" {
+            return Ok(RemoteComponentResult::done(Some(Value::from(
+                self.log.join(","),
+            ))));
+        }
+        Ok(RemoteComponentResult::pending())
+    }
+}
+
+/// viewport-probe's component: it captures viewport input until it receives `t`, then stops, and closes on `q`.
+struct ViewportProbe {
+    captures: bool,
+}
+
+impl RemoteComponent for ViewportProbe {
+    fn render(&self, _width: u32) -> Vec<String> {
+        vec!["viewport probe".to_string()]
+    }
+
+    fn captures_viewport_input(&self) -> bool {
+        self.captures
+    }
+
+    fn handle_input(&mut self, data: &pig_sdk::JsString) -> Result<RemoteComponentResult, String> {
+        match data.to_string().as_deref().ok() {
+            Some("t") => {
+                self.captures = false;
+                Ok(RemoteComponentResult::pending())
+            }
+            Some("q") => Ok(RemoteComponentResult::done(Some(Value::from(
+                "viewport=done",
+            )))),
+            _ => Ok(RemoteComponentResult::pending()),
+        }
+    }
+}
+
+/// tui-alt-viewport-probe's component: a focusable component that captures viewport input.
+struct ViewportFocus {
+    focused: AtomicBool,
+}
+
+impl pig_sdk::Component for ViewportFocus {
+    fn render(&self, _width: u32) -> Vec<String> {
+        vec!["viewport probe".to_string()]
+    }
+    fn captures_viewport_input(&self) -> bool {
+        true
+    }
+    fn is_focusable(&self) -> bool {
+        true
+    }
+    fn focused(&self) -> bool {
+        self.focused.load(Ordering::SeqCst)
+    }
+    fn set_focused(&self, focused: bool) {
+        self.focused.store(focused, Ordering::SeqCst);
+    }
+}
+
+/// Image n of kit-images: a 1×1 RGBA PNG whose pixel encodes n, so each n has
+/// its own bytes and ref.
+fn kit_image_png(n: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let crc = crc32(&png[start..]);
+        png.extend_from_slice(&crc.to_be_bytes());
+    }
+    // One filter byte (none) and the pixel, in a zlib stream of one stored block.
+    let raw = [0, n as u8, (n >> 8) as u8, 0x5f, 0xff];
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    let mut idat = vec![
+        0x78,
+        0x01,
+        0x01,
+        raw.len() as u8,
+        0,
+        !(raw.len() as u8),
+        0xff,
+    ];
+    idat.extend_from_slice(&raw);
+    idat.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+    chunk(&mut png, b"IDAT", &idat);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// kit-kinds' image, a 1×1 PNG every SDK fixture embeds byte for byte.
+const KIT_KINDS_PNG: &str = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c48900000010494441547801010500faff002a005fff026a01892888e8cd0000000049454e44ae426082";
+
+const KIT_BRANCH_SUMMARY: &str = "The branch explored **two** options:\n\n- keep the cache\n- drop the cache\n\nIt chose `drop`.";
+
+fn kit_branch_view(set: impl FnOnce(&mut kit::BranchSummary)) -> kit::View {
+    let mut node = kit::BranchSummary::new(KIT_BRANCH_SUMMARY).id("b");
+    set(&mut node);
+    kit::View::new(Container::new().child(node))
+}
+
+const KIT_COMPACTION_SUMMARY: &str = "Compacted the first **forty** turns:\n\n1. the build setup\n2. the failing test\n\nThe fix is pending.";
+
+fn kit_compaction_view(tokens: u64, set: impl FnOnce(&mut kit::CompactionSummary)) -> kit::View {
+    let mut node = kit::CompactionSummary::new(KIT_COMPACTION_SUMMARY, tokens).id("c");
+    set(&mut node);
+    kit::View::new(Container::new().child(node))
+}
+
+const KIT_SKILL_CONTENT: &str =
+    "Review the diff for **bugs** first.\n\n- correctness\n- naming\n\nReport findings as a list.";
+
+fn kit_skill_view(set: impl FnOnce(&mut kit::SkillInvocation)) -> kit::View {
+    let mut node = kit::SkillInvocation::new("code-review", KIT_SKILL_CONTENT).id("s");
+    set(&mut node);
+    kit::View::new(Container::new().child(node))
+}
+
+fn kit_custom_message_view(text: &str, set: impl FnOnce(&mut kit::CustomMessage)) -> kit::View {
+    let mut node = kit::CustomMessage::new("ci-status", text).id("m");
+    set(&mut node);
+    kit::View::new(Container::new().child(node))
+}
+
+const KIT_WIDE_MESSAGE: &str =
+    "A very long message that wraps around the narrow widths of the table";
+
+fn kit_cancellable_view(loader: kit::Loader) -> kit::View {
+    kit::View::new(Container::new().child(kit::CancellableLoader::new("c", loader))).focus("c")
+}
+
+fn kit_bordered_view(
+    message: &str,
+    set: impl FnOnce(kit::BorderedLoader) -> kit::BorderedLoader,
+) -> kit::View {
+    kit::View::new(Container::new().child(set(kit::BorderedLoader::new("b", message)))).focus("b")
+}
+
+fn kit_input_view(focus: bool, set: impl FnOnce(kit::Input) -> kit::Input) -> kit::View {
+    let view = kit::View::new(Container::new().child(set(kit::Input::new("i"))));
+    if focus { view.focus("i") } else { view }
+}
+
+fn kit_editor_view(focus: bool, set: impl FnOnce(kit::Editor) -> kit::Editor) -> kit::View {
+    let view = kit::View::new(Container::new().child(set(kit::Editor::new("e"))));
+    if focus { view.focus("e") } else { view }
+}
+
+fn kit_editor_commands() -> kit::Autocomplete {
+    kit::Autocomplete::new(vec![
+        kit::SlashCommand::new("help").description("Show help"),
+        kit::SlashCommand::new("model")
+            .description("Switch the model")
+            .argument_hint("<name>"),
+        kit::SlashCommand::new("quit").description("Exit"),
+        kit::SlashCommand::new("session").description("Session info"),
+        kit::SlashCommand::new("settings").description("Open settings"),
+        kit::SlashCommand::new("share"),
+        kit::SlashCommand::new("skills").description("List skills"),
+        kit::SlashCommand::new("compact").description("Compact the context"),
+    ])
+}
+
+fn kit_scroll_child(kind: &str) -> kit::Node {
+    match kind {
+        "md" => Markdown::new("# Title\n\n- one\n- two with a long line that wraps at narrow widths\n\n`code`", 1, 0).into(),
+        "region" => Text::new("Region content\nsecond row", 1, 0).into(),
+        "empty" => Container::new().into(),
+        "branch" => kit::BranchSummary::new("The branch explored **two** options:\n\n- keep the cache\n- drop the cache\n\nIt chose `drop`.").id("b").into(),
+        _ => Text::new("Alpha line of the log\nBeta line of the log\nGamma line of the log that is long enough to wrap at the narrow widths\nDelta", 1, 0).into(),
+    }
+}
+
+/// The widget kinds' Pi vector cases (D107, docs/plan/extension-component-kit.md
+/// §10), built with the SDK's own constructors; the key is
+/// "<module>/<export>/<case name>" and the case's wire node is its vector's
+/// `root`.
+fn kit_widget_case(key: &str) -> Option<kit::View> {
+    Some(match key {
+        "pi-coding-agent/BranchSummaryMessageComponent/collapsed"
+        | "pi-coding-agent/BranchSummaryMessageComponent/click toggles"
+        | "pi-coding-agent/BranchSummaryMessageComponent/right click ignored" => {
+            kit_branch_view(|_| {})
+        }
+        "pi-coding-agent/BranchSummaryMessageComponent/expanded" => {
+            kit_branch_view(|n| n.set_expanded(true))
+        }
+        "pi-coding-agent/BranchSummaryMessageComponent/outputPad 0 collapsed" => {
+            kit_branch_view(|n| n.set_output_pad(0))
+        }
+        "pi-coding-agent/BranchSummaryMessageComponent/outputPad 0 expanded" => {
+            kit_branch_view(|n| {
+                n.set_output_pad(0);
+                n.set_expanded(true);
+            })
+        }
+        "pi-coding-agent/BranchSummaryMessageComponent/empty summary expanded" => {
+            let mut node = kit::BranchSummary::new("");
+            node.set_expanded(true);
+            kit::View::new(node)
+        }
+        "pi-coding-agent/CompactionSummaryMessageComponent/collapsed"
+        | "pi-coding-agent/CompactionSummaryMessageComponent/click toggles"
+        | "pi-coding-agent/CompactionSummaryMessageComponent/right click ignored" => {
+            kit_compaction_view(123456, |_| {})
+        }
+        "pi-coding-agent/CompactionSummaryMessageComponent/expanded" => {
+            kit_compaction_view(123456, |n| n.set_expanded(true))
+        }
+        "pi-coding-agent/CompactionSummaryMessageComponent/outputPad 0 collapsed" => {
+            kit_compaction_view(123456, |n| n.set_output_pad(0))
+        }
+        "pi-coding-agent/CompactionSummaryMessageComponent/outputPad 0 expanded" => {
+            kit_compaction_view(123456, |n| {
+                n.set_output_pad(0);
+                n.set_expanded(true);
+            })
+        }
+        "pi-coding-agent/CompactionSummaryMessageComponent/tokens 999" => {
+            kit_compaction_view(999, |_| {})
+        }
+        "pi-coding-agent/CompactionSummaryMessageComponent/tokens 1234567 expanded" => {
+            kit_compaction_view(1234567, |n| n.set_expanded(true))
+        }
+        "pi-coding-agent/CompactionSummaryMessageComponent/empty summary tokens 0 expanded" => {
+            let mut node = kit::CompactionSummary::new("", 0);
+            node.set_expanded(true);
+            kit::View::new(node)
+        }
+        "pi-coding-agent/SkillInvocationMessageComponent/collapsed"
+        | "pi-coding-agent/SkillInvocationMessageComponent/click toggles"
+        | "pi-coding-agent/SkillInvocationMessageComponent/right click ignored" => {
+            kit_skill_view(|_| {})
+        }
+        "pi-coding-agent/SkillInvocationMessageComponent/expanded" => {
+            kit_skill_view(|n| n.set_expanded(true))
+        }
+        "pi-coding-agent/SkillInvocationMessageComponent/outputPad 0 collapsed" => {
+            kit_skill_view(|n| n.set_output_pad(0))
+        }
+        "pi-coding-agent/SkillInvocationMessageComponent/outputPad 0 expanded" => {
+            kit_skill_view(|n| {
+                n.set_output_pad(0);
+                n.set_expanded(true);
+            })
+        }
+        "pi-coding-agent/SkillInvocationMessageComponent/empty skill expanded" => {
+            let mut node = kit::SkillInvocation::new("", "");
+            node.set_expanded(true);
+            kit::View::new(node)
+        }
+        "pi-coding-agent/CustomMessageComponent/default" => kit_custom_message_view(
+            "Build **passed** in 12s\n\n- 214 tests\n- 0 failures",
+            |_| {},
+        ),
+        "pi-coding-agent/CustomMessageComponent/outputPad 0" => kit_custom_message_view(
+            "Build **passed** in 12s\n\n- 214 tests\n- 0 failures",
+            |n| n.set_output_pad(0),
+        ),
+        "pi-coding-agent/CustomMessageComponent/expanded changes nothing" => {
+            kit_custom_message_view(
+                "Build **passed** in 12s\n\n- 214 tests\n- 0 failures",
+                |n| n.set_expanded(true),
+            )
+        }
+        "pi-coding-agent/CustomMessageComponent/empty text" => kit_custom_message_view("", |_| {}),
+        "pi-coding-agent/CustomMessageComponent/no id" => {
+            kit::View::new(kit::CustomMessage::new("note", "plain"))
+        }
+        "pi-tui/CancellableLoader/default"
+        | "pi-tui/CancellableLoader/escape aborts"
+        | "pi-tui/CancellableLoader/escape twice aborts twice"
+        | "pi-tui/CancellableLoader/other keys are ignored" => {
+            kit_cancellable_view(Loader::new("Working"))
+        }
+        "pi-tui/CancellableLoader/default message" => {
+            kit_cancellable_view(Loader::new("Loading..."))
+        }
+        "pi-tui/CancellableLoader/colors" => kit_cancellable_view(
+            Loader::new("Working")
+                .spinner_color("accent")
+                .message_color("muted"),
+        ),
+        "pi-tui/CancellableLoader/frame 3" => kit_cancellable_view(Loader::new("Working").frame(3)),
+        "pi-tui/CancellableLoader/indicator frames" => kit_cancellable_view(
+            Loader::new("Working")
+                .indicator(LoaderIndicator {
+                    frames: Some(vec!["*".into(), "+".into(), "x".into()]),
+                    interval_ms: Some(50),
+                })
+                .frame(1),
+        ),
+        "pi-tui/CancellableLoader/hidden indicator" => {
+            kit_cancellable_view(Loader::new("Working").indicator(LoaderIndicator {
+                frames: Some(vec![]),
+                interval_ms: None,
+            }))
+        }
+        "pi-tui/CancellableLoader/wide message" => {
+            kit_cancellable_view(Loader::new(KIT_WIDE_MESSAGE).spinner_color("accent"))
+        }
+        "pi-coding-agent/BorderedLoader/cancellable"
+        | "pi-coding-agent/BorderedLoader/escape aborts"
+        | "pi-coding-agent/BorderedLoader/escape twice aborts twice"
+        | "pi-coding-agent/BorderedLoader/other keys are ignored" => {
+            kit_bordered_view("Fetching models", |l| l)
+        }
+        "pi-coding-agent/BorderedLoader/not cancellable"
+        | "pi-coding-agent/BorderedLoader/escape ignored when not cancellable" => {
+            kit_bordered_view("Fetching models", |l| l.cancellable(false))
+        }
+        "pi-coding-agent/BorderedLoader/default message" => kit_bordered_view("Loading...", |l| l),
+        "pi-coding-agent/BorderedLoader/frame 4" => {
+            kit_bordered_view("Fetching models", |l| l.frame(4))
+        }
+        "pi-coding-agent/BorderedLoader/wide message" => kit_bordered_view(
+            "Fetching the models of every configured provider, one after another",
+            |l| l,
+        ),
+        "pi-tui/Input/empty" => kit_input_view(false, |n| n),
+        "pi-tui/Input/empty focused"
+        | "pi-tui/Input/typing"
+        | "pi-tui/Input/left then insert"
+        | "pi-tui/Input/backspace and delete"
+        | "pi-tui/Input/home and end"
+        | "pi-tui/Input/kill word and yank"
+        | "pi-tui/Input/kill to end"
+        | "pi-tui/Input/paste scrolls"
+        | "pi-tui/Input/submit" => kit_input_view(true, |n| n),
+        "pi-tui/Input/placeholder" => kit_input_view(false, |n| n.placeholder("type here")),
+        "pi-tui/Input/placeholder focused colored" => kit_input_view(true, |n| {
+            n.placeholder("type here").placeholder_color("dim")
+        }),
+        "pi-tui/Input/custom prompt" => kit_input_view(true, |n| n.prompt("$ ").value("ls -la")),
+        "pi-tui/Input/value" => kit_input_view(false, |n| n.value("hello world")),
+        "pi-tui/Input/value focused"
+        | "pi-tui/Input/click moves the cursor"
+        | "pi-tui/Input/right click ignored" => kit_input_view(true, |n| n.value("hello world")),
+        "pi-tui/Input/wide characters" => kit_input_view(true, |n| n.value("漢字 and 😀 text")),
+        "pi-tui/Input/submit newline key" => kit_input_view(true, |n| n.value("preset")),
+        "pi-tui/Input/escape" => kit_input_view(true, |n| n.value("keep")),
+        "pi-tui/Editor/empty" => kit_editor_view(false, |n| n),
+        "pi-tui/Editor/empty focused" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/value" => kit_editor_view(false, |n| n.value("hello world")),
+        "pi-tui/Editor/multiline value focused" => {
+            kit_editor_view(true, |n| n.value("one\ntwo\nthree"))
+        }
+        "pi-tui/Editor/wrapped line" => {
+            kit_editor_view(true, |n| {
+                n.value("The quick brown fox jumps over the lazy dog and keeps running through the field")
+            })
+        }
+        "pi-tui/Editor/wide characters" => kit_editor_view(true, |n| n.value("漢字 and 😀 text")),
+        "pi-tui/Editor/typing" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/newline" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/backspace and delete" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/kill word and yank" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/undo" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/submit" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/paste" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/paste large" => kit_editor_view(true, |n| n),
+        "pi-tui/Editor/cursor movement" => kit_editor_view(true, |n| n.value("one\ntwo\nthree")),
+        "pi-tui/Editor/submit multiline" => kit_editor_view(true, |n| n.value("one\ntwo")),
+        "pi-tui/Editor/submit disabled" => {
+            kit_editor_view(true, |n| n.value("keep").disable_submit(true))
+        }
+        "pi-tui/Editor/padding" => kit_editor_view(true, |n| n.value("padded text").padding_x(2)),
+        "pi-tui/Editor/padding wrapped" => kit_editor_view(true, |n| {
+            n.value("The quick brown fox jumps over the lazy dog and keeps running")
+                .padding_x(3)
+        }),
+        "pi-tui/Editor/border color" => {
+            kit_editor_view(true, |n| n.value("colored").border_color("accent"))
+        }
+        "pi-tui/Editor/history" => {
+            kit_editor_view(true, |n| n.history(["first", "second", "third"]))
+        }
+        "pi-tui/Editor/history then edit" => {
+            kit_editor_view(true, |n| n.history(["first", "second"]))
+        }
+        "pi-tui/Editor/scrolls past the visible lines" => kit_editor_view(true, |n| {
+            n.value("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12")
+        }),
+        "pi-tui/Editor/scroll indicator below" => kit_editor_view(true, |n| {
+            n.value("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12")
+        }),
+        "pi-tui/Editor/more rows show more lines" => kit_editor_view(true, |n| {
+            n.value("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12")
+        }),
+        "pi-tui/Editor/few rows show five lines" => kit_editor_view(true, |n| {
+            n.value("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12")
+        }),
+        "pi-tui/Editor/page up and down" => kit_editor_view(true, |n| {
+            n.value("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\nline 25\nline 26\nline 27\nline 28\nline 29\nline 30")
+        }),
+        "pi-tui/Editor/click moves the cursor" => {
+            kit_editor_view(true, |n| n.value("hello\nworld"))
+        }
+        "pi-tui/Editor/click on the border" => kit_editor_view(true, |n| n.value("hello\nworld")),
+        "pi-tui/Editor/right click ignored" => kit_editor_view(true, |n| n.value("hello")),
+        "pi-tui/Editor/slash opens the menu" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/slash narrows" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/slash no match" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/slash tab accepts" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/slash arrow then tab" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/slash enter accepts" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/slash escape closes" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/slash click selects" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/text after the slash opens nothing" => {
+            kit_editor_view(true, |n| n.autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/slash max visible 3" => kit_editor_view(true, |n| {
+            n.autocomplete_max_visible(3)
+                .autocomplete(kit_editor_commands())
+        }),
+        "pi-tui/Editor/slash with padding" => {
+            kit_editor_view(true, |n| n.padding_x(2).autocomplete(kit_editor_commands()))
+        }
+        "pi-tui/Editor/autocomplete menu does not follow disabled submit" => {
+            kit_editor_view(true, |n| {
+                n.disable_submit(true).autocomplete(kit_editor_commands())
+            })
+        }
+        "pi-tui/ScrollView/default" => kit::View::new(
+            Container::new().child(kit::ScrollView::new("s", kit_scroll_child("text"))),
+        ),
+        "pi-tui/ScrollView/scrollbar always" => kit::View::new(
+            Container::new()
+                .child(kit::ScrollView::new("s", kit_scroll_child("text")).scrollbar("always")),
+        ),
+        "pi-tui/ScrollView/scrollbar auto" => kit::View::new(
+            Container::new()
+                .child(kit::ScrollView::new("s", kit_scroll_child("text")).scrollbar("auto")),
+        ),
+        "pi-tui/ScrollView/scrollbar colors" => kit::View::new(
+            Container::new().child(
+                kit::ScrollView::new("s", kit_scroll_child("text"))
+                    .scrollbar("always")
+                    .scrollbar_track_color("dim")
+                    .scrollbar_thumb_color("accent"),
+            ),
+        ),
+        "pi-tui/ScrollView/follow end" => kit::View::new(
+            Container::new()
+                .child(kit::ScrollView::new("s", kit_scroll_child("text")).follow("end")),
+        ),
+        "pi-tui/ScrollView/primary and contain" => kit::View::new(
+            Container::new().child(
+                kit::ScrollView::new("s", kit_scroll_child("text"))
+                    .primary(true)
+                    .overscroll("contain"),
+            ),
+        ),
+        "pi-tui/ScrollView/hide delay" => kit::View::new(
+            Container::new().child(
+                kit::ScrollView::new("s", kit_scroll_child("text"))
+                    .scrollbar("auto")
+                    .scrollbar_hide_delay_ms(50),
+            ),
+        ),
+        "pi-tui/ScrollView/scroll top clamps" => kit::View::new(
+            Container::new()
+                .child(kit::ScrollView::new("s", kit_scroll_child("text")).scroll_top(3)),
+        ),
+        "pi-tui/ScrollView/markdown child" => kit::View::new(
+            Container::new()
+                .child(kit::ScrollView::new("s", kit_scroll_child("md")).scrollbar("always")),
+        ),
+        "pi-tui/ScrollView/after other rows" => kit::View::new(
+            Container::new()
+                .child(Text::new("Header", 1, 0))
+                .child(kit::ScrollView::new("s", kit_scroll_child("text")).scrollbar("always"))
+                .child(Text::new("Footer", 1, 0)),
+        ),
+        "pi-tui/ScrollView/empty child" => kit::View::new(
+            Container::new()
+                .child(kit::ScrollView::new("s", kit_scroll_child("empty")).scrollbar("always")),
+        ),
+        "pi-tui/ScrollView/wheel and click pass" => kit::View::new(
+            Container::new()
+                .child(kit::ScrollView::new("s", kit_scroll_child("text")))
+                .child(Text::new("after", 1, 0)),
+        ),
+        "pi-tui/MouseRegion/renders its child" => kit::View::new(
+            Container::new().child(kit::MouseRegion::new("m", kit_scroll_child("region"))),
+        ),
+        "pi-tui/MouseRegion/every type by default" => kit::View::new(
+            Container::new().child(kit::MouseRegion::new("m", kit_scroll_child("region"))),
+        ),
+        "pi-tui/MouseRegion/types filter" => kit::View::new(
+            Container::new()
+                .child(kit::MouseRegion::new("m", kit_scroll_child("region")).types(["click"])),
+        ),
+        "pi-tui/MouseRegion/not handled" => kit::View::new(
+            Container::new()
+                .child(kit::MouseRegion::new("m", kit_scroll_child("region")).handled(false)),
+        ),
+        "pi-tui/MouseRegion/capture" => kit::View::new(
+            Container::new()
+                .child(kit::MouseRegion::new("m", kit_scroll_child("region")).capture(true)),
+        ),
+        "pi-tui/MouseRegion/focus and render" => kit::View::new(
+            Container::new().child(
+                kit::MouseRegion::new("m", kit_scroll_child("region"))
+                    .focus(true)
+                    .render(false),
+            ),
+        ),
+        "pi-tui/MouseRegion/local coordinates" => kit::View::new(
+            Container::new()
+                .child(Text::new("Above the region", 1, 0))
+                .child(kit::MouseRegion::new("m", kit_scroll_child("region")))
+                .child(Text::new("Below", 1, 0)),
+        ),
+        "pi-tui/MouseRegion/the child takes the event first" => kit::View::new(
+            Container::new().child(kit::MouseRegion::new("m", kit_scroll_child("branch"))),
+        ),
+        "pi-tui/MouseRegion/right button" => kit::View::new(
+            Container::new().child(kit::MouseRegion::new("m", kit_scroll_child("region"))),
+        ),
+        // kit-widget-cases
+        _ => return None,
+    })
+}
+
+/// kit-widget's component: it takes the keys and mouse events the view leaves
+/// to the extension, and notifies each callback its nodes fire as
+/// "kit-widget-event=<type>:<value>" (a change report is not one). It never
+/// closes itself: the harness delivers the case's steps and then reads the
+/// callbacks, and a probe that closed after the callbacks Pi fired would drop
+/// the steps still to come.
+struct KitWidgetProbe {
+    ctx: pig_sdk::Context,
+    view: kit::View,
+}
+
+impl ViewComponent for KitWidgetProbe {
+    fn view(&self, _width: u32) -> kit::View {
+        self.view.clone()
+    }
+
+    fn handle_input(&mut self, _data: &pig_sdk::JsString) -> Result<RemoteComponentResult, String> {
+        Ok(RemoteComponentResult::pending())
+    }
+
+    fn handles_mouse(&self) -> bool {
+        true
+    }
+
+    fn handle_mouse(&mut self, _event: &MouseEvent) -> Result<RemoteComponentResult, String> {
+        Ok(RemoteComponentResult::pending())
+    }
+
+    fn handle_view_event(&mut self, event: kit::Event) -> Result<RemoteComponentResult, String> {
+        let entry = match event.kind {
+            EventKind::Change => return Ok(RemoteComponentResult::pending()),
+            EventKind::Mouse => match &event.mouse {
+                Some(m) => format!("mouse:{}/{}/{}/{}", m.kind, m.button, m.x, m.y),
+                None => "mouse:".to_string(),
+            },
+            kind => format!("{}:{}", kit_event_name(kind), event.value),
+        };
+        self.ctx
+            .notify(&format!("kit-widget-event={entry}"), "info");
+        Ok(RemoteComponentResult::pending())
+    }
+}
+
+fn kit_event_name(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::Select => "select",
+        EventKind::Cancel => "cancel",
+        EventKind::SelectionChange => "selectionChange",
+        EventKind::Change => "change",
+        EventKind::Submit => "submit",
+        EventKind::Escape => "escape",
+        EventKind::Abort => "abort",
+        EventKind::Mouse => "mouse",
+    }
+}
+
+/// The tag of the last ui.view.intent whose handler saw its request cancelled.
+static VIEW_CANCELLED_TAG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+// D614: the redraw panel and the abilities watcher, the same way in every SDK fixture (conformance
+// TestConformance_UIViewAnswerRedraw and TestConformance_UIViewAbilitiesEvent).
+
+/// The context of the command that mounted the redraw panel: an update made through it is the extension's, not an
+/// intent handler's.
+static VIEW_REDRAW_COMMAND: std::sync::Mutex<Option<pig_sdk::Context>> =
+    std::sync::Mutex::new(None);
+static VIEW_WATCH_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIEW_WATCH_BLOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIEW_WATCH_RELEASED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static VIEW_WATCH_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn row_text_view(text: String) -> pig_sdk::kit::View {
+    pig_sdk::kit::View::new(pig_sdk::kit::Text::new(text, 0, 0))
+}
+
+fn row_panel_mount(
+    key: &str,
+    view: pig_sdk::kit::View,
+    intents: Vec<pig_sdk::ViewIntent>,
+) -> pig_sdk::ViewMount {
+    pig_sdk::ViewMount {
+        key: key.into(),
+        slot: "panel".into(),
+        title: String::new(),
+        target: None,
+        view,
+        intents,
+        assets: vec![],
+        fallback: None,
+        alternatives: vec![],
+        drawing: None,
+        a11y: vec![],
+        focus: vec![],
+        bindings: vec![],
+    }
+}
+
+fn redraw_intents() -> Vec<pig_sdk::ViewIntent> {
+    let int = pig_sdk::ViewShape::new("integer");
+    ["fx.redraw", "fx.foreign"]
+        .iter()
+        .map(|name| pig_sdk::ViewIntent {
+            name: (*name).into(),
+            arg: pig_sdk::ViewShape::object(&[("n", int.clone())], &["n"]),
+            answer: Some(pig_sdk::ViewShape::object(
+                &[("rev", int.clone())],
+                &["rev"],
+            )),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn describe_abilities(abilities: &Option<pig_sdk::ViewAbilities>) -> String {
+    match abilities {
+        Some(a) => format!("slots={},mounts={}", a.slots.join("+"), a.limits.mounts),
+        None => "none".to_string(),
+    }
+}
+
+/// Answers fx.redraw and fx.foreign: both replace the view of the mount the intent came from and answer done with the
+/// new rev. fx.redraw updates through the handler's context; fx.foreign through the context of the command that mounted
+/// the panel.
+fn redraw_intent(inv: &pig_sdk::ViewIntentInvocation) -> pig_sdk::ViewIntentResult {
+    let own = inv.intent == "fx.redraw";
+    let n = inv
+        .arg
+        .get("n")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let limit = inv
+        .context
+        .view_abilities()
+        .map(|a| a.limits.intent_arg_bytes as i64)
+        .unwrap_or(0);
+    let ctx = if own {
+        inv.context.clone()
+    } else {
+        match VIEW_REDRAW_COMMAND.lock().unwrap().clone() {
+            Some(ctx) => ctx,
+            None => return pig_sdk::ViewIntentResult::failed("ui_view_redraw has not run"),
+        }
+    };
+    let name = if own { "redraw" } else { "foreign" };
+    match ctx.update_view(pig_sdk::ViewUpdate {
+        mount: pig_sdk::ViewRef {
+            key: inv.mount.key.clone(),
+            epoch: inv.mount.epoch,
+            rev: inv.rev,
+        },
+        title: String::new(),
+        view: row_text_view(format!("fixture-{name}-{}", n + limit)),
+        intents: redraw_intents(),
+        assets: vec![],
+        fallback: None,
+        alternatives: vec![],
+        drawing: None,
+        a11y: vec![],
+        focus: vec![],
+        bindings: vec![],
+    }) {
+        Ok(st) => pig_sdk::ViewIntentResult::done(serde_json::json!({"rev": st.mount.rev})),
+        Err(e) => pig_sdk::ViewIntentResult::failed(&e.to_string()),
+    }
+}
+
+fn register_view_rows(ext: &mut pig_sdk::Extension) {
+    use std::sync::atomic::Ordering::SeqCst;
+    ext.command(
+        "ui_view_redraw",
+        "Mount the panel whose intents redraw it",
+        |ctx, _args| match ctx.mount_view(row_panel_mount(
+            "redraw",
+            row_text_view("fixture-redraw-0".to_string()),
+            redraw_intents(),
+        )) {
+            Ok(st) => {
+                *VIEW_REDRAW_COMMAND.lock().unwrap() = Some(ctx.clone());
+                ctx.notify(&format!("view-redraw:rev={}", st.mount.rev), "info");
+                CommandResult::Ok
+            }
+            Err(e) => CommandResult::Error(e.to_string()),
+        },
+    );
+    ext.on_view_abilities(|ctx, abilities| {
+        VIEW_WATCH_EVENTS.fetch_add(1, SeqCst);
+        if !VIEW_WATCH_ARMED.load(SeqCst) {
+            return;
+        }
+        if VIEW_WATCH_BLOCK.swap(false, SeqCst) {
+            ctx.notify("view-event-blocked", "info");
+            while !VIEW_WATCH_RELEASED.swap(false, SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            ctx.notify("view-event-released", "info");
+        }
+        let Some(arrived) = abilities.clone() else {
+            ctx.notify("view-event:none", "info");
+            return;
+        };
+        let shown = describe_abilities(&abilities);
+        ctx.notify(
+            &format!(
+                "view-event:{shown},same={}",
+                shown == describe_abilities(&ctx.view_abilities())
+            ),
+            "info",
+        );
+        match ctx.mount_view(row_panel_mount(
+            "arrived",
+            row_text_view(format!("fixture-arrived-{}", arrived.limits.mounts)),
+            vec![],
+        )) {
+            Ok(st) => ctx.notify(&format!("view-arrived:{}", st.state), "info"),
+            Err(e) => ctx.notify(&format!("view-arrived:{}", e.code), "info"),
+        };
+    });
+    ext.command(
+        "ui_view_watch",
+        "Arm the abilities watcher",
+        |ctx, _args| {
+            VIEW_WATCH_ARMED.store(true, SeqCst);
+            ctx.notify("view-watch:armed", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_block",
+        "Block the abilities watcher on its next event",
+        |ctx, _args| {
+            VIEW_WATCH_RELEASED.store(false, SeqCst);
+            VIEW_WATCH_BLOCK.store(true, SeqCst);
+            ctx.notify("view-block:set", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_release",
+        "Release the blocked abilities watcher",
+        |ctx, _args| {
+            VIEW_WATCH_RELEASED.store(true, SeqCst);
+            ctx.notify("view-release:done", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_events",
+        "Report how often the abilities watcher ran",
+        |ctx, _args| {
+            ctx.notify(
+                &format!("view-events:{}", VIEW_WATCH_EVENTS.load(SeqCst)),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+}
+
+fn main() {
+    let mut ext = Extension::new("rust-sdk-fixture");
+    // factory_agent_dir is get_agent_dir() while the factory runs, where Pi's extensions call it (TestConformance_HostConfigurationAgreesAcrossSDKs).
+    let factory_agent_dir = pig_sdk::get_agent_dir().unwrap_or_else(|err| format!("error: {err}"));
+    let schema_rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ext.tool(
+            "schema-invalid",
+            "Must not register",
+            Value::Null,
+            |_, _| ToolResult::text("bad"),
+        );
+    }))
+    .is_err();
+    {
+        use pig_sdk::Type;
+        let parameters = Type::object(
+            [
+                (
+                    "query",
+                    Type::string(json!({"description": "What to look up"}).as_object()),
+                ),
+                (
+                    "limit",
+                    Type::optional(Type::integer(
+                        json!({"minimum": 1, "maximum": 50}).as_object(),
+                    )),
+                ),
+                (
+                    "mode",
+                    Type::union(
+                        [
+                            Type::literal("fast", None).unwrap(),
+                            Type::literal("deep", None).unwrap(),
+                        ],
+                        None,
+                    ),
+                ),
+                (
+                    "tags",
+                    Type::optional(Type::array(Type::string(None), None)),
+                ),
+                (
+                    "filter",
+                    Type::optional(
+                        Type::record(Type::string(None), Type::number(None), None).unwrap(),
+                    ),
+                ),
+            ],
+            json!({"additionalProperties": false}).as_object(),
+        );
+        ext.tool(
+            "type-schema-tool",
+            "Parameters built with Type",
+            parameters.to_value(),
+            |_, _| ToolResult::text("ok"),
+        );
+    }
+    {
+        // type-engine-tool (TestConformance_TypeEngineMembersAgreeAcrossSDKs): one property per member of Type that the host's type engine serves.
+        use pig_sdk::{TSchema, TValue, Type};
+        let (s, n, i, b) = (
+            Type::string(None),
+            Type::number(None),
+            Type::integer(None),
+            Type::boolean(None),
+        );
+        let lit = |text: &str| Type::literal(text, None).unwrap();
+        let obj = |pairs: Vec<(&str, TSchema)>| Type::object(pairs, None);
+        let base = obj(vec![
+            ("id", s.clone()),
+            ("name", Type::optional(s.clone())),
+            ("n", i.clone()),
+            ("tags", Type::array(s.clone(), None)),
+        ]);
+        let same = obj(vec![("a", s.clone())]);
+        let key = Type::identifier("K").unwrap();
+        let parameters = Type::object(vec![
+            ("picked", Type::pick(&base, ["id", "name"], None).unwrap()),
+            ("omitted", Type::omit(&base, ["tags"], None).unwrap()),
+            ("partial", Type::partial(&base, None).unwrap()),
+            ("required", Type::required(obj(vec![("a", Type::optional(s.clone())), ("b", Type::optional(n.clone()))]), None).unwrap()),
+            ("keys", Type::key_of(&base, None).unwrap()),
+            ("indexed", Type::index(&base, lit("n"), None).unwrap()),
+            ("readonlyObject", Type::readonly_object(&base, None).unwrap()),
+            ("readonlyType", Type::readonly_type(Type::array(s.clone(), None), None).unwrap()),
+            ("evaluated", Type::evaluate(Type::intersect([same.clone(), obj(vec![("b", n.clone())])], None), None).unwrap()),
+            ("excluded", Type::exclude(Type::union([s.clone(), n.clone(), b.clone()], None), s.clone(), None).unwrap()),
+            ("extracted", Type::extract(Type::union([s.clone(), n.clone(), b.clone()], None), Type::union([s.clone(), n.clone()], None), None).unwrap()),
+            ("nonNullable", Type::non_nullable(Type::union([s.clone(), Type::null(None)], None), None).unwrap()),
+            ("uppercase", Type::uppercase(lit("abc"), None).unwrap()),
+            ("lowercase", Type::lowercase(lit("ABC"), None).unwrap()),
+            ("capitalize", Type::capitalize(lit("abc"), None).unwrap()),
+            ("uncapitalize", Type::uncapitalize(lit("ABC"), None).unwrap()),
+            ("parameters", Type::parameters(Type::function(vec![s.clone(), n.clone()], b.clone(), None).unwrap(), None).unwrap()),
+            ("constructorParameters", Type::constructor_parameters(Type::constructor(vec![s.clone()], obj(vec![]), None).unwrap(), None).unwrap()),
+            ("returnType", Type::return_type(Type::function(vec![s.clone()], n.clone(), None).unwrap(), None).unwrap()),
+            ("instanceType", Type::instance_type(Type::constructor(vec![s.clone()], same.clone(), None).unwrap(), None).unwrap()),
+            ("fn", Type::function(vec![s.clone()], n.clone(), None).unwrap()),
+            ("constructorType", Type::constructor(vec![s.clone()], same.clone(), None).unwrap()),
+            ("tuple", Type::tuple(vec![s.clone(), n.clone()], None).unwrap()),
+            ("template", Type::template_literal("a${string}", None).unwrap()),
+            ("conditional", Type::conditional(s.clone(), s.clone(), lit("yes"), lit("no"), None).unwrap()),
+            ("mapped", Type::mapped(&key, Type::union([lit("a"), lit("b")], None), Type::ref_("K", None), s.clone(), None).unwrap()),
+            ("cyclic", Type::cyclic(TValue::object([("A", obj(vec![("next", Type::optional(Type::ref_("A", None)))]))]), "A", None).unwrap()),
+            ("module", Type::module(TValue::object([("A", s.clone()), ("B", Type::array(Type::ref_("A", None), None))]), None).unwrap()),
+            ("interface", Type::interface(vec![same.clone()], TValue::object([("b", n.clone())]), None).unwrap()),
+            ("dependent", Type::dependent(s.clone(), n.clone(), b.clone(), None).unwrap()),
+            ("extends", Type::extends(None, s.clone(), s.clone()).unwrap()),
+            ("instantiate", Type::instantiate(TValue::object([("A", s.clone())]), Type::ref_("A", None)).unwrap()),
+            ("call", Type::instantiate(TValue::object([("Id", Type::generic(vec![Type::parameter("T", None, None).unwrap()], Type::ref_("T", None)).unwrap())]), Type::call(Type::ref_("Id", None), vec![s.clone()]).unwrap()).unwrap()),
+            ("script", Type::script(vec![TValue::from("{ a: string; b?: number[] }")]).unwrap()),
+            ("rest", Type::rest(Type::tuple(vec![s.clone()], None).unwrap()).unwrap()),
+            ("this", Type::this(None).unwrap()),
+            ("infer", Type::infer("U", Some(TValue::from(&s))).unwrap()),
+            ("identifier", key.clone()),
+            ("generic", Type::generic(vec![Type::parameter("T", Some(TValue::from(&s)), Some(TValue::from(&s))).unwrap()], Type::array(Type::ref_("T", None), None)).unwrap()),
+            ("recordKey", Type::record_key(Type::record(s.clone(), n.clone(), None).unwrap()).unwrap()),
+            ("recordValue", Type::record_value(Type::record(s.clone(), n.clone(), None).unwrap()).unwrap()),
+            ("recordPattern", Type::string(json!({"description": Type::record_pattern(Type::record(s.clone(), n.clone(), None).unwrap()).unwrap()}).as_object())),
+            ("enumKeyRecord", Type::record(Type::enum_(&json!(["x", "y"]), None).unwrap(), n.clone(), None).unwrap()),
+        ], json!({"additionalProperties": false}).as_object());
+        ext.tool(
+            "type-engine-tool",
+            "Parameters built with the engine members of Type",
+            parameters.to_value(),
+            |_, _| ToolResult::text("ok"),
+        );
+    }
+    {
+        // refine-probe (TestConformance_RefinedToolArgumentsAreNotRefined): the schema of the probe tool; every predicate and message function logs its call, and the test asserts the log stays empty (Pi 1.4.0+b556cfe5 never runs a refinement).
+        use pig_sdk::Type;
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let checked = |tag: &'static str, log: Arc<Mutex<Vec<String>>>, check: RefineCheck| {
+            move |value: &Value| -> Result<bool, String> {
+                log.lock().unwrap().push(format!("check:{tag}"));
+                check(value)
+            }
+        };
+        let worded = |tag: &'static str,
+                      log: Arc<Mutex<Vec<String>>>,
+                      message: Box<dyn Fn(&Value) -> String + Send + Sync>|
+         -> Option<RefineMessage> {
+            Some(Box::new(move |value: &Value| {
+                log.lock().unwrap().push(format!("error:{tag}"));
+                Ok(message(value))
+            }))
+        };
+        let equals = |tag: &'static str,
+                      message_tag: &'static str,
+                      want: &'static str,
+                      log: Arc<Mutex<Vec<String>>>| {
+            Type::refine(
+                Type::string(None),
+                checked(
+                    tag,
+                    log.clone(),
+                    Box::new(move |value| Ok(value.as_str() == Some(want))),
+                ),
+                worded(message_tag, log, Box::new(move |_| format!("not {want}"))),
+            )
+        };
+        let name = Type::refine(
+            Type::string(None),
+            checked(
+                "len",
+                log.clone(),
+                Box::new(|value| Ok(value.as_str().is_some_and(|text| text.len() >= 3))),
+            ),
+            worded(
+                "lenmsg",
+                log.clone(),
+                Box::new(|_| "name is too short".to_string()),
+            ),
+        );
+        let qty = Type::optional(Type::refine(
+            Type::integer(None),
+            checked(
+                "even",
+                log.clone(),
+                Box::new(|value| Ok(value.as_f64().is_some_and(|n| n % 2.0 == 0.0))),
+            ),
+            worded(
+                "evenmsg",
+                log.clone(),
+                Box::new(|value| {
+                    format!("qty must be even, got {}", value.as_f64().unwrap_or(0.0))
+                }),
+            ),
+        ));
+        let pick = Type::union(
+            [
+                equals("u1", "u1m", "a", log.clone()),
+                equals("u2", "u2m", "b", log.clone()),
+            ],
+            None,
+        );
+        let boom = Type::optional(Type::refine(
+            Type::string(None),
+            checked("boom", log.clone(), Box::new(|_| Err("kaboom".to_string()))),
+            None,
+        ));
+        let root = Type::refine(
+            Type::object(
+                [("name", name), ("qty", qty), ("pick", pick), ("boom", boom)],
+                None,
+            ),
+            checked("root", log.clone(), Box::new(|_| Ok(true))),
+            worded(
+                "rootmsg",
+                log.clone(),
+                Box::new(|_| "root refused".to_string()),
+            ),
+        );
+        ext.tool_typed(
+            "refine-probe",
+            "Arguments checked by refinements",
+            &root,
+            |_, _| ToolResult::text("ok"),
+        );
+        let probe = root.clone();
+        let probed = log.clone();
+        ext.command(
+            "refine_value",
+            "Run Value.check or Value.errors on the refine-probe schema",
+            move |ctx, args| {
+                let case: serde_json::Value = match serde_json::from_str(args) {
+                    Ok(case) => case,
+                    Err(err) => return CommandResult::Error(err.to_string()),
+                };
+                let value = case
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let outcome = match case.get("mode").and_then(|mode| mode.as_str()) {
+                    Some("cycle") => Type::unsafe_(json!({"$ref": "#"}).as_object().unwrap())
+                        .and_then(|cyclic| pig_sdk::value::Value::check(cyclic, &json!(1)))
+                        .map(|valid| json!(valid)),
+                    Some("check") => pig_sdk::value::Value::check(probe.clone(), &value)
+                        .map(|valid| json!(valid)),
+                    Some("errors") => {
+                        pig_sdk::value::Value::errors(probe.clone(), &value).map(|list| {
+                            json!(
+                                list.iter()
+                                    .map(|error| json!({
+                                        "keyword": error.keyword,
+                                        "schemaPath": error.schema_path,
+                                        "instancePath": error.instance_path,
+                                        "params": error.params,
+                                        "message": error.message,
+                                    }))
+                                    .collect::<Vec<_>>()
+                            )
+                        })
+                    }
+                    _ => return CommandResult::Error("mode must be check or errors".to_string()),
+                };
+                let calls: Vec<String> = std::mem::take(&mut *probed.lock().unwrap());
+                let report = match outcome {
+                    Ok(result) => json!({"result": result, "calls": calls}),
+                    Err(thrown) => json!({"thrown": thrown, "calls": calls}),
+                };
+                ctx.notify(&format!("refine_value:{report}:end"), "info");
+                CommandResult::Ok
+            },
+        );
+        let reported = log.clone();
+        ext.command(
+            "refine_log",
+            "Report and clear the refinement call log",
+            move |ctx, _args| {
+                let calls: Vec<String> = std::mem::take(&mut *reported.lock().unwrap());
+                ctx.notify(&format!("refine_log:{}:end", json!(calls)), "info");
+                CommandResult::Ok
+            },
+        );
+    }
+    ext.command(
+        "language_probe",
+        "Report the highlight language of a path",
+        |ctx, args| {
+            let case: serde_json::Value = match serde_json::from_str(args) {
+                Ok(case) => case,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let language = pig_sdk::get_language_from_path(case["path"].as_str().unwrap_or(""));
+            ctx.notify(
+                &format!("language:{}:end", json!({"lang": language})),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "convert_probe",
+        "Run convertToLlm or formatDimensionNote on a JSON case and report the result",
+        |ctx, args| {
+            let case: serde_json::Value = match serde_json::from_str(args) {
+                Ok(case) => case,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let result = if case["fn"] == "convert" {
+                json!(pig_sdk::convert_to_llm(
+                    case["messages"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                ))
+            } else {
+                let i = &case["image"];
+                let image = pig_sdk::ResizedImage {
+                    original_width: i["originalWidth"].as_f64().unwrap_or(0.0),
+                    original_height: i["originalHeight"].as_f64().unwrap_or(0.0),
+                    width: i["width"].as_f64().unwrap_or(0.0),
+                    height: i["height"].as_f64().unwrap_or(0.0),
+                    was_resized: i["wasResized"].as_bool().unwrap_or(false),
+                    ..Default::default()
+                };
+                json!(pig_sdk::format_dimension_note(&image))
+            };
+            ctx.notify(
+                &format!("convert:{}:end", json!({"result": result})),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    // The helpers run here, while the factory runs, before the connection to the host is ready.
+    fn key_lists(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Array(items) => items.iter().for_each(|item| key_lists(item, out)),
+            serde_json::Value::Object(map) => {
+                out.push(map.keys().cloned().collect::<Vec<_>>().join(","));
+                map.values().for_each(|item| key_lists(item, out));
+            }
+            _ => {}
+        }
+    }
+    fn frontmatter_report(
+        parsed: std::io::Result<pig_sdk::ParsedFrontmatter>,
+    ) -> serde_json::Value {
+        match parsed {
+            Ok(parsed) => {
+                let mut keys = Vec::new();
+                key_lists(&parsed.frontmatter, &mut keys);
+                json!({"frontmatter": parsed.frontmatter, "body": parsed.body, "keys": keys})
+            }
+            Err(_) => json!({"error": true}),
+        }
+    }
+    fn date_report(parsed: std::io::Result<Option<f64>>) -> serde_json::Value {
+        match parsed {
+            Ok(ms) => json!({"ms": ms}),
+            Err(_) => json!({"error": true}),
+        }
+    }
+    let factory_helpers = json!({
+        "frontmatter": frontmatter_report(pig_sdk::parse_frontmatter("---\nz: 1\n10: a\n2: b\nnested:\n  y: 1\n  3: x\n  \"q r\": [1, 2]\n---\nbody text\n")),
+        "error": frontmatter_report(pig_sdk::parse_frontmatter("---\na: [\n---\nx")),
+        "date": date_report(pig_sdk::parse_date("2020-01-02T03:04:05.678Z")),
+        "strip": match pig_sdk::strip_frontmatter("---\nz: 1\n---\nbody text\n") { Ok(body) => json!({"body": body}), Err(_) => json!({"error": true}) },
+    });
+    ext.command(
+        "helper_probe",
+        "Run parseFrontmatter, stripFrontmatter or Date.parse on its argument",
+        |ctx, args| {
+            let case: serde_json::Value = match serde_json::from_str(args) {
+                Ok(case) => case,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let input = case["input"].as_str().unwrap_or("");
+            let out = match case["fn"].as_str().unwrap_or("") {
+                "date" => date_report(ctx.parse_date(input)),
+                "strip" => match ctx.strip_frontmatter(input) {
+                    Ok(body) => json!({"body": body}),
+                    Err(_) => json!({"error": true}),
+                },
+                _ => frontmatter_report(ctx.parse_frontmatter(input)),
+            };
+            ctx.notify(&format!("helper:{out}:end"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "helper_factory_probe",
+        "Report the helpers' results from the factory",
+        move |ctx, _args| {
+            ctx.notify(&format!("helper-factory:{factory_helpers}:end"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command("serialize_probe", "Run serializeConversation on JSON messages and report the text", |ctx, args| {
+        // The messages stay JSON text, so an unpaired surrogate escape reaches serialize_conversation_json as the unit it is.
+        let case: std::collections::HashMap<String, Box<serde_json::value::RawValue>> = match serde_json::from_str(args) { Ok(case) => case, Err(err) => return CommandResult::Error(err.to_string()) };
+        let messages = case.get("messages").map(|messages| messages.get()).unwrap_or("[]");
+        // A conversation a serde_json::Value can hold runs through the typed serialize_conversation; one with an unpaired surrogate, which a Value refuses, through the JSON-text form. Both answer Pi's text.
+        let exact = pig_sdk::serialize_conversation_json(messages);
+        // A conversation a serde_json::Value can hold also runs through the typed serialize_conversation: it must fail where the JSON-text form fails and, where both succeed, give the same text with each unpaired unit written as U+FFFD (a String cannot hold one).
+        let out = match (&exact, serde_json::from_str::<Vec<serde_json::Value>>(messages)) {
+            (Ok(text), Ok(typed)) => match pig_sdk::serialize_conversation(&typed) {
+                Ok(lossy) if lossy == text.to_string_lossy() => None,
+                _ => Some("{\"error\":\"typed serialize_conversation differs from serialize_conversation_json\"}".to_string()),
+            },
+            (Err(_), Ok(typed)) => match pig_sdk::serialize_conversation(&typed) {
+                Err(_) => None,
+                Ok(_) => Some("{\"error\":\"typed serialize_conversation succeeded where serialize_conversation_json failed\"}".to_string()),
+            },
+            _ => None,
+        };
+        let out = out.unwrap_or_else(|| match exact {
+            // A JsString serializes as a JSON string that keeps an unpaired surrogate as its escape; a serde_json::Value could not hold it.
+            Ok(text) => format!("{{\"result\":{}}}", serde_json::to_string(&text).unwrap_or_default()),
+            Err(_) => "{\"error\":true}".to_string(),
+        });
+        ctx.notify(&format!("serialize:{out}:end"), "info");
+        CommandResult::Ok
+    });
+    ext.command("branch_probe", "Run a branch summarization helper on a JSON case and report the result", |ctx, args| {
+        struct EntrySession(std::collections::HashMap<String, serde_json::Value>);
+        impl pig_sdk::SessionReader for EntrySession {
+            fn get_entry(&self, id: &str) -> std::io::Result<serde_json::Value> { Ok(self.0.get(id).cloned().unwrap_or(serde_json::Value::Null)) }
+            fn get_branch(&self, from_id: Option<&str>) -> std::io::Result<serde_json::Value> {
+                let mut path = Vec::new();
+                let mut current = from_id.and_then(|id| self.0.get(id));
+                while let Some(entry) = current {
+                    path.push(entry.clone());
+                    current = entry["parentId"].as_str().filter(|id| !id.is_empty()).and_then(|id| self.0.get(id));
+                }
+                path.reverse();
+                Ok(serde_json::Value::Array(path))
+            }
+        }
+        // The entries are read as JSON text: a JavaScript string may hold an unpaired surrogate, which a Value cannot, and only the text path keeps it.
+        let raw: std::collections::HashMap<String, Box<serde_json::value::RawValue>> = match serde_json::from_str(args) { Ok(raw) => raw, Err(err) => return CommandResult::Error(err.to_string()) };
+        // Every member but the entries holds no surrogate; the entries are parsed as Values only where a Value can hold them.
+        let member = |name: &str| raw.get(name).and_then(|member| serde_json::from_str::<serde_json::Value>(member.get()).ok()).unwrap_or(serde_json::Value::Null);
+        let mut case = serde_json::Map::new();
+        for name in ["fn", "lone", "budget", "old", "target"] {
+            case.insert(name.to_string(), member(name));
+        }
+        let case = serde_json::Value::Object(case);
+        let entries: Vec<serde_json::Value> = if case["lone"] == true { Vec::new() } else { member("entries").as_array().cloned().unwrap_or_default() };
+        let report: String = if case["fn"] == "prepare" {
+            let budget = case["budget"].as_i64().unwrap_or(0);
+            let entries_json = raw.get("entries").map_or("[]", |entries| entries.get());
+            match pig_sdk::prepare_branch_entries_json(entries_json, budget) {
+                Err(_) => json!({"error": true}).to_string(),
+                Ok(text) if case["lone"] == true => text,
+                // Where a Value can hold the input, the Value path must answer what the text path answers.
+                Ok(text) => {
+                    let plain = pig_sdk::prepare_branch_entries(&entries, budget).map(|r| json!({"messages": r.messages, "fileOps": {"read": r.file_ops.read, "written": r.file_ops.written, "edited": r.file_ops.edited}, "totalTokens": r.total_tokens}));
+                    if plain.is_ok_and(|plain| serde_json::from_str::<serde_json::Value>(&text).ok() == Some(plain)) { text } else { json!({"error": "the Value path and the text path differ"}).to_string() }
+                }
+            }
+        } else {
+            let session = EntrySession(entries.iter().filter_map(|entry| Some((entry["id"].as_str()?.to_string(), entry.clone()))).collect());
+            match pig_sdk::collect_entries_for_branch_summary(&session, case["old"].as_str(), case["target"].as_str().unwrap_or("")) {
+                Ok(r) => json!({"entries": r.entries, "commonAncestorId": r.common_ancestor_id}),
+                Err(_) => json!({"error": true}),
+            }
+            .to_string()
+        };
+        ctx.notify(&format!("branch:{report}:end"), "info");
+        CommandResult::Ok
+    });
+    ext.command("compact_usage_probe", "Run a compaction usage helper on a JSON case and report the result", |ctx, args| {
+        let case: serde_json::Value = match serde_json::from_str(args) { Ok(case) => case, Err(err) => return CommandResult::Error(err.to_string()) };
+        let result = match case["fn"].as_str().unwrap_or("") {
+            "calc" => {
+                let usage: pig_sdk::UsageInfo = match serde_json::from_value(case["usage"].clone()) { Ok(usage) => usage, Err(err) => return CommandResult::Error(err.to_string()) };
+                json!({"tokens": pig_sdk::calculate_context_tokens(&usage)})
+            }
+            "should" => {
+                let s = &case["settings"];
+                let settings = pig_sdk::CompactionSettings { enabled: s["enabled"].as_bool().unwrap_or(false), reserve_tokens: s["reserveTokens"].as_i64().unwrap_or(0), keep_recent_tokens: s["keepRecentTokens"].as_i64().unwrap_or(0) };
+                json!({"result": pig_sdk::should_compact(case["tokens"].as_i64().unwrap_or(0), case["window"].as_i64().unwrap_or(0), &settings)})
+            }
+            "last" => {
+                let entries: Vec<serde_json::Value> = case["entries"].as_array().cloned().unwrap_or_default();
+                match pig_sdk::get_last_assistant_usage(&entries) {
+                    Some(u) => json!({"usage": {"input": u.input, "output": u.output, "cacheRead": u.cache_read, "cacheWrite": u.cache_write, "totalTokens": u.total_tokens}}),
+                    None => json!({"usage": null}),
+                }
+            }
+            "cut" => {
+                let entries: Vec<serde_json::Value> = case["entries"].as_array().cloned().unwrap_or_default();
+                let cut = pig_sdk::find_cut_point(&entries, case["start"].as_u64().unwrap_or(0) as usize, case["end"].as_u64().unwrap_or(0) as usize, case["keep"].as_i64().unwrap_or(0));
+                json!({"firstKeptEntryIndex": cut.first_kept_entry_index, "turnStartIndex": cut.turn_start_index.map_or(-1, |i| i as i64), "isSplitTurn": cut.is_split_turn})
+            }
+            "turn" => {
+                let entries: Vec<serde_json::Value> = case["entries"].as_array().cloned().unwrap_or_default();
+                let found = pig_sdk::find_turn_start_index(&entries, case["index"].as_u64().unwrap_or(0) as usize, case["start"].as_u64().unwrap_or(0) as usize);
+                json!({"index": found.map_or(-1, |i| i as i64)})
+            }
+            "estimate" => json!({"tokens": pig_sdk::estimate_tokens(&case["message"])}),
+            _ => {
+                let d = pig_sdk::DEFAULT_COMPACTION_SETTINGS;
+                json!({"enabled": d.enabled, "reserveTokens": d.reserve_tokens, "keepRecentTokens": d.keep_recent_tokens})
+            }
+        };
+        ctx.notify(&format!("compact:{result}:end"), "info");
+        CommandResult::Ok
+    });
+    ext.command("skills_probe", "Run a session or skill helper on a JSON case and report the result", |ctx, args| {
+        let case: serde_json::Value = match serde_json::from_str(args) { Ok(case) => case, Err(err) => return CommandResult::Error(err.to_string()) };
+        let result = match case["fn"].as_str().unwrap_or("") {
+            "latest" => {
+                let entries: Vec<serde_json::Value> = case["entries"].as_array().cloned().unwrap_or_default();
+                json!({"entry": pig_sdk::get_latest_compaction_entry(&entries)})
+            }
+            "parse" => {
+                let block = pig_sdk::parse_skill_block(case["text"].as_str().unwrap_or(""));
+                json!({"block": block.map(|b| json!({"name": b.name, "location": b.location, "content": b.content, "userMessage": b.user_message}))})
+            }
+            "format" => {
+                let skills: Vec<serde_json::Value> = case["skills"].as_array().cloned().unwrap_or_default();
+                json!({"text": pig_sdk::format_skills_for_prompt(&skills, case["tool"].as_str().unwrap_or("read"))})
+            }
+            _ => json!({"version": pig_sdk::CURRENT_SESSION_VERSION, "virtual": pig_sdk::VIRTUAL_MODEL_STATE_ENTRY}),
+        };
+        ctx.notify(&format!("skills:{result}:end"), "info");
+        CommandResult::Ok
+    });
+    ext.command(
+        "schema-probe",
+        "Report schema rejection",
+        move |ctx, _args| {
+            ctx.notify(&format!("schema-rejected:{schema_rejected}"), "info");
+            CommandResult::Ok
+        },
+    );
+    // The factory get_editor_component answered right after this extension's install: the editor-get-probe reports "installed" only for
+    // that same Arc, so a getter that builds another factory fails TestConformance_EditorComponentGetterAgreesAcrossSDKs.
+    let installed_factory: Arc<Mutex<Option<pig_sdk::EditorFactory>>> = Arc::new(Mutex::new(None));
+    let installed = installed_factory.clone();
+    ext.command(
+        "editor-install",
+        "Install a custom editor component",
+        move |ctx, _args| match ctx
+            .set_editor_component(|base| Box::new(ConformanceEditor { base }))
+        {
+            Ok(()) => {
+                *installed.lock().unwrap() = ctx.get_editor_component();
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // editor-get-probe and editor-clear back TestConformance_EditorComponentGetterAgreesAcrossSDKs; editor-install is above.
+    let installed = installed_factory.clone();
+    ext.command(
+        "editor-get-probe",
+        "Report the factory get_editor_component returns",
+        move |ctx, _args| {
+            let state = match (
+                ctx.get_editor_component(),
+                installed.lock().unwrap().as_ref(),
+            ) {
+                (None, _) => "absent",
+                (Some(got), Some(want)) if Arc::ptr_eq(&got, want) => "installed",
+                (Some(_), _) => "other",
+            };
+            ctx.notify(&format!("editor_get:{state}:end"), "info");
+            CommandResult::Ok
+        },
+    );
+    // truncate_probe runs one SDK truncation helper on the JSON case in its argument and reports the result in Pi's shape (TestConformance_TruncationHelpersAgreeAcrossSDKs).
+    ext.command("truncate_probe", "Run a truncation helper on a JSON case and report the result", |ctx, args| {
+        let case: Value = match serde_json::from_str(args) {
+            Ok(case) => case,
+            Err(err) => return CommandResult::Error(err.to_string()),
+        };
+        let limit = |key: &str| case.get(key).and_then(Value::as_u64).map(|n| n as usize);
+        let options = pig_sdk::TruncationOptions { max_lines: limit("maxLines"), max_bytes: limit("maxBytes") };
+        let content = case["content"].as_str().unwrap_or("");
+        let result = match case["fn"].as_str().unwrap_or("") {
+            fn_name @ ("head" | "tail") => {
+                let r = if fn_name == "head" { pig_sdk::truncate_head(content, options) } else { pig_sdk::truncate_tail(content, options) };
+                json!({"content": r.content, "truncated": r.truncated, "truncatedBy": r.truncated_by.map(|by| by.as_str()), "totalLines": r.total_lines,
+                    "totalBytes": r.total_bytes, "outputLines": r.output_lines, "outputBytes": r.output_bytes, "lastLinePartial": r.last_line_partial,
+                    "firstLineExceedsLimit": r.first_line_exceeds_limit, "maxLines": r.max_lines, "maxBytes": r.max_bytes})
+            }
+            "line" => {
+                let (text, was) = pig_sdk::truncate_line(content, limit("maxChars").unwrap_or(pig_sdk::GREP_MAX_LINE_LENGTH));
+                json!({"text": text, "wasTruncated": was})
+            }
+            "limits" => json!({"maxLines": pig_sdk::DEFAULT_MAX_LINES, "maxBytes": pig_sdk::DEFAULT_MAX_BYTES}),
+            _ => json!({"text": pig_sdk::format_size(limit("bytes").unwrap_or(0))}),
+        };
+        ctx.notify(&format!("truncate:{result}:end"), "info");
+        CommandResult::Ok
+    });
+    ext.command(
+        "select-page-probe",
+        "Report getSelectPageIndex for a key under the default keybindings",
+        |ctx, args| {
+            let case: Value = match serde_json::from_str(args) {
+                Ok(case) => case,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let number = |name: &str| case[name].as_u64().unwrap_or(0) as usize;
+            let index = pig_sdk::tui::get_select_page_index(
+                &pig_sdk::tui::get_keybindings(),
+                case["data"].as_str().unwrap_or(""),
+                number("selected"),
+                number("count"),
+                number("page"),
+            );
+            match index {
+                Some(index) => ctx.notify(&format!("select-page={index}"), "info"),
+                None => ctx.notify("select-page=none", "info"),
+            }
+            CommandResult::Ok
+        },
+    );
+    // builtin_probe: see the Go fixture (testfixture/builtin_tool.go).
+    ext.command(
+        "builtin_probe",
+        "Delegate to a built-in tool through the SDK and report what it returned",
+        |ctx, args| {
+            let case: Value = match serde_json::from_str(args) {
+                Ok(case) => case,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            match builtin_probe(ctx, &case) {
+                Ok(report) => {
+                    ctx.notify(&format!("builtin:{report}:end"), "info");
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err),
+            }
+        },
+    );
+    // message_probe reads the event payload in its JSON argument with the SDK's message_role and message_text helpers (TestConformance_MessageHelpersAgreeAcrossSDKs).
+    ext.command("message_probe", "Report message_role and message_text of a JSON event payload", |ctx, args| {
+        let data: Value = match serde_json::from_str(args) {
+            Ok(data) => data,
+            Err(err) => return CommandResult::Error(err.to_string()),
+        };
+        let result = json!({"role": pig_sdk::message_role(&data).unwrap_or_default(), "text": pig_sdk::message_text(&data)});
+        ctx.notify(&format!("message:{result}:end"), "info");
+        CommandResult::Ok
+    });
+    // file_queue_probe runs the tasks in its JSON argument concurrently through the SDK's file mutation queue and reports the start/end log and the tasks that failed (TestConformance_FileMutationQueueAgreesAcrossSDKs).
+    // Tasks are ordered by waiting on each other's progress, never by sleeping through a race: waitStarted/waitCalled delay the call into the queue, holdEnded/holdCalled keep a task inside it.
+    // After a "called" signal a fixed settle time lets a task that wrongly skipped the queue show itself.
+    ext.command(
+        "file_queue_probe",
+        "Run tasks through the file mutation queue and report the log",
+        |ctx, args| {
+            use std::collections::HashSet;
+            use std::time::{Duration, Instant};
+            let case: Value = match serde_json::from_str(args) {
+                Ok(case) => case,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let settle_ms = case["settleMs"].as_u64().unwrap_or(0);
+            let log = Arc::new(Mutex::new(Vec::<String>::new()));
+            let failed = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let progress = Arc::new(Mutex::new(HashSet::<(String, u64)>::new()));
+            let ids_of = |task: &Value, key: &str| -> Vec<u64> {
+                task[key]
+                    .as_array()
+                    .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+                    .unwrap_or_default()
+            };
+            let handles: Vec<_> = case["tasks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|task| {
+                    let (log, failed, progress) = (log.clone(), failed.clone(), progress.clone());
+                    let (wait_started, wait_called) =
+                        (ids_of(&task, "waitStarted"), ids_of(&task, "waitCalled"));
+                    let (hold_ended, hold_called) =
+                        (ids_of(&task, "holdEnded"), ids_of(&task, "holdCalled"));
+                    std::thread::spawn(move || {
+                        let id = task["id"].as_u64().unwrap_or(0);
+                        let fail = task["fail"].as_bool().unwrap_or(false);
+                        let mark = |kind: &str, who: u64| {
+                            progress.lock().unwrap().insert((kind.to_string(), who));
+                        };
+                        let await_stage = |kind: &str, ids: &[u64]| {
+                            for other in ids {
+                                let deadline = Instant::now() + Duration::from_secs(20);
+                                while !progress
+                                    .lock()
+                                    .unwrap()
+                                    .contains(&(kind.to_string(), *other))
+                                {
+                                    if Instant::now() > deadline {
+                                        log.lock()
+                                            .unwrap()
+                                            .push(format!("timeout:{id}:{kind}:{other}"));
+                                        return;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                        };
+                        let settle = |ids: &[u64]| {
+                            if !ids.is_empty() {
+                                std::thread::sleep(Duration::from_millis(settle_ms));
+                            }
+                        };
+                        await_stage("started", &wait_started);
+                        await_stage("called", &wait_called);
+                        settle(&wait_called);
+                        mark("called", id);
+                        let outcome = pig_sdk::with_file_mutation_queue(
+                            task["path"].as_str().unwrap_or(""),
+                            || {
+                                log.lock().unwrap().push(format!("start:{id}"));
+                                mark("started", id);
+                                await_stage("ended", &hold_ended);
+                                await_stage("called", &hold_called);
+                                settle(&hold_called);
+                                log.lock().unwrap().push(format!("end:{id}"));
+                                mark("ended", id);
+                                !fail
+                            },
+                        );
+                        if !matches!(outcome, Ok(true)) {
+                            mark("ended", id);
+                            failed.lock().unwrap().push(id);
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let _ = handle.join();
+            }
+            let mut failed = failed.lock().unwrap().clone();
+            failed.sort_unstable();
+            ctx.notify(
+                &format!(
+                    "file_queue:{}:end",
+                    json!({"log": *log.lock().unwrap(), "errors": failed})
+                ),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    // host_paths_probe reports getPackageDir() and getShellConfig() as this SDK answers them, for the default shell and for the existing and the missing custom shell path
+    // in args ("<existing>|<missing>") (TestConformance_HostPathsAgreeAcrossSDKs).
+    ext.command("host_paths_probe", "Report getPackageDir and getShellConfig", |ctx, args| {
+        let (existing, missing) = args.split_once('|').unwrap_or((args, ""));
+        let shell = |custom: Option<&str>| match pig_sdk::get_shell_config(custom) {
+            Ok(config) => {
+                let mut report = json!({"shell": config.shell, "args": config.args});
+                if let Some(transport) = config.command_transport {
+                    report["commandTransport"] = json!(transport);
+                }
+                report
+            }
+            Err(err) => json!({"error": err.to_string()}),
+        };
+        match pig_sdk::get_package_dir() {
+            Ok(package_dir) => {
+                ctx.notify(&format!("host_paths:{}:end", json!({"packageDir": package_dir, "default": shell(None), "custom": shell(Some(existing)), "missing": shell(Some(missing))})), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        }
+    });
+    // host_helpers_probe runs the host-served pi helpers over the golden file's inputs (TestConformance_HostHelpersAgreeAcrossSDKs). args is
+    // "<golden>|<auth.json path>|<text to copy>".
+    ext.command(
+        "host_helpers_probe",
+        "Run the host-served pi helpers over the golden inputs",
+        |ctx, args| match host_helpers_probe(ctx, args) {
+            Ok(report) => {
+                ctx.notify(&format!("host_helpers:{report}:end"), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err),
+        },
+    );
+    // pi_ai_helpers_probe runs every call of the vector calls (test/parity/sdk-vectors, Pi's own answers at the pin, listed in one file by the test) through this SDK's pi-ai
+    // helpers and reports each answer as JSON (TestConformance_PiAiHelpersAgreeAcrossSDKs).
+    ext.command(
+        "pi_ai_helpers_probe",
+        "Run the golden pi-ai helper calls",
+        |ctx, args| match pi_ai_helpers_probe(args) {
+            Ok(report) => {
+                ctx.notify(&format!("pi_ai_helpers:{report}:end"), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err),
+        },
+    );
+    // host_info_probe reports Pi's getAgentDir(), CONFIG_DIR_NAME and VERSION as this SDK answers them (TestConformance_HostConfigurationAgreesAcrossSDKs).
+    ext.command("host_info_probe", "Report getAgentDir, CONFIG_DIR_NAME and VERSION", move |ctx, _args| {
+        let report = (|| -> std::io::Result<Value> {
+            Ok(json!({"agentDir": pig_sdk::get_agent_dir()?, "configDirName": pig_sdk::get_config_dir_name()?, "version": pig_sdk::get_version()?, "factoryAgentDir": factory_agent_dir}))
+        })();
+        match report {
+            Ok(report) => {
+                ctx.notify(&format!("host_info:{report}:end"), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        }
+    });
+    // ui_dialog_values_probe reports the value each dialog resolves with (TestConformance_UIDialogValuesAgreeAcrossSDKs): `<undefined>` for Pi's undefined, else the JSON of the value.
+    ext.command(
+        "ui_dialog_values_probe",
+        "Report the typed result of each dialog",
+        |ctx, _args| {
+            let report = |name: &str, value: Value, ok: bool| {
+                let text = if ok {
+                    value.to_string()
+                } else {
+                    "<undefined>".to_string()
+                };
+                ctx.notify(&format!("{name}={text}"), "info");
+            };
+            let result = (|| -> std::io::Result<()> {
+                for title in ["S1", "S2", "S3", "S4"] {
+                    let (value, ok) = ctx.select(title, &["a", "b"])?;
+                    report(title, value, ok);
+                }
+                for title in ["C1", "C2", "C3", "C4"] {
+                    report(title, ctx.confirm(title, "m")?, true);
+                }
+                for title in ["I1", "I2"] {
+                    let (value, ok) = ctx.input(title, "p")?;
+                    report(title, value, ok);
+                }
+                for title in ["E1", "E2"] {
+                    let (value, ok) = ctx.editor(title, "p")?;
+                    report(title, value, ok);
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // The extension owns the thinking runs from load; thinking_runs_off / thinking_runs_on change that at run time.
+    ext.own_thinking_runs(true);
+    ext.command(
+        "thinking_runs_off",
+        "Stop owning the thinking runs",
+        |ctx, _args| match ctx.own_thinking_runs(false) {
+            Ok(()) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "thinking_runs_on",
+        "Own the thinking runs",
+        |ctx, _args| match ctx.own_thinking_runs(true) {
+            Ok(()) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // ui_forward_probe calls the UI members whose host effect a conformance row records (TestConformance_UIForwardingAgreesAcrossSDKs).
+    ext.command(
+        "ui_forward_probe",
+        "Call the working, paste, editor-text and tools-expanded UI members",
+        |ctx, _args| {
+            ctx.set_working_message("Thinking hard");
+            ctx.set_working_message("");
+            ctx.clear_working_message();
+            let _ = ctx.set_hidden_thinking_label("Pondering");
+            let _ = ctx.set_hidden_thinking_label("");
+            let _ = ctx.clear_hidden_thinking_label();
+            ctx.set_working_visible(false);
+            if let Err(err) =
+                ctx.set_working_indicator(json!({"frames": ["-", "+"], "intervalMs": 120}))
+            {
+                return CommandResult::Error(err.to_string());
+            }
+            ctx.paste_to_editor("pasted \u{1F600}");
+            ctx.set_editor_text("draft");
+            ctx.set_tools_expanded(true);
+            CommandResult::Ok
+        },
+    );
+    // dialog-stack-probe opens its dialogs at the same time, each from its own thread, and reports each one's answer as it settles (TestConformance_ConcurrentDialogsAgreeAcrossSDKs). "pair" is a select A and a confirm B; "mix" is a select S, a confirm C, an input I and an editor E.
+    ext.command(
+        "dialog-stack-probe",
+        "Open concurrent dialogs from one command",
+        |ctx, scenario| {
+            let names: &[&str] = if scenario == "mix" {
+                &["S", "C", "I", "E"]
+            } else {
+                &["A", "B"]
+            };
+            let workers: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    let ctx = ctx.clone();
+                    let name = name.to_string();
+                    thread::spawn(move || -> std::io::Result<()> {
+                        let chosen = |(value, ok): (serde_json::Value, bool)| {
+                            if ok {
+                                value
+                                    .as_str()
+                                    .map_or_else(|| value.to_string(), str::to_string)
+                            } else {
+                                "cancelled".to_string()
+                            }
+                        };
+                        let value = match name.as_str() {
+                            "A" => chosen(ctx.select("A", &["a1", "a2"])?),
+                            "B" => ctx.confirm("B", "message")?.to_string(),
+                            "S" => chosen(ctx.select("S", &["s1", "s2"])?),
+                            "C" => ctx.confirm("C", "message")?.to_string(),
+                            "I" => chosen(ctx.input("I", "placeholder")?),
+                            _ => chosen(ctx.editor("E", "prefill")?),
+                        };
+                        ctx.notify(&format!("stack settled {name}={value}"), "info");
+                        Ok(())
+                    })
+                })
+                .collect();
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return CommandResult::Error(err.to_string()),
+                    Err(_) => return CommandResult::Error("a dialog thread panicked".to_string()),
+                }
+            }
+            ctx.notify("stack done", "info");
+            CommandResult::Ok
+        },
+    );
+    // ui_wire_empties_probe calls the UI members Pi's RPC mode writes with empty strings and lists, and the optional members it omits, in this SDK's own spelling of each (TestConformance_UIEmptyMembersAgreeAcrossSDKs).
+    ext.command(
+        "ui_wire_empties_probe",
+        "Call the UI members with empty and unset arguments",
+        |ctx, _args| {
+            ctx.set_status("k", "");
+            ctx.clear_status("k");
+            ctx.notify("", "");
+            ctx.notify("typed", "warning");
+            ctx.set_title("");
+            ctx.set_editor_text("");
+            let _ = ctx.select("T", &[]);
+            let _ = ctx.confirm("", "");
+            let _ = ctx.input_without_placeholder("T1");
+            let _ = ctx.input("T2", "");
+            let _ = ctx.input("T3", "ph");
+            let _ = ctx.editor_without_prefill("E1");
+            let _ = ctx.editor("E2", "");
+            let _ = ctx.editor("E3", "pre");
+            CommandResult::Ok
+        },
+    );
+    let installed = installed_factory;
+    ext.command(
+        "editor-clear",
+        "Restore the host's editor",
+        move |ctx, _args| {
+            *installed.lock().unwrap() = None;
+            match ctx.clear_editor_component() {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "editor-install-eager",
+        "Install a custom editor that calls super in its factory",
+        |ctx, _args| {
+            let notify = ctx.clone();
+            match ctx.set_editor_component(move |base| {
+                let text = base
+                    .set_text(&JsString::from("eager"))
+                    .and_then(|()| base.get_text());
+                // The stock editor's other queries and setters, at the values it already holds.
+                let _ = (
+                    base.get_cursor(),
+                    base.get_expanded_text(),
+                    base.is_showing_autocomplete(),
+                );
+                let _ = (base.set_padding_x(0), base.set_autocomplete_max_visible(5));
+                match text {
+                    Ok(text) => notify.notify(&format!("eager:{}", text.to_string_lossy()), "info"),
+                    Err(err) => notify.notify(&format!("eager-error:{err}"), "info"),
+                }
+                Box::new(ConformanceEditor { base })
+            }) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "editor-install-embed",
+        "Install a custom editor that embeds the working status",
+        |ctx, _args| match ctx
+            .set_editor_component(|base| Box::new(EmbeddingEditor(ConformanceEditor { base })))
+        {
+            Ok(()) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "editor-install-viewport",
+        "Install a custom editor that captures viewport input until it receives t",
+        |ctx, _args| match ctx.set_editor_component(|base| {
+            Box::new(ViewportCapturingEditor {
+                inner: ConformanceEditor { base },
+                captures: true,
+            })
+        }) {
+            Ok(()) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "editor-install-hooks",
+        "Install a custom editor that sets CustomEditor's handlers",
+        |ctx, _args| match ctx.set_editor_component(|base| Box::new(HooksEditor::new(base))) {
+            Ok(()) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // headless-ui-probe hands the SDK footer, header and custom component closures; its argument is a file every closure appends a marker to when it runs (TestConformance_HeadlessModesNeverRunUIClosures).
+    ext.command(
+        "headless-ui-probe",
+        "Hand the SDK footer, header and custom component closures",
+        |ctx, path| {
+            fn mark(path: &str, line: &str) {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(path)
+                {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            struct HeadlessComponent(String);
+            impl RemoteComponent for HeadlessComponent {
+                fn render(&self, _width: u32) -> Vec<String> {
+                    mark(&self.0, "rust:custom");
+                    vec!["rust:custom".to_string()]
+                }
+                fn handle_input(
+                    &mut self,
+                    _data: &pig_sdk::JsString,
+                ) -> Result<RemoteComponentResult, String> {
+                    mark(&self.0, "rust:custom");
+                    Ok(RemoteComponentResult::done(Some(json!("closed"))))
+                }
+            }
+            let footer_path = path.to_string();
+            if let Err(err) = ctx.set_footer_renderer(Some(move |_width: u32| {
+                mark(&footer_path, "rust:footer");
+                vec!["rust:footer".to_string()]
+            })) {
+                return CommandResult::Error(err.to_string());
+            }
+            let header_path = path.to_string();
+            if let Err(err) = ctx.set_header_renderer(Some(move |_width: u32| {
+                mark(&header_path, "rust:header");
+                vec!["rust:header".to_string()]
+            })) {
+                return CommandResult::Error(err.to_string());
+            }
+            if let Err(err) = ctx.custom_component(HeadlessComponent(path.to_string()), json!({})) {
+                return CommandResult::Error(err.to_string());
+            }
+            // Options only, no component: Pi's RPC and no-op UIs resolve undefined, the TUI SDK reports it unsupported.
+            match ctx.custom(json!({})) {
+                Ok(None) => mark(path, "rust:custom-opaque:undefined"),
+                Ok(Some(_)) => mark(path, "rust:custom-opaque:value"),
+                Err(_) => mark(path, "rust:custom-opaque:error"),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.flag("flag-true", pig_sdk::FlagOptions::boolean("", true));
+    ext.flag("flag-false", pig_sdk::FlagOptions::boolean("", false));
+    ext.flag("flag-string", pig_sdk::FlagOptions::string("", "default"));
+    ext.flag("flag-empty", pig_sdk::FlagOptions::string("", ""));
+    ext.flag(
+        "flag-unset",
+        pig_sdk::FlagOptions {
+            description: String::new(),
+            flag_type: pig_sdk::FlagType::String,
+            default: None,
+        },
+    );
+    ext.command(
+        "flag-probe",
+        "Report registered flag values",
+        |ctx, _args| {
+            let values: Vec<_> = [
+                "flag-true",
+                "flag-false",
+                "flag-string",
+                "flag-empty",
+                "flag-unset",
+                "unregistered",
+            ]
+            .iter()
+            .map(|name| ctx.get_flag(name).unwrap())
+            .collect();
+            ctx.notify(&serde_json::to_string(&values).unwrap(), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "timeout-probe",
+        "Send JavaScript-number timeouts",
+        |ctx, _| {
+            for timeout in [0.5, 4294967296.5, 1e21] {
+                if let Err(err) = ctx.exec_with_options(
+                    "timeout-command",
+                    &[],
+                    &pig_sdk::ExecOptions {
+                        timeout: Some(timeout),
+                        ..Default::default()
+                    },
+                ) {
+                    return CommandResult::Error(err);
+                }
+            }
+            match ctx.select_with_options(
+                "timeout",
+                &["a"],
+                &pig_sdk::DialogOptions {
+                    timeout: Some(1500.5),
+                },
+            ) {
+                Ok(_) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command("exec-reject-probe", "Report exec outcomes", |ctx, args| {
+        let commands: Vec<String> = match serde_json::from_str(args) {
+            Ok(commands) => commands,
+            Err(err) => return CommandResult::Error(err.to_string()),
+        };
+        for command in commands {
+            match ctx.exec(&command, &[]) {
+                Ok(result) => ctx.notify(&format!("resolved:{}", result.exit_code), "info"),
+                Err(err) => ctx.notify(&format!("rejected:{err}"), "info"),
+            }
+        }
+        CommandResult::Ok
+    });
+    ext.command(
+        "exec-abort-probe",
+        "Abort a running exec through its signal",
+        |ctx, args| {
+            let probe: Value = match serde_json::from_str(args) {
+                Ok(probe) => probe,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let command = probe["command"].as_str().unwrap_or_default().to_string();
+            let argv: Vec<String> = probe["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|arg| arg.as_str().map(str::to_string))
+                .collect();
+            let signal = pig_sdk::ProviderSignal::new();
+            if probe["pre"].as_bool() == Some(true) {
+                signal.cancel();
+            } else {
+                let signal = signal.clone();
+                let pid_file = probe["pidFile"].as_str().unwrap_or_default().to_string();
+                thread::spawn(move || {
+                    for _ in 0..1500 {
+                        if std::path::Path::new(&pid_file).exists() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    signal.cancel();
+                });
+            }
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match ctx.exec_with_options(
+                &command,
+                &argv,
+                &pig_sdk::ExecOptions {
+                    signal: Some(signal),
+                    ..Default::default()
+                },
+            ) {
+                Ok(result) => ctx.notify(
+                    &format!(
+                        "exec-abort:killed={};code={};stdout={}",
+                        result.killed,
+                        result.exit_code,
+                        result.stdout.trim()
+                    ),
+                    "info",
+                ),
+                Err(err) => ctx.notify(&format!("rejected:{err}"), "info"),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "exec-limits-probe",
+        "Run a command with a max_buffer and report the result",
+        |ctx, args| {
+            let probe: Value = match serde_json::from_str(args) {
+                Ok(probe) => probe,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let command = probe["command"].as_str().unwrap_or_default().to_string();
+            let argv: Vec<String> = probe["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|arg| arg.as_str().map(str::to_string))
+                .collect();
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let options = pig_sdk::ExecOptions {
+                max_buffer: probe["maxBuffer"].as_f64(),
+                ..Default::default()
+            };
+            match ctx.exec_with_options(&command, &argv, &options) {
+                Ok(result) => ctx.notify(
+                    &format!(
+                        "exec-limits:truncated={};killed={};code={};stdout={};stderr={}",
+                        result.truncated,
+                        result.killed,
+                        result.exit_code,
+                        result.stdout.trim(),
+                        result.stderr.trim()
+                    ),
+                    "info",
+                ),
+                Err(err) => ctx.notify(&format!("rejected:{err}"), "info"),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "thinking-model",
+        "Read the thinking level and switch the model",
+        |ctx, _| {
+            let level = match ctx.get_thinking_level() {
+                Ok(level) => level,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            ctx.set_thinking_level("high");
+            let (ok, _) = ctx.set_model("probe/model");
+            ctx.notify(&json!([level, ok]).to_string(), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "replicated-accessors",
+        "Read the replicated accessors after each write",
+        |ctx, _| {
+            let run = || -> std::io::Result<()> {
+                let last_type = || -> std::io::Result<String> {
+                    Ok(ctx
+                        .get_entries()?
+                        .last()
+                        .and_then(|entry| entry["type"].as_str().map(str::to_string))
+                        .unwrap_or_default())
+                };
+                let mut out = serde_json::Map::new();
+                out.insert("name0".into(), json!(ctx.session_name()));
+                out.insert("model0".into(), json!(ctx.model()));
+                out.insert("provider0".into(), json!(ctx.model_provider()));
+                ctx.set_session_name("renamed")?;
+                out.insert("name1".into(), json!(ctx.session_name()));
+                ctx.set_label("one", "lab")?;
+                out.insert("entryAfterLabel".into(), json!(last_type()?));
+                ctx.send_message("probe", "hi", true, None, None)?;
+                out.insert("entryAfterMessage".into(), json!(last_type()?));
+                ctx.set_model("prov-after/id-after");
+                out.insert("model1".into(), json!(ctx.model()));
+                out.insert("provider1".into(), json!(ctx.model_provider()));
+                out.insert("qualified1".into(), json!(ctx.model_qualified()));
+                ctx.notify(&serde_json::Value::Object(out).to_string(), "info");
+                Ok(())
+            };
+            match run() {
+                Ok(()) => CommandResult::Ok,
+                Err(error) => CommandResult::Error(error.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "active_tools_set",
+        "Set the active tools to the comma-separated names",
+        |ctx, args| {
+            let names: Vec<&str> = args.trim().split(',').collect();
+            ctx.set_active_tools(&names);
+            CommandResult::Ok
+        },
+    );
+    // event_session_actions_on keeps the handler's context; event_session_actions_stored calls the actions through it after the handler's request ended.
+    let kept_event_ctx: Arc<Mutex<Option<pig_sdk::Context>>> = Arc::new(Mutex::new(None));
+    let report_session_actions = |ctx: &pig_sdk::Context| {
+        let describe = |name: &str, result: std::io::Result<Option<serde_json::Value>>| match result
+        {
+            Ok(_) => format!("{name}=allowed"),
+            Err(err) if err.to_string().contains("is not a function") => {
+                format!("{name}=rejected")
+            }
+            Err(err) => format!("{name}=error:{err}"),
+        };
+        [
+            describe("wait", ctx.wait_for_idle().map(|()| None)),
+            describe("new", ctx.new_session(serde_json::json!({}))),
+            describe("fork", ctx.fork("entry", serde_json::json!({}))),
+            describe(
+                "navigate",
+                ctx.navigate_tree("entry", serde_json::json!({})),
+            ),
+            describe(
+                "switch",
+                ctx.switch_session("/s.jsonl", serde_json::json!({})),
+            ),
+            describe("reload", ctx.reload().map(|()| None)),
+        ]
+        .join(",")
+    };
+    let event_session_actions_subscriber = ext.event_subscriber();
+    let event_session_actions_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let kept_on_event = kept_event_ctx.clone();
+    ext.command(
+        "event_session_actions_on",
+        "Subscribe to the event named by the argument with a handler that calls the session actions",
+        move |_ctx, args| {
+            let kept = kept_on_event.clone();
+            let subscription = subscribe(
+                &event_session_actions_subscriber,
+                args.trim(),
+                move |ctx, _data| {
+                    *kept.lock().unwrap() = Some(ctx.clone());
+                    ctx.notify(&format!("event_actions:{}", report_session_actions(ctx)), "info");
+                    Ok(None)
+                },
+            );
+            event_session_actions_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "event_session_actions_stored",
+        "Call the session actions through the context an event handler kept",
+        move |ctx, _| {
+            let kept = kept_event_ctx
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("no event context was kept");
+            ctx.notify(
+                &format!("stored_actions:{}", report_session_actions(&kept)),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    // tool_call_cancel_on subscribes to tool_call with a handler that waits for the cancel signal and then answers (D650 claim 6).
+    let tool_call_cancel_subscriber = ext.event_subscriber();
+    let tool_call_cancel_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "tool_call_cancel_on",
+        "Subscribe to tool_call with a handler that waits for the cancel signal",
+        move |_ctx, _args| {
+            let subscription = subscribe(
+                &tool_call_cancel_subscriber,
+                "tool_call",
+                move |ctx, _data| {
+                    ctx.notify("cancel_wait", "info");
+                    while !ctx.is_cancelled() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    ctx.notify("cancel_seen", "info");
+                    Ok(Some(
+                        json!({"block": true, "reason": "answered after the abort"}),
+                    ))
+                },
+            );
+            tool_call_cancel_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // session_actions_tool makes the same calls, and the wait, through the context of a tool's execute: Pi's createContext() object, so every one is refused.
+    ext.tool(
+        "session_actions_tool",
+        "Call the session actions through the tool's context",
+        json!({"type": "object", "properties": {}}),
+        move |ctx, _| ToolResult::text(format!("tool_actions:{}", report_session_actions(ctx))),
+    );
+    // wait_idle_command waits for the run from a command context (runner.ts createCommandContext); wait_idle_with_session from a withSession callback's context.
+    ext.command(
+        "wait_idle_command",
+        "Wait for the run from a command",
+        |ctx, _| {
+            let text = match ctx.wait_for_idle() {
+                Ok(()) => "done".to_string(),
+                Err(err) => format!("error:{err}"),
+            };
+            ctx.notify(&format!("wait_idle:{text}"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "wait_idle_with_session",
+        "Wait for the run from a withSession callback",
+        |ctx, _| {
+            // The callback runs while this command's switch_session call is in flight, so the notice is sent once the call returned.
+            let text = Arc::new(Mutex::new("never ran".to_string()));
+            let callback_text = text.clone();
+            let _ = ctx.switch_session_with("/s.jsonl", serde_json::json!({}), move |replaced| {
+                *callback_text.lock().unwrap() = match replaced.wait_for_idle() {
+                    Ok(()) => "done".to_string(),
+                    Err(err) => format!("error:{err}"),
+                };
+                Ok(())
+            });
+            let text = text.lock().unwrap().clone();
+            ctx.notify(&format!("with_session_wait:{text}"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "host_error_probe",
+        "Report what a host error on navigateTree looks like to the extension",
+        |ctx, _| {
+            let text = match ctx.navigate_tree("entry", serde_json::json!({})) {
+                Ok(_) => "no error".to_string(),
+                Err(err) => err.to_string(),
+            };
+            ctx.notify(&format!("host_error:{text}|-"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "session_actions_unbound",
+        "Report what unbound session actions answer",
+        |ctx, _| {
+            let cancelled =
+                |name: &str, result: std::io::Result<Option<serde_json::Value>>| match result {
+                    Ok(value) => format!(
+                        "{name}={}",
+                        value
+                            .and_then(|v| v.get("cancelled").and_then(|c| c.as_bool()))
+                            .map_or("none".to_string(), |c| c.to_string())
+                    ),
+                    Err(err) => format!("{name}=error:{err}"),
+                };
+            let parts = [
+                cancelled("new", ctx.new_session(serde_json::json!({}))),
+                cancelled("fork", ctx.fork("entry", serde_json::json!({}))),
+                cancelled(
+                    "navigate",
+                    ctx.navigate_tree("entry", serde_json::json!({})),
+                ),
+                cancelled(
+                    "switch",
+                    ctx.switch_session("/s.jsonl", serde_json::json!({})),
+                ),
+                match ctx.reload() {
+                    Ok(()) => "reload=ok".to_string(),
+                    Err(err) => format!("reload=error:{err}"),
+                },
+            ];
+            ctx.notify(&format!("unbound:{}", parts.join(",")), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "active_tools_get",
+        "Report the active tools",
+        |ctx, _| match ctx.get_active_tools() {
+            Ok(names) => {
+                ctx.notify(&format!("active_tools:{}", names.join(",")), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // mcp_register_run registers two MCP servers in one synchronous run and reads the active tools after each call (TestConformance_McpServerRegisteredAtRunTimeIsHandledInsideTheCall).
+    ext.command(
+        "mcp_register_run",
+        "Register two MCP servers and report the active tools after each",
+        |ctx, _| {
+            let mut reads = Vec::new();
+            for name in ["conformance-run-a", "conformance-run-b"] {
+                if let Err(err) = ctx.register_mcp_server(
+                    name,
+                    json!({"url": format!("https://{name}.invalid/mcp")}),
+                ) {
+                    return CommandResult::Error(err.to_string());
+                }
+                match ctx.get_active_tools() {
+                    Ok(names) => reads.push(names.join(",")),
+                    Err(err) => return CommandResult::Error(err.to_string()),
+                }
+            }
+            ctx.notify(&format!("mcp_register_run:{}", reads.join("|")), "info");
+            CommandResult::Ok
+        },
+    );
+    // registry-model-probe registers the provider of the active model again with the argument as the model's name, then reads the model (TestARegistryWriteIsVisibleToTheNextModelReadAcrossSDKs).
+    ext.command(
+        "registry-model-probe",
+        "Register the active model's provider with a new name, then read the model",
+        |ctx, name| {
+            let config = json!({"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"m","name":name,"reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100}]});
+            if let Err(err) = ctx.model_registry().register_provider("replica-reg", config) {
+                return CommandResult::Error(err.to_string());
+            }
+            match ctx.get_model_info() {
+                Ok(info) => {
+                    ctx.notify(&format!("regname={}", info.map(|info| info.name).unwrap_or_default()), "info");
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command("provider_probe_register", "Register a provider with one model", |ctx, _| {
+        let config: Value = serde_json::from_str(r#"{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":true,"input":["text","image"],"cost":{"input":3.5,"output":4.5,"cacheRead":0.35,"cacheWrite":0.45},"contextWindow":54321,"maxTokens":4321}]}"#).unwrap();
+        match ctx.model_registry().register_provider("conformance-probe", config) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        }
+    });
+    ext.command(
+        "provider_probe_unregister",
+        "Unregister the provider",
+        |ctx, _| match ctx
+            .model_registry()
+            .unregister_provider("conformance-probe")
+        {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "commands-probe",
+        "Read the host's slash commands",
+        |ctx, _| match ctx.get_commands() {
+            Ok(commands) => {
+                let listed: Vec<Value> = commands
+                    .iter()
+                    .filter(|c| c.name == "conformance-listed")
+                    .map(|c| json!([c.name, c.source, c.description]))
+                    .collect();
+                ctx.notify(&Value::Array(listed).to_string(), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "session-identity",
+        "Read context identity accessors",
+        |ctx, _| {
+            let identity = (|| -> std::io::Result<Value> {
+                Ok(json!([
+                    ctx.get_session_id()?,
+                    ctx.get_session_file()?,
+                    ctx.get_leaf_id()?,
+                    ctx.get_session_name()?
+                ]))
+            })();
+            match identity {
+                Ok(identity) => {
+                    ctx.notify(&identity.to_string(), "info");
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command("registry-session", "Read registry and session facades", |ctx, _| {
+        let run = || -> std::io::Result<()> {
+            let s = ctx.session_manager();
+            let r = ctx.model_registry();
+            let out = json!({
+                "cwd":s.get_cwd()?, "dir":s.get_session_dir()?, "id":s.get_session_id()?, "name":s.get_session_name()?, "leaf":s.get_leaf_id()?,
+                "entry":s.get_entry("one")?, "missing":s.get_entry("missing")?, "label":s.get_label("one")?,
+                "entries":s.get_entries()?, "branch":s.get_branch(Some("one"))?, "tree":s.get_tree()?,
+                "contextEntries":s.build_context_entries()?, "projection":s.build_session_projection()?,
+                "persisted":s.is_persisted()?, "usesDefaultDir":s.uses_default_session_dir()?, "children":s.get_children(Some("one"))?, "sessionContext":s.build_session_context()?,
+                "models":r.get_all()?, "available":r.get_available()?, "status":r.get_provider_auth_status("registry-probe")?,
+                "display":r.get_provider_display_name("registry-probe")?, "error":r.get_error()?,
+                "config":r.get_registered_provider_config("registry-probe")?, "ids":r.get_registered_provider_ids()?,
+                "auth":r.get_provider_auth("registry-probe")?, "apiKey":r.get_api_key_for_provider("registry-probe"),
+                "missingKey":r.get_api_key_for_provider("missing"), "refresh":r.refresh(json!({"allowNetwork":false}))?
+            });
+            ctx.notify(&out.to_string(), "info");
+            Ok(())
+        };
+        match run() { Ok(()) => CommandResult::Ok, Err(error) => CommandResult::Error(error.to_string()) }
+    });
+    ext.command("registry-edges", "Read the registry answers that depend on the provider state", |ctx, _| {
+        let run = || -> std::io::Result<()> {
+            let r = ctx.model_registry();
+            let mut models = r.get_all()?.as_array().cloned().unwrap_or_default();
+            models.push(json!({}));
+            let has_auth = models.iter().map(|model| r.has_configured_auth(model)).collect::<std::io::Result<Vec<_>>>()?;
+            let oauth = models.iter().map(|model| r.is_using_oauth(model)).collect::<std::io::Result<Vec<_>>>()?;
+            let out = json!({
+                "available": r.get_available()?, "hasAuth": has_auth, "oauth": oauth,
+                "found": r.find("registry-probe", "a")?, "foundOff": r.find("registry-off", "d")?,
+                "missing": r.find("registry-probe", "zzz")?, "mismatch": r.find("registry-probe", "c")?
+            });
+            ctx.notify(&out.to_string(), "info");
+            Ok(())
+        };
+        match run() { Ok(()) => CommandResult::Ok, Err(error) => CommandResult::Error(error.to_string()) }
+    });
+    ext.command(
+        "registry-unbound-reads",
+        "Report find and a session read against a host that cannot answer",
+        |ctx, _| {
+            let report = |read: std::io::Result<Value>| match read {
+                Ok(value) => format!("ok:{value}"),
+                Err(error) => format!("error:{error}"),
+            };
+            let find = report(
+                ctx.model_registry()
+                    .find("registry-probe", "a")
+                    .map(|model| model.unwrap_or(Value::Null)),
+            );
+            let entries = report(ctx.session_manager().get_entries());
+            ctx.notify(
+                &json!({"find": find, "entries": entries}).to_string(),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "session-order",
+        "Read the session as Pi returns it",
+        |ctx, _| {
+            let run = || -> std::io::Result<()> {
+                let s = ctx.session_manager();
+                let mut out = serde_json::Map::new();
+                out.insert("getEntries".into(), s.get_entries()?);
+                out.insert("getEntry".into(), s.get_entry("a4")?);
+                out.insert("getLeafEntry".into(), s.get_leaf_entry()?);
+                out.insert("getBranch".into(), s.get_branch(Some("a4"))?);
+                out.insert("getChildren".into(), s.get_children(Some("a1"))?);
+                out.insert("getTree".into(), s.get_tree()?);
+                out.insert("buildContextEntries".into(), s.build_context_entries()?);
+                out.insert(
+                    "buildSessionProjection".into(),
+                    s.build_session_projection()?,
+                );
+                out.insert("buildSessionContext".into(), s.build_session_context()?);
+                ctx.notify(&Value::Object(out).to_string(), "info");
+                Ok(())
+            };
+            match run() {
+                Ok(()) => CommandResult::Ok,
+                Err(error) => CommandResult::Error(error.to_string()),
+            }
+        },
+    );
+    ext.message_renderer("conformance-message", |_ctx, message, options, width| {
+        let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        if content == "padding-options" {
+            return Ok(vec![
+                serde_json::to_string(&options).map_err(|e| e.to_string())?,
+            ]);
+        }
+        Ok(vec![format!(
+            "renderer:{content}:expanded={}:width={width}",
+            options.expanded
+        )])
+    });
+    // Test fixture, Pi 9376c8d1 (#4748): key_text and key_hint on the message and entry options and the tool render context. The content, data and q are the keybinding id.
+    ext.message_renderer("keyhints-message", |_ctx, message, options, _width| {
+        let id = message.get("content").and_then(Value::as_str).unwrap_or("");
+        Ok(vec![format!(
+            "{} | {}",
+            options.key_text(id),
+            options.key_hint(id, "to expand")
+        )])
+    });
+    ext.entry_renderer("keyhints-entry", |_ctx, entry, options, _width| {
+        let id = entry.get("data").and_then(Value::as_str).unwrap_or("");
+        Ok(vec![format!(
+            "{} | {}",
+            options.key_text(id),
+            options.key_hint(id, "to expand")
+        )])
+    });
+    ext.message_view_renderer("kit-message", |_ctx, _message, _options, _width| {
+        Ok(kit_probe_view())
+    });
+    ext.entry_view_renderer("kit-entry", |_ctx, _entry, _options, _width| {
+        Ok(kit_probe_view())
+    });
+    // conformance-click-message / conformance-click-entry: a card whose mouse region counts clicks in the renderer state the SDK keeps per displayed
+    // message. The handler runs for each event the host's view took, before the render.
+    fn click_state(state: &pig_sdk::RenderState, event: &kit::Event) {
+        if event.kind != EventKind::Mouse || event.node != "card" {
+            return;
+        }
+        let Some(mouse) = &event.mouse else { return };
+        let mut state = state.lock().unwrap();
+        let clicks = state.get("clicks").and_then(Value::as_i64).unwrap_or(0);
+        state.insert("clicks".into(), json!(clicks + 1));
+        state.insert("last".into(), json!(format!("{},{}", mouse.x, mouse.y)));
+    }
+    fn click_view(
+        label: &str,
+        subject: &str,
+        state: &pig_sdk::RenderState,
+        expanded: bool,
+    ) -> kit::View {
+        let state = state.lock().unwrap();
+        let clicks = state.get("clicks").and_then(Value::as_i64).unwrap_or(0);
+        let last = state.get("last").and_then(Value::as_str).unwrap_or("none");
+        kit::View::new(
+            kit::MouseRegion::new(
+                "card",
+                Text::new(
+                    format!("{label}:{subject}:clicks={clicks}:last={last}:expanded={expanded}"),
+                    0,
+                    0,
+                ),
+            )
+            .types(["click"]),
+        )
+    }
+    ext.message_view_renderer(
+        "conformance-click-message",
+        |_ctx, message, options, _width| {
+            let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+            Ok(click_view(
+                "clickcard",
+                content,
+                &options.state,
+                options.expanded,
+            ))
+        },
+    );
+    ext.message_view_event(
+        "conformance-click-message",
+        |_ctx, _message, options, event| {
+            click_state(&options.state, &event);
+            Ok(())
+        },
+    );
+    ext.entry_view_renderer("conformance-click-entry", |_ctx, entry, options, _width| {
+        let data = entry.get("data").and_then(Value::as_str).unwrap_or("");
+        Ok(click_view(
+            "clickentry",
+            data,
+            &options.state,
+            options.expanded,
+        ))
+    });
+    ext.entry_view_event("conformance-click-entry", |_ctx, _entry, options, event| {
+        click_state(&options.state, &event);
+        Ok(())
+    });
+    ext.markdown_transformer_with_options(
+        |markdown, context| {
+            // "trace:<dir>:<name>" records the body's entry in <dir>/trace; the body named "first" returns only once <dir>/release exists.
+            if let Some(rest) = markdown.strip_prefix("trace:") {
+                // The name is the last field: a Windows <dir> contains a drive colon.
+                if let Some((dir, name)) = rest.rsplit_once(':') {
+                    let append = |line: &str| {
+                        use std::io::Write;
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(format!("{dir}/trace"))
+                            .unwrap();
+                        writeln!(file, "{line}").unwrap();
+                    };
+                    append(&format!("entered {name}"));
+                    if name == "first" {
+                        while !std::path::Path::new(&format!("{dir}/release")).exists() {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        append("returned first");
+                    }
+                }
+            }
+            Some(format!(
+                "md:{markdown}:{}:streaming={}:width={}",
+                context.message_type, context.is_streaming, context.available_width
+            ))
+        },
+        pig_sdk::MarkdownTransformerOptions {
+            message_types: Some(
+                [
+                    "user",
+                    "assistant",
+                    "assistant-thinking",
+                    "custom",
+                    "summary",
+                    "changelog",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+        },
+    );
+    fn resolved_line(prefix: &'static str, tool: &str) -> pig_sdk::ToolRendererSet {
+        let tool = tool.to_string();
+        pig_sdk::ToolRendererSet::with_call(move |_ctx, args, _render, _width| {
+            let q = args.get("q").and_then(Value::as_str).unwrap_or("");
+            Ok(vec![format!("{prefix}:{tool}:{q}")])
+        })
+    }
+    ext.tool_renderer(|tool, next| match tool {
+        "conformance_tool_renderer" => Some(resolved_line("resolved", tool)),
+        "kit_resolved_tool" => {
+            // The resolver draws a call and its result as the kit probe (D107): the view forms of ToolRendererSet.
+            let mut set = pig_sdk::ToolRendererSet::default();
+            set.call_view = Some(Arc::new(
+                |_ctx, _args, _render, _width| Ok(kit_probe_view()),
+            ));
+            set.result_view = Some(Arc::new(|_ctx, _result, _options, _render, _width| {
+                Ok(kit_probe_view())
+            }));
+            Some(set)
+        }
+        "last_view_probe" => {
+            // A view renderer that reads the view form of ToolRenderContext::last_component: the kind of what its previous run returned, and the run's own n.
+            let mut set = pig_sdk::ToolRendererSet::default();
+            set.call_view = Some(Arc::new(|_ctx, args, render, _width| {
+                let kind = match &render.last_component {
+                    None => "none",
+                    Some(pig_sdk::ToolRenderComponent::View(_)) => "view",
+                    Some(_) => "lines",
+                };
+                let n = args.get("n").map(Value::to_string).unwrap_or_default();
+                Ok(kit::View::new(Container::new().child(Text::new(
+                    format!("lastview:{kind}:n={n}"),
+                    0,
+                    0,
+                ))))
+            }));
+            Some(set)
+        }
+        "conformance_keyhints" => Some(pig_sdk::ToolRendererSet::with_call(
+            |_ctx, args, render, _width| {
+                let id = args.get("q").and_then(Value::as_str).unwrap_or("");
+                Ok(vec![format!(
+                    "{} | {}",
+                    render.key_text(id),
+                    render.key_hint(id, "to expand")
+                )])
+            },
+        )),
+        "conformance_no_renderer" => None,
+        "conformance_fill" => next().or_else(|| Some(resolved_line("filled", tool))),
+        "conformance_wrap" => {
+            let mut wrapped = next()?;
+            wrapped.render_call = resolved_line("wrapped", tool).render_call;
+            Some(wrapped)
+        }
+        _ => next(),
+    });
+    ext.command(
+        "late_tool_renderer",
+        "Register a tool renderer resolver after loading",
+        |ctx, _args| match ctx.register_tool_renderer(|tool, next| {
+            if tool == "conformance_late" {
+                Some(resolved_line("late", tool))
+            } else {
+                next()
+            }
+        }) {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+    );
+    ext.entry_renderer("conformance-entry", |_ctx, entry, options, width| {
+        let data = entry.get("data").and_then(Value::as_str).unwrap_or("");
+        Ok(vec![format!(
+            "entryrenderer:{data}:expanded={}:width={width}",
+            options.expanded
+        )])
+    });
+    ext.tool(
+        "render_probe",
+        "Render its own tool card",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, _params| ToolResult::text("render ok"),
+    );
+    ext.tool_render_shell("render_probe", ToolRenderShell::SelfShell);
+    ext.render_tool_call("render_probe", |_ctx, args, render, width| {
+        let calls = render
+            .state
+            .get("calls")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            + 1;
+        render.state.insert("calls".to_string(), json!(calls));
+        let topic = args.get("topic").and_then(Value::as_str).unwrap_or("");
+        Ok(vec![format!(
+            "toolrender:call:{topic}:partial={}:calls={calls}:width={width}:last={}",
+            render.is_partial,
+            last_render_line(render)
+        )])
+    });
+    ext.render_tool_result("render_probe", |_ctx, result, options, render, width| {
+        let text = result.content[0].get("text").and_then(Value::as_str).unwrap_or("");
+        let key = result.details.get("k").and_then(Value::as_str).unwrap_or("");
+        let calls = render.state.get("calls").cloned().unwrap_or(Value::Null);
+        let duration = render.duration_ms.map_or("none".to_string(), |ms| ms.to_string());
+        Ok(vec![format!(
+            "toolrender:result:{text}:{key}:expanded={}:calls={calls}:width={width}:duration={duration}:last={}",
+            options.expanded,
+            last_render_line(render)
+        )])
+    });
+    ext.tool(
+        "update_tool",
+        "Stream two partial results",
+        json!({"type": "object", "properties": {}}),
+        |ctx, _params: Value| {
+            let _ = ctx.on_update(ToolResult::Json(
+                json!({"content": [{"type": "text", "text": "step 1"}]}),
+            ));
+            let _ = ctx.on_update(ToolResult::Json(
+                json!({"content": [{"type": "text", "text": "step 2"}]}),
+            ));
+            ToolResult::Json(json!({"content": [{"type": "text", "text": "done"}]}))
+        },
+    );
+    ext.tool(
+        "big_out",
+        "Return text of the size in the argument",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, params: Value| ToolResult::Json(json!({"content": [{"type": "text", "text": "a".repeat(params["n"].as_u64().unwrap_or(0) as usize)}]})),
+    );
+    // lone_decl: the other SDKs' fixtures put a lone UTF-16 surrogate into this declaration. A Rust String is UTF-8 and a serde_json::Value holds
+    // Strings, so neither can hold one: this fixture declares the tool with U+FFFD in each place.
+    ext.tool(
+        "lone_decl",
+        "D[\u{FFFD}]",
+        json!({"type": "object", "properties": {"K[\u{FFFD}\u{FFFD}]": {"type": "string", "description": "PD[\u{FFFD}]", "enum": ["E[\u{FFFD}]"], "default": "DF[\u{FFFD}]"}}}),
+        |_ctx, _params: Value| ToolResult::Json(json!({"content": [{"type": "text", "text": "lone"}]})),
+    );
+    ext.tool(
+        "echo_params",
+        "Return the arguments as the result details",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, params: Value| {
+            ToolResult::Json(
+                json!({"content": [{"type": "text", "text": "echoed"}], "details": params}),
+            )
+        },
+    );
+    ext.tool(
+        "nan_out",
+        "Return details holding NaN and Infinity",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, _params: Value| ToolResult::Json(json!({"content": [{"type": "text", "text": "nan"}], "details": {"n": f64::NAN, "i": f64::NEG_INFINITY, "l": [f64::NAN, 2, {"d": f64::INFINITY}], "ok": 1}})),
+    );
+    ext.tool(
+        "ordered_details",
+        "Return details whose members are not in alphabetical order",
+        json!({"type": "object", "properties": {}}),
+        |ctx, _params: Value| {
+            let _ = ctx.on_update(ToolResult::Json(json!({"content": [{"type": "text", "text": "partial"}], "details": {"zeta": 1.0, "alpha": {"yy": 2, "bb": 3}, "mid": [{"qq": 1, "aa": 2}]}})));
+            ToolResult::Json(json!({"content": [{"type": "text", "text": "done"}], "details": {"zeta": 1.0, "alpha": {"yy": 2, "bb": 3}, "mid": [{"qq": 1, "aa": 2}]}}))
+        },
+    );
+    ext.tool(
+        "ordered_result",
+        "Return a result whose members are not in the declared order",
+        json!({"type": "object", "properties": {}}),
+        |ctx, _params: Value| {
+            let _ = ctx.on_update(ToolResult::Json(json!({"details": {"k": 1}, "content": [{"type": "text", "text": "partial"}]})));
+            ToolResult::Json(json!({"details": {"k": 1}, "is_error": true, "content": [{"type": "text", "text": "done"}]}))
+        },
+    );
+    let abort_observed = Arc::new(AtomicBool::new(false));
+    let abort_set = abort_observed.clone();
+    let abort_reason: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    let abort_reason_set = abort_reason.clone();
+    let abort_reason_read = abort_reason;
+    ext.tool(
+        "abort_tool",
+        "Wait for the abort signal",
+        json!({"type": "object", "properties": {}}),
+        move |ctx, _params: Value| {
+            let _ = ctx.on_update(ToolResult::Json(
+                json!({"content": [{"type": "text", "text": "waiting"}]}),
+            ));
+            while !ctx.is_cancelled() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            *abort_reason_set.lock().unwrap() = ctx.cancellation_reason();
+            abort_set.store(true, Ordering::SeqCst);
+            ToolResult::text("aborted")
+        },
+    );
+    // hang_tool ignores its abort signal for longer than the host's abort grace period (D111).
+    ext.tool(
+        "hang_tool",
+        "Ignore the abort signal",
+        json!({"type": "object", "properties": {}}),
+        |ctx, _params: Value| {
+            let _ = ctx.on_update(ToolResult::Json(
+                json!({"content": [{"type": "text", "text": "waiting"}]}),
+            ));
+            thread::sleep(Duration::from_secs(8));
+            ToolResult::text("late")
+        },
+    );
+    // signal_host_probe: the host keeps answering a tool's host calls after the abort, as Pi's in-process calls are.
+    ext.tool(
+        "signal_host_probe",
+        "Await host dialogs across the abort",
+        json!({"type": "object", "properties": {}}),
+        |ctx, _params: Value| {
+            let dialog = |title: &str| match ctx.input(title, "p") {
+                Ok((value, _)) => value.as_str().unwrap_or("").to_string(),
+                Err(error) => format!("failed: {error}"),
+            };
+            let first = dialog("tool_signal:first");
+            let aborted = ctx.is_cancelled();
+            let second = dialog("tool_signal:later");
+            ToolResult::text(format!("tool_signal:{aborted}:{first}:{second}"))
+        },
+    );
+    // aborted_entry_probe: called with its run already aborted, it echoes the nonce, reports whether its signal was aborted on its first line, and makes a host call after that, which the host answers (TestConformance_ToolCalledAbortedEntersWithItsSignalAborted).
+    ext.tool(
+        "aborted_entry_probe",
+        "Report the signal a tool starts with",
+        json!({"type": "object", "properties": {}}),
+        |ctx, params: Value| {
+            let aborted = ctx.is_cancelled();
+            let nonce = params["nonce"].as_str().unwrap_or("").to_string();
+            let answer = match ctx.input(&format!("aborted_entry:{nonce}"), "p") {
+                Ok((value, _)) => value.as_str().unwrap_or("").to_string(),
+                Err(error) => format!("failed: {error}"),
+            };
+            ToolResult::text(format!("aborted_entry:{nonce}:{aborted}:{answer}"))
+        },
+    );
+    // signal_nested_probe: a nested tool call keeps working after the abort, as Pi's in-process calls do.
+    ext.tool(
+        "signal_nested_probe",
+        "Run abort_tool as a nested tool call",
+        json!({"type": "object", "properties": {}}),
+        |ctx, _params: Value| {
+            let text = match ctx.execute_tool(
+                "abort_tool",
+                json!({}),
+                pig_sdk::ExecuteToolOptions::default(),
+            ) {
+                Ok(outcome) => outcome
+                    .result
+                    .content
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<String>(),
+                Err(error) => format!("failed: {error}"),
+            };
+            ToolResult::text(format!("tool_signal_nested:{text}"))
+        },
+    );
+    ext.command(
+        "abort_probe",
+        "Report whether abort_tool saw its abort signal",
+        move |ctx, _args| {
+            ctx.notify(
+                &format!("abort:{}", abort_observed.load(Ordering::SeqCst)),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "abort_reason",
+        "Report the cancellation reason abort_tool saw",
+        move |ctx, _args| {
+            ctx.notify(
+                &format!(
+                    "reason:{}",
+                    abort_reason_read
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_default()
+                ),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.tool(
+        "rich_tool",
+        "Return text, image, and terminate",
+        json!({"type": "object", "properties": {}}),
+        |_ctx, _params: Value| {
+            ToolResult::Json(json!({
+                "content": [
+                    {"type": "text", "text": "  padded  "},
+                    {"type": "image", "data": "aW1n", "mimeType": "image/png"},
+                    {"type": "text", "text": "tail\n"}
+                ],
+                "terminate": true
+            }))
+        },
+    );
+    ext.tool(
+        "echo",
+        "Echo back the input",
+        json!({
+            "type": "object",
+            "required": ["text"],
+            "properties": {"text": {"type": "string", "description": "Text to echo"}, "offset": {"type": "number"}}
+        }),
+        |_ctx, params: Value| {
+            let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+            ToolResult::text(format!("echo: {text}"))
+        },
+    );
+    // D232 shared-cells rows: instance-local state, the process's event bus, and what this instance heard (the same three tools in every SDK fixture).
+    let shared_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shared_heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    {
+        let heard = shared_heard.clone();
+        ext.events()
+            .on("shared-cells", move |_ctx, data| {
+                heard.lock().unwrap().push(
+                    data.get("from")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    ext.tool(
+        "counter",
+        "This instance's call count",
+        json!({"type": "object", "properties": {}}),
+        move |_ctx, _params: Value| {
+            ToolResult::text(
+                (shared_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1).to_string(),
+            )
+        },
+    );
+    ext.tool(
+        "ping",
+        "Emit on the shared-cells channel",
+        json!({"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}),
+        |ctx, params: Value| match ctx.events().emit(
+            "shared-cells",
+            json!({"from": params.get("name").and_then(Value::as_str).unwrap_or("")}),
+        ) {
+            Ok(()) => ToolResult::text("pinged"),
+            Err(err) => ToolResult::error(err.to_string()),
+        },
+    );
+    ext.tool(
+        "received",
+        "What this instance heard on shared-cells",
+        json!({"type": "object", "properties": {}}),
+        move |_ctx, _params: Value| {
+            ToolResult::text(format!(
+                "received={}",
+                shared_heard.lock().unwrap().join(",")
+            ))
+        },
+    );
+    ext.tool_with_prepare_arguments(
+        "prepared_tool",
+        "Transform legacy arguments before execution",
+        json!({"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}),
+        |params| Ok(json!({"text": params.get("legacy").cloned().unwrap_or(Value::Null)})),
+        |_ctx, params| {
+            let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+            ToolResult::text(format!("prepared:{text}"))
+        },
+    );
+    // Reports the order in which calls start: the number of calls that started before it, plus its own argument.
+    static STARTED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    ext.tool(
+        "start_order",
+        "Report the order in which calls start",
+        json!({"type": "object", "properties": {"n": {"type": "number"}}}),
+        |_ctx, params: Value| {
+            let number = STARTED_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            ToolResult::text(format!(
+                "start#{number} n={}",
+                params.get("n").map(Value::to_string).unwrap_or_default()
+            ))
+        },
+    );
+    // A tool that notifies inline and, from a thread timer_release releases, after its handler returned (D189).
+    static TIMER_GATE: (std::sync::Mutex<usize>, std::sync::Condvar) =
+        (std::sync::Mutex::new(0), std::sync::Condvar::new());
+    static STALE_CTX: std::sync::Mutex<Option<pig_sdk::Context>> = std::sync::Mutex::new(None);
+    ext.tool(
+        "timer_defer",
+        "Notify inline and from deferred work",
+        json!({"type": "object"}),
+        |ctx, _params: Value| {
+            ctx.notify("inline:sync", "info");
+            *STALE_CTX.lock().unwrap() = Some(ctx.clone());
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let (released, signal) = &TIMER_GATE;
+                let mut count = released.lock().unwrap();
+                while *count == 0 {
+                    count = signal.wait(count).unwrap();
+                }
+                *count -= 1;
+                drop(count);
+                ctx.notify("deferred:thread", "info");
+            });
+            ToolResult::text("queued")
+        },
+    );
+    // timer_stale awaits a host call it makes through the context of the earlier timer_defer request, which Pi-port extensions keep (an activeCtx), and returns once it was applied. The call is not detached work: the handler waits for it, so the host must not hold it for a loop turn that waits for the handler.
+    ext.tool(
+        "timer_stale",
+        "Await a host call made through an earlier request's context",
+        json!({"type": "object"}),
+        |_ctx, _params: Value| {
+            let earlier = STALE_CTX
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("timer_defer has not run");
+            earlier.notify("stale:awaited", "info");
+            ToolResult::text("applied")
+        },
+    );
+    ext.tool(
+        "timer_release",
+        "Release the deferred work",
+        json!({"type": "object"}),
+        |_ctx, _params: Value| {
+            let (released, signal) = &TIMER_GATE;
+            *released.lock().unwrap() += 1;
+            signal.notify_one();
+            ToolResult::text("released")
+        },
+    );
+    // order_probe makes the host calls and updates whose order the ordering rows pin (ordering_test.go): its first acts are two synchronous host calls, then one update, and the tool_result handler below reports each result as its first act.
+    ext.tool(
+        "order_probe",
+        "Make a host call and an update in the first tick",
+        json!({"type": "object", "properties": {"n": {"type": "number"}}}),
+        |ctx, params: Value| {
+            let n = params.get("n").map(Value::to_string).unwrap_or_default();
+            ctx.notify(&format!("order-call={n}"), "info");
+            ctx.notify(&format!("order-then={n}"), "info");
+            let _ = ctx.on_update(ToolResult::Json(
+                json!({"content": [{"type": "text", "text": format!("order-update={n}")}]}),
+            ));
+            ToolResult::text(format!("order-done n={n}"))
+        },
+    );
+    // mutation_order_probe takes the file mutation queue in its first statement and appends its tag to the file (TestFileMutationOrderAcrossSDKs).
+    ext.tool(
+        "mutation_order_probe",
+        "Take the file mutation queue and append a tag to the file",
+        json!({"type": "object", "properties": {"file": {"type": "string"}, "tag": {"type": "string"}}}),
+        |_, params: Value| {
+            let file = params["file"].as_str().unwrap_or_default().to_string();
+            let tag = params["tag"].as_str().unwrap_or_default().to_string();
+            let result = pig_sdk::with_file_mutation_queue(&file, || {
+                let before = std::fs::read_to_string(&file).unwrap_or_default();
+                std::fs::write(&file, format!("{before}{tag}\n"))
+            });
+            match result {
+                Ok(Ok(())) => ToolResult::text(format!("mutated {tag}")),
+                Ok(Err(err)) | Err(err) => ToolResult::Error(err.to_string()),
+            }
+        },
+    );
+    // mutation_order_ctx_probe makes `calls` getter calls, then takes the queue through its context (TestFileMutationOrderOfTheContextFormAcrossSDKs).
+    ext.tool(
+        "mutation_order_ctx_probe",
+        "Make getter calls, take the queue through the context and append a tag",
+        json!({"type": "object", "properties": {"file": {"type": "string"}, "tag": {"type": "string"}, "calls": {"type": "number"}}}),
+        |ctx, params: Value| {
+            let file = params["file"].as_str().unwrap_or_default().to_string();
+            let tag = params["tag"].as_str().unwrap_or_default().to_string();
+            for _ in 0..params["calls"].as_u64().unwrap_or(0) {
+                let _ = ctx.get_context_usage();
+            }
+            let result = ctx.with_file_mutation_queue(&file, || {
+                let before = std::fs::read_to_string(&file).unwrap_or_default();
+                std::fs::write(&file, format!("{before}{tag}\n"))
+            });
+            match result {
+                Ok(Ok(())) => ToolResult::text(format!("mutated {tag}")),
+                Ok(Err(err)) | Err(err) => ToolResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.tool(
+        "dialog_order",
+        "Open a select dialog titled by the call and report the answer",
+        json!({"type": "object", "properties": {"title": {"type": "string"}, "exec": {"type": "boolean"}}}),
+        |ctx, params: Value| {
+            let title = params["title"].as_str().unwrap_or("").to_string();
+            if params["exec"].as_bool() == Some(true) {
+                let _ = ctx.exec("dialog-order-exec", &[]);
+            }
+            match ctx.select(&title, &["a", "b"]) {
+                Ok((selected, _)) => ToolResult::text(format!("dialog:{title}={selected}")),
+                Err(error) => ToolResult::Error(error.to_string()),
+            }
+        },
+    );
+    ext.tool(
+        "throw_probe",
+        "Throw a value of the requested kind",
+        json!({"type": "object", "properties": {"kind": {"type": "string"}}}),
+        |_ctx, params: Value| match params["kind"].as_str().unwrap_or("") {
+            "unicode" => ToolResult::Error("é😀 \n x".to_string()),
+            "empty" => ToolResult::Error(String::new()),
+            "long" => ToolResult::Error("x".repeat(100000)),
+            _ => ToolResult::Text("ok".to_string()),
+        },
+    );
+    ext.tool(
+        "tool_error",
+        "Return a thrown tool error",
+        json!({"type": "object"}),
+        |_ctx, _params: Value| ToolResult::Error("tool exploded".to_string()),
+    );
+    ext.tool(
+        "tool_is_error",
+        "Return a structured tool error result",
+        json!({"type": "object"}),
+        |_ctx, _params: Value| {
+            ToolResult::Json(json!({"content": "soft tool error", "is_error": true}))
+        },
+    );
+    ext.tool_with_guidelines(
+        "guided_tool",
+        "Tool with prompt guidelines",
+        json!({"type": "object"}),
+        vec!["Use guided_tool when the user asks for guided behavior.".to_string()],
+        |_ctx, _params: Value| ToolResult::Json(json!({"content": "guided"})),
+    );
+    ext.tool_prompt_snippet("guided_tool", " \u{feff}Guided\r\n tool\t summary ");
+    ext.tool_with_source(
+        "sourced_tool",
+        "Tool with explicit source",
+        json!({"type": "object"}),
+        "mcp:test-server",
+        vec!["Use sourced_tool to test per-tool source attribution.".to_string()],
+        |_ctx, _params: Value| ToolResult::Json(json!({"content": "sourced"})),
+    );
+    let mut disabled = pig_sdk::ToolDefinition::new(
+        "sampling_disabled",
+        "sampling_disabled",
+        "Disable constrained sampling",
+        json!({"type":"object"}),
+        |_, _| ToolResult::text("disabled"),
+    );
+    disabled.constrained_sampling = Some(pig_sdk::ToolConstrainedSampling::Disabled);
+    ext.register_tool(disabled);
+    ext.tool_with_constrained_sampling(
+        "grammar_tool",
+        "Tool with a grammar constrained sampling request",
+        json!({"type": "object"}),
+        ConstrainedSampling {
+            kind: "grammar".to_string(),
+            strict: None,
+            variants: Some(
+                [("openai_lark".to_string(), "start: NUMBER".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        },
+        |_ctx, _params: Value| ToolResult::Json(json!({"content": "grammar"})),
+    );
+    ext.command("complete_probe", "Complete its arguments", |_ctx, _args| {
+        CommandResult::Ok
+    });
+    ext.command_argument_completions("complete_probe", |prefix| {
+        let items: Vec<AutocompleteItem> = [
+            AutocompleteItem {
+                value: "alpha".into(),
+                label: Some("alpha — first".into()),
+                description: None,
+            },
+            AutocompleteItem {
+                value: "apple".into(),
+                label: None,
+                description: Some("fruit".into()),
+            },
+            AutocompleteItem {
+                value: "beta".into(),
+                label: None,
+                description: None,
+            },
+        ]
+        .into_iter()
+        .filter(|item| item.value.starts_with(prefix.trim()))
+        .collect();
+        (!items.is_empty()).then_some(items)
+    });
+    ext.command("ping", "Respond with pong", |ctx, _args| {
+        ctx.notify("pong", "info");
+        CommandResult::Ok
+    });
+    ext.command("model-stream-probe", "Exercise model streaming", |ctx, _args| {
+        let registry = ctx.model_registry();
+        let find = |provider: &str, id: &str| registry.find(provider, id).map_err(|error| CommandResult::Error(format!("find {id}: {error}")));
+        let current = match find("conformance", "current") { Ok(Some(model)) => model, Ok(None) => return CommandResult::Error("find current returned no model".into()), Err(error) => return error };
+        if current["id"] != "current" { return CommandResult::Error(format!("find current = {current}")); }
+        let found = match find("conformance", "declared") { Ok(Some(model)) => model, Ok(None) => return CommandResult::Error("find declared returned no model".into()), Err(error) => return error };
+        if found["id"] != "declared" || found["provider"] != "conformance" { return CommandResult::Error(format!("find declared = {found}")); }
+        let slash = match find("conformance", "org/model/name") { Ok(Some(model)) => model, Ok(None) => return CommandResult::Error("find slash returned no model".into()), Err(error) => return error };
+        if slash["id"] != "org/model/name" { return CommandResult::Error(format!("find slash = {slash}")); }
+        let expected_limits = json!({"maxRequestBytes":12345,"images":{"maxPerMessage":7,"maxPerRequest":11,"resize":{"maxWidth":321,"maxHeight":123,"maxBytes":45678,"jpegQuality":67}}});
+        if slash["inputLimits"] != expected_limits || ctx.get_model_info().unwrap().and_then(|model| model.input_limits) != Some(expected_limits) { return CommandResult::Error(format!("model inputLimits = {slash}")); }
+        for field in ["baseUrl", "input", "cost", "thinkingLevelMap", "promptCache", "contextWindow", "maxTokens", "samplingParams", "headers", "compat"] {
+            if slash.get(field).is_none() { return CommandResult::Error(format!("find slash missing {field}: {slash}")); }
+        }
+        if slash["input"].as_array().map(Vec::len) != Some(0) || slash["cost"]["input"] != 0 || slash["cost"]["tiers"].as_array().map(Vec::len) != Some(1) || slash["compat"]["supportsStrictMode"] != false { return CommandResult::Error(format!("find slash shape = {slash}")); }
+        for missing in ["missing", "override-only"] {
+            match find("conformance", missing) {
+                Ok(None) => {}
+                Ok(Some(_)) => return CommandResult::Error(format!("find {missing} returned a model")),
+                Err(error) => return error,
+            }
+        }
+        let auth = match registry.get_api_key_and_headers(&found) {
+            Ok(value) => value,
+            Err(error) => return CommandResult::Error(format!("get auth: {error}")),
+        };
+        let expected_auth = json!({"ok":true,"apiKey":"conformance-key","headers":{"X-Conformance-Auth":"yes"},"baseUrl":"https://models.invalid/v1","env":{"CONFORMANCE_AUTH":"yes"}});
+        if auth != expected_auth { return CommandResult::Error(format!("auth = {auth}")); }
+        let model = json!({"provider":"conformance", "modelId":"declared", "api":"openai-responses"});
+        let request = json!({
+            "systemPrompt":"conformance-system",
+            "messages":[
+                {"role":"system", "content":[{"type":"text", "text":"signed system", "textSignature":"system-signature"}], "sections":{"zeta":"last-first","alpha":null,"middle":"middle"}, "timestamp":41},
+                {"role":"user", "content":"hello", "timestamp":42},
+                {"role":"assistant", "content":[{"type":"text", "text":"prior", "textSignature":"signed"}], "api":"openai-responses", "provider":"prior-provider", "model":"prior-model", "usage":{"input":1,"output":2,"cacheRead":3,"cacheWrite":4,"totalTokens":10,"cost":{"input":0.1,"output":0.2,"cacheRead":0.3,"cacheWrite":0.4,"total":1.0}}, "stopReason":"stop", "timestamp":43}
+            ],
+            "tools":[{"name":"lookup", "description":"lookup", "parameters":{"type":"object"}, "constrainedSampling":{"type":"grammar","variants":{"openai_lark":"start: NUMBER"}}}]
+        });
+        let options = json!({
+            "timeoutMs":0,"websocketConnectTimeoutMs":1234,"maxRetries":2,"maxRetryDelayMs":3000,
+            "maxTokens":321, "temperature":0.65, "samplingParams":{"topP":0.8},
+            "thinkingBudgets":{"minimal":11,"low":22,"medium":33,"high":44}, "reasoning":"high", "isReasoning":true,
+            "env":{"WIRE_ENV":"request-value","SECOND_ENV":"distinct-value"}, "headers":{"X-Wire":"yes","X-Remove":null}, "sessionId":"conformance-session", "transport":"sse"
+        });
+        let stream = ctx.model_registry().stream(model.clone(), request.clone(), options.clone());
+        let mut types = Vec::new();
+        while let Some(event) = stream.next() { types.push(event["type"].as_str().unwrap_or_default().to_string()); }
+        if types.join(",") != "start,text_start,text_delta,text_end,done" { return CommandResult::Error(format!("stream events = {types:?}")); }
+        let result = stream.result().unwrap_or_default();
+        if result["content"][0]["text"] != "streamed" { return CommandResult::Error(format!("stream result = {result}")); }
+        let simple = ctx.model_registry().stream_simple(model.clone(), request.clone(), options.clone());
+        types.clear();
+        while let Some(event) = simple.next() { types.push(event["type"].as_str().unwrap_or_default().to_string()); }
+        if types.join(",") != "start,text_start,text_delta,text_end,done" { return CommandResult::Error(format!("simple events = {types:?}")); }
+        if simple.result().unwrap_or_default()["stopReason"] != "stop" { return CommandResult::Error("simple did not stop".into()); }
+        if ctx.model_registry().complete(model.clone(), request.clone(), options.clone()).unwrap_or_default()["stopReason"] != "stop" { return CommandResult::Error("complete did not stop".into()); }
+        if ctx.model_registry().stream(model, request.clone(), options.clone()).result().unwrap_or_default()["stopReason"] != "stop" { return CommandResult::Error("result without iteration did not stop".into()); }
+        let unknown = ctx.model_registry().complete(json!({"provider":"conformance", "modelId":"unknown", "api":"openai-responses"}), request.clone(), options.clone()).unwrap_or_default();
+        if unknown["stopReason"] != "error" || !unknown["errorMessage"].as_str().unwrap_or_default().contains("unknown model") { return CommandResult::Error(format!("unknown result = {unknown}")); }
+        let mut transport_error = ctx.model_registry().complete(json!({"provider":"conformance", "modelId":"protocol-error", "api":"openai-responses"}), request, options).unwrap_or_default();
+        let timestamp = transport_error.get("timestamp").and_then(Value::as_u64).unwrap_or_default();
+        if timestamp == 0 { return CommandResult::Error(format!("transport timestamp = {}", transport_error["timestamp"])); }
+        transport_error.as_object_mut().map(|value| value.remove("timestamp"));
+        let expected_transport = json!({
+            "role":"assistant", "content":[], "api":"openai-responses", "provider":"conformance", "model":"protocol-error",
+            "usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
+            "stopReason":"error", "errorMessage":"transport boom"
+        });
+        if transport_error != expected_transport { return CommandResult::Error(format!("transport result = {transport_error}")); }
+        ctx.notify("model-stream=ok", "info");
+        CommandResult::Ok
+    });
+    ext.command(
+        "overlay-handle-probe",
+        "Exercise the overlay handle custom hands to on_handle",
+        |ctx, _args| {
+            struct HandleProbe;
+            impl RemoteComponent for HandleProbe {
+                fn render(&self, _width: u32) -> Vec<String> {
+                    vec!["overlay".to_string()]
+                }
+                fn handle_input(
+                    &mut self,
+                    data: &pig_sdk::JsString,
+                ) -> Result<RemoteComponentResult, String> {
+                    if data == "q" {
+                        return Ok(RemoteComponentResult::done(Some(json!("closed"))));
+                    }
+                    Ok(RemoteComponentResult::pending())
+                }
+            }
+            let failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let recorded = failures.clone();
+            let on_handle = move |handle: pig_sdk::OverlayHandle| {
+                let expect = |label: &str, ok: bool, detail: String| {
+                    if !ok {
+                        recorded.lock().unwrap().push(format!("{label}: {detail}"));
+                    }
+                };
+                expect(
+                    "initial focused",
+                    handle.is_focused(),
+                    format!("{}", handle.is_focused()),
+                );
+                expect(
+                    "initial hidden",
+                    !handle.is_hidden(),
+                    format!("{}", handle.is_hidden()),
+                );
+                expect(
+                    "initial bounds",
+                    handle.bounds()
+                        == Some(pig_sdk::OverlayBounds {
+                            row: 3,
+                            col: 4,
+                            width: 20,
+                            height: 5,
+                        }),
+                    format!("{:?}", handle.bounds()),
+                );
+                let _ = handle.focus();
+                expect(
+                    "focus",
+                    handle.is_focused(),
+                    format!("{}", handle.is_focused()),
+                );
+                let _ = handle.set_hidden(true);
+                expect(
+                    "hidden",
+                    handle.is_hidden() && !handle.is_focused() && handle.bounds().is_none(),
+                    format!(
+                        "{} {} {:?}",
+                        handle.is_hidden(),
+                        handle.is_focused(),
+                        handle.bounds()
+                    ),
+                );
+                let _ = handle.set_hidden(false);
+                expect(
+                    "shown",
+                    !handle.is_hidden() && !handle.is_focused(),
+                    format!("{} {}", handle.is_hidden(), handle.is_focused()),
+                );
+                let _ = handle.focus();
+                expect(
+                    "refocus",
+                    handle.is_focused(),
+                    format!("{}", handle.is_focused()),
+                );
+                let _ = handle.unfocus();
+                expect(
+                    "unfocus",
+                    !handle.is_focused(),
+                    format!("{}", handle.is_focused()),
+                );
+                let _ = handle.unfocus_target(pig_sdk::UnfocusTarget::Nothing);
+            };
+            if let Err(err) =
+                ctx.custom_component_with_handle(HandleProbe, json!({"overlay": true}), on_handle)
+            {
+                return CommandResult::Error(err.to_string());
+            }
+            let failures = failures.lock().unwrap();
+            if !failures.is_empty() {
+                return CommandResult::Error(failures.join("; "));
+            }
+            ctx.notify("overlay-handle=ok", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "overlay-invalidate-probe",
+        "Count the host's invalidations of a mounted overlay and draw the theme",
+        |ctx, args| {
+            fn row(ctx: &pig_sdk::Context) -> String {
+                let theme = ctx.theme();
+                format!("{}|{}", theme.name, theme.fg("accent", "x"))
+            }
+            fn input(data: &pig_sdk::JsString) -> Result<RemoteComponentResult, String> {
+                if data == "q" {
+                    return Ok(RemoteComponentResult::done(Some(json!("closed"))));
+                }
+                Ok(RemoteComponentResult::pending())
+            }
+            struct InvalidateProbe {
+                ctx: pig_sdk::Context,
+                invalidations: u64,
+                kept: String,
+            }
+            impl RemoteComponent for InvalidateProbe {
+                fn render(&self, _width: u32) -> Vec<String> {
+                    vec![format!(
+                        "inv={} kept={} live={}",
+                        self.invalidations,
+                        self.kept,
+                        self.ctx.theme().name
+                    )]
+                }
+                fn invalidate(&mut self) {
+                    self.invalidations += 1;
+                    self.kept = row(&self.ctx);
+                }
+                fn handle_input(
+                    &mut self,
+                    data: &pig_sdk::JsString,
+                ) -> Result<RemoteComponentResult, String> {
+                    input(data)
+                }
+            }
+            // No invalidate: the host's invalidation renders it again all the same.
+            struct PlainThemeProbe(pig_sdk::Context);
+            impl RemoteComponent for PlainThemeProbe {
+                fn render(&self, _width: u32) -> Vec<String> {
+                    vec![format!("plain live={}", row(&self.0))]
+                }
+                fn handle_input(
+                    &mut self,
+                    data: &pig_sdk::JsString,
+                ) -> Result<RemoteComponentResult, String> {
+                    input(data)
+                }
+            }
+            let on_handle = |_overlay: pig_sdk::OverlayHandle| {};
+            let result = if args.trim() == "plain" {
+                ctx.custom_component_with_handle(
+                    PlainThemeProbe(ctx.clone()),
+                    json!({"overlay": true}),
+                    on_handle,
+                )
+            } else {
+                ctx.custom_component_with_handle(
+                    InvalidateProbe {
+                        ctx: ctx.clone(),
+                        invalidations: 0,
+                        kept: row(ctx),
+                    },
+                    json!({"overlay": true}),
+                    on_handle,
+                )
+            };
+            if let Err(err) = result {
+                return CommandResult::Error(err.to_string());
+            }
+            ctx.notify("overlay-invalidate=ok", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "theme-read-probe",
+        "Report the theme the extension holds, with no component mounted",
+        |ctx, _args| {
+            let theme = ctx.theme();
+            ctx.notify(
+                &format!("theme-read={}|{}", theme.name, theme.fg("accent", "x")),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "overlay-focus-probe",
+        "Render the focus the host publishes to a mounted overlay",
+        |ctx, _args| {
+            struct FocusProbe(Arc<Mutex<Option<pig_sdk::OverlayHandle>>>);
+            impl RemoteComponent for FocusProbe {
+                fn render(&self, _width: u32) -> Vec<String> {
+                    match self.0.lock().unwrap().as_ref() {
+                        Some(handle) => vec![format!("focused={}", handle.is_focused())],
+                        None => vec!["focused=pending".to_string()],
+                    }
+                }
+                fn handle_input(
+                    &mut self,
+                    data: &pig_sdk::JsString,
+                ) -> Result<RemoteComponentResult, String> {
+                    if data == "q" {
+                        return Ok(RemoteComponentResult::done(Some(json!("closed"))));
+                    }
+                    Ok(RemoteComponentResult::pending())
+                }
+            }
+            let handle: Arc<Mutex<Option<pig_sdk::OverlayHandle>>> = Arc::new(Mutex::new(None));
+            let mounted = handle.clone();
+            let on_handle = move |overlay: pig_sdk::OverlayHandle| {
+                *mounted.lock().unwrap() = Some(overlay);
+            };
+            if let Err(err) = ctx.custom_component_with_handle(
+                FocusProbe(handle),
+                json!({"overlay": true}),
+                on_handle,
+            ) {
+                return CommandResult::Error(err.to_string());
+            }
+            ctx.notify("overlay-focus=ok", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command("model-stream-fetch-probe", "Exercise the fetch option of the model registry stream", |ctx, _args| {
+        let registry = ctx.model_registry();
+        let model = json!({"provider":"conformance","id":"declared","modelId":"declared","api":"openai-responses"});
+        let request = json!({"systemPrompt":"fetch","messages":[{"role":"user","content":"hello","timestamp":1}]});
+        let seen: Arc<Mutex<Option<SeenRequest>>> = Arc::new(Mutex::new(None));
+        let recorded = seen.clone();
+        let callbacks = pig_sdk::ModelStreamCallbacks::new().fetch(move |call| {
+            let host = call.headers.iter().find(|(name, _)| name == "X-Host").map(|(_, value)| value.clone());
+            *recorded.lock().unwrap() = Some((call.url, call.method, host, String::from_utf8_lossy(&call.body.unwrap_or_default()).to_string()));
+            let body: Vec<u8> = (0..70000u32).map(|index| (index % 251) as u8).collect();
+            Ok(pig_sdk::ModelFetchResponse {
+                status: 207,
+                status_text: "Answered".to_string(),
+                headers: vec![("x-sdk-fetch".to_string(), "answered".to_string())],
+                body: Some(Box::new(std::io::Cursor::new(body))),
+            })
+        });
+        let result = registry.stream_with_callbacks(model.clone(), request.clone(), json!({}), callbacks).result();
+        if result.as_ref().and_then(|value| value["stopReason"].as_str()) != Some("stop") { return CommandResult::Error(format!("fetch stream = {result:?}")); }
+        let saw = seen.lock().unwrap().clone();
+        let expected = Some(("https://fetch.invalid/v1/chat?x=1".to_string(), "POST".to_string(), Some("1".to_string()), "ping-body".to_string()));
+        if saw != expected { return CommandResult::Error(format!("fetch saw {saw:?}")); }
+        let plain = registry.stream(model, request, json!({})).result();
+        if plain.as_ref().and_then(|value| value["stopReason"].as_str()) != Some("stop") { return CommandResult::Error(format!("plain stream = {plain:?}")); }
+        ctx.notify("model-fetch=ok", "info");
+        CommandResult::Ok
+    });
+    ext.command("model-stream-callback-probe", "Exercise the provider request callbacks of the model registry stream", |ctx, _args| {
+        let registry = ctx.model_registry();
+        let model = json!({"provider":"conformance","id":"declared","modelId":"declared","api":"openai-responses"});
+        let request = json!({"systemPrompt":"callbacks","messages":[{"role":"user","content":"hello","timestamp":1}]});
+        let seen: Arc<Mutex<(Value, String, Value)>> = Arc::new(Mutex::new((Value::Null, String::new(), Value::Null)));
+        let (payload_seen, response_seen) = (seen.clone(), seen.clone());
+        let callbacks = pig_sdk::ModelStreamCallbacks::new()
+            .on_payload(move |payload, callback_model| {
+                let mut marked = payload.clone();
+                marked["mark"] = json!("on-payload");
+                let mut seen = payload_seen.lock().unwrap();
+                seen.0 = payload;
+                seen.1 = callback_model["id"].as_str().unwrap_or_default().to_string();
+                Ok(Some(marked))
+            })
+            .on_response(move |response, _model| {
+                response_seen.lock().unwrap().2 = response;
+                Ok(())
+            })
+            .transform_headers(|mut headers, _model| {
+                headers["x-transformed"] = json!("yes");
+                Ok(headers)
+            });
+        let result = registry.stream_with_callbacks(model.clone(), request.clone(), json!({}), callbacks).result();
+        if result.as_ref().and_then(|value| value["stopReason"].as_str()) != Some("stop") { return CommandResult::Error(format!("callback stream = {result:?}")); }
+        let (payload, callback_model, response) = seen.lock().unwrap().clone();
+        if payload["original"] != true || callback_model != "declared" { return CommandResult::Error(format!("onPayload saw {payload} for {callback_model}")); }
+        if response["status"] != 201 || response["headers"]["x-upstream"] != "seen" { return CommandResult::Error(format!("onResponse saw {response}")); }
+        let plain = registry.stream(model, request, json!({})).result();
+        if plain.as_ref().and_then(|value| value["stopReason"].as_str()) != Some("stop") { return CommandResult::Error(format!("plain stream = {plain:?}")); }
+        ctx.notify("model-callbacks=ok", "info");
+        CommandResult::Ok
+    });
+    ext.command(
+        "liveness_host_call",
+        "Exercise an awaited host call",
+        |ctx, _args| match ctx.wait_for_idle() {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // io_wait and io_wait_settled wait on a plain TCP read: they dial the address they get, announce themselves with a "waiting" line and return when the peer writes a line.
+    ext.command(
+        "io_wait",
+        "Wait on a socket read",
+        |_ctx, args| match io_wait(args) {
+            Ok(()) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "io_wait_name",
+        "Make the session_info_changed handler wait on a socket read",
+        |_ctx, args| {
+            *NAME_WAIT_ADDR.lock().unwrap() = args.to_string();
+            CommandResult::Ok
+        },
+    );
+    // io_wait_input and io_wait_start subscribe an input / before_agent_start handler that waits on a socket read first and then notifies "<event>:<text or prompt>".
+    for (command, event, member) in [
+        ("io_wait_input", "input", "text"),
+        ("io_wait_start", "before_agent_start", "prompt"),
+    ] {
+        let subscriber = ext.event_subscriber();
+        ext.command(
+            command,
+            "Make an input or before_agent_start handler wait on a socket read",
+            move |_ctx, args| {
+                let addr = args.to_string();
+                let subscription = subscribe(&subscriber, event, move |ctx, data| {
+                    io_wait(&addr).map_err(|err| err.to_string())?;
+                    ctx.notify(
+                        &format!(
+                            "{event}:{}",
+                            data.get(member).and_then(Value::as_str).unwrap_or("")
+                        ),
+                        "info",
+                    );
+                    Ok(None)
+                });
+                // The handler stays subscribed for the life of the extension.
+                std::mem::forget(subscription);
+                CommandResult::Ok
+            },
+        );
+    }
+    let io_wait_subscriber = ext.event_subscriber();
+    let io_wait_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "io_wait_settled",
+        "Make agent_settled wait on a socket read",
+        move |_ctx, args| {
+            let addr = args.to_string();
+            let subscription = io_wait_subscriber.on_event("agent_settled", move |_ctx, _data| {
+                io_wait(&addr).map_err(|err| err.to_string())?;
+                Ok(None)
+            });
+            io_wait_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "liveness_user_call",
+        "Exercise an interactive host call",
+        |ctx, _args| match ctx.input("Question", "Answer") {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "liveness_fire_call",
+        "Exercise a no-result UI host call",
+        |ctx, _args| {
+            ctx.set_title("Conformance title");
+            CommandResult::Ok
+        },
+    );
+    ext.command("command_error", "Return a command error", |_ctx, _args| {
+        CommandResult::Error("command exploded".to_string())
+    });
+    ext.command(
+        "command_awaited_error",
+        "Return an error after awaited work",
+        |_ctx, _args| {
+            thread::sleep(Duration::from_millis(150));
+            CommandResult::Error("awaited command exploded".to_string())
+        },
+    );
+    ext.command(
+        "surface_footer",
+        "Install a footer renderer",
+        |ctx, _args| match ctx
+            .set_footer_renderer(Some(|width: u32| vec![format!("footer@{width}")]))
+        {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+    );
+    ext.command(
+        "surface_header",
+        "Install a header renderer",
+        |ctx, _args| match ctx
+            .set_header_renderer(Some(|width: u32| vec![format!("header@{width}")]))
+        {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+    );
+    ext.command(
+        "surface_static_footer",
+        "Push static footer rows",
+        |ctx, _args| match ctx.set_footer(vec![format!("static@{}", ctx.width())]) {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+    );
+    ext.command(
+        "surface_static_header",
+        "Push static header rows",
+        |ctx, _args| match ctx.set_header(vec![format!("static@{}", ctx.width())]) {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+    );
+    ext.command(
+        "surface_widget_value",
+        "Set the string list widget through the JSON content form",
+        |ctx, _args| match ctx.set_widget_value(
+            "wide",
+            serde_json::json!([format!("{} tail", "A".repeat(60)), "short"]),
+            None,
+        ) {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+    );
+    ext.command(
+        "surface_widget",
+        "Set a string list widget wider than the pane",
+        |ctx, _args| match ctx.set_widget(
+            "wide",
+            vec![format!("{} tail", "A".repeat(60)), "short".to_string()],
+        ) {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+    );
+    // pi.on called after the extension connected returns an unsubscribe (conformance TestConformance_EventUnsubscribe): the
+    // handler reports the event's own message entry id, which no SDK fallback produces.
+    let event_probe: Arc<Mutex<Option<pig_sdk::EventSubscription>>> = Arc::new(Mutex::new(None));
+    let event_probe_for_subscribe = event_probe.clone();
+    let event_subscriber = ext.event_subscriber();
+    ext.command(
+        "event_probe_subscribe",
+        "Subscribe to turn_end after connecting",
+        move |_ctx, _args| {
+            let subscription = event_subscriber.on_event("turn_end", |ctx, data| {
+                ctx.notify(
+                    &format!(
+                        "event_probe:{}",
+                        data["messageEntryId"].as_str().unwrap_or("")
+                    ),
+                    "info",
+                );
+                Ok(None)
+            });
+            *event_probe_for_subscribe.lock().unwrap() = Some(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "event_probe_unsubscribe",
+        "Remove the turn_end handler registered after connecting",
+        move |_ctx, _args| {
+            if let Some(subscription) = event_probe.lock().unwrap().take() {
+                subscription.unsubscribe();
+            }
+            CommandResult::Ok
+        },
+    );
+    // D614 plugin UI mounts: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewMounts).
+    fn view_text(ctx: &pig_sdk::Context, suffix: &str) -> kit::View {
+        let n = ctx
+            .view_abilities()
+            .map(|a| a.limits.intent_arg_bytes)
+            .unwrap_or(0);
+        kit::View::new(kit::Text::new(format!("fixture-view-{n}{suffix}"), 0, 0))
+    }
+    fn view_mount(
+        key: &str,
+        view: kit::View,
+        intents: Vec<pig_sdk::ViewIntent>,
+    ) -> pig_sdk::ViewMount {
+        pig_sdk::ViewMount {
+            key: key.into(),
+            slot: "panel".into(),
+            title: String::new(),
+            target: None,
+            view,
+            intents,
+            assets: vec![],
+            fallback: None,
+            alternatives: vec![],
+            drawing: None,
+            a11y: vec![],
+            focus: vec![],
+            bindings: vec![],
+        }
+    }
+    ext.command(
+        "ui_view_abilities",
+        "Report the replicated client abilities",
+        |ctx, _args| {
+            match ctx.view_abilities() {
+                None => ctx.notify("view-abilities:none", "info"),
+                Some(ab) => ctx.notify(
+                    &format!(
+                        "view-abilities:mounts={},argbytes={},slots={},nodes={},markdown={}",
+                        ab.limits.mounts,
+                        ab.limits.intent_arg_bytes,
+                        ab.slots.join("+"),
+                        ab.nodes.join("+"),
+                        ab.markdown
+                    ),
+                    "info",
+                ),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_probe",
+        "Mount, update, hide, show, finish and remove a view",
+        |ctx, _args| {
+            let code = |r: Result<pig_sdk::ViewStatus, pig_sdk::ViewError>| match r {
+                Ok(_) => "none".to_string(),
+                Err(e) => e.code,
+            };
+            let st = match ctx.mount_view(view_mount("probe", view_text(ctx, ""), vec![])) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(
+                &format!(
+                    "view-mounted:epoch={},rev={},state={}",
+                    st.mount.epoch, st.mount.rev, st.state
+                ),
+                "info",
+            );
+            let first = st.mount.clone();
+            let st = match ctx.update_view(pig_sdk::ViewUpdate {
+                mount: first.clone(),
+                title: String::new(),
+                view: view_text(ctx, "-2"),
+                intents: vec![],
+                assets: vec![],
+                fallback: None,
+                alternatives: vec![],
+                drawing: None,
+                a11y: vec![],
+                focus: vec![],
+                bindings: vec![],
+            }) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-updated:rev={}", st.mount.rev), "info");
+            let stale = ctx.update_view(pig_sdk::ViewUpdate {
+                mount: first,
+                title: String::new(),
+                view: view_text(ctx, "-stale"),
+                intents: vec![],
+                assets: vec![],
+                fallback: None,
+                alternatives: vec![],
+                drawing: None,
+                a11y: vec![],
+                focus: vec![],
+                bindings: vec![],
+            });
+            ctx.notify(&format!("view-stale:{}", code(stale)), "info");
+            let cur = st.mount.clone();
+            for (op, label) in [
+                ("hide", "view-hidden"),
+                ("show", "view-shown"),
+                ("finish", "view-finished"),
+            ] {
+                let r = match op {
+                    "hide" => ctx.hide_view(&cur),
+                    "show" => ctx.show_view(&cur),
+                    _ => ctx.finish_view(&cur),
+                };
+                match r {
+                    Ok(st) => ctx.notify(&format!("{label}:{}", st.state), "info"),
+                    Err(e) => return CommandResult::Error(e.to_string()),
+                }
+            }
+            ctx.notify(
+                &format!("view-terminal:{}", code(ctx.remove_view(&cur))),
+                "info",
+            );
+            match ctx.view_state("probe") {
+                Ok(st) => ctx.notify(&format!("view-final:{}", st.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            let int = pig_sdk::ViewShape::new("integer");
+            let intents = vec![
+                pig_sdk::ViewIntent {
+                    name: "fx.add".into(),
+                    arg: pig_sdk::ViewShape::object(&[("n", int.clone())], &["n"]),
+                    answer: Some(pig_sdk::ViewShape::object(&[("sum", int)], &["sum"])),
+                    ..Default::default()
+                },
+                pig_sdk::ViewIntent {
+                    name: "fx.wait".into(),
+                    arg: pig_sdk::ViewShape::object(
+                        &[("tag", pig_sdk::ViewShape::new("string"))],
+                        &["tag"],
+                    ),
+                    cancellable: true,
+                    timeout_ms: 5000,
+                    ..Default::default()
+                },
+            ];
+            match ctx.mount_view(view_mount("probe2", view_text(ctx, "-live"), intents)) {
+                Ok(st) => ctx.notify(
+                    &format!("view-second:epoch={},rev={}", st.mount.epoch, st.mount.rev),
+                    "info",
+                ),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_cancelled",
+        "Report the intent whose handler was cancelled",
+        |ctx, _args| {
+            let tag = VIEW_CANCELLED_TAG.lock().unwrap().clone();
+            ctx.notify(&format!("intent-cancelled:{tag}"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_state",
+        "Report the state of the second mount",
+        |ctx, _args| match ctx.view_state("probe2") {
+            Ok(st) => {
+                ctx.notify(&format!("view-state:{}:{}", st.state, st.reason), "info");
+                CommandResult::Ok
+            }
+            Err(e) => CommandResult::Error(e.to_string()),
+        },
+    );
+    // D614 amendment: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewExtras).
+    fn x_claim<'a>(claims: &'a [pig_sdk::ViewClaim], name: &str) -> Option<&'a Value> {
+        claims.iter().find(|c| c.name == name).map(|c| &c.value)
+    }
+    fn x_picked(ab: &pig_sdk::ViewAbilities) -> i64 {
+        ab.slot_claims
+            .iter()
+            .find(|s| s.slot == "panel")
+            .and_then(|s| x_claim(&s.claims, "display.colors"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+    fn x_list(id: &str, label: &str) -> kit::View {
+        kit::View::new(kit::SelectList::new(
+            id,
+            vec![kit::SelectItem::new(id, label)],
+            5,
+        ))
+    }
+    fn x_rects(n: u64) -> Vec<pig_sdk::ViewDrawShape> {
+        (0..n)
+            .map(|_| pig_sdk::ViewDrawShape {
+                kind: "rect".into(),
+                width: 1.0,
+                height: 1.0,
+                ..Default::default()
+            })
+            .collect()
+    }
+    fn x_scene(shapes: Vec<pig_sdk::ViewDrawShape>) -> Option<pig_sdk::ViewDrawing> {
+        Some(pig_sdk::ViewDrawing {
+            profile: "scene".into(),
+            shapes,
+            ..Default::default()
+        })
+    }
+    fn x_code<T>(r: Result<T, pig_sdk::ViewError>) -> String {
+        match r {
+            Ok(_) => "none".into(),
+            Err(e) => e.code,
+        }
+    }
+    fn x_update(mount: &pig_sdk::ViewRef) -> pig_sdk::ViewUpdate {
+        pig_sdk::ViewUpdate {
+            mount: mount.clone(),
+            title: String::new(),
+            view: x_list("base", "fixture-x-base"),
+            intents: vec![],
+            assets: vec![],
+            fallback: None,
+            alternatives: vec![],
+            drawing: None,
+            a11y: vec![],
+            focus: vec![],
+            bindings: vec![],
+        }
+    }
+    fn x_when(claim: &str, op: &str, value: Option<Value>) -> pig_sdk::ViewWhen {
+        pig_sdk::ViewWhen {
+            any: vec![pig_sdk::ViewWhenAll {
+                all: vec![pig_sdk::ViewClause {
+                    claim: claim.into(),
+                    op: op.into(),
+                    value,
+                }],
+            }],
+        }
+    }
+    ext.command(
+        "ui_view_extras",
+        "Mount a view with alternatives, a drawing, a11y and focus, and probe the bounds",
+        |ctx, _args| {
+            let Some(ab) = ctx.view_abilities() else { return CommandResult::Error("no client".into()) };
+            let Some(drawing) = ab.drawing.clone() else { return CommandResult::Error("no drawing abilities".into()) };
+            let picked = x_picked(&ab);
+            let text = |name: &str| x_claim(&ab.claims, name).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_default();
+            let gestures: Vec<String> =
+                x_claim(&ab.claims, "input.gestures").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+            ctx.notify(
+                &format!(
+                    "view-x-claims:colors={},kind={},gestures={},hover={},panel.colors={},profiles={},shapes={},pixels={}",
+                    text("display.colors"),
+                    text("display.kind"),
+                    gestures.join("+"),
+                    text("display.hover"),
+                    picked,
+                    drawing.profiles.join("+"),
+                    drawing.shapes,
+                    drawing.pixels
+                ),
+                "info",
+            );
+            let mut alt_drawing = x_scene(x_rects(drawing.shapes - 1));
+            if let Some(d) = alt_drawing.as_mut() {
+                d.regions = vec![pig_sdk::ViewRegion {
+                    key: "r".into(),
+                    shape: pig_sdk::ViewDrawShape { kind: "rect".into(), width: 4.0, height: 4.0, ..Default::default() },
+                    gestures: vec!["activate".into()],
+                    intent: "fx.tap".into(),
+                    name: "Tap".into(),
+                    ..Default::default()
+                }];
+            }
+            let st = match ctx.mount_view(pig_sdk::ViewMount {
+                key: "extras".into(),
+                slot: "panel".into(),
+                title: String::new(),
+                target: None,
+                view: x_list("base", "fixture-x-base"),
+                intents: vec![pig_sdk::ViewIntent { name: "fx.tap".into(), arg: pig_sdk::ViewShape::new("object"), ..Default::default() }],
+                assets: vec![],
+                fallback: None,
+                alternatives: vec![pig_sdk::ViewAlternative {
+                    when: x_when("display.colors", "equals", Some(json!(picked))),
+                    view: x_list("alt", &format!("fixture-x-alt-{picked}")),
+                    drawing: alt_drawing,
+                }],
+                drawing: None,
+                a11y: vec![
+                    pig_sdk::ViewA11y {
+                        node: "alt".into(),
+                        name: format!("Extras {picked}"),
+                        role: "button".into(),
+                        checked: Some(true),
+                        relations: vec![pig_sdk::ViewRelation { kind: "describedBy".into(), target: "base".into() }],
+                        ..Default::default()
+                    },
+                    pig_sdk::ViewA11y { node: "base".into(), name: "Base".into(), ..Default::default() },
+                ],
+                focus: vec![pig_sdk::ViewFocus { node: "alt".into(), request: "mount".into(), restore: "previous".into() }],
+                bindings: vec![],
+            }) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-x-mounted:{}", st.state), "info");
+            let attempt = |label: &str, update: pig_sdk::ViewUpdate| ctx.notify(&format!("view-x-{label}:{}", x_code(ctx.update_view(update))), "info");
+            let mut update = x_update(&st.mount);
+            update.alternatives = (0..9).map(|_| pig_sdk::ViewAlternative { when: x_when("display.hover", "present", None), view: x_list("base", "fixture-x-base"), drawing: None }).collect();
+            attempt("alts", update);
+            let mut nested = pig_sdk::ViewDrawShape { kind: "rect".into(), width: 1.0, height: 1.0, ..Default::default() };
+            for _ in 0..8 {
+                nested = pig_sdk::ViewDrawShape { kind: "group".into(), children: vec![nested], ..Default::default() };
+            }
+            let mut update = x_update(&st.mount);
+            update.drawing = x_scene(vec![nested]);
+            attempt("nest", update);
+            let mut update = x_update(&st.mount);
+            update.drawing = x_scene(vec![pig_sdk::ViewDrawShape {
+                kind: "polyline".into(),
+                points: (0..1025).map(|i| pig_sdk::ViewPoint { x: f64::from(i), y: f64::from(i) }).collect(),
+                ..Default::default()
+            }]);
+            attempt("points", update);
+            let mut update = x_update(&st.mount);
+            update.drawing = x_scene(x_rects(4097));
+            attempt("shapes", update);
+            let mut update = x_update(&st.mount);
+            update.a11y = (0..257).map(|i| pig_sdk::ViewA11y { node: format!("n{i}"), ..Default::default() }).collect();
+            attempt("a11y", update);
+            let mut update = x_update(&st.mount);
+            update.drawing = x_scene(x_rects(drawing.shapes + 1));
+            attempt("over", update);
+            let mut update = x_update(&st.mount);
+            update.drawing = Some(pig_sdk::ViewDrawing {
+                profile: "pixels".into(),
+                pixels: Some(pig_sdk::ViewPixels { width: 2, height: 2, asset: "img".into(), scaling: "nearest".into() }),
+                ..Default::default()
+            });
+            update.assets = vec![pig_sdk::ViewAsset { id: "img".into(), mime: "image/png".into(), size: 4, sha256: "a".repeat(64), delivery: "inline".into() }];
+            attempt("pixels", update);
+            let mut old = st.mount.clone();
+            old.rev += 50;
+            let mut stale = String::from("none");
+            for _ in 0..3 {
+                stale = x_code(ctx.update_view(x_update(&old)));
+            }
+            ctx.notify(&format!("view-x-stale:{stale}"), "info");
+            let notices = match ctx.view_diagnostics("extras") {
+                Ok(n) => n,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            let count = |code: &str| notices.iter().filter(|n| n.code == code && n.path == "update").map(|n| n.count).sum::<u64>();
+            ctx.notify(&format!("view-x-diag:invalid={},limit={},unsupported={},stale={}", count("invalid"), count("limit"), count("unsupported"), count("stale")), "info");
+            ctx.notify(&format!("view-x-bigresult:{}", x_code(ctx.finish_view_with(&st.mount, json!("r".repeat(65536))))), "info");
+            CommandResult::Ok
+        },
+    );
+    // D614 bindings: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewBindings).
+    fn b_intents() -> Vec<pig_sdk::ViewIntent> {
+        vec![
+            pig_sdk::ViewIntent {
+                name: "fx.go".into(),
+                arg: pig_sdk::ViewShape::object(
+                    &[("n", pig_sdk::ViewShape::new("integer"))],
+                    &["n"],
+                ),
+                ..Default::default()
+            },
+            pig_sdk::ViewIntent {
+                name: "fx.tap".into(),
+                arg: pig_sdk::ViewShape::new("object"),
+                ..Default::default()
+            },
+        ]
+    }
+    fn b_go(key: &str, n: Value) -> pig_sdk::ViewBinding {
+        pig_sdk::ViewBinding {
+            key: key.into(),
+            intent: "fx.go".into(),
+            arg: Some(json!({ "n": n })),
+            ..Default::default()
+        }
+    }
+    fn b_tap(key: &str) -> pig_sdk::ViewBinding {
+        pig_sdk::ViewBinding {
+            key: key.into(),
+            intent: "fx.tap".into(),
+            ..Default::default()
+        }
+    }
+    ext.command(
+        "ui_view_bindings",
+        "Mount a view with bindings and probe what the host refuses",
+        |ctx, args| {
+            let Some((key, number)) = args.split_once(' ') else {
+                return CommandResult::Error("want a key and a number".into());
+            };
+            let Ok(n) = number.parse::<i64>() else {
+                return CommandResult::Error("want a number".into());
+            };
+            let mut mount = view_mount("bind", view_text(ctx, "-bind"), b_intents());
+            mount.bindings = vec![
+                pig_sdk::ViewBinding {
+                    name: format!("Go {n}"),
+                    ..b_go(key, json!(n))
+                },
+                b_go("w", json!(n + 1)),
+                pig_sdk::ViewBinding {
+                    gesture: "swipe-left".into(),
+                    intent: "fx.tap".into(),
+                    ..Default::default()
+                },
+            ];
+            let st = match ctx.mount_view(mount) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-b-mounted:{}", st.state), "info");
+            let attempt = |label: &str, bindings: Vec<pig_sdk::ViewBinding>| {
+                let mut update = x_update(&st.mount);
+                update.view = view_text(ctx, "-bind");
+                update.intents = b_intents();
+                update.bindings = bindings;
+                ctx.notify(
+                    &format!("view-b-{label}:{}", x_code(ctx.update_view(update))),
+                    "info",
+                );
+            };
+            attempt(
+                "many",
+                "abcdefghijklmnopqrstuvwxyz0123456"
+                    .chars()
+                    .map(|c| b_tap(&c.to_string()))
+                    .collect(),
+            );
+            attempt("reserved", vec![b_tap("shift+tab")]);
+            attempt("order", vec![b_tap("ctrl+shift+p"), b_tap("shift+ctrl+p")]);
+            attempt(
+                "gesture",
+                vec![pig_sdk::ViewBinding {
+                    gesture: "pinch".into(),
+                    intent: "fx.tap".into(),
+                    ..Default::default()
+                }],
+            );
+            attempt("arg", vec![b_go("a", json!("x"))]);
+            attempt(
+                "ok",
+                vec![
+                    b_go("ctrl+shift+p", json!(n)),
+                    b_go("shift+ctrl+q", json!(n + 1)),
+                ],
+            );
+            CommandResult::Ok
+        },
+    );
+    // D614 slot dialog: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDialog).
+    ext.command(
+        "ui_view_dialog",
+        "Mount a titled view with a bound key in the dialog slot, hide it and show it",
+        |ctx, args| {
+            let Some((key, number)) = args.split_once(' ') else {
+                return CommandResult::Error("want a key and a number".into());
+            };
+            let Ok(n) = number.parse::<i64>() else {
+                return CommandResult::Error("want a number".into());
+            };
+            let int = pig_sdk::ViewShape::new("integer");
+            let mut mount = view_mount(
+                "dlg",
+                view_text(ctx, "-dlg"),
+                vec![pig_sdk::ViewIntent {
+                    name: "fx.add".into(),
+                    arg: pig_sdk::ViewShape::object(&[("n", int.clone())], &["n"]),
+                    answer: Some(pig_sdk::ViewShape::object(&[("sum", int)], &["sum"])),
+                    ..Default::default()
+                }],
+            );
+            mount.slot = "dialog".into();
+            mount.title = format!("Chart {n}");
+            mount.bindings = vec![pig_sdk::ViewBinding {
+                key: key.into(),
+                intent: "fx.add".into(),
+                arg: Some(json!({ "n": n })),
+                ..Default::default()
+            }];
+            let st = match ctx.mount_view(mount) {
+                Ok(st) => st,
+                Err(e) => {
+                    ctx.notify(&format!("view-d-mounted:{}", e.code), "info");
+                    return CommandResult::Ok;
+                }
+            };
+            ctx.notify(&format!("view-d-mounted:{}", st.state), "info");
+            match ctx.hide_view(&st.mount) {
+                Ok(hidden) => ctx.notify(&format!("view-d-hidden:{}", hidden.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            match ctx.show_view(&st.mount) {
+                Ok(shown) => ctx.notify(&format!("view-d-shown:{}", shown.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    // D614 dismiss: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDismiss).
+    ext.command(
+        "ui_view_dismiss",
+        "Mount a dialog with a dismiss intent and probe what the host refuses",
+        |ctx, args| {
+            let tap = || pig_sdk::ViewIntent {
+                name: "fx.tap".into(),
+                arg: pig_sdk::ViewShape::new("object"),
+                ..Default::default()
+            };
+            let closing = |name: &str| pig_sdk::ViewIntent {
+                name: name.into(),
+                arg: pig_sdk::ViewShape::new("object"),
+                dismiss: true,
+                ..Default::default()
+            };
+            let mut mount = view_mount(
+                "dismiss",
+                view_text(ctx, "-dismiss"),
+                vec![tap(), closing(args)],
+            );
+            mount.slot = "dialog".into();
+            let st = match ctx.mount_view(mount) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-d-mounted:{}", st.state), "info");
+            let attempt = |label: &str, intents: Vec<pig_sdk::ViewIntent>| {
+                let mut update = x_update(&st.mount);
+                update.view = view_text(ctx, "-dismiss");
+                update.intents = intents;
+                ctx.notify(
+                    &format!("view-d-{label}:{}", x_code(ctx.update_view(update))),
+                    "info",
+                );
+            };
+            attempt(
+                "two",
+                vec![tap(), closing(args), closing(&format!("{args}2"))],
+            );
+            attempt(
+                "node",
+                vec![
+                    tap(),
+                    pig_sdk::ViewIntent {
+                        node_key: "n".into(),
+                        ..closing(args)
+                    },
+                ],
+            );
+            attempt(
+                "arg",
+                vec![
+                    tap(),
+                    pig_sdk::ViewIntent {
+                        arg: pig_sdk::ViewShape::object(
+                            &[("value", pig_sdk::ViewShape::new("string"))],
+                            &["value"],
+                        ),
+                        ..closing(args)
+                    },
+                ],
+            );
+            attempt("ok", vec![closing(args), tap()]);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "ui_view_extras_end",
+        "Read the notices of the extras mount and finish it with a result",
+        |ctx, _args| {
+            let Some(ab) = ctx.view_abilities() else {
+                return CommandResult::Error("no client".into());
+            };
+            let picked_of = |st: &pig_sdk::ViewStatus| {
+                st.result
+                    .as_ref()
+                    .and_then(|r| r.get("picked"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            };
+            let run = || -> Result<(), pig_sdk::ViewError> {
+                let st = ctx.view_state("extras")?;
+                let notices = ctx.view_diagnostics("extras")?;
+                ctx.notify(
+                    &format!(
+                        "view-x-diag2:n={},last={}",
+                        notices.len(),
+                        notices.last().map(|n| n.path.as_str()).unwrap_or("")
+                    ),
+                    "info",
+                );
+                let done = ctx.finish_view_with(&st.mount, json!({"picked": x_picked(&ab)}))?;
+                ctx.notify(
+                    &format!("view-x-finished:{},picked={}", done.state, picked_of(&done)),
+                    "info",
+                );
+                let cur = ctx.view_state("extras")?;
+                ctx.notify(
+                    &format!("view-x-state:{},picked={}", cur.state, picked_of(&cur)),
+                    "info",
+                );
+                Ok(())
+            };
+            match run() {
+                Ok(()) => CommandResult::Ok,
+                Err(e) => CommandResult::Error(e.to_string()),
+            }
+        },
+    );
+    register_view_rows(&mut ext);
+    // D614: a view an agent's tool shows. The command registers the tool; the tool mounts a titled panel, hides it,
+    // shows it and updates it with a focus request, the same way in every SDK fixture (conformance
+    // TestConformance_UIViewToolShowsAndFocuses).
+    // D521: bigint_tool registers a tool whose schema declares a bigint parameter and answers the kind of value it receives for it and the value.
+    ext.command(
+        "bigint_tool",
+        "Register the tool that reports what a bigint argument arrives as",
+        |ctx, _args| {
+            let tool = ToolDefinition::new(
+                "bigint_arg",
+                "bigint_arg",
+                "Report the kind and value of n",
+                json!({"type": "object", "required": ["n"], "properties": {"n": {"type": "bigint"}}}),
+                |_ctx, params| {
+                    let value = params.get("n").cloned().unwrap_or(Value::Null);
+                    let kind = if value.is_string() { "string" } else { "other" };
+                    let shown = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                    ToolResult::text(format!("{kind}:{shown}"))
+                },
+            );
+            match ctx.register_tool(tool) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "ui_view_tool",
+        "Register the tool that shows a titled view",
+        |ctx, _args| {
+            let tool = ToolDefinition::new(
+                "view_show",
+                "view_show",
+                "Mount, show and focus a titled view",
+                json!({"type": "object"}),
+                |ctx, params| {
+                    let text = |name: &str| {
+                        params
+                            .get(name)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let (title, node) = (text("title"), text("node"));
+                    let run = || -> Result<String, pig_sdk::ViewError> {
+                        if text("op") == "hide" {
+                            let st = ctx.hide_view(&ctx.view_state("shown")?.mount)?;
+                            return Ok(format!("view-tool:{}", st.state));
+                        }
+                        let intents = || {
+                            vec![
+                                pig_sdk::ViewIntent {
+                                    name: "fx.reopen".into(),
+                                    arg: pig_sdk::ViewShape::new("object"),
+                                    when_hidden: true,
+                                    ..Default::default()
+                                },
+                                pig_sdk::ViewIntent {
+                                    name: "fx.tap".into(),
+                                    arg: pig_sdk::ViewShape::new("object"),
+                                    ..Default::default()
+                                },
+                            ]
+                        };
+                        let focus = |request: &str| {
+                            vec![pig_sdk::ViewFocus {
+                                node: node.clone(),
+                                request: request.into(),
+                                ..Default::default()
+                            }]
+                        };
+                        let st = ctx.mount_view(pig_sdk::ViewMount {
+                            key: "shown".into(),
+                            slot: "panel".into(),
+                            title: title.clone(),
+                            target: None,
+                            view: x_list(&node, "fixture-shown"),
+                            intents: intents(),
+                            assets: vec![],
+                            fallback: None,
+                            alternatives: vec![],
+                            drawing: None,
+                            a11y: vec![],
+                            focus: focus(""),
+                            bindings: vec![],
+                        })?;
+                        let st = ctx.hide_view(&st.mount)?;
+                        let st = ctx.show_view(&st.mount)?;
+                        let st = ctx.update_view(pig_sdk::ViewUpdate {
+                            mount: st.mount,
+                            title: format!("{title}/2"),
+                            view: x_list(&node, "fixture-shown"),
+                            intents: intents(),
+                            assets: vec![],
+                            fallback: None,
+                            alternatives: vec![],
+                            drawing: None,
+                            a11y: vec![],
+                            focus: focus("update"),
+                            bindings: vec![],
+                        })?;
+                        Ok(format!("view-tool:{},rev={}", st.state, st.mount.rev))
+                    };
+                    match run() {
+                        Ok(text) => ToolResult::text(text),
+                        Err(e) => ToolResult::Error(e.to_string()),
+                    }
+                },
+            );
+            match ctx.register_tool(tool) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // D614 grid node: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewGrid). The
+    // argument is the row's token: the cell values, the selection and one chip text are built from it.
+    fn g_mount(tok: &str, grid: kit::Grid) -> pig_sdk::ViewMount {
+        pig_sdk::ViewMount {
+            fallback: Some(kit::Text::new(format!("grid-fallback {tok}"), 0, 0).into()),
+            ..view_mount(
+                "grid",
+                kit::View::new(
+                    Container::new()
+                        .child(kit::Text::new(format!("Month {tok}"), 0, 0))
+                        .child(grid),
+                ),
+                vec![pig_sdk::ViewIntent {
+                    name: "fx.pick".into(),
+                    node_key: "month".into(),
+                    arg: pig_sdk::ViewShape::object(
+                        &[("value", pig_sdk::ViewShape::new("string"))],
+                        &["value"],
+                    ),
+                    ..Default::default()
+                }],
+            )
+        }
+    }
+    ext.command(
+        "ui_view_grid",
+        "Mount a month as a grid and probe the bounds of the grid",
+        |ctx, args| {
+            let tok = args.trim();
+            let mut cells = vec![
+                kit::GridCell::new().label("30").dim(true),
+                kit::GridCell::new().label("31").dim(true),
+            ];
+            for d in 1..=28 {
+                let cell = kit::GridCell::new().value(format!("{tok}-{d}"));
+                let cell = if d == 28 {
+                    cell
+                } else {
+                    cell.label(d.to_string())
+                };
+                cells.push(match d {
+                    1 => cell
+                        .chip(kit::GridChip::new(format!("{tok} standup")).color("#3366cc"))
+                        .chip(kit::GridChip::new("lunch").color("accent"))
+                        .more(2),
+                    2 => cell.mark("current").color("#ff000080"),
+                    3 => cell.chip(kit::GridChip::new("plain")),
+                    _ => cell,
+                });
+            }
+            let month = kit::Grid::new("month", 7, cells)
+                .head(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"])
+                .chip_rows(2)
+                .selected(format!("{tok}-2"));
+            let st = match ctx.mount_view(g_mount(tok, month)) {
+                Ok(st) => st,
+                Err(e) => return CommandResult::Error(e.to_string()),
+            };
+            ctx.notify(&format!("view-g-mounted:{}", st.state), "info");
+            let attempt = |label: &str, columns: u32, cells: Vec<kit::GridCell>| {
+                let m = g_mount(tok, kit::Grid::new("month", columns, cells));
+                let update = pig_sdk::ViewUpdate {
+                    mount: st.mount.clone(),
+                    title: String::new(),
+                    view: m.view,
+                    intents: m.intents,
+                    assets: vec![],
+                    fallback: m.fallback,
+                    alternatives: vec![],
+                    drawing: None,
+                    a11y: vec![],
+                    focus: vec![],
+                    bindings: vec![],
+                };
+                ctx.notify(
+                    &format!("view-g-{label}:{}", x_code(ctx.update_view(update))),
+                    "info",
+                );
+            };
+            attempt("cells", 7, vec![kit::GridCell::new().label("x"); 129]);
+            let mut crowded = kit::GridCell::new().value("a");
+            for _ in 0..9 {
+                crowded = crowded.chip(kit::GridChip::new("c"));
+            }
+            attempt("chips", 7, vec![crowded]);
+            attempt("columns", 17, vec![kit::GridCell::new().value("a")]);
+            attempt("mark", 7, vec![kit::GridCell::new().value("a").mark(tok)]);
+            match ctx.view_state("grid") {
+                Ok(cur) => ctx.notify(
+                    &format!("view-g-state:{},rev={}", cur.state, cur.mount.rev),
+                    "info",
+                ),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    // D614 node ids: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewNodeIds). The
+    // argument is the row's token: the ids of the container, the text and the box are built from it.
+    ext.command(
+        "ui_view_node_ids",
+        "Mount a view whose container, text and box carry an id",
+        |ctx, args| {
+            let tok = args.trim();
+            let root = Container::new()
+                .id(format!("{tok}-root"))
+                .child(
+                    kit::Text::new(format!("Label {tok}"), 0, 0)
+                        .id(format!("{tok}-label"))
+                        .bg("selectedBg"),
+                )
+                .child(
+                    kit::Box::new(1, 0)
+                        .id(format!("{tok}-frame"))
+                        .bg("toolPendingBg")
+                        .child(kit::Text::new("inside", 0, 0)),
+                );
+            let mut mount = view_mount("ids", kit::View::new(root), vec![]);
+            mount.a11y = vec![pig_sdk::ViewA11y {
+                node: format!("{tok}-label"),
+                name: format!("Label {tok}"),
+                ..Default::default()
+            }];
+            match ctx.mount_view(mount) {
+                Ok(st) => ctx.notify(&format!("view-i-mounted:{}", st.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    // D614 image id: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewImageID). The argument is the row's token and a Kitty image id only that row uses: the image node carries both, its bytes are the token's.
+    ext.command(
+        "ui_view_image_id",
+        "Mount a view whose image node carries a Kitty image id",
+        |ctx, args| {
+            let Some((tok, number)) = args.trim().split_once(' ') else {
+                return CommandResult::Error("want a token and an image id".into());
+            };
+            let Ok(number) = number.parse::<u32>() else {
+                return CommandResult::Error("the image id is not a number".into());
+            };
+            let image = kit::Image::new(format!("pig-image-{tok}").into_bytes(), "image/png")
+                .id(format!("{tok}-photo"))
+                .image_id(number)
+                .filename(format!("{tok}.png"));
+            match ctx.mount_view(view_mount("image-id", kit::View::new(image), vec![])) {
+                Ok(st) => ctx.notify(&format!("view-m-mounted:{}", st.state), "info"),
+                Err(e) => return CommandResult::Error(e.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.on_view_intent(|inv| match inv.intent.as_str() {
+        // The user dismissed the dialog: the client raised the intent with {}, and its handler removes the mount.
+        name if name.starts_with("fx.close-") => {
+            if inv.arg != json!({}) {
+                return pig_sdk::ViewIntentResult::refused("dismiss takes {}");
+            }
+            let removed = inv.context.remove_view(&pig_sdk::ViewRef {
+                key: inv.mount.key.clone(),
+                epoch: inv.mount.epoch,
+                rev: inv.rev,
+            });
+            match removed {
+                Ok(_) => pig_sdk::ViewIntentResult::done(json!({})),
+                Err(e) => pig_sdk::ViewIntentResult::failed(&e.to_string()),
+            }
+        }
+        "fx.redraw" | "fx.foreign" => redraw_intent(&inv),
+        // The user opened the hidden view: its handler shows it.
+        "fx.reopen" => {
+            let shown = inv.context.show_view(&pig_sdk::ViewRef {
+                key: inv.mount.key.clone(),
+                epoch: inv.mount.epoch,
+                rev: inv.rev,
+            });
+            match shown {
+                Ok(_) => pig_sdk::ViewIntentResult::done(json!({})),
+                Err(e) => pig_sdk::ViewIntentResult::failed(&e.to_string()),
+            }
+        }
+        "fx.pick" => pig_sdk::ViewIntentResult::done(json!({
+            "node": inv.node_key,
+            "picked": inv.arg.get("value").and_then(Value::as_str).unwrap_or(""),
+        })),
+        "fx.add" => {
+            let n = inv.arg.get("n").and_then(Value::as_i64).unwrap_or(0);
+            let extra = inv
+                .context
+                .view_abilities()
+                .map(|a| a.limits.intent_arg_bytes as i64)
+                .unwrap_or(0);
+            pig_sdk::ViewIntentResult::done(json!({"sum": n * 2 + extra}))
+        }
+        "fx.wait" => {
+            let tag = inv
+                .arg
+                .get("tag")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            inv.context.notify(&format!("intent-started:{tag}"), "info");
+            while !inv.context.is_cancelled() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            // A call made after the cancel is cancelled with its request, so the tag is kept for ui_view_cancelled.
+            *VIEW_CANCELLED_TAG.lock().unwrap() = tag;
+            pig_sdk::ViewIntentResult::done(json!({}))
+        }
+        _ => pig_sdk::ViewIntentResult::refused("unknown intent"),
+    });
+    ext.command(
+        "report_geometry",
+        "Report observed terminal geometry",
+        |ctx, _args| {
+            ctx.notify(
+                &format!("geometry:{}x{}", ctx.width(), ctx.height()),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    // A width handler makes a host call the way any other handler does; the host's reply must reach it (conformance TestConformance_WidthHandlerHostCall).
+    let width_probe = std::sync::Mutex::new(None);
+    ext.command(
+        "arm_width_probe",
+        "Notify from a width handler",
+        move |ctx, _args| {
+            let mut armed = width_probe.lock().unwrap();
+            if armed.is_none() {
+                let retained = ctx.clone();
+                *armed = Some(ctx.on_width_change(move |width| {
+                    retained.notify(&format!("width-probe:{width}"), "info");
+                    retained.notify(&format!("width-probe-returned:{width}"), "info");
+                }));
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command("status", "Set a status entry", |ctx, _args| {
+        ctx.set_status("conformance", "ok");
+        CommandResult::Ok
+    });
+    ext.command(
+        "status_burst",
+        "Set one status repeatedly without awaiting",
+        |ctx, _args| {
+            for i in 0..200 {
+                ctx.set_status("burst", &i.to_string());
+            }
+            CommandResult::Ok
+        },
+    );
+    let term_sub: Arc<Mutex<Option<TerminalInputSubscription>>> = Arc::new(Mutex::new(None));
+    let sub_for_subscribe = term_sub.clone();
+    ext.command(
+        "term_subscribe",
+        "Subscribe to raw terminal input",
+        move |ctx, _args| {
+            let input_ctx = ctx.clone();
+            match ctx.on_terminal_input(move |data: &pig_sdk::JsString| {
+                if matches!(data.as_units(), [0xd83d] | [0xde00] | [0xd83d, 0xde00]) {
+                    let mut units: Vec<u16> = "seen:".encode_utf16().collect();
+                    units.extend_from_slice(data.as_units());
+                    return TerminalInputResult {
+                        consume: false,
+                        data: Some(pig_sdk::JsString::from_units(units)),
+                    };
+                }
+                match data.to_string().as_deref() {
+                    Ok("\x1b[96~") => TerminalInputResult {
+                        consume: false,
+                        data: Some(
+                            serde_json::to_string(&(
+                                input_ctx.get_editor_text().unwrap(),
+                                input_ctx.get_tools_expanded().unwrap(),
+                            ))
+                            .unwrap()
+                            .into(),
+                        ),
+                    },
+                    Ok("\x1b[98~") => TerminalInputResult {
+                        consume: false,
+                        data: Some("rewritten".into()),
+                    },
+                    Ok("\x1b[97~") => {
+                        thread::sleep(Duration::from_millis(200));
+                        TerminalInputResult {
+                            consume: true,
+                            data: None,
+                        }
+                    }
+                    _ => TerminalInputResult {
+                        consume: data == "\x1b[99~",
+                        data: None,
+                    },
+                }
+            }) {
+                Ok(sub) => {
+                    *sub_for_subscribe.lock().unwrap() = Some(sub);
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    let sub_for_release = term_sub.clone();
+    ext.command(
+        "term_unsubscribe",
+        "Release the raw input subscription",
+        move |_ctx, _args| {
+            if let Some(sub) = sub_for_release.lock().unwrap().take() {
+                sub.unsubscribe();
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "send_message",
+        "Send a custom message",
+        |ctx, _args| match ctx.send_message(
+            "notice",
+            "hello-custom",
+            true,
+            Some(true),
+            Some("steer"),
+        ) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "send_message_default",
+        "Send a custom message with default options",
+        |ctx, _args| match ctx.send_message("notice", "default", true, None, None) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "send_message_no_turn",
+        "Send a custom message that never starts a turn",
+        |ctx, _args| match ctx.send_message("notice", "no-turn", true, Some(false), None) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command("send_user_message", "Send a user message", |ctx, args| {
+        let content = if args.is_empty() {
+            serde_json::Value::String("hello-user".into())
+        } else {
+            match serde_json::from_str::<serde_json::Value>(args) {
+                Ok(value) => value,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            }
+        };
+        match ctx.send_user_message(content, "followUp") {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        }
+    });
+    ext.command(
+        "send_user_message_delivery",
+        "Send a user message with the delivery named by the argument",
+        |ctx, args| match ctx.send_user_message(
+            format!("delivery-{args}"),
+            if args == "absent" { "" } else { args },
+        ) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "send_refusal_order",
+        "Send a refused user message and others in one run, as the argument names",
+        |ctx, args| {
+            const FIRST: [(&str, &str); 3] = [
+                ("order-absent", ""),
+                ("order-steer", "steer"),
+                ("order-followUp", "followUp"),
+            ];
+            fn send(ctx: &pig_sdk::Context, items: &[(&str, &str)]) -> CommandResult {
+                for (text, deliver_as) in items {
+                    if let Err(err) = ctx.send_user_message(*text, deliver_as) {
+                        return CommandResult::Error(err.to_string());
+                    }
+                }
+                CommandResult::Ok
+            }
+            fn after_return(
+                ctx: &pig_sdk::Context,
+                items: &'static [(&'static str, &'static str)],
+            ) {
+                let ctx = ctx.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(100));
+                    send(&ctx, items);
+                });
+            }
+            match args {
+                "first" => send(ctx, &FIRST),
+                "between" => send(
+                    ctx,
+                    &[
+                        ("order-absent", ""),
+                        ("order-steer", "steer"),
+                        ("order-absent-2", ""),
+                    ],
+                ),
+                "yielded" => match ctx.yield_now() {
+                    Ok(_) => send(ctx, &FIRST),
+                    Err(err) => CommandResult::Error(err.to_string()),
+                },
+                "throws" => match send(ctx, &FIRST) {
+                    CommandResult::Ok => CommandResult::Error("order-throws".to_string()),
+                    failed => failed,
+                },
+                "blocked" => {
+                    let sent = send(ctx, &FIRST);
+                    thread::sleep(Duration::from_secs(30));
+                    sent
+                }
+                "detached" => {
+                    after_return(ctx, &FIRST);
+                    CommandResult::Ok
+                }
+                "detached_alone" => {
+                    after_return(ctx, &[("order-absent", "")]);
+                    CommandResult::Ok
+                }
+                other => CommandResult::Error(format!("send_refusal_order: unknown case {other}")),
+            }
+        },
+    );
+    ext.command(
+        "send_user_message_expand",
+        "Send a user message with expandPromptTemplates set to the argument",
+        |ctx, args| match ctx.send_user_message_with(
+            "expand-user",
+            "followUp",
+            Some(args == "true"),
+        ) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "settings_probe",
+        "Report the effective settings",
+        |ctx, _args| match ctx.get_settings() {
+            Ok(settings) => {
+                ctx.notify(&format!("settings_probe:{}", settings), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command("model_set", "Switch the model", |ctx, args| {
+        let (ok, _error) = ctx.set_model(args.trim());
+        ctx.notify(&format!("model_set:{}", ok), "info");
+        CommandResult::Ok
+    });
+    ext.command("thinking_set", "Set the thinking level", |ctx, args| {
+        ctx.set_thinking_level(args.trim());
+        CommandResult::Ok
+    });
+    ext.command(
+        "thinking_get",
+        "Report the thinking level",
+        |ctx, _args| match ctx.get_thinking_level() {
+            Ok(level) => {
+                ctx.notify(&format!("thinking_get:{}", level), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    ext.command(
+        "set_session_name",
+        "Set the session name",
+        |ctx, _args| match ctx.set_session_name("conformance-session") {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    let event_field_subscriber = ext.event_subscriber();
+    let event_field_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_field_probe",
+        "Report a field of the events named by the argument `<event> <field>`",
+        move |_ctx, args| {
+            let mut words = args.split_whitespace();
+            let (name, field) = (
+                words.next().unwrap_or("").to_string(),
+                words.next().unwrap_or("").to_string(),
+            );
+            let reported = name.clone();
+            let subscription = subscribe(&event_field_subscriber, &name, move |ctx, data| {
+                let value = data
+                    .get(field.as_str())
+                    .map_or_else(|| "absent".to_string(), |value| value.to_string());
+                ctx.notify(
+                    &format!("event_field:{}.{}={}", reported, field, value),
+                    "info",
+                );
+                Ok(None)
+            });
+            event_field_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_level_subscriber = ext.event_subscriber();
+    let event_level_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    // event_level_edit_probe `<event> <top|deep>`: a handler that edits the event in place and returns nothing. `top` assigns a member of the event itself (probeTop); `deep` edits inside the message the event carries (the first user message of a `messages` list): the text of its first text block, else a string content, else a `probe` member. Every edit writes `other-event-edit`.
+    ext.command(
+        "event_level_edit_probe",
+        "Subscribe to the event named by the argument `<event> <top|deep>` with a handler that edits the event itself or the message inside it in place",
+        move |_ctx, args| {
+            let mut words = args.split_whitespace();
+            let name = words.next().unwrap_or("").to_string();
+            let top = words.next() == Some("top");
+            let subscription = subscribe(&event_level_subscriber, &name, move |_ctx, data| {
+                let edited = Value::from("other-event-edit");
+                if top {
+                    data["probeTop"] = edited;
+                    return Ok(None);
+                }
+                let target: Option<&mut Value> = if data.get("message").is_some() {
+                    data.get_mut("message")
+                } else if let Some(list) = data.get_mut("messages").and_then(|v| v.as_array_mut()) {
+                    let at = list
+                        .iter()
+                        .position(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                        .unwrap_or(0);
+                    list.get_mut(at)
+                } else {
+                    None
+                };
+                let Some(target) = target.filter(|t| t.is_object()) else {
+                    return Ok(None);
+                };
+                let first_is_text = target
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .and_then(|c| c.first())
+                    .is_some_and(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"));
+                if first_is_text {
+                    target["content"][0]["text"] = edited;
+                } else if target.get("content").is_some_and(|c| c.is_string()) {
+                    target["content"] = edited;
+                } else {
+                    target["probe"] = edited;
+                }
+                Ok(None)
+            });
+            event_level_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_member_subscriber = ext.event_subscriber();
+    let event_member_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    // event_member_probe `<event> <set|delete|once> <member> [json]`: a handler that assigns the member the JSON, deletes it, or (once) assigns it in its first call only and reports `member_probe_stale:<event>:<bool>` whether a later call found it already there.
+    ext.command(
+        "event_member_probe",
+        "Subscribe to the event named by the argument `<event> <set|delete|once> <member> [json]` with a handler that assigns, deletes or once assigns a member of the event",
+        move |_ctx, args| {
+            let mut words = args.trim().splitn(4, char::is_whitespace);
+            let name = words.next().unwrap_or("").to_string();
+            let op = words.next().unwrap_or("").to_string();
+            let member = words.next().unwrap_or("").to_string();
+            let value: Value = match words.next().map(str::trim) {
+                Some(raw) if !raw.is_empty() => match serde_json::from_str(raw) {
+                    Ok(value) => value,
+                    Err(err) => return CommandResult::Error(err.to_string()),
+                },
+                _ => Value::Null,
+            };
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reported = name.clone();
+            let subscription = subscribe(&event_member_subscriber, &name, move |ctx, data| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if op == "delete" {
+                    if let Some(object) = data.as_object_mut() {
+                        object.remove(&member);
+                    }
+                } else if op == "once" && call > 1 {
+                    let stale = data.get(member.as_str()) == Some(&value);
+                    ctx.notify(&format!("member_probe_stale:{}:{}", reported, stale), "info");
+                } else {
+                    data[member.as_str()] = value.clone();
+                }
+                Ok(None)
+            });
+            event_member_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "host_state_probe",
+        "Report the thinking level and the session commands",
+        |ctx, _args| {
+            let level = match ctx.get_thinking_level() {
+                Ok(level) => level,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let commands = match ctx.get_commands() {
+                Ok(commands) => commands,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let parts: Vec<String> = commands
+                .iter()
+                .map(|c| {
+                    [
+                        c.name.as_str(),
+                        c.description.as_str(),
+                        c.source.as_str(),
+                        c.source_info.path.as_str(),
+                        c.source_info.scope.as_str(),
+                    ]
+                    .join("|")
+                })
+                .collect();
+            ctx.notify(
+                &format!("getThinkingLevel={level};getCommands={}", parts.join(",")),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "rw_prompt_state",
+        "Read the system prompt state after registering and activating tools",
+        |ctx, _args| {
+            let tool = |name: &str| {
+                let mut tool =
+                    ToolDefinition::new(name, name, name, json!({"type":"object"}), |_, _| {
+                        ToolResult::text("ok")
+                    });
+                tool.prompt_snippet = Some(format!("{name}-snippet"));
+                tool
+            };
+            if let Err(err) = ctx
+                .register_tool(tool("rw-alpha"))
+                .and_then(|_| ctx.register_tool(tool("rw-beta")))
+            {
+                return CommandResult::Error(err.to_string());
+            }
+            let registered = match ctx.get_system_prompt_options() {
+                Ok(options) => options,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            ctx.set_active_tools(&["rw-beta"]);
+            let options = match ctx.get_system_prompt_options() {
+                Ok(options) => options,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let prompt = match ctx.get_system_prompt() {
+                Ok(prompt) => prompt,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let selected: Vec<&str> = options["selectedTools"]
+                .as_array()
+                .map(|tools| tools.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            ctx.notify(
+                &format!(
+                    "rw_prompt_state=registered:{};selected:{};beta:{};alpha:{}",
+                    registered["toolSnippets"]["rw-alpha"]
+                        .as_str()
+                        .unwrap_or(""),
+                    selected.join(","),
+                    prompt.contains("rw-beta-snippet"),
+                    prompt.contains("rw-alpha-snippet"),
+                ),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "rw_idle_after_trigger",
+        "Read isIdle after a message that starts a run",
+        |ctx, _args| {
+            if let Err(err) = ctx.send_message("rw-trigger", "rw-trigger", true, Some(true), None) {
+                return CommandResult::Error(err.to_string());
+            }
+            match ctx.is_idle() {
+                Ok(idle) => ctx.notify(&format!("rw_idle_after_trigger={idle}"), "info"),
+                Err(err) => return CommandResult::Error(err.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "rw_idle_busy_until_yield",
+        "Read isIdle after a message that starts a run, before and after a wait for the run",
+        |ctx, _args| {
+            if let Err(err) = ctx.send_message("rw-trigger", "rw-trigger", true, Some(true), None) {
+                return CommandResult::Error(err.to_string());
+            }
+            let reads = (|| -> std::io::Result<(bool, bool, bool)> {
+                let first = ctx.is_idle()?;
+                let second = ctx.is_idle()?;
+                ctx.wait_for_idle()?;
+                Ok((first, second, ctx.is_idle()?))
+            })();
+            match reads {
+                Ok((first, second, later)) => ctx.notify(
+                    &format!("rw_idle_busy_until_yield=sync:{first},{second};later:{later}"),
+                    "info",
+                ),
+                Err(err) => return CommandResult::Error(err.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "rw_idle_send_then_await",
+        "Await the run a message starts with no read in between, then read; again for a second message",
+        |ctx, _args| {
+            let reads = (|| -> std::io::Result<(bool, bool, bool)> {
+                ctx.send_message("rw-trigger", "rw-trigger", true, Some(true), None)?;
+                ctx.wait_for_idle()?;
+                let awaited = ctx.is_idle()?;
+                ctx.send_message("rw-trigger", "rw-trigger", true, Some(true), None)?;
+                let second = ctx.is_idle()?;
+                ctx.wait_for_idle()?;
+                Ok((awaited, second, ctx.is_idle()?))
+            })();
+            match reads {
+                Ok((awaited, second, again)) => ctx.notify(
+                    &format!("rw_idle_send_then_await=awaited:{awaited};second:{second};awaited-again:{again}"),
+                    "info",
+                ),
+                Err(err) => return CommandResult::Error(err.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "rw_idle_blocking",
+        "Read isIdle after a message that starts a run and a wait that is no call",
+        |ctx, _args| {
+            let reads = (|| -> std::io::Result<(bool, bool)> {
+                let before = ctx.is_idle()?;
+                ctx.send_message("rw-trigger", "rw-trigger", true, Some(true), None)?;
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                Ok((before, ctx.is_idle()?))
+            })();
+            match reads {
+                Ok((before, after)) => ctx.notify(
+                    &format!("rw_idle_blocking=before:{before};after:{after}"),
+                    "info",
+                ),
+                Err(err) => return CommandResult::Error(err.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "rw_idle_yield_poll",
+        "Read isIdle while polling for the run a message started, waiting with the SDK sleep helper",
+        |ctx, _args| {
+            let reads = (|| -> std::io::Result<(bool, bool)> {
+                ctx.send_message("rw-trigger", "rw-trigger", true, Some(true), None)?;
+                let first = ctx.is_idle()?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !ctx.is_idle()? && std::time::Instant::now() < deadline {
+                    ctx.sleep(std::time::Duration::from_millis(10))?;
+                }
+                Ok((first, ctx.is_idle()?))
+            })();
+            match reads {
+                Ok((first, last)) => ctx.notify(
+                    &format!("rw_idle_yield_poll=first:{first};final:{last}"),
+                    "info",
+                ),
+                Err(err) => return CommandResult::Error(err.to_string()),
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "rw_idle_callback",
+        "Read isIdle after a message that starts a run, sent from a thread the handler waits for",
+        |ctx, _args| {
+            let before = match ctx.is_idle() {
+                Ok(idle) => idle,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let thread_ctx = ctx.clone();
+            let callback = std::thread::spawn(move || -> std::io::Result<()> {
+                thread_ctx.send_message("rw-trigger", "rw-trigger", true, Some(true), None)?;
+                let first = thread_ctx.is_idle()?;
+                let second = thread_ctx.is_idle()?;
+                thread_ctx.wait_for_idle()?;
+                let later = thread_ctx.is_idle()?;
+                thread_ctx.notify(
+                    &format!(
+                        "rw_idle_callback=before:{before};sync:{first},{second};later:{later}"
+                    ),
+                    "info",
+                );
+                Ok(())
+            });
+            match callback.join() {
+                Ok(Ok(())) => CommandResult::Ok,
+                Ok(Err(err)) => CommandResult::Error(err.to_string()),
+                Err(_) => CommandResult::Error("the callback thread panicked".to_string()),
+            }
+        },
+    );
+    let rw_settled_subscriber = ext.event_subscriber();
+    let rw_settled_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let rw_settled_once = Arc::new(AtomicBool::new(false));
+    ext.command(
+        "rw_idle_in_settled",
+        "Read isIdle after a message that starts a run, sent from an agent_settled handler",
+        move |_ctx, _args| {
+            let once = rw_settled_once.clone();
+            let subscription =
+                rw_settled_subscriber.on_event("agent_settled", move |ctx, _data| {
+                    if once.swap(true, Ordering::SeqCst) {
+                        return Ok(None);
+                    }
+                    ctx.send_message("rw-trigger", "rw-trigger", true, Some(true), None)
+                        .map_err(|err| err.to_string())?;
+                    let idle = ctx.is_idle().map_err(|err| err.to_string())?;
+                    ctx.notify(&format!("rw_idle_in_settled={idle}"), "info");
+                    Ok(None)
+                });
+            rw_settled_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let rw_background_subscriber = ext.event_subscriber();
+    let rw_background_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "rw_idle_background",
+        "Poll isIdle from a background callback after agent_end",
+        move |_ctx, _args| {
+            let subscription = rw_background_subscriber.on_event("agent_end", |ctx, _data| {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let mut idle = false;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while !idle && std::time::Instant::now() < deadline {
+                        idle = ctx.is_idle().unwrap_or(false);
+                        if !idle {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                    ctx.notify(&format!("rw_idle_background={idle}"), "info");
+                });
+                Ok(None)
+            });
+            rw_background_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "rw_idle_live",
+        "Poll isIdle live and report the sequence of answers",
+        |ctx, _args| {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let mut seen: Vec<String> = Vec::new();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while seen.len() < 3 && std::time::Instant::now() < deadline {
+                    let answer = match ctx.is_idle() {
+                        Ok(idle) => idle.to_string(),
+                        Err(_) => "error".to_string(),
+                    };
+                    if seen.last() != Some(&answer) {
+                        seen.push(answer);
+                        ctx.notify(&format!("rw_idle_live={}", seen.join(",")), "info");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "set_model",
+        "Switch to the model in the arguments",
+        |ctx, args| {
+            let (ok, error) = ctx.set_model(args);
+            if !error.is_empty() {
+                return CommandResult::Error(error);
+            }
+            ctx.notify(&format!("setModel={ok}"), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "set_model_object",
+        "Switch to the model object in the arguments",
+        |ctx, args| {
+            let model: serde_json::Value = match serde_json::from_str(args) {
+                Ok(model) => model,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let (ok, error) = ctx.set_model(&model);
+            if error.is_empty() {
+                ctx.notify(&format!("setModelObject={ok}"), "info");
+            } else {
+                ctx.notify(&format!("setModelObject=error:{error}"), "info");
+            }
+            CommandResult::Ok
+        },
+    );
+    let before_agent_model_subscriber = ext.event_subscriber();
+    ext.command(
+        "set_model_object_before_agent_start",
+        "Switch to the model object in the arguments before each agent start",
+        move |_ctx, args| {
+            let model: serde_json::Value = match serde_json::from_str(args) {
+                Ok(model) => model,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let subscription =
+                before_agent_model_subscriber.on_before_agent_start(move |ctx, _event| {
+                    let (ok, error) = ctx.set_model(&model);
+                    if !error.is_empty() {
+                        return Err(error);
+                    }
+                    ctx.notify(&format!("beforeAgentSetModel={ok}"), "info");
+                    Ok(None)
+                });
+            // The handler stays subscribed for the life of the extension.
+            std::mem::forget(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_probe_on_subscriber = ext.event_subscriber();
+    let event_probe_on_subscriptions: Arc<Mutex<Vec<(String, pig_sdk::EventSubscription)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let event_probe_off_subscriptions = event_probe_on_subscriptions.clone();
+    let event_probe_results: Arc<Mutex<std::collections::HashMap<String, Vec<Value>>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let event_probe_result_setter = event_probe_results.clone();
+    ext.command(
+        "event_probe_result",
+        "Queue the JSON result the next event_probe_on handler call of an event returns",
+        move |_ctx, args| {
+            let (name, raw) = args.trim().split_once(' ').unwrap_or((args.trim(), "null"));
+            match serde_json::from_str::<Value>(raw) {
+                Ok(value) => {
+                    event_probe_result_setter
+                        .lock()
+                        .unwrap()
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(value);
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "event_probe_on",
+        "Subscribe to the event named by the argument",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let reported = name.clone();
+            let results = event_probe_results.clone();
+            let subscription = subscribe(&event_probe_on_subscriber, &name, move |ctx, data| {
+                ctx.notify(&format!("event_probe_on:{}", reported), "info");
+                // The event as the host sent it, for the tests that compare a payload field with the Go reference's.
+                ctx.notify(
+                    &format!(
+                        "event_probe_data:{}:{}",
+                        reported,
+                        serde_json::to_string(&*data).unwrap()
+                    ),
+                    "info",
+                );
+                // mcp_servers_change carries every registered server (types.ts:699-709): report their names, which only the host's registry knows.
+                if let Some(servers) = data.get("servers").and_then(|servers| servers.as_array()) {
+                    let names: Vec<String> = servers
+                        .iter()
+                        .map(|server| server["name"].as_str().unwrap_or("").to_string())
+                        .collect();
+                    ctx.notify(&format!("event_probe_servers:{}", names.join(",")), "info");
+                }
+                ctx.notify(
+                    &format!(
+                        "event_payload:{}:{}",
+                        reported,
+                        serde_json::to_string(&*data).unwrap()
+                    ),
+                    "info",
+                );
+                let mut queued = results.lock().unwrap();
+                let value = queued
+                    .get_mut(&reported)
+                    .filter(|values| !values.is_empty())
+                    .map(|values| values.remove(0));
+                // Pi ignores what a before_provider_headers handler returns and sends the headers object the handlers edited (runner.ts emitBeforeProviderHeaders), so the queued result becomes the headers by editing event.headers in place, as the Node fixture does.
+                if reported == "before_provider_headers"
+                    && let (Some(Value::Object(replacement)), Some(headers)) =
+                        (value.as_ref(), data["headers"].as_object_mut())
+                {
+                    *headers = replacement.clone();
+                    return Ok(None);
+                }
+                Ok(value)
+            });
+            event_probe_on_subscriptions
+                .lock()
+                .unwrap()
+                .push((name, subscription));
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "event_probe_off",
+        "Unsubscribe the event_probe_on handlers of the event named by the argument",
+        move |_ctx, args| {
+            let name = args.trim();
+            let removed: Vec<(String, pig_sdk::EventSubscription)> = {
+                let mut subscriptions = event_probe_off_subscriptions.lock().unwrap();
+                let (removed, kept) = subscriptions
+                    .drain(..)
+                    .partition(|(event, _)| event == name);
+                *subscriptions = kept;
+                removed
+            };
+            for (_, subscription) in removed {
+                subscription.unsubscribe();
+            }
+            CommandResult::Ok
+        },
+    );
+    // lone_passthrough subscribes to the event named by the argument with a handler that returns the value it received, and lone_send sends the
+    // argument's text back through sendUserMessage, sendMessage or registerProvider (TestConformance_LoneSurrogatePassThroughAcrossSDKs).
+    fn lone_units(text: Option<&str>) -> String {
+        match text {
+            Some(text) => text
+                .chars()
+                .map(|unit| format!("{:x}", unit as u32))
+                .collect::<Vec<_>>()
+                .join("."),
+            None => "none".to_string(),
+        }
+    }
+    let lone_subscriber = ext.event_subscriber();
+    let lone_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "lone_passthrough",
+        "Subscribe to the event named by the argument with a handler that returns the value it received",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let reported = name.clone();
+            let event = if name == "context_edit" {
+                "context"
+            } else {
+                name.as_str()
+            };
+            let subscription = subscribe(&lone_subscriber, event, move |ctx, data| {
+                let (seen, result) = match reported.as_str() {
+                    "input" => (
+                        data["text"].as_str().map(str::to_string),
+                        json!({"action": "transform", "text": data["text"]}),
+                    ),
+                    "before_agent_start" => (
+                        data["systemPrompt"].as_str().map(str::to_string),
+                        json!({"systemPrompt": data["systemPrompt"]}),
+                    ),
+                    "tool_result" => (
+                        data["content"][0]["text"].as_str().map(str::to_string),
+                        json!({"content": data["content"]}),
+                    ),
+                    _ => (
+                        data["messages"][0]["content"]
+                            .as_str()
+                            .or_else(|| data["messages"][0]["content"][0]["text"].as_str())
+                            .map(str::to_string),
+                        if reported == "context_edit" {
+                            json!({"messages": [data["messages"][0], {"role": "user", "content": "edited", "timestamp": 2}]})
+                        } else {
+                            json!({"messages": data["messages"]})
+                        },
+                    ),
+                };
+                ctx.notify(
+                    &format!("lone_seen:{}:{}", reported, lone_units(seen.as_deref())),
+                    "info",
+                );
+                Ok(Some(result))
+            });
+            lone_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "lone_send",
+        "Send the argument's text back through sendUserMessage, sendMessage or registerProvider",
+        |ctx, args| {
+            let (kind, value) = args.trim().split_once(' ').unwrap_or((args.trim(), ""));
+            ctx.notify(
+                &format!("lone_seen:{}:{}", kind, lone_units(Some(value))),
+                "info",
+            );
+            let sent = match kind {
+                "user" => ctx
+                    .send_user_message(serde_json::Value::String(value.to_string()), "followUp")
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()),
+                "custom" => ctx
+                    .send_message("lone", value, true, None, None)
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()),
+                _ => ctx
+                    .model_registry()
+                    .register_provider("lone-compat", json!({"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"m","name":value,"reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000,"maxTokens":100,"compat":{"openRouterRouting":{"sort":value}}}]}))
+                    .map(|_| ())
+                    .map_err(|err| err.to_string()),
+            };
+            match sent {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err),
+            }
+        },
+    );
+    let event_probe_result_subscriber = ext.event_subscriber();
+    let event_probe_result_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_result_probe",
+        "Subscribe to an event with a handler that returns the given JSON",
+        move |_ctx, args| {
+            let trimmed = args.trim();
+            let (name, raw) = trimmed.split_once(' ').unwrap_or((trimmed, "null"));
+            let result: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let subscription =
+                subscribe(&event_probe_result_subscriber, name, move |_ctx, _data| {
+                    Ok(Some(result.clone()))
+                });
+            event_probe_result_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // event_signal_probe subscribes to session_before_compact or session_before_tree with a handler that returns the state of its event signal (the request's cancellation) on its first line and after a dialog it opened was answered, and the dialog's answer: the signal aborts while the dialog is pending (mode "wait") or before the handler runs (mode "first"), and Pi's in-process host call still returns its answer.
+    let event_signal_subscriber = ext.event_subscriber();
+    let event_signal_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_signal_probe",
+        "Subscribe to session_before_compact or session_before_tree with a handler that returns the state of its event signal",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let event = name.clone();
+            let subscription = subscribe(&event_signal_subscriber, &name, move |hctx, data| {
+                let source: &serde_json::Value = if event == "session_before_tree" {
+                    data.get("preparation").unwrap_or(&serde_json::Value::Null)
+                } else {
+                    &*data
+                };
+                let mode = source
+                    .get("customInstructions")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let before = hctx.is_cancelled();
+                let answer = match hctx.input(&format!("event_signal:{event}:{mode}:pending"), "p") {
+                    Ok((value, _)) => value.as_str().unwrap_or("").to_string(),
+                    Err(error) => format!("failed: {error}"),
+                };
+                let state = format!("event_signal:{mode}:{before}:{}:{answer}", hctx.is_cancelled());
+                if event == "session_before_compact" {
+                    Ok(Some(serde_json::json!({"compaction": {"summary": state, "firstKeptEntryId": "k", "tokensBefore": 1}})))
+                } else {
+                    Ok(Some(serde_json::json!({"label": state})))
+                }
+            });
+            event_signal_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // tool_call_abort_probe subscribes to tool_call with a handler that answers from a dialog it opened (TestConformance_ToolCallHandlerIsAwaitedThroughTheAbort).
+    let tool_call_abort_subscriber = ext.event_subscriber();
+    let tool_call_abort_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "tool_call_abort_probe",
+        "Subscribe to tool_call with a handler that answers from a dialog it opened",
+        move |_ctx, _args| {
+            let subscription = subscribe(&tool_call_abort_subscriber, "tool_call", move |hctx, data| {
+                let mode = data
+                    .get("input")
+                    .and_then(|input| input.get("mode"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let answer = match hctx.input(&format!("tool_call_abort:{mode}:pending"), "p") {
+                    Ok((value, _)) => value.as_str().unwrap_or("").to_string(),
+                    Err(error) => format!("failed: {error}"),
+                };
+                Ok(Some(serde_json::json!({"block": true, "reason": format!("tool_call_abort:{mode}:{answer}")})))
+            });
+            tool_call_abort_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_ordered_result_subscriber = ext.event_subscriber();
+    let event_ordered_result_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_ordered_result_probe",
+        "Subscribe to an event with a handler that returns the given JSON, members in written order",
+        move |_ctx, args| {
+            let trimmed = args.trim();
+            let (name, raw) = trimmed.split_once(' ').unwrap_or((trimmed, "null"));
+            // serde_json keeps the members in the order they are written (preserve_order).
+            let result: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(value) => value,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let subscription = subscribe(&event_ordered_result_subscriber, name, move |_ctx, _data| {
+                Ok(Some(result.clone()))
+            });
+            event_ordered_result_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_keys_subscriber = ext.event_subscriber();
+    let event_keys_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_keys_probe",
+        "Subscribe to the event named by the argument with a handler that reports the key order of its payload",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let reported = name.clone();
+            let subscription = subscribe(&event_keys_subscriber, &name, move |ctx, data| {
+                let keys = |value: &Value| -> Vec<String> {
+                    value.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default()
+                };
+                let payload = &data["payload"];
+                let wire = serde_json::json!([keys(payload), keys(&payload["zeta"])]);
+                ctx.notify(&format!("event_keys:{reported}:{wire}"), "info");
+                Ok(None)
+            });
+            event_keys_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_echo_subscriber = ext.event_subscriber();
+    let event_echo_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_echo_probe",
+        "Subscribe to the event named by the argument with a handler that hands back the objects it was sent",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let echoed = name.clone();
+            let subscription = subscribe(&event_echo_subscriber, &name, move |_ctx, data| {
+                let member = |key: &str| data.get(key).cloned().unwrap_or(Value::Null);
+                match echoed.as_str() {
+                    "turn_end" => Ok(Some(serde_json::json!({ "entries": member("entries") }))),
+                    "context" => {
+                        let messages = member("messages");
+                        let rest: Vec<Value> = messages.as_array().map(|m| m[1..].to_vec()).unwrap_or_default();
+                        Ok(Some(serde_json::json!({ "messages": rest })))
+                    }
+                    "before_provider_request" => Ok(Some(member("payload"))),
+                    "tool_result" => Ok(Some(serde_json::json!({ "content": member("content"), "details": member("details") }))),
+                    "message_end" => Ok(Some(serde_json::json!({ "message": member("message") }))),
+                    other => Err(format!("event_echo_probe has no echo for {other}")),
+                }
+            });
+            event_echo_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_mutate_subscriber = ext.event_subscriber();
+    let event_mutate_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_mutate_probe",
+        "Subscribe to the event named by the argument `<event> [mode]` with a handler that works on the event's payload (before_provider_request) or headers (before_provider_headers) as the mode says: no mode edits it in place and returns nothing, fail edits it and fails, replace edits nothing and returns a replacement, both edits it in place under a key of its own and returns the replacement, delete (headers) sets the header the first edit wrote to null",
+        move |_ctx, args| {
+            let (name, mode) = match args.trim().split_once(' ') {
+                Some((name, mode)) => (name.to_string(), mode.trim().to_string()),
+                None => (args.trim().to_string(), String::new()),
+            };
+            let headers = name == "before_provider_headers";
+            let subscription = subscribe(&event_mutate_subscriber, &name, move |_ctx, data| {
+                let key = match mode.as_str() {
+                    "fail" => "inPlaceBeforeError",
+                    "both" => "inPlaceAlongside",
+                    _ => "inPlace",
+                };
+                if headers {
+                    if mode == "delete" {
+                        data["headers"]["x-pig-inPlace"] = Value::Null;
+                    } else if mode != "replace" {
+                        data["headers"][format!("x-pig-{key}")] = Value::from("in-place-edit");
+                    }
+                } else if mode != "replace" {
+                    data["payload"][key] = Value::from("in-place-edit");
+                    if data["payload"]["zeta"].is_object() {
+                        data["payload"]["zeta"][key] = Value::from("in-place-edit");
+                    }
+                }
+                if mode == "fail" {
+                    return Err("failed after the edit".to_string());
+                }
+                if mode == "replace" || mode == "both" {
+                    return Ok(Some(if headers {
+                        serde_json::json!({"x-pig-replaced": "returned"})
+                    } else {
+                        serde_json::json!({"replaced": "returned"})
+                    }));
+                }
+                Ok(None)
+            });
+            event_mutate_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_edit_subscriber = ext.event_subscriber();
+    let event_edit_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    // event_assign_probe: `<event>`, a handler that ASSIGNS a new value to the event's input (tool_call), messages (context) or entries (turn_end) instead of editing the old value in place, and returns nothing.
+    let event_assign_subscriber = ext.event_subscriber();
+    let event_assign_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_assign_probe",
+        "Subscribe to the event named by the argument with a handler that assigns a new value to the event's input, messages or entries",
+        move |_ctx, args| {
+            let (name, variant) = args.trim().split_once(' ').map_or((args.trim().to_string(), String::new()), |(n, v)| (n.to_string(), v.to_string()));
+            let which = name.clone();
+            let subscription = subscribe(&event_assign_subscriber, &name, move |_ctx, data| {
+                match which.as_str() {
+                    "tool_call" => data["input"] = serde_json::json!({"command": "other-event-edit"}),
+                    "context" => {
+                        data["messages"] = match variant.as_str() {
+                            "bad" => serde_json::json!("oops"),
+                            "badmsg" => serde_json::json!([42]),
+                            _ => serde_json::json!([{"role": "user", "content": [{"type": "text", "text": "other-event-edit"}], "timestamp": 1}]),
+                        }
+                    }
+                    "turn_end" => {
+                        data["entries"] = serde_json::json!([{"type": "custom", "customType": "other-event-edit"}])
+                    }
+                    other => return Err(format!("event_assign_probe has no event {other}")),
+                }
+                Ok(None)
+            });
+            event_assign_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // event_edit_probe: `<event> <edit> [fail]`, a handler that makes one edit of the event's content, details, isError, message or messages (tool_result, message_end, context), returns nothing and, with fail, errors after the edit. Every edit writes the value `other-event-edit`, which no other test uses.
+    ext.command(
+        "event_edit_probe",
+        "Subscribe to the event named by the argument with a handler that edits the event in place and returns nothing",
+        move |_ctx, args| {
+            let words: Vec<&str> = args.split_whitespace().collect();
+            let (name, edit, fail) = (
+                words[0].to_string(),
+                words[1].to_string(),
+                words.get(2) == Some(&"fail"),
+            );
+            let which = format!("{name}/{edit}");
+            let subscription = subscribe(&event_edit_subscriber, &name, move |_ctx, data| {
+                let edited = Value::from("other-event-edit");
+                let text = || serde_json::json!([{"type": "text", "text": "other-event-edit"}]);
+                match which.as_str() {
+                    "tool_result/content-assign" => data["content"] = text(),
+                    "tool_result/details-assign" => {
+                        data["details"] = serde_json::json!({"k": "other-event-edit"})
+                    }
+                    "tool_result/iserror-assign" => data["isError"] = Value::from(true),
+                    "tool_result/content-deep" => data["content"][0]["text"] = edited,
+                    "tool_result/details-deep" => data["details"]["k"] = edited,
+                    "message_end/deep" => data["message"]["content"][0]["text"] = edited,
+                    "message_end/content-assign" => data["message"]["content"] = text(),
+                    "message_end/message-assign" => {
+                        data["message"] = serde_json::json!({"role": "user", "content": text(), "timestamp": 1})
+                    }
+                    "context/deep" => data["messages"][0]["content"][0]["text"] = edited,
+                    other => return Err(format!("event_edit_probe has no edit {other}")),
+                }
+                if fail {
+                    Err("failed after the edit".to_string())
+                } else {
+                    Ok(None)
+                }
+            });
+            event_edit_subscriptions.lock().unwrap().push(subscription);
+            CommandResult::Ok
+        },
+    );
+    ext.command("label_probe", "Label the entry named first", |ctx, args| {
+        let trimmed = args.trim();
+        let (id, label) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+        match ctx.set_label(id, label) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        }
+    });
+    let tool_result_guards_subscriber = ext.event_subscriber();
+    let tool_result_guards_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "tool_result_guards_probe",
+        "Report the tool_result guards that accept each tool_result event",
+        move |_ctx, _args| {
+            let subscription =
+                tool_result_guards_subscriber.on_event("tool_result", move |ctx, data| {
+                    let guards: [(&str, ToolGuard); 8] = [
+                        ("bash", pig_sdk::is_bash_tool_result),
+                        ("edit", pig_sdk::is_edit_tool_result),
+                        ("find", pig_sdk::is_find_tool_result),
+                        ("grep", pig_sdk::is_grep_tool_result),
+                        ("ls", pig_sdk::is_ls_tool_result),
+                        ("powershell", pig_sdk::is_powershell_tool_result),
+                        ("read", pig_sdk::is_read_tool_result),
+                        ("write", pig_sdk::is_write_tool_result),
+                    ];
+                    let matched: Vec<&str> = guards
+                        .iter()
+                        .filter(|(_, guard)| guard(&*data))
+                        .map(|(name, _)| *name)
+                        .collect();
+                    ctx.notify(
+                        &format!("tool_result_guards:{}:end", matched.join(",")),
+                        "info",
+                    );
+                    Ok(None)
+                });
+            tool_result_guards_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // tool_call_guard_probe reports which tool names isToolCallEventType accepts for each tool_call event it receives (TestConformance_ToolCallGuardAgreesAcrossSDKs).
+    let tool_call_guard_subscriber = ext.event_subscriber();
+    let tool_call_guard_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "tool_call_guard_probe",
+        "Report the tool names the tool_call guard accepts",
+        move |_ctx, _args| {
+            let subscription =
+                tool_call_guard_subscriber.on_event("tool_call", move |ctx, data| {
+                    let accepted: Vec<&str> = ["bash", "read", "probe", "other"]
+                        .into_iter()
+                        .filter(|name| pig_sdk::is_tool_call_event_type(name, &*data))
+                        .collect();
+                    ctx.notify(
+                        &format!("tool_call_guard:{}:end", accepted.join(",")),
+                        "info",
+                    );
+                    Ok(None)
+                });
+            tool_call_guard_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    let event_payload_subscriber = ext.event_subscriber();
+    let event_payload_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_payload_probe",
+        "Subscribe and report the payload of the event named by the argument",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let reported = name.clone();
+            let subscription = subscribe(&event_payload_subscriber, &name, move |ctx, data| {
+                ctx.notify(
+                    &format!(
+                        "event_payload:{}:{}",
+                        reported,
+                        serde_json::to_string(&*data).unwrap()
+                    ),
+                    "info",
+                );
+                Ok(None)
+            });
+            event_payload_subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription);
+            CommandResult::Ok
+        },
+    );
+    // event_isolation_probe: two handlers; the first reports the marker it received and writes a sentinel into its container, the second reports what it
+    // received (TestConformance_EventHandlersDoNotShareTheirPayload). A handler's data is a &mut Value that cannot outlive the call, so there is no late writer.
+    // A boundary event's marker is the first context entry's sourceEntry id (the container is that source entry); a context or context_with_system event's is
+    // the length of messages (the container is that list).
+    let event_isolation_subscriber = ext.event_subscriber();
+    let event_isolation_subscriptions: Arc<Mutex<Vec<pig_sdk::EventSubscription>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ext.command(
+        "event_isolation_probe",
+        "Subscribe two handlers that report the nested marker they received and then write sentinels into it",
+        move |_ctx, args| {
+            let name = args.trim().to_string();
+            let conversation = name == "context" || name == "context_with_system";
+            let paths: [&'static str; 3] = if conversation {
+                ["/messages/0/content", "/messages/1/content", "/messages/2/content"]
+            } else {
+                [
+                    "/context/contextMessages/0/content",
+                    "/context/llmMessages/0/content",
+                    "/context/contextEntries/0/messages/0/content",
+                ]
+            };
+            let marker = move |data: &Value| -> String {
+                if conversation {
+                    data.get("messages")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len)
+                        .to_string()
+                } else {
+                    isolation_text(data.pointer("/context/contextEntries/0/sourceEntry/id"))
+                }
+            };
+            let report = move |data: &Value| -> String {
+                paths
+                    .iter()
+                    .map(|path| isolation_text(data.pointer(path)))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            };
+            let first_report = report;
+            let first = subscribe(&event_isolation_subscriber, &name, move |ctx, data| {
+                ctx.notify(&format!("event_isolation:A:{}:end", marker(data)), "info");
+                if conversation {
+                    if let Some(list) = data.get_mut("messages").and_then(Value::as_array_mut) {
+                        list.push(json!({"role": "user", "content": "SENTINEL-HANDLER-A", "timestamp": 0}));
+                    }
+                } else if let Some(id) = data.pointer_mut("/context/contextEntries/0/sourceEntry/id") {
+                    *id = json!("SENTINEL-HANDLER-A");
+                }
+                ctx.notify(&format!("event_isolation_msgs:A:{}", first_report(data)), "info");
+                for path in paths {
+                    if let Some(content) = data.pointer_mut(path) {
+                        *content = json!("SENTINEL-HANDLER-A");
+                    }
+                }
+                Ok(None)
+            });
+            let second = subscribe(&event_isolation_subscriber, &name, move |ctx, data| {
+                ctx.notify(&format!("event_isolation:B:{}:end", marker(data)), "info");
+                ctx.notify(&format!("event_isolation_msgs:B:{}", report(data)), "info");
+                Ok(None)
+            });
+            let mut held = event_isolation_subscriptions.lock().unwrap();
+            held.push(first);
+            held.push(second);
+            CommandResult::Ok
+        },
+    );
+    ext.command("set_label", "Set an entry label", |ctx, _args| {
+        match ctx.set_label("label-entry", "conformance-label") {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        }
+    });
+    ext.shortcut("ctrl+alt+y", "Conformance shortcut", |_ctx| {
+        CommandResult::Ok
+    });
+    ext.command(
+        "append_entry",
+        "Append a custom entry",
+        |ctx, _args| match ctx.append_entry("conformance-entry", json!("hello-entry")) {
+            Ok(_) => CommandResult::Ok,
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // An entry and a message with the optional member left out, then with it written as null: Value::Null is Pi's omitted argument in append_entry, and
+    // the siblings that take an Option write Some(Value::Null) as null.
+    ext.command(
+        "entry_null_members",
+        "Append entries and send messages with an omitted and a null member",
+        |ctx, _args| {
+            let result = ctx
+                .append_entry("conformance-null-omitted", Value::Null)
+                .and_then(|_| ctx.append_entry_opt("conformance-null-explicit", Some(Value::Null)))
+                .and_then(|_| ctx.send_message("conformance-null-omitted", "x", false, None, None))
+                .and_then(|_| {
+                    ctx.send_message_with_details(
+                        "conformance-null-explicit",
+                        "x",
+                        false,
+                        None,
+                        None,
+                        Some(Value::Null),
+                    )
+                });
+            match result {
+                Ok(_) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // setLabel on the entry in the arguments without a label, with a null one and with an empty one: Pi writes a different entry for each.
+    ext.command(
+        "label_members",
+        "Set a label that is omitted, null and empty",
+        |ctx, args| {
+            let result = ctx
+                .set_label_opt(args, None)
+                .and_then(|_| ctx.set_label_opt(args, Some(Value::Null)))
+                .and_then(|_| ctx.set_label(args, ""));
+            match result {
+                Ok(_) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // The setup callback's SessionManager: an entry and a message with the optional member left out, then with it written as null. Value::Null is
+    // Pi's omitted argument, and the siblings that take an Option write Some(Value::Null) as null.
+    ext.command(
+        "setup_null_members",
+        "Seed a new session with an omitted and a null member",
+        |ctx, _args| {
+            let result = ctx.new_session_setup(
+                json!({}),
+                |manager: &pig_sdk::SetupSessionManager| {
+                    manager.append_custom_entry("api-custom", Value::Null)?;
+                    manager.append_custom_entry_opt("api-custom", Some(Value::Null))?;
+                    manager.append_custom_message_entry(
+                        "api-message",
+                        json!("x"),
+                        false,
+                        Value::Null,
+                    )?;
+                    manager.append_custom_message_entry_opt(
+                        "api-message",
+                        json!("x"),
+                        true,
+                        Some(Value::Null),
+                    )?;
+                    Ok(())
+                },
+                None,
+            );
+            match result {
+                Ok(_) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "append-entries-probe",
+        "Append a custom entry for each comma-separated type",
+        |ctx, args| {
+            for custom_type in args.split(',') {
+                // Pi's appendEntry returns nothing and never fails, so a refusal the SDK reports is dropped here; the row reads the session afterwards.
+                let _ = ctx.append_entry(custom_type, json!(format!("data-of-{custom_type}")));
+            }
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "sprite-probe",
+        "Exercise sprite registration and host errors",
+        |ctx, _args| {
+            let mut definition = conformance_sprite_definition();
+            if let Err(err) = ctx.register_sprite(&definition) {
+                return CommandResult::Error(err.to_string());
+            }
+            definition.mascot[0].pop();
+            match ctx.register_sprite(&definition) {
+                Ok(()) => {
+                    CommandResult::Error("invalid sprite definition was accepted".to_string())
+                }
+                Err(err) => {
+                    ctx.notify(&err.to_string(), "error");
+                    CommandResult::Ok
+                }
+            }
+        },
+    );
+    ext.command(
+        "login-probe",
+        "Exercise semantic login submission and host errors",
+        |ctx, _args| {
+            let mut definition = conformance_login_definition();
+            if let Err(err) = ctx.set_login(&definition) {
+                return CommandResult::Error(err.to_string());
+            }
+            definition.brand[0].pop();
+            match ctx.set_login(&definition) {
+                Ok(()) => CommandResult::Error("invalid login definition was accepted".to_string()),
+                Err(err) => {
+                    ctx.notify(&err.to_string(), "error");
+                    CommandResult::Ok
+                }
+            }
+        },
+    );
+    ext.command(
+        "scoped-models-probe",
+        "Report the model scope",
+        |ctx, _args| match ctx.scoped_models() {
+            Ok(models) => {
+                ctx.notify(&serde_json::to_string(&models).unwrap(), "info");
+                CommandResult::Ok
+            }
+            Err(error) => CommandResult::Error(error.to_string()),
+        },
+    );
+    ext.command(
+        "ui-availability",
+        "Probe bound UI and headless defaults",
+        |ctx, _args| {
+            let result = (|| -> std::io::Result<()> {
+                let (selected, _) = ctx.select("Pick", &["first", "second"])?;
+                let selected = dialog_text(&selected);
+                ctx.notify("availability-notify", "info");
+                if !ctx.has_ui() {
+                    assert_eq!(
+                        ctx.input("Input", "placeholder")?,
+                        (serde_json::Value::Null, false)
+                    );
+                    assert_eq!(
+                        ctx.editor("Editor", "prefill")?,
+                        (serde_json::Value::Null, false)
+                    );
+                    assert_eq!(ctx.confirm("Confirm", "message")?, json!(false));
+                    struct NoUIComponent;
+                    impl pig_sdk::RemoteComponent for NoUIComponent {
+                        fn render(&self, _: u32) -> Vec<String> {
+                            panic!("headless render")
+                        }
+                        fn handle_input(
+                            &mut self,
+                            _: &pig_sdk::JsString,
+                        ) -> Result<pig_sdk::RemoteComponentResult, String>
+                        {
+                            panic!("headless input")
+                        }
+                        fn dispose(&mut self) {
+                            panic!("headless disposal")
+                        }
+                    }
+                    assert!(ctx.custom_component(NoUIComponent, json!({}))?.is_none());
+                    let _off = ctx.on_terminal_input(|_| panic!("headless terminal"))?;
+                    ctx.add_autocomplete_provider(std::sync::Arc::new(|_, _| {
+                        panic!("headless autocomplete factory")
+                    }))?;
+                    ctx.set_editor_text("ignored");
+                    ctx.set_tools_expanded(true);
+                    assert_eq!(ctx.get_editor_text()?, "");
+                    assert!(!ctx.get_tools_expanded()?);
+                    assert!(ctx.get_all_themes()?.is_empty());
+                    assert!(ctx.get_theme("dark")?.is_none());
+                    assert_eq!(
+                        ctx.set_theme("dark"),
+                        (false, "UI not available".to_string())
+                    );
+                }
+                ctx.append_entry(
+                    "ui-availability",
+                    json!(format!("hasUI={} selected={selected}", ctx.has_ui())),
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command("ui-state-barrier", "Read UI state after a dialog", |ctx, _args| {
+        let result = (|| -> std::io::Result<()> {
+            let (selected, _) = ctx.select("expand", &["chosen"])?;
+            let selected = dialog_text(&selected);
+            let named = ctx.get_theme("light")?.unwrap();
+            let missing = ctx.get_theme("missing")?;
+            let (success, message) = ctx.set_theme("missing");
+            ctx.notify(&format!("selected={selected} expanded={} named={} missing={} success={success} error={message}", ctx.get_tools_expanded()?, named["name"].as_str().unwrap(), missing.is_none()), "info");
+            Ok(())
+        })();
+        match result { Ok(()) => CommandResult::Ok, Err(err) => CommandResult::Error(err.to_string()) }
+    });
+    ext.command(
+        "autocomplete-register",
+        "Register retained provider wrappers",
+        |ctx, _| {
+            let result = (|| -> std::io::Result<()> {
+                for tag in ["A", "B"] {
+                    ctx.add_autocomplete_provider(std::sync::Arc::new(move |ctx, current| {
+                        ctx.notify(&format!("factory:{tag}"), "info");
+                        let calls = std::sync::atomic::AtomicUsize::new(0);
+                        let get = current.clone();
+                        let apply = current.clone();
+                        Ok(std::sync::Arc::new(pig_sdk::AutocompleteProvider {
+                            trigger_characters: if tag == "A" {
+                                vec!["$".into()]
+                            } else {
+                                vec!["#".into(), "$".into()]
+                            },
+                            get_suggestions: std::sync::Arc::new(
+                                move |ctx, lines, line, col, force| {
+                                    let count =
+                                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                    let Some(mut result) =
+                                        (get.get_suggestions)(ctx, lines, line, col, force)?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    if tag == "A" {
+                                        result.items.retain(|item| item.value != "drop");
+                                        for item in &mut result.items {
+                                            item.label = Some(format!("{}:{count}", item.value));
+                                        }
+                                    } else {
+                                        result.items.push(pig_sdk::AutocompleteItem {
+                                            value: "tail".into(),
+                                            label: Some(format!("tail:{count}")),
+                                            description: None,
+                                        });
+                                    }
+                                    Ok(Some(result))
+                                },
+                            ),
+                            apply_completion: std::sync::Arc::new(
+                                move |ctx, lines, line, col, item, prefix| {
+                                    let mut result = (apply.apply_completion)(
+                                        ctx, lines, line, col, item, prefix,
+                                    )?;
+                                    result.lines[result.cursor_line].push_str(&format!("-{tag}"));
+                                    result.cursor_col += 2;
+                                    Ok(result)
+                                },
+                            ),
+                            should_trigger_file_completion: Some(std::sync::Arc::new(
+                                move |ctx, lines, line, col| {
+                                    current.should_trigger_file_completion.as_ref().unwrap()(
+                                        ctx, lines, line, col,
+                                    )
+                                },
+                            )),
+                        }))
+                    }))?;
+                    ctx.notify(&format!("registered:{tag}"), "info");
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "autocomplete-settle-register",
+        "Register a provider whose answer settles or awaits real I/O",
+        |ctx, _| {
+            let result = ctx.add_autocomplete_provider(std::sync::Arc::new(|_, current| {
+                let get = current.clone();
+                let apply = current.clone();
+                Ok(std::sync::Arc::new(pig_sdk::AutocompleteProvider {
+                    trigger_characters: vec![],
+                    get_suggestions: std::sync::Arc::new(move |ctx, lines, line, col, force| {
+                        (get.get_suggestions)(ctx, lines, line, col, force)?;
+                        if lines[0] == "slow" {
+                            std::thread::sleep(std::time::Duration::from_millis(400));
+                        }
+                        Ok(Some(pig_sdk::AutocompleteSuggestions {
+                            prefix: lines[0].clone(),
+                            items: vec![pig_sdk::AutocompleteItem {
+                                value: lines[0].clone(),
+                                label: Some(format!("settled:{}", lines[0])),
+                                description: None,
+                            }],
+                        }))
+                    }),
+                    apply_completion: std::sync::Arc::new(
+                        move |ctx, lines, line, col, item, prefix| {
+                            (apply.apply_completion)(ctx, lines, line, col, item, prefix)
+                        },
+                    ),
+                    should_trigger_file_completion: None,
+                }))
+            }));
+            match result {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // Upstream ctx.cwd, ctx.mode, ctx.hasUI and ctx.model throw the stale message after invalidation (runner.ts:571-600).
+    ext.command(
+        "stale-probe",
+        "Report cwd, mode, hasUI and model",
+        |ctx, _args| {
+            ctx.notify(
+                &format!(
+                    "stale:{}|{}|{}|{}",
+                    ctx.cwd(),
+                    ctx.mode(),
+                    ctx.has_ui(),
+                    ctx.model()
+                ),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    // stale-members calls the members that answer a context kept past its Session: each outcome is one line, and the command fails with every
+    // line when one carries the stale message, else it reports them.
+    fn stale_members(ctx: &pig_sdk::Context) -> Result<(), String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut stale = false;
+        let mut member = |name: &str, call: &dyn Fn() -> Result<String, String>| {
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+                Ok(Ok(value)) => format!("ok:{value}"),
+                Ok(Err(error)) => format!("error:{error}"),
+                Err(payload) => {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    format!("panics:{message}")
+                }
+            };
+            stale = stale || outcome.contains("This extension ctx is stale");
+            lines.push(format!("{name}={outcome}"));
+        };
+        member("theme", &|| {
+            let _ = ctx.theme();
+            Ok("Theme".to_string())
+        });
+        member("width", &|| Ok(ctx.width().to_string()));
+        member("height", &|| Ok(ctx.height().to_string()));
+        member("sessionName", &|| Ok(ctx.session_name()));
+        member("setWidgetLines", &|| {
+            ctx.set_widget("stale-members", vec!["x".to_string()])
+                .map(|()| String::new())
+                .map_err(|e| e.to_string())
+        });
+        member("setWidgetView", &|| {
+            ctx.set_widget_view(
+                "stale-members-view",
+                pig_sdk::kit::View::new(pig_sdk::kit::Text::new("x", 0, 0)),
+                None,
+            )
+            .map(|()| String::new())
+            .map_err(|e| e.to_string())
+        });
+        member("setWidgetRenderer", &|| {
+            ctx.set_widget_renderer(
+                "stale-members-renderer",
+                Some(|_width: u32| vec!["x".to_string()]),
+                None,
+            )
+            .map(|()| String::new())
+            .map_err(|e| e.to_string())
+        });
+        member("onUpdate", &|| {
+            ctx.on_update(pig_sdk::ToolResult::text("x"))
+                .map(|()| String::new())
+                .map_err(|e| e.to_string())
+        });
+        member("getSettings", &|| {
+            ctx.get_settings()
+                .map(|_| String::new())
+                .map_err(|e| e.to_string())
+        });
+        member("registerToolRenderer", &|| {
+            ctx.register_tool_renderer(|_tool, _builtin| None)
+                .map(|()| String::new())
+                .map_err(|e| e.to_string())
+        });
+        if stale {
+            return Err(format!("stale-members\n{}", lines.join("\n")));
+        }
+        ctx.notify(&format!("members\n{}", lines.join("\n")), "info");
+        Ok(())
+    }
+    ext.command(
+        "stale-members",
+        "Call the members that fail with the stale message",
+        |ctx, _args| match stale_members(ctx) {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error),
+        },
+    );
+    ext.command("signal-probe", "Report ctx.signal", |ctx, _args| {
+        let state = match ctx.signal() {
+            None => "none",
+            Some(signal) if signal.is_cancelled() => "aborted",
+            Some(_) => "live",
+        };
+        ctx.notify(&format!("signal:{state}"), "info");
+        CommandResult::Ok
+    });
+    ext.command(
+        "signal-wait",
+        "Wait for ctx.signal to abort",
+        |ctx, _args| {
+            let Some(signal) = ctx.signal() else {
+                ctx.notify("wait:none", "info");
+                return CommandResult::Ok;
+            };
+            ctx.notify("wait:start", "info");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !signal.is_cancelled() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            ctx.notify(
+                if signal.is_cancelled() {
+                    "wait:aborted"
+                } else {
+                    "wait:timeout"
+                },
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "signal-poll",
+        "Poll ctx.signal until it is live or none",
+        |ctx, args| {
+            ctx.notify("poll:start", "info");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if ctx.signal().is_some() == (args == "live") {
+                    ctx.notify(&format!("poll:{args}"), "info");
+                    return CommandResult::Ok;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            ctx.notify("poll:timeout", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command("usage-probe", "Report context usage", |ctx, _args| {
+        let usage = ctx.get_context_usage().unwrap().map(|u| json!({"tokens": u.tokens, "contextWindow": u.context_window, "percent": u.percent}));
+        ctx.notify(&serde_json::to_string(&usage).unwrap(), "info");
+        CommandResult::Ok
+    });
+    // Reports the model, the session id read through the context and through the session manager, and the context usage, as one JSON object (TestReplicatedReadsAreLocalAcrossSDKs). "set-model:<provider>/<id>" switches the model first.
+    ext.command(
+        "replica-probe",
+        "Report the replicated reads",
+        |ctx, args| {
+            if let Some(model) = args.strip_prefix("set-model:") {
+                let (ok, error) = ctx.set_model(model);
+                if !ok {
+                    return CommandResult::Error(format!("set_model failed: {error:?}"));
+                }
+            }
+            let model = ctx.get_model_info().unwrap().map(|m| {
+                json!({
+                    "id": m.id, "name": m.name, "provider": m.provider,
+                    "contextWindow": m.context_window, "maxOutputTokens": m.max_output_tokens,
+                    "reasoning": m.reasoning,
+                    "inputCostPer1M": m.input_cost_per_1m, "outputCostPer1M": m.output_cost_per_1m,
+                    "cacheReadCostPer1M": m.cache_read_cost_per_1m, "cacheWriteCostPer1M": m.cache_write_cost_per_1m,
+                })
+            });
+            let usage = ctx.get_context_usage().unwrap().map(|u| json!({"tokens": u.tokens, "contextWindow": u.context_window, "percent": u.percent}));
+            let report = json!({
+                "model": model,
+                "sessionId": ctx.get_session_id().unwrap(),
+                "managerSessionId": ctx.session_manager().get_session_id().unwrap(),
+                "sessionName": ctx.get_session_name().unwrap(),
+                "sessionFile": ctx.get_session_file().unwrap(),
+                "managerSessionName": ctx.session_manager().get_session_name().unwrap(),
+                "managerSessionFile": ctx.session_manager().get_session_file().unwrap(),
+                "usage": usage,
+            });
+            ctx.notify(&report.to_string(), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "console-probe",
+        "Write console lines to stdout and stderr",
+        |_ctx, args| {
+            use std::io::Write;
+            for n in 1..=2 {
+                if args != "stderr" {
+                    println!("probe-out-{n}");
+                    let _ = std::io::stdout().flush();
+                }
+                eprintln!("probe-err-{n}");
+            }
+            CommandResult::Ok
+        },
+    );
+    // panic-probe and the on_loaded handler panic after a deliberate stderr line the extension itself writes (TestConformance_SDKDiagnosticsReachOnlyTheExtensionLog).
+    ext.on_loaded(|_ctx| {
+        if std::env::var_os("PIG_FIXTURE_PANIC_PROBE").is_some() {
+            eprintln!("probe-err-loaded");
+            panic!("probe-panic-boom");
+        }
+    });
+    ext.command(
+        "panic-probe",
+        "Panic after an stderr line of the extension's own",
+        |_ctx, _args| {
+            eprintln!("probe-err-command");
+            panic!("probe-panic-boom");
+        },
+    );
+    ext.command(
+        "context-probe",
+        "Report ctx.mode + ctx.getSystemPromptOptions()",
+        |ctx, _args| {
+            let opts = ctx.get_system_prompt_options().unwrap();
+            let prompt = opts
+                .get("customPrompt")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let cwd = opts.get("cwd").and_then(Value::as_str).unwrap_or("");
+            let tools = opts
+                .get("selectedTools")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let shape = |value: Option<&Value>| match value {
+                None | Some(Value::Null) => "absent".to_string(),
+                Some(Value::Array(items)) => format!("array:{}", items.len()),
+                Some(Value::Object(fields)) => format!("object:{}", fields.len()),
+                Some(Value::String(text)) => format!("string:{}", text.encode_utf16().count()),
+                Some(other) => format!("other:{other}"),
+            };
+            let shapes = ["selectedTools", "toolSnippets", "toolGuidelines", "promptGuidelines", "appendSystemPrompt", "sections", "contextFiles", "skills"]
+                .iter()
+                .map(|key| format!("{key}:{}", shape(opts.get(*key))))
+                .collect::<Vec<_>>()
+                .join(",");
+            ctx.notify(
+                &format!(
+                    "mode={} trusted={} spo_prompt={} spo_cwd={} spo_tools={} spo_shape={} spo_guidelines={} spo_skill_scope={} spo_force_empty={} spo_custom_present={}",
+                    ctx.mode(),
+                    ctx.is_project_trusted().unwrap(),
+                    prompt,
+                    cwd,
+                    tools,
+                    shapes,
+                    opts["toolGuidelines"]["read"].as_array().map(|v| v.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default(),
+                    opts["skills"][0]["sourceInfo"]["scope"].as_str().unwrap_or(""),
+                    opts["forceSystemPrompt"].as_str() == Some(""),
+                    opts.get("customPrompt").is_some()
+                ),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    // model-info-probe: see the Go fixture.
+    ext.command(
+        "model-info-probe",
+        "Report the typed active model",
+        |ctx, _args| {
+            match ctx.get_model_info() {
+                Err(err) => return CommandResult::Error(err.to_string()),
+                Ok(None) => ctx.notify("modelinfo:none:end", "info"),
+                Ok(Some(m)) => ctx.notify(
+                    &format!(
+                        "modelinfo:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}:end",
+                        m.id,
+                        m.name,
+                        m.provider,
+                        m.context_window,
+                        m.max_output_tokens,
+                        m.reasoning,
+                        m.input_cost_per_1m,
+                        m.output_cost_per_1m,
+                        m.cache_read_cost_per_1m,
+                        m.cache_write_cost_per_1m
+                    ),
+                    "info",
+                ),
+            }
+            CommandResult::Ok
+        },
+    );
+    // branch-typed-probe: see the Go fixture.
+    ext.command(
+        "branch-typed-probe",
+        "Report the typed branch entries",
+        |ctx, _args| {
+            let branch = match ctx.get_branch() {
+                Ok(branch) => branch,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let entries: Vec<String> = branch
+                .iter()
+                .map(|entry| {
+                    let calls: Vec<String> = entry
+                        .tool_calls
+                        .iter()
+                        .map(|call| format!("{}={}={}", call.name, call.id, call.args))
+                        .collect();
+                    let usage = entry
+                        .usage
+                        .as_ref()
+                        .map(|u| {
+                            format!(
+                                "{}/{}/{}/{}/{}",
+                                u.input, u.output, u.cache_read, u.cache_write, u.total_tokens
+                            )
+                        })
+                        .unwrap_or_else(|| "-".to_string());
+                    [
+                        entry.id.as_str(),
+                        &entry.role,
+                        &entry.content,
+                        &entry.thinking,
+                        &entry.provider,
+                        &entry.model,
+                        &calls.join(","),
+                        &usage,
+                    ]
+                    .join("~")
+                })
+                .collect();
+            ctx.notify(&format!("branchtyped:{}:end", entries.join(" | ")), "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "session-log-probe",
+        "Read a paged session log",
+        |ctx, _args| {
+            ctx.notify(
+                &format!(
+                    "session entries={} branch={}",
+                    ctx.get_entries().unwrap().len(),
+                    ctx.get_branch().unwrap().len()
+                ),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "session-branch-probe",
+        "Read the branch, an entry and its label",
+        |ctx, args| {
+            let manager = ctx.session_manager();
+            let id = |value: serde_json::Value| {
+                value
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("none")
+                    .to_string()
+            };
+            let ids: Vec<String> = ctx
+                .get_branch()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+            let label = match manager.get_label(args).unwrap() {
+                serde_json::Value::String(text) => text,
+                _ => "none".to_string(),
+            };
+            ctx.notify(
+                &format!(
+                    "branch={} leaf={} entry={} label={}",
+                    ids.join(">"),
+                    id(manager.get_leaf_entry().unwrap()),
+                    id(manager.get_entry(args).unwrap()),
+                    label
+                ),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "dialog-probe",
+        "Exercise interactive dialog responses",
+        |ctx, _args| {
+            let result = (|| -> std::io::Result<String> {
+                let selected = dialog_text(&ctx.select("Pick", &["first", "second"])?.0);
+                let input = dialog_text(&ctx.input("Input", "placeholder")?.0);
+                let edited = dialog_text(&ctx.editor("Editor", "prefill")?.0);
+                let confirmed = ctx.confirm("Confirm", "message")? == json!(true);
+                Ok(format!(
+                    "select={selected} input={input} editor={edited} confirm={confirmed}"
+                ))
+            })();
+            match result {
+                Ok(summary) => {
+                    ctx.notify(&summary, "info");
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "focused-probe",
+        "Exercise focused subprocess UI",
+        |ctx, _args| {
+            let disposed = Arc::new(AtomicBool::new(false));
+            let component = FocusedList {
+                items: ["alpha", "beta", "gamma"],
+                selected: 0,
+                disposed: disposed.clone(),
+            };
+            match ctx.custom_component(
+                component,
+                json!({"title": "Focused", "widthFraction": 0.5, "heightFraction": 0.5}),
+            ) {
+                Ok(value) => {
+                    let selected = value
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    ctx.notify(
+                        &format!(
+                            "focused={selected} disposed={}",
+                            disposed.load(Ordering::Relaxed)
+                        ),
+                        "info",
+                    );
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // kit-widget "<case key>" opens a widget kind's Pi vector case in an
+    // overlay; the probe notifies its callbacks as they fire.
+    ext.command(
+        "kit-widget",
+        "Show a widget kind's Pi vector case (D107)",
+        |ctx, key| {
+            let Some(view) = kit_widget_case(key) else {
+                return CommandResult::Error(format!("kit-widget: unknown case {key:?}"));
+            };
+            match ctx.custom_view(
+                KitWidgetProbe {
+                    ctx: ctx.clone(),
+                    view,
+                },
+                json!({"title": "Kit"}),
+            ) {
+                Ok(_) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "kit-probe",
+        "Exercise the component kit (D107)",
+        |ctx, _args| match ctx.custom_view(KitProbe { log: Vec::new() }, json!({"title": "Kit"})) {
+            Ok(result) => {
+                let text = result
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_string)
+                    })
+                    .unwrap_or_default();
+                ctx.notify(&format!("kit={text}"), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // mouse-probe opens the mouse row's component: the host hands it
+    // fullscreen mouse events, and it closes on a click with what it got.
+    ext.command(
+        "mouse-probe",
+        "Exercise extension mouse input",
+        |ctx, _args| match ctx
+            .custom_component(MouseProbe { log: Vec::new() }, json!({"overlay": true}))
+        {
+            Ok(result) => {
+                let text = result
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_string)
+                    })
+                    .unwrap_or_default();
+                ctx.notify(&format!("mouse={text}"), "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // viewport-probe opens a component that captures viewport input until it
+    // receives `t` and closes on `q`.
+    ext.command(
+        "viewport-probe",
+        "Exercise capturesViewportInput",
+        |ctx, _args| match ctx
+            .custom_component(ViewportProbe { captures: true }, json!({"overlay": true}))
+        {
+            Ok(result) => {
+                let text = result
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_string)
+                    })
+                    .unwrap_or_default();
+                ctx.notify(&text, "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+    // tui-alt-viewport-probe mounts a focused component with capturesViewportInput on a TuiAltScreen and idles until the command's signal ends.
+    ext.command(
+        "tui-alt-viewport-probe",
+        "Mount a viewport-capturing component on a TuiAltScreen",
+        |ctx, _args| {
+            use pig_sdk::{ComponentRef, Terminal, TuiAltScreen, TuiAltScreenOptions};
+            let terminal: Arc<dyn Terminal> = Arc::new(ProbeTerminal::default());
+            let mount = || -> std::io::Result<TuiAltScreen> {
+                let screen = TuiAltScreen::new(
+                    ctx,
+                    terminal,
+                    TuiAltScreenOptions {
+                        show_hardware_cursor: Some(false),
+                        mouse: Some(false),
+                        ..Default::default()
+                    },
+                )?;
+                let component: ComponentRef = Arc::new(ViewportFocus {
+                    focused: AtomicBool::new(false),
+                });
+                screen.add_child(&component)?;
+                screen.set_focus(Some(&component))?;
+                screen.start()?;
+                screen.render_now(false)?;
+                Ok(screen)
+            };
+            match mount() {
+                Ok(screen) => {
+                    ctx.notify("tui-alt-viewport:mounted", "info");
+                    if let Some(signal) = ctx.signal() {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while !signal.is_cancelled() && std::time::Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    let _ = screen.stop(Default::default());
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // kit-surfaces shows the kit probe's tree on every other view surface
+    // (D107, spec §10): a pushed widget, the header, the footer and a tool
+    // result. The message renderer "kit-message" draws it too.
+    ext.command(
+        "kit-surfaces",
+        "Show the kit probe on every view surface (D107)",
+        |ctx, _args| {
+            let steps = || -> std::io::Result<()> {
+                ctx.set_widget_view("kit-probe", kit_probe_view(), None)?;
+                ctx.set_header_view(kit_probe_view())?;
+                ctx.set_footer_view(kit_probe_view())?;
+                let mut tool = ToolDefinition::new(
+                    "kit_view_tool",
+                    "kit_view_tool",
+                    "Render its result as the kit probe",
+                    json!({"type": "object"}),
+                    |_ctx, _params| ToolResult::text("kit"),
+                );
+                tool.render_result_view = Some(Box::new(|_, _, _, _, _| Ok(kit_probe_view())));
+                ctx.register_tool(tool)
+            };
+            match steps() {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // kit-images drives the image transport (D107, spec §7): step "a<k>"
+    // shows image 0 and step "b<n>" image n (1 ≤ n ≤ 64), each with its step
+    // as the text, as one ui.setWidget call on the "kit-img" widget.
+    ext.command(
+        "kit-images",
+        "Exercise the component kit's image transport (D107)",
+        |ctx, args| {
+            let image = match (
+                args.get(..1),
+                args.get(1..).and_then(|n| n.parse::<u32>().ok()),
+            ) {
+                (Some("a"), Some(1..)) => 0,
+                (Some("b"), Some(n @ 1..=64)) => n,
+                _ => return CommandResult::Error(format!("kit-images: unknown step {args:?}")),
+            };
+            let view = kit::View::new(
+                Container::new()
+                    .child(Image::new(kit_image_png(image), "image/png"))
+                    .child(Text::new(args, 0, 0)),
+            );
+            match ctx.set_widget_view("kit-img", view, Some(json!({}))) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // kit-kinds sets the "kit-kinds" widget to the kinds kit-probe does not
+    // draw (D107, spec §10): a box, a settings list, a loader, an image and a
+    // lines node whose list annotation goes out only while a frontend draws.
+    ext.command(
+        "kit-kinds",
+        "Show every other component kit kind (D107)",
+        |ctx, _args| {
+            let png: Vec<u8> = (0..KIT_KINDS_PNG.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&KIT_KINDS_PNG[i..i + 2], 16).unwrap())
+                .collect();
+            let settings = SettingsList::new(
+                "kit-settings",
+                vec![
+                    SettingItem::new("theme", "Theme", "dark")
+                        .description("Color theme")
+                        .values(vec!["dark".into(), "light".into()]),
+                    SettingItem::new("wrap", "Wrap", "on")
+                        .description("Wrap lines")
+                        .values(vec!["on".into(), "off".into()]),
+                ],
+                3,
+            );
+            let loader = Loader::new("Working")
+                .spinner_color("accent")
+                .message_color("muted")
+                .indicator(LoaderIndicator {
+                    frames: Some(vec!["*".into()]),
+                    interval_ms: None,
+                });
+            let item = |label: &str, detail: &str| ListItem {
+                label: label.into(),
+                detail: Some(detail.into()),
+                columns: None,
+            };
+            let lines = Lines::new(vec!["track one".into(), "track two".into()]).list(kit::List {
+                items: vec![item("track one", "A"), item("track two", "B")],
+                selected: Some(1),
+            });
+            let stack = VStack::new()
+                .child(
+                    KitBox::new(1, 0)
+                        .bg("customMessageBg")
+                        .child(Text::new("boxed", 0, 0)),
+                )
+                .child(settings)
+                .child(loader)
+                .child(Image::new(png, "image/png"))
+                .child(lines)
+                .gap(1);
+            match ctx.set_widget_view(
+                "kit-kinds",
+                kit::View::new(stack).theme("accent", "#d75f00"),
+                Some(json!({})),
+            ) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // kit-conversation sets the "kit-conversation" widget to every
+    // conversation kind (D107, spec §2.1, §10); "next" updates the nodes
+    // with an id as a Pi author updates kept components.
+    ext.command(
+        "kit-conversation",
+        "Show Pi's conversation components (D107)",
+        |ctx, args| {
+            use pig_sdk::kit::{
+                AssistantMessage, BashExecution, ContentBlock, Diff, Message, ToolDefinition,
+                ToolExecution, ToolResult, ToolResultContent, UserMessage,
+            };
+            let next = args == "next";
+            let text_result = |text: &str, is_error: bool| ToolResult {
+                content: vec![ToolResultContent::text(text)],
+                is_error,
+                details: None,
+                duration_ms: None,
+            };
+            let user = UserMessage::new("Fix **the** kit build\n\n- one\n- two");
+            let mut streaming = AssistantMessage::new(None).id("kit-a1");
+            let mut reply = String::from("Done. **Bold** reply\n\n1. a\n2. b");
+            if next {
+                reply.push_str("\n\nThen more kit.");
+            }
+            streaming.update_content(
+                Message {
+                    content: vec![
+                        ContentBlock::thinking("Reading the *kit* file"),
+                        ContentBlock::text(reply),
+                    ],
+                    ..Message::default()
+                },
+                !next,
+            );
+            let mut failed = AssistantMessage::new(Some(Message {
+                content: vec![
+                    ContentBlock::thinking("secret"),
+                    ContentBlock::text("Visible kit"),
+                ],
+                stop_reason: "error".into(),
+                error_message: "kit-boom-7".into(),
+            }));
+            failed.set_hide_thinking_block(true);
+            failed.set_hidden_thinking_label("Pondering kit...");
+            failed.set_output_pad(0);
+            let card = |id: &str, name: &str, call_id: &str, args: Value| {
+                let mut tool = ToolExecution::new(name, call_id, args, "/work/kit");
+                if !id.is_empty() {
+                    tool = tool.id(id);
+                }
+                tool.set_args_complete();
+                tool.mark_execution_started();
+                tool
+            };
+            let mut ls = card("kit-t1", "ls", "call-1", json!({"path": "src"}));
+            ls.update_result(text_result("a.go\nb.go", false), false);
+            let mut grep = card("kit-t2", "grep", "call-2", json!({"pattern": "TODO"}));
+            if next {
+                grep.update_result(
+                    text_result("x.go:1: TODO kit\ny.go:2: TODO kit", false),
+                    false,
+                );
+            } else {
+                grep.update_result(text_result("x.go:1: TODO kit", false), true);
+            }
+            let mut read = card("", "read", "call-3", json!({"path": "missing.txt"}));
+            read.update_result(text_result("ENOENT: kit", true), false);
+            read.set_expanded(true);
+            let mut custom = card("", "kit_tool", "call-4", json!({"q": "x"}))
+                .tool_definition(ToolDefinition::Empty);
+            custom.update_result(text_result("answer 42", false), false);
+            let mut exited = BashExecution::new("ls -la", false).id("kit-b1");
+            exited.append_output("a.txt\n");
+            exited.append_output("b.txt");
+            exited.set_complete(Some(2), false, false, "");
+            exited.set_expanded(next);
+            let mut seq = BashExecution::new("seq 25", true);
+            seq.append_output(
+                &(1..=25)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            seq.set_complete(Some(0), false, false, "");
+            let diff =
+                Diff::new(" 1 keep\n-2 old kit line\n+2 new kit line\n 3 tail").file_path("kit.go");
+            let root = Container::new()
+                .child(user)
+                .child(streaming)
+                .child(failed)
+                .child(ls)
+                .child(grep)
+                .child(read)
+                .child(custom)
+                .child(exited)
+                .child(seq)
+                .child(diff);
+            match ctx.set_widget_view("kit-conversation", kit::View::new(root), Some(json!({}))) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // kit-output-pad sets the "kit-output-pad" widget to a bash tool card and
+    // a bash command with Pi 1.1.0's outputPad 3 and a final result's
+    // durationMs 1234 (F7); "next" calls setOutputPad(2) on both and gives
+    // the result durationMs 61500.
+    ext.command(
+        "kit-output-pad",
+        "Show Pi's outputPad and durationMs (D107)",
+        |ctx, args| {
+            use pig_sdk::kit::{BashExecution, ToolExecution, ToolResult, ToolResultContent};
+            let next = args == "next";
+            let mut tool = ToolExecution::new(
+                "bash",
+                "call-p1",
+                json!({"command": "echo kit"}),
+                "/work/kit",
+            )
+            .id("kit-p1");
+            tool.set_output_pad(3);
+            tool.set_args_complete();
+            tool.mark_execution_started();
+            tool.update_result(
+                ToolResult {
+                    content: vec![ToolResultContent::text("kit out")],
+                    duration_ms: Some(if next { 61500 } else { 1234 }),
+                    ..ToolResult::default()
+                },
+                false,
+            );
+            let mut command = BashExecution::new("echo pad", false).id("kit-p2");
+            command.set_output_pad(3);
+            command.append_output("padded");
+            command.set_complete(Some(0), false, false, "");
+            if next {
+                tool.set_output_pad(2);
+                command.set_output_pad(2);
+            }
+            match ctx.set_widget_view(
+                "kit-output-pad",
+                kit::View::new(Container::new().child(tool).child(command)),
+                Some(json!({})),
+            ) {
+                Ok(()) => CommandResult::Ok,
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    ext.command(
+        "overlay-width-probe",
+        "Report the width overlay components render at",
+        |ctx, _args| {
+            let mut widths = Vec::new();
+            for options in [
+                json!({"overlay": true}),
+                json!({"overlay": true, "overlayOptions": {"width": "50%"}}),
+            ] {
+                match ctx.custom_component(OverlayWidthProbe::default(), options) {
+                    Ok(value) => widths.push(value.and_then(|v| v.as_u64()).unwrap_or(0)),
+                    Err(err) => return CommandResult::Error(err.to_string()),
+                }
+            }
+            ctx.notify(
+                &format!("overlay-width default={} percent={}", widths[0], widths[1]),
+                "info",
+            );
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "blocked-custom-probe",
+        "Open inline custom components with and without the blocked option",
+        |ctx, _args| {
+            for options in [
+                json!({"blocked": {"kind": "permission", "message": "Approve?"}}),
+                json!({}),
+            ] {
+                if let Err(err) = ctx.custom_component(OverlayWidthProbe::default(), options) {
+                    return CommandResult::Error(err.to_string());
+                }
+            }
+            ctx.notify("blocked-custom done", "info");
+            CommandResult::Ok
+        },
+    );
+    ext.command(
+        "timer-focused-probe",
+        "Exercise timer-driven focused UI",
+        |ctx, _args| {
+            let (component, disposed, detached) = TimerFocused::new();
+            match ctx.custom_component(component, json!({"title": "Timer"})) {
+                Ok(value) => {
+                    let frame = value.and_then(|v| v.as_u64()).unwrap_or(0);
+                    ctx.notify(
+                        &format!(
+                            "timer={frame} disposed={} detached={}",
+                            disposed.load(Ordering::Acquire),
+                            detached.load(Ordering::Acquire),
+                        ),
+                        "info",
+                    );
+                    CommandResult::Ok
+                }
+                Err(err) => CommandResult::Error(err.to_string()),
+            }
+        },
+    );
+    // Typed tool events (upstream PowerShellToolCallEvent/BashToolCallEvent and
+    // their result variants): record the input and details, block the
+    // conformance sentinel command, and replace a result's content.
+    ext.on_event("user_bash", |ctx, data| {
+        let mut value =
+            json!({"result":{"output":"handled","exitCode":7,"cancelled":false,"truncated":false}});
+        match data["command"].as_str().unwrap_or("") {
+            "valid" => {}
+            "undefined" => value["result"]["exitCode"] = Value::Null,
+            "undefined-path" => value["result"]["fullOutputPath"] = Value::Null,
+            "missing" => {
+                value["result"].as_object_mut().unwrap().remove("exitCode");
+            }
+            "invalid" => value["result"]["exitCode"] = json!("invalid"),
+            "null-operations" => value["operations"] = Value::Null,
+            "operations" => return Some(ctx.bash_operations(conformance_bash_operations())),
+            _ => return None,
+        }
+        Some(value)
+    });
+
+    ext.on_event("tool_call", |ctx, data| {
+        let name = data["toolName"].as_str().unwrap_or_default().to_string();
+        let name = name.as_str();
+        // Pi's handler mutates event.input in place and the runner reads it back (runner.ts emitToolCall), so the rewrite is the handler's own edit to the event.
+        // Moving a member to the end is an edit in Pi, and two added members follow in the order the handler added them. With serde_json's preserve_order, `shift_remove` is JavaScript's `delete`; `remove` swaps the last member into the gap.
+        if name == "rewrite_order_probe" {
+            let order = data["input"].as_object_mut().unwrap();
+            if order.get("command") == Some(&json!("reorder")) {
+                let timeout = order.shift_remove("timeout").unwrap();
+                order.insert("timeout".to_string(), timeout);
+            } else {
+                order.insert("zeta".to_string(), json!(1));
+                order.insert("alpha".to_string(), json!(2));
+            }
+            return None;
+        }
+        if name == "rewrite_probe" || name == "rewrite_block_probe" {
+            if data["input"]["command"] == "git status" || name == "rewrite_block_probe" {
+                data["input"]["command"] = json!("git status --short");
+                data["input"].as_object_mut().unwrap().shift_remove("drop");
+                data["input"]["added"] = json!(true);
+                data["input"]["nested"] = json!({"depth": 2});
+            }
+            if name == "rewrite_block_probe" {
+                return Some(json!({"block": true, "reason": "blocked after rewrite"}));
+            }
+            return None;
+        }
+        if name != "powershell" && name != "bash" {
+            return None;
+        }
+        let command = data["input"]["command"].as_str().unwrap_or_default();
+        ctx.notify(
+            &format!(
+                "tool-call={}:{}:{}",
+                name,
+                command,
+                data["input"]["timeout"].as_u64().unwrap_or_default()
+            ),
+            "info",
+        );
+        if command == "blocked-command" {
+            return Some(json!({"block": true, "reason": format!("blocked {name}")}));
+        }
+        None
+    });
+    ext.on_event("tool_result", |ctx, data| {
+        if data["toolName"] == "order_probe" {
+            ctx.notify(
+                &format!(
+                    "order-result={}",
+                    data["toolCallId"].as_str().unwrap_or_default()
+                ),
+                "info",
+            );
+            return None;
+        }
+        let held: Vec<&str> = [
+            ("bash", pig_sdk::is_bash_tool_result as fn(&Value) -> bool),
+            ("powershell", pig_sdk::is_powershell_tool_result),
+            ("read", pig_sdk::is_read_tool_result),
+            ("edit", pig_sdk::is_edit_tool_result),
+            ("write", pig_sdk::is_write_tool_result),
+            ("grep", pig_sdk::is_grep_tool_result),
+            ("find", pig_sdk::is_find_tool_result),
+            ("ls", pig_sdk::is_ls_tool_result),
+        ]
+        .into_iter()
+        .filter(|(_, is)| is(data))
+        .map(|(name, _)| name)
+        .collect();
+        ctx.notify(&format!("tool-result-guards={}", held.join(",")), "info");
+        let name = data["toolName"].as_str().unwrap_or_default();
+        if name != "powershell" && name != "bash" {
+            return None;
+        }
+        ctx.notify(
+            &format!(
+                "tool-result={}:{}:{}:{}",
+                name,
+                data["details"]["fullOutputPath"]
+                    .as_str()
+                    .unwrap_or_default(),
+                data["details"]["truncation"]["totalLines"]
+                    .as_u64()
+                    .unwrap_or_default(),
+                data["content"][0]["text"].as_str().unwrap_or_default()
+            ),
+            "info",
+        );
+        Some(json!({"content": [{"type": "text", "text": format!("{name} redacted")}]}))
+    });
+    ext.on_event("after_provider_response", |ctx, data| {
+        ctx.notify(
+            &format!(
+                "provider-response={}:{}:{}",
+                data["type"].as_str().unwrap_or_default(),
+                data["status"],
+                data["headers"]["x-probe"].as_str().unwrap_or_default()
+            ),
+            "info",
+        );
+        Some(json!({"cancel":true}))
+    });
+    ext.on_event("after_provider_response", |ctx, _| {
+        ctx.notify("provider-response=second", "info");
+        None
+    });
+    ext.on_event("message_update", |ctx, data| {
+        let assistant = &data["assistantMessageEvent"];
+        ctx.notify(
+            &format!(
+                "message-update={}:{}:{}:{}",
+                assistant["type"].as_str().unwrap_or_default(),
+                assistant["contentIndex"].as_u64().unwrap_or_default(),
+                assistant["delta"].as_str().unwrap_or_default(),
+                assistant.get("assistantMessageEvent").is_some()
+            ),
+            "info",
+        );
+        None
+    });
+    ext.on_event("tool_execution_update", |ctx, data| {
+        if data["toolName"] == "production_tool" {
+            ctx.notify(
+                &format!(
+                    "tool-update={}:{}:{}:{}:{}",
+                    data["toolName"].as_str().unwrap_or_default(),
+                    data["args"]["path"].as_str().unwrap_or_default(),
+                    data["args"]["nested"]["depth"].as_u64().unwrap_or_default(),
+                    data["partialResult"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    data["partialResult"]["details"]["progress"]
+                        .as_u64()
+                        .unwrap_or_default()
+                ),
+                "info",
+            );
+            return None;
+        }
+        ctx.notify(
+            &format!(
+                "tool-update={}:{}:{}:{}",
+                data["toolName"].as_str().unwrap_or_default(),
+                data["args"],
+                data["partialResult"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default(),
+                data["partialResult"]["details"]["progress"]
+                    .as_u64()
+                    .unwrap_or_default()
+            ),
+            "info",
+        );
+        None
+    });
+    ext.on_event("tool_execution_end", |ctx, data| {
+        if data["toolName"] == "production_tool" {
+            ctx.notify(
+                &format!(
+                    "tool-end={}:{}:{}:{}:{}:{}:{}",
+                    data["toolName"].as_str().unwrap_or_default(),
+                    data["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    data["result"]["content"]
+                        .as_array()
+                        .map(Vec::len)
+                        .unwrap_or_default(),
+                    data["result"]["content"][1]["data"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    data["result"]["content"][1]["mimeType"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    data["result"]["details"]["nested"]["value"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    data["isError"].as_bool().unwrap_or_default()
+                ),
+                "info",
+            );
+            return None;
+        }
+        ctx.notify(
+            &format!(
+                "tool-end={}:{}:{}:{}:{}",
+                data["toolName"].as_str().unwrap_or_default(),
+                data["result"]["content"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                data["result"]["content"][1]["data"]
+                    .as_str()
+                    .unwrap_or_default(),
+                data["result"]["details"]["nested"]["value"]
+                    .as_str()
+                    .unwrap_or_default(),
+                data["isError"].as_bool().unwrap_or_default()
+            ),
+            "info",
+        );
+        None
+    });
+    ext.on_project_trust(|_, _| Err("trust-boom".to_string()));
+    ext.on_project_trust(|_, _| {
+        Ok(ProjectTrustResult {
+            trusted: ProjectTrustDecision::Undecided,
+            remember: None,
+        })
+    });
+    ext.on_project_trust(|_, data| {
+        if data["cwd"] == json!("/probe") {
+            return Ok(ProjectTrustResult {
+                trusted: ProjectTrustDecision::Undecided,
+                remember: None,
+            });
+        }
+        Ok(ProjectTrustResult {
+            trusted: ProjectTrustDecision::Yes,
+            remember: Some(true),
+        })
+    });
+    ext.on_event("cache_warming_decision", |_, data| {
+        if data["warmCost"] != json!(0.05)
+            || data["missCost"] != json!(0.5)
+            || data["continuationProbability"] != json!(0.15)
+            || data["action"] != json!("warm")
+        {
+            return Some(json!({"error": "unexpected cache decision"}));
+        }
+        Some(json!({"action": "stop"}))
+    });
+    ext.on_event("agent_before_settle", |ctx, data| {
+        let outcome = data.get("outcome").and_then(Value::as_str).unwrap_or("");
+        let entries = data.get("entries").and_then(Value::as_array).map_or(0, Vec::len);
+        let continuation = data.get("continue").and_then(Value::as_bool).unwrap_or(false);
+        let preview = data.get("context").and_then(Value::as_object);
+        let context_entries = preview
+            .and_then(|value| value.get("contextEntries"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let can_continue = preview
+            .and_then(|value| value.get("canContinue"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        ctx.notify(
+            &format!("agent_before_settle:{outcome}:{entries}:{continuation}:{context_entries}:{can_continue}"),
+            "info",
+        );
+        data["entries"].as_array_mut().unwrap().push(json!({"type": "custom", "customType": "kept"}));
+        None
+    });
+    ext.on_event("agent_before_settle", |_, data| {
+        data["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "custom", "customType": "before-error"}));
+        panic!("boundary failed");
+    });
+    ext.on_event("agent_before_settle", |_, data| {
+        assert_eq!(data["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(data["entries"][0]["customType"], "kept");
+        assert_eq!(data["entries"][1]["customType"], "before-error");
+        assert_eq!(
+            data["context"]["contextEntries"].as_array().unwrap().len(),
+            2
+        );
+        // One draft with a null replacement, one without the member, and a compaction that keeps nothing.
+        Some(json!({
+            "entries": [
+                {"type": "custom", "customType": "conformance-boundary"},
+                {"type": "context_edit", "targetId": "conformance-failed-attempt", "replacement": null},
+                {"type": "context_edit", "targetId": "conformance-omitted-member"},
+                {"type": "compaction", "summary": "conformance-summary", "firstKeptEntryId": null, "details": {"format": "conformance-checkpoint"}, "usage": null},
+                {"type": "custom", "customType": "conformance-null-data", "data": null},
+                {"type": "custom_message", "customType": "conformance-null-details", "content": "x", "display": false, "details": null}
+            ],
+            "continue": true
+        }))
+    });
+    ext.on_event("agent_before_settle", |ctx, data| {
+        let entries = data["entries"].as_array().cloned().unwrap_or_default();
+        assert_eq!(entries.len(), 6, "boundary result reached the next handler");
+        let member = |index: usize, key: &str| match entries[index].get(key) {
+            None => "absent",
+            Some(Value::Null) => "null",
+            Some(_) => "value",
+        };
+        let format = entries[3]["details"]["format"].as_str().unwrap_or("");
+        ctx.notify(
+            &format!(
+                "agent_before_settle_drafts:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                entries.len(),
+                member(1, "replacement"),
+                member(2, "replacement"),
+                member(3, "firstKeptEntryId"),
+                format,
+                member(0, "data"),
+                member(3, "usage"),
+                member(4, "data"),
+                member(5, "details")
+            ),
+            "info",
+        );
+        None
+    });
+    ext.on_event("session_start", |ctx, data| {
+        let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+        ctx.notify(&format!("session_start:{reason}"), "info");
+        if let Some(path) = data
+            .get("previousSessionFile")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            ctx.notify(&format!("previous:{path}"), "info");
+        }
+        None
+    });
+    // The handler's own context is still active (Pi invalidates after the handlers ran): the stale-members test reads every member from here.
+    ext.on_event_result("session_shutdown", |ctx, data| {
+        if data.get("reason").and_then(Value::as_str) == Some("stale-members-test") {
+            stale_members(ctx)?;
+        }
+        Ok(None)
+    });
+    ext.on_event("session_shutdown", |ctx, data| {
+        let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+        ctx.notify(&format!("session_shutdown:{reason}"), "info");
+        if let Some(path) = data
+            .get("targetSessionFile")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            ctx.notify(&format!("target:{path}"), "info");
+        }
+        None
+    });
+    ext.on_event("session_info_changed", |ctx, data| {
+        // io_wait_name arms the handler to wait on a socket read first, as a handler that awaits does in Pi.
+        let addr = NAME_WAIT_ADDR.lock().unwrap().clone();
+        if !addr.is_empty() {
+            let _ = io_wait(&addr);
+        }
+        let name = data.get("name").and_then(Value::as_str).unwrap_or("");
+        ctx.notify(&format!("session_info_changed:{name}"), "info");
+        None
+    });
+    ext.on_event("session_before_compact", |ctx, data| {
+        let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+        let will_retry = data
+            .get("willRetry")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        ctx.notify(
+            &format!("session_before_compact:{reason}:{will_retry}"),
+            "info",
+        );
+        None
+    });
+    ext.on_event("session_compact", |ctx, data| {
+        let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+        let will_retry = data
+            .get("willRetry")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let from_extension = data
+            .get("fromExtension")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        ctx.notify(
+            &format!("session_compact:{reason}:{will_retry}:{from_extension}"),
+            "info",
+        );
+        None
+    });
+    ext.on_event("session_compact_failed", |ctx, data| {
+        let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+        let error = data
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let aborted = data
+            .get("aborted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let will_retry = data
+            .get("willRetry")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let from_extension = data
+            .get("fromExtension")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        ctx.notify(
+            &format!(
+                "session_compact_failed:{reason}:{error}:{aborted}:{will_retry}:{from_extension}"
+            ),
+            "info",
+        );
+        None
+    });
+    ext.on_event("turn_end", |_, data| {
+        if data["messageEntryId"] != "boundary-assistant" {
+            return None;
+        }
+        data["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"custom", "customType":"mutated"}));
+        panic!("turn-boundary-failure");
+    });
+    ext.on_event("turn_end", |_, data| {
+        if data["messageEntryId"] != "boundary-assistant" { return None; }
+        Some(json!({"entries":[{"type":"custom", "customType":"turn-boundary", "data": data}], "continue":true}))
+    });
+    ext.on_event("turn_end", |ctx, data| {
+        let message_id = data
+            .get("messageEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tool_id = data
+            .get("toolResultEntryIds")
+            .and_then(Value::as_array)
+            .and_then(|ids| ids.first())
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        ctx.notify(&format!("turn_end:{message_id}:{tool_id}"), "info");
+        None
+    });
+    let prompt_sequence = Arc::new(Mutex::new(0));
+    for name in ["ui_prompt_start", "ui_prompt_end"] {
+        let prompt_sequence = prompt_sequence.clone();
+        ext.on_event(name, move |ctx, data| {
+            let sequence = {
+                let mut counter = prompt_sequence.lock().unwrap();
+                let n = *counter;
+                *counter += 1;
+                n
+            };
+            let field = |key: &str| {
+                data.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let title = data
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("(none)");
+            if title.starts_with("fifo:") {
+                ctx.notify(
+                    &format!("fifo:{sequence}:{}:{title}", field("type")),
+                    "info",
+                );
+                return None;
+            }
+            ctx.notify(
+                &format!(
+                    "ui_prompt:{}:{}:{}:{title}",
+                    field("type"),
+                    field("reason"),
+                    field("kind")
+                ),
+                "info",
+            );
+            None
+        });
+    }
+    register_conformance_oauth(&mut ext);
+    register_conformance_oauth_object(&mut ext);
+    register_conformance_oauth_large(&mut ext);
+    register_state_push_probe(&mut ext);
+    register_signal_abort(&mut ext);
+    register_tui_alt_screen_probe(&mut ext);
+    register_tui_alt_frame_probe(&mut ext);
+    register_tui_alt_children_probe(&mut ext);
+    register_tui_alt_reentry_probe(&mut ext);
+    ext.run().unwrap();
+}
+
+/// How long a state-push-probe reader waits for the value it armed on to change before it reports the value it still holds.
+const STATE_PUSH_WINDOW: Duration = Duration::from_secs(5);
+
+/// Registers the state-push-probe command (TestHostStateChangeReachesABackgroundReaderAcrossSDKs). The command arms a thread that reads one replicated accessor from outside every request, as an extension's timer does, and returns: the host then changes its own state with no call and no event to this extension, and the thread reports the first value that differs from the one it armed on, or the value it still holds after STATE_PUSH_WINDOW, to a file in the directory the arguments name.
+/// The arguments are {"kind": "model" | "model-name" | "session-id" | "context-usage" | "session-name" | "theme" | "settings:<key>" | "mcp", "dir": <directory>}; the report is "<armed>=><read>".
+fn register_state_push_probe(ext: &mut Extension) {
+    ext.command(
+        "state-push-probe",
+        "Read one replicated accessor from a thread between requests",
+        |ctx, args| {
+            let request: Value = match serde_json::from_str(args) {
+                Ok(request) => request,
+                Err(err) => return CommandResult::Error(err.to_string()),
+            };
+            let kind = request["kind"].as_str().unwrap_or("").to_string();
+            let dir = std::path::PathBuf::from(request["dir"].as_str().unwrap_or(""));
+            let read = match state_push_reader(ctx, &kind) {
+                Ok(read) => read,
+                Err(err) => return CommandResult::Error(err),
+            };
+            let armed = read();
+            thread::spawn(move || {
+                let mut current = armed.clone();
+                let deadline = std::time::Instant::now() + STATE_PUSH_WINDOW;
+                while current == armed && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                    current = read();
+                }
+                let name = format!("state-push-{}", kind.replace(':', "_"));
+                let temp = dir.join(format!("{name}.tmp"));
+                if std::fs::write(&temp, format!("{armed}=>{current}")).is_ok() {
+                    let _ = std::fs::rename(&temp, dir.join(name));
+                }
+            });
+            CommandResult::Ok
+        },
+    );
+}
+
+/// The read of one replicated accessor as a string, or an error for a kind the Rust SDK does not replicate: its thinking level is a host call, which is live.
+fn state_push_reader(
+    ctx: &pig_sdk::Context,
+    kind: &str,
+) -> Result<Box<dyn Fn() -> String + Send>, String> {
+    let ctx = ctx.clone();
+    if kind == "model" {
+        return Ok(Box::new(move || ctx.model()));
+    }
+    if kind == "session-name" {
+        return Ok(Box::new(move || ctx.session_name()));
+    }
+    if kind == "model-name" {
+        return Ok(Box::new(move || match ctx.get_model_info() {
+            Ok(info) => info.map(|info| info.name).unwrap_or_default(),
+            Err(err) => format!("error:{err}"),
+        }));
+    }
+    if kind == "context-usage" {
+        return Ok(Box::new(move || match ctx.get_context_usage() {
+            Ok(Some(usage)) => format!(
+                "tokens={}",
+                usage.tokens.map(|n| n.to_string()).unwrap_or_default()
+            ),
+            Ok(None) => "none".to_string(),
+            Err(err) => format!("error:{err}"),
+        }));
+    }
+    if kind == "usage-then-id" {
+        // A host call, then the replicated id: the id must not be older than the host's answer.
+        return Ok(Box::new(move || match ctx.get_context_usage() {
+            Ok(Some(usage)) if usage.tokens == Some(250) => match ctx.get_session_id() {
+                Ok(id) => format!("tokens=250,id={id}"),
+                Err(err) => format!("error:{err}"),
+            },
+            Ok(Some(usage)) => format!(
+                "tokens={}",
+                usage.tokens.map(|n| n.to_string()).unwrap_or_default()
+            ),
+            Ok(None) => "none".to_string(),
+            Err(err) => format!("error:{err}"),
+        }));
+    }
+    if kind == "session-id" {
+        return Ok(Box::new(move || match ctx.get_session_id() {
+            Ok(id) => id,
+            Err(err) => format!("error:{err}"),
+        }));
+    }
+    if kind == "theme" {
+        return Ok(Box::new(move || ctx.theme().name));
+    }
+    if let Some(key) = kind.strip_prefix("settings:") {
+        let key = key.to_string();
+        return Ok(Box::new(move || match ctx.get_settings() {
+            Ok(settings) => settings
+                .get(&key)
+                .cloned()
+                .unwrap_or(Value::Null)
+                .to_string(),
+            Err(err) => format!("error:{err}"),
+        }));
+    }
+    if kind == "mcp" {
+        return Ok(Box::new(move || {
+            ctx.get_mcp_servers()
+                .iter()
+                .map(|server| server.name.clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        }));
+    }
+    Err(format!("state-push-probe: unsupported kind {kind:?}"))
+}
+
+/// Owns credential persistence for the conformance OAuth provider. Its returned
+/// values must match the Go and Python fixtures so the recordings compare equal.
+struct ConformanceStore;
+
+impl OAuthCredentialStore for ConformanceStore {
+    fn credential_status(&self) -> OAuthCredentialStatus {
+        OAuthCredentialStatus {
+            present: true,
+            auth_type: "oauth".to_string(),
+            source: "conformance".to_string(),
+        }
+    }
+    fn store_credentials(&self, creds: OAuthCredentials) -> Result<String, String> {
+        if creds.account_id != "account-store" || creds.scope != "scope-store" {
+            return Err("credential metadata lost".to_string());
+        }
+        Ok("/conf/creds.json".to_string())
+    }
+    fn delete_credentials(&self) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+/// Contributes a provider whose callbacks treat credentials as Pi's complete token object: login returns
+/// a fractional expiry and provider-owned keys, and refresh spreads its input as `{ ...creds, access,
+/// expires }` does. Behavior must match the Go, Python and Node fixtures.
+fn register_conformance_oauth_object(ext: &mut Extension) {
+    ext.register_oauth_provider(
+        "conformance-oauth-object",
+        json!({"name": "Conformance OAuth Object"}),
+        OAuthProvider {
+            name: "Conformance OAuth Object".to_string(),
+            login: Box::new(|_cb| {
+                let mut creds = OAuthCredentials {
+                    access: "object-access".to_string(),
+                    refresh: "object-refresh".to_string(),
+                    ..Default::default()
+                };
+                creds
+                    .extra
+                    .insert("meta".into(), json!({"k": [1, null, ""]}));
+                creds.extra.insert("projectId".into(), json!(""));
+                creds.set_expires_millis(1_700_000_000_000.25);
+                Ok(creds)
+            }),
+            refresh_token: Some(Box::new(|creds: OAuthCredentials| {
+                let mut next = creds.clone();
+                next.access = format!("refreshed-{}", creds.refresh);
+                next.set_expires_millis(creds.expires_millis().unwrap_or(f64::NAN) + 0.5);
+                Ok(next)
+            })),
+            get_api_key: Some(Box::new(|creds: OAuthCredentials| {
+                let typed = if creds.extra.get("type") == Some(&json!("oauth")) {
+                    "typed"
+                } else {
+                    "untyped"
+                };
+                let meta = if creds.extra.contains_key("meta") {
+                    "meta"
+                } else {
+                    "nometa"
+                };
+                format!("key:{typed}:{meta}")
+            })),
+            is_subscription: false,
+            credential_store: None,
+            modify_models: None,
+            uses_callback_server: false,
+        },
+    );
+}
+
+/// Contributes a provider whose expiry is the double 2**60: JSON.parse reads the wire digits 1152921504606847000 as that double, so get_api_key reports a distance of 0 from 2**60 for the number and for its integer projection. Behavior must match the Go, Python and Node fixtures.
+fn register_conformance_oauth_large(ext: &mut Extension) {
+    const TWO_60: f64 = 1_152_921_504_606_846_976.0;
+    ext.register_oauth_provider(
+        "conformance-oauth-large",
+        json!({"name": "Conformance OAuth Large"}),
+        OAuthProvider {
+            name: "Conformance OAuth Large".to_string(),
+            login: Box::new(|_cb| {
+                let mut creds = OAuthCredentials {
+                    access: "large-access".to_string(),
+                    refresh: "large-refresh".to_string(),
+                    ..Default::default()
+                };
+                creds.set_expires_millis(TWO_60);
+                Ok(creds)
+            }),
+            refresh_token: None,
+            get_api_key: Some(Box::new(|creds: OAuthCredentials| {
+                format!(
+                    "key:{}:{}",
+                    (creds.expires_millis().unwrap_or(f64::NAN) - TWO_60) as i64,
+                    creds.expires - (1_i64 << 60)
+                )
+            })),
+            is_subscription: false,
+            credential_store: None,
+            modify_models: None,
+            uses_callback_server: false,
+        },
+    );
+}
+
+/// Contributes the canonical OAuth provider the cross-transport conformance
+/// suite drives. Behavior must match the Go and Python fixtures byte-for-byte.
+fn register_conformance_oauth(ext: &mut Extension) {
+    ext.register_oauth_provider(
+        "conformance-oauth",
+        json!({"name": "Conformance OAuth"}),
+        OAuthProvider {
+            name: "Conformance OAuth".to_string(),
+            is_subscription: true,
+            login: Box::new(|cb| {
+                cb.on_device_code(OAuthDeviceCodeInfo {
+                    user_code: "CONF-USER-CODE".to_string(),
+                    verification_uri: "https://conf.example/verify".to_string(),
+                    ..Default::default()
+                });
+                cb.on_progress("waiting");
+                let value = cb.on_prompt(OAuthPrompt {
+                    message: "paste the code".to_string(),
+                    ..Default::default()
+                })?;
+                Ok(OAuthCredentials {
+                    access: format!("access-{value}"),
+                    refresh: "refresh-tok".to_string(),
+                    expires: 4242,
+                    account_id: "account-login".to_string(),
+                    scope: "scope-login".to_string(),
+                    ..Default::default()
+                })
+            }),
+            refresh_token: Some(Box::new(|creds: OAuthCredentials| {
+                Ok(OAuthCredentials {
+                    access: format!("refreshed-{}", creds.refresh),
+                    refresh: creds.refresh,
+                    expires: 9999,
+                    account_id: creds.account_id,
+                    scope: creds.scope,
+                    ..Default::default()
+                })
+            })),
+            get_api_key: Some(Box::new(|creds: OAuthCredentials| {
+                if creds.access == "boom" {
+                    panic!("getApiKey exploded");
+                }
+                format!("key:{}", creds.access)
+            })),
+            credential_store: Some(Box::new(ConformanceStore)),
+            modify_models: None,
+            uses_callback_server: false,
+        },
+    );
+}
+
+/// Swallows "q", rewrites "a" to "A", upper-cases the host's setText, and frames super.render.
+struct ConformanceEditor {
+    base: EditorBase,
+}
+
+impl EditorComponent for ConformanceEditor {
+    fn base(&self) -> &EditorBase {
+        &self.base
+    }
+    fn handle_input(&mut self, data: &JsString) -> Result<(), String> {
+        if data == "!" {
+            panic!("bad key");
+        }
+        if data == "q" {
+            return Ok(());
+        }
+        if data == "L" {
+            let lines = self.base.get_lines().map_err(|e| e.to_string())?;
+            let mut units: Vec<u16> = "raw:lines=".encode_utf16().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    units.push(u16::from(b'|'));
+                }
+                units.extend_from_slice(line.as_units());
+            }
+            return self
+                .base
+                .set_text(&JsString::from_units(units))
+                .map_err(|e| e.to_string());
+        }
+        let data = if data == "a" {
+            JsString::from("A")
+        } else {
+            data.clone()
+        };
+        self.base.handle_input(&data).map_err(|e| e.to_string())
+    }
+    fn set_text(&mut self, text: &JsString) -> Result<(), String> {
+        if text.to_string_lossy().starts_with("raw:") {
+            return self.base.set_text(text).map_err(|e| e.to_string());
+        }
+        self.base
+            .set_text(&JsString::from(text.to_string_lossy().to_uppercase()))
+            .map_err(|e| e.to_string())
+    }
+    // insert_text_at_cursor wraps the host's text in angle brackets and add_to_history prefixes it, unless it starts with "raw:" (TestEditorComponentOverridesReachSuper).
+    fn insert_text_at_cursor(&mut self, text: &JsString) -> Result<(), String> {
+        if text.to_string_lossy().starts_with("raw:") {
+            return self
+                .base
+                .insert_text_at_cursor(text)
+                .map_err(|e| e.to_string());
+        }
+        self.base
+            .insert_text_at_cursor(&JsString::from(format!("<{}>", text.to_string_lossy())))
+            .map_err(|e| e.to_string())
+    }
+    fn add_to_history(&mut self, text: &JsString) -> Result<(), String> {
+        if text.to_string_lossy().starts_with("raw:") {
+            return self.base.add_to_history(text).map_err(|e| e.to_string());
+        }
+        self.base
+            .add_to_history(&JsString::from(format!(
+                "history:{}",
+                text.to_string_lossy()
+            )))
+            .map_err(|e| e.to_string())
+    }
+    fn render(&mut self, width: u32) -> Result<Vec<JsString>, String> {
+        let mut rows = vec![JsString::from("[custom editor]")];
+        rows.extend(self.base.render(width).map_err(|e| e.to_string())?);
+        Ok(rows)
+    }
+}
+
+/// Opts into the working status in its border.
+struct EmbeddingEditor(ConformanceEditor);
+
+impl EditorComponent for EmbeddingEditor {
+    fn base(&self) -> &EditorBase {
+        self.0.base()
+    }
+    fn embed_working_status(&self) -> bool {
+        true
+    }
+    fn handle_input(&mut self, data: &JsString) -> Result<(), String> {
+        self.0.handle_input(data)
+    }
+    fn set_text(&mut self, text: &JsString) -> Result<(), String> {
+        self.0.set_text(text)
+    }
+    fn render(&mut self, width: u32) -> Result<Vec<JsString>, String> {
+        self.0.render(width)
+    }
+}
+
+/// Captures viewport input until it receives "t"; every key goes to the delegated editor.
+struct ViewportCapturingEditor {
+    inner: ConformanceEditor,
+    captures: bool,
+}
+
+impl EditorComponent for ViewportCapturingEditor {
+    fn base(&self) -> &EditorBase {
+        self.inner.base()
+    }
+    fn captures_viewport_input(&self) -> bool {
+        self.captures
+    }
+    fn handle_input(&mut self, data: &JsString) -> Result<(), String> {
+        if data == "t" {
+            self.captures = false;
+        }
+        self.inner.handle_input(data)
+    }
+    fn set_text(&mut self, text: &JsString) -> Result<(), String> {
+        self.inner.set_text(text)
+    }
+    fn render(&mut self, width: u32) -> Result<Vec<JsString>, String> {
+        self.inner.render(width)
+    }
+}
+
+/// A CustomEditor subclass that sets the handlers Pi's CustomEditor keeps as public fields (on_escape, on_ctrl_d, on_paste_image,
+/// action_handlers through on_action, on_extension_shortcut), reads and sets the members it inherits from Pi's Editor on its base ("M"),
+/// and hears the host's working status and invalidate. Each handler writes what ran into the host's text
+/// (TestEditorComponentAppHandlersRunInTheExtension, TestEditorComponentInheritedMembersReachTheHost,
+/// TestEditorComponentHearsTheWorkingStatusAndInvalidate).
+struct HooksEditor(ConformanceEditor);
+
+fn io_message(err: std::io::Error) -> String {
+    err.to_string()
+}
+
+impl HooksEditor {
+    fn new(base: EditorBase) -> Self {
+        let say = |what: &'static str| -> pig_sdk::EditorHook {
+            let base = base.clone();
+            Arc::new(move || {
+                base.set_text(&JsString::from(format!("raw:hook={what}")))
+                    .map_err(io_message)
+            })
+        };
+        base.set_on_escape(Some(say("escape")));
+        base.set_on_ctrl_d(Some(say("ctrl-d")));
+        base.set_on_paste_image(Some(say("paste-image")));
+        base.on_action("app.clear", say("clear"));
+        // action_handlers is the live map: an entry removed from it is no longer the component's.
+        base.on_action("app.unused", say("unused"));
+        let _ = base.action_handlers().remove("app.unused");
+        let shortcut_base = base.clone();
+        base.set_on_extension_shortcut(Some(Arc::new(move |data: &JsString| {
+            if data != "S" {
+                return Ok(false);
+            }
+            shortcut_base
+                .set_text(&JsString::from("raw:hook=shortcut"))
+                .map_err(io_message)?;
+            Ok(true)
+        })));
+        HooksEditor(ConformanceEditor { base })
+    }
+}
+
+impl EditorComponent for HooksEditor {
+    fn base(&self) -> &EditorBase {
+        self.0.base()
+    }
+    fn handle_input(&mut self, data: &JsString) -> Result<(), String> {
+        if data != "M" {
+            return self.0.handle_input(data);
+        }
+        let base = &self.0.base;
+        let padding = base.get_padding_x().map_err(io_message)?;
+        let visible = base.get_autocomplete_max_visible().map_err(io_message)?;
+        let border = base
+            .border_color(&JsString::from("x"))
+            .map_err(io_message)?;
+        base.set_disable_submit(true).map_err(io_message)?;
+        let disabled = base.disable_submit().map_err(io_message)?;
+        base.set_focused(true).map_err(io_message)?;
+        let focused = base.focused().map_err(io_message)?;
+        let provider = pig_sdk::kit::Autocomplete::new([
+            pig_sdk::kit::SlashCommand::new("help").description("Show help")
+        ])
+        .base_path("/work");
+        base.set_autocomplete_provider(Some(&provider))
+            .map_err(io_message)?;
+        base.on_submit(&JsString::from("sub")).map_err(io_message)?;
+        base.on_change(&JsString::from("chg")).map_err(io_message)?;
+        let text = format!(
+            "raw:members=padding={padding},max={visible},border={},disable={disabled},focused={focused}",
+            border.to_string_lossy()
+        );
+        base.set_text(&JsString::from(text)).map_err(io_message)
+    }
+    fn set_text(&mut self, text: &JsString) -> Result<(), String> {
+        self.0.set_text(text)
+    }
+    fn render(&mut self, width: u32) -> Result<Vec<JsString>, String> {
+        self.0.render(width)
+    }
+    fn set_working_status_indicator(
+        &mut self,
+        status: Option<&pig_sdk::EditorStatus>,
+    ) -> Result<(), String> {
+        let text = match status {
+            None => "raw:status=none".to_string(),
+            Some(status) => format!(
+                "raw:status={}/{}/{}",
+                status.kind, status.message, status.frame
+            ),
+        };
+        self.0
+            .base
+            .set_text(&JsString::from(text))
+            .map_err(io_message)
+    }
+    fn invalidate(&mut self) -> Result<(), String> {
+        self.0
+            .base
+            .set_text(&JsString::from("raw:invalidated"))
+            .map_err(io_message)
+    }
+}
+
+/// Renders the width the SDK draws it at and returns that width on Enter.
+#[derive(Default)]
+struct OverlayWidthProbe {
+    width: std::sync::atomic::AtomicU32,
+}
+
+impl pig_sdk::RemoteComponent for OverlayWidthProbe {
+    fn render(&self, width: u32) -> Vec<String> {
+        self.width
+            .store(width, std::sync::atomic::Ordering::Release);
+        vec![format!("overlay width={width}")]
+    }
+
+    fn handle_input(
+        &mut self,
+        data: &pig_sdk::JsString,
+    ) -> Result<pig_sdk::RemoteComponentResult, String> {
+        if *data == "\r" {
+            return Ok(pig_sdk::RemoteComponentResult::done(Some(json!(
+                self.width.load(std::sync::atomic::Ordering::Acquire)
+            ))));
+        }
+        Ok(pig_sdk::RemoteComponentResult::pending())
+    }
+}
+
+/// The BashOperations every SDK fixture returns for the user_bash command "operations" (TestConformance_UserBashOperationsRunInTheExtension).
+fn conformance_bash_operations() -> pig_sdk::BashOperations {
+    pig_sdk::BashOperations {
+        exec: std::sync::Arc::new(|command, cwd, options| match command {
+            "echo" => {
+                (options.on_data)(format!("cmd:{command}\n").as_bytes());
+                (options.on_data)(format!("cwd:{cwd}\n").as_bytes());
+                if options.env.as_ref().is_some_and(|env| env.is_empty()) {
+                    (options.on_data)(b"env-empty\n");
+                }
+                let mut names: Vec<&String> =
+                    options.env.iter().flat_map(|env| env.keys()).collect();
+                names.sort();
+                for name in names {
+                    (options.on_data)(
+                        format!("env:{name}={}\n", options.env.as_ref().unwrap()[name]).as_bytes(),
+                    );
+                }
+                if let Some(timeout) = options.timeout {
+                    (options.on_data)(format!("timeout:{timeout}\n").as_bytes());
+                }
+                Ok(Some(3))
+            }
+            "chunks" => {
+                for chunk in ["a", "b", "c"] {
+                    (options.on_data)(chunk.as_bytes());
+                }
+                Ok(None)
+            }
+            "binary" => {
+                (options.on_data)(&[0xff, 0x00, 0x80]);
+                Ok(Some(0))
+            }
+            "wait" => {
+                (options.on_data)(b"waiting");
+                options.signal.wait();
+                (options.on_data)(b"stopped");
+                Err("aborted".into())
+            }
+            other => Err(format!("exec failed: {other}").into()),
+        }),
+    }
+}
+
+fn pi_ai_helpers_call(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    let a = |i: usize| &args[i];
+    let messages = |i: usize| a(i).as_array().cloned().unwrap_or_default();
+    let flag = |i: usize| a(i).as_bool().unwrap_or_default();
+    Ok(Some(match name {
+        "StringEnum" => {
+            let values: Vec<&str> = a(0)
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            let options = args.get(1).map(|o| pig_sdk::StringEnumOptions {
+                description: o
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                default: o.get("default").and_then(Value::as_str).map(String::from),
+            });
+            pig_sdk::string_enum(&values, options.as_ref())
+        }
+        "getSupportedThinkingLevels" => json!(pig_sdk::get_supported_thinking_levels(a(0))),
+        "clampThinkingLevel" => json!(pig_sdk::clamp_thinking_level(
+            a(0),
+            a(1).as_str().unwrap_or_default()
+        )),
+        "calculateCost" => pig_sdk::calculate_cost(a(0), &mut a(1).clone())?,
+        "contentText" => json!(pig_sdk::content_text(
+            Some(a(0)),
+            args.get(1).and_then(Value::as_str).unwrap_or("\n")
+        )?),
+        "getCurrentTools" => json!(pig_sdk::get_current_tools(&messages(0))),
+        "getCurrentSystemMessage" => return pig_sdk::get_current_system_message(&messages(0)),
+        "getCurrentSystemPrompt" => json!(pig_sdk::get_current_system_prompt(&messages(0))?),
+        "getInitialSystemMessage" => {
+            return Ok(pig_sdk::get_initial_system_message(&messages(0)).cloned());
+        }
+        "getDeclaredTools" => json!(pig_sdk::get_declared_tools(&messages(0))),
+        "hasNonAdditiveToolChanges" => json!(pig_sdk::has_non_additive_tool_changes(&messages(0))),
+        "resolveTranscriptTools" => {
+            let support = match a(1).as_str().unwrap_or_default() {
+                "none" => pig_sdk::TranscriptToolSupport::None,
+                "additions" => pig_sdk::TranscriptToolSupport::Additions,
+                "changes" => pig_sdk::TranscriptToolSupport::Changes,
+                other => return Err(format!("unknown transcript tool support {other:?}")),
+            };
+            let resolved = pig_sdk::resolve_transcript_tools(&messages(0), support);
+            json!({ "requestTools": resolved.request_tools, "foldedSystemMessages": resolved.folded_system_messages })
+        }
+        "collapseSystemMessages" => pig_sdk::collapse_system_messages(a(0))?,
+        "resolveTranscript" => pig_sdk::resolve_transcript(a(0), flag(1))?,
+        "withoutInitialSystemMessage" => {
+            json!(pig_sdk::without_initial_system_message(&messages(0)))
+        }
+        "normalizeContext" => pig_sdk::normalize_context(a(0)),
+        "createInitialSystemMessage" => {
+            let tools = args
+                .get(1)
+                .filter(|tools| !tools.is_null())
+                .map(|tools| tools.as_array().cloned().unwrap_or_default());
+            return Ok(pig_sdk::create_initial_system_message(
+                a(0).as_str(),
+                tools.as_deref(),
+            ));
+        }
+        "getSystemMessageText" => json!(pig_sdk::get_system_message_text(a(0))?),
+        "renderSystemMessageUpdate" => json!(pig_sdk::render_system_message_update(a(0))?),
+        "getModelType" => json!(pig_sdk::get_model_type(a(0))),
+        "isModelType" => json!(pig_sdk::is_model_type(
+            a(0),
+            a(1).as_str().unwrap_or_default()
+        )),
+        "hasApi" => json!(pig_sdk::has_api(a(0), a(1).as_str().unwrap_or_default())),
+        "modelsAreEqual" => json!(pig_sdk::models_are_equal(
+            Some(a(0)).filter(|first| !first.is_null()),
+            Some(a(1)).filter(|other| !other.is_null())
+        )),
+        "isRetryableAssistantError" => json!(pig_sdk::is_retryable_assistant_error(a(0))),
+        "isContextOverflow" => json!(pig_sdk::is_context_overflow(
+            a(0),
+            args.get(1).and_then(Value::as_f64)
+        )),
+        "isRecoverableLength" => json!(pig_sdk::is_recoverable_length(
+            a(0),
+            a(1).as_f64().unwrap_or_default()
+        )),
+        "retryDelayMs" => {
+            let policy = pig_sdk::RetryPolicy {
+                base_delay_ms: a(0)["baseDelayMs"].as_f64().unwrap_or_default(),
+                max_agent_delay_ms: a(0).get("maxAgentDelayMs").and_then(Value::as_f64),
+            };
+            json!(pig_sdk::retry_delay_ms(
+                &policy,
+                a(1).as_i64().unwrap_or_default()
+            ))
+        }
+        "DEFAULT_MAX_AGENT_RETRY_DELAY_MS" => json!(pig_sdk::DEFAULT_MAX_AGENT_RETRY_DELAY_MS),
+        other => return Err(format!("no Rust counterpart for {other}")),
+    }))
+}
+
+fn pi_ai_helpers_probe(path: &str) -> Result<Value, String> {
+    let golden: Value =
+        serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let mut cases = Vec::new();
+    for case in golden["cases"].as_array().ok_or("no cases")? {
+        let name = case["fn"].as_str().unwrap_or_default();
+        let value = pi_ai_helpers_call(name, case["args"].as_array().unwrap_or(&Vec::new()))
+            .map_err(|e| format!("{name}: {e}"))?;
+        cases.push(Value::Array(value.into_iter().collect()));
+    }
+    let mut auth = Vec::new();
+    for case in golden["auth"]["cases"].as_array().ok_or("no auth cases")? {
+        let vars: Vec<&str> = case["envVars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let env = case["env"].clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        let input = pig_sdk::APIKeyAuthInput {
+            ctx: pig_sdk::AuthContext {
+                env: Arc::new(move |name| {
+                    seen_in.lock().unwrap().push(name.clone());
+                    Ok(env.get(&name).and_then(Value::as_str).map(String::from))
+                }),
+                file_exists: Arc::new(|_| Ok(false)),
+            },
+            credential: case.get("credential").filter(|c| !c.is_null()).cloned(),
+            signal: pig_sdk::ProviderSignal::default(),
+        };
+        let result = (pig_sdk::env_api_key_auth(case["name"].as_str().unwrap_or_default(), &vars)
+            .resolve)(input)?;
+        auth.push(json!({ "result": result.map(|r| serde_json::to_value(r).unwrap()), "seen": *seen.lock().unwrap() }));
+    }
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let prompts_in = prompts.clone();
+    let credential = (pig_sdk::env_api_key_auth("Name", &["FIRST", "SECOND"])
+        .login
+        .unwrap())(pig_sdk::AuthInteraction {
+        signal: pig_sdk::ProviderSignal::default(),
+        prompt: Arc::new(move |request| {
+            prompts_in.lock().unwrap().push(request);
+            Ok("typed-key".to_string())
+        }),
+        notify: Arc::new(|_| Ok(())),
+    })?;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64)
+    };
+    let mut timing = Vec::new();
+    for case in golden["timing"].as_array().ok_or("no timing")? {
+        let stream = pig_sdk::create_assistant_message_event_stream();
+        let kind = case["kind"].as_str().unwrap_or_default();
+        let message = |is_later: bool| {
+            let mut message = json!({ "role": "assistant", "content": [], "stopReason": if kind == "error" { "error" } else { "stop" } });
+            match case["timestamp"].as_str().unwrap_or_default() {
+                _ if is_later => message["timestamp"] = json!(now()),
+                "now" => message["timestamp"] = json!(now()),
+                "old" => message["timestamp"] = json!(1),
+                _ => {}
+            }
+            if !case["preset"].is_null() && !is_later {
+                message["durationMs"] = case["preset"].clone();
+            }
+            message
+        };
+        let (final_message, later) = (message(false), message(true));
+        let delivered = match kind {
+            "done" => {
+                stream.push(json!({ "type": "done", "reason": "stop", "message": final_message }));
+                stream.next().unwrap()["message"].clone()
+            }
+            "error" => {
+                stream.push(json!({ "type": "error", "reason": "error", "error": final_message }));
+                stream.next().unwrap()["error"].clone()
+            }
+            "end" => {
+                stream.end(final_message);
+                stream.result().unwrap()
+            }
+            _ => {
+                stream.push(json!({ "type": "done", "reason": "stop", "message": final_message }));
+                stream.end(later);
+                stream.next().unwrap()["message"].clone()
+            }
+        };
+        let value = delivered.get("durationMs");
+        let kept = value
+            .filter(|value| !case["preset"].is_null() && **value == case["preset"])
+            .cloned()
+            .unwrap_or(Value::Null);
+        timing.push(json!({ "present": value.is_some(), "value": kept, "laterTimed": false }));
+    }
+    Ok(
+        json!({ "cases": cases, "timing": timing, "auth": auth, "login": { "prompts": *prompts.lock().unwrap(), "result": credential } }),
+    )
+}
+
+fn host_helpers_probe(ctx: &pig_sdk::Context, args: &str) -> Result<Value, String> {
+    let mut parts = args.splitn(3, '|');
+    let (golden_path, auth_path, text) = (
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+    );
+    let golden: Value =
+        serde_json::from_str(&std::fs::read_to_string(golden_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let io = |e: std::io::Error| e.to_string();
+    let mut diffs = Vec::new();
+    for case in golden["diffs"].as_array().ok_or("no diffs")? {
+        let lines = case.get("contextLines").and_then(Value::as_i64);
+        let (old, new) = (
+            case["oldContent"].as_str().unwrap_or_default(),
+            case["newContent"].as_str().unwrap_or_default(),
+        );
+        let mut report = json!({"patch": ctx.generate_unified_patch(case.get("path").and_then(Value::as_str).unwrap_or("src/a.ts"), old, new, lines).map_err(io)?});
+        if !case
+            .get("patchOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let diff = ctx.generate_diff_string(old, new, lines).map_err(io)?;
+            report["diff"] = json!(diff.diff);
+            report["firstChangedLine"] = json!(diff.first_changed_line);
+        }
+        diffs.push(report);
+    }
+    let mut entries = Vec::new();
+    for case in golden["entries"].as_array().ok_or("no entries")? {
+        entries.push(json!(
+            pig_sdk::session_entry_to_context_messages(&case["entry"]).map_err(io)?
+        ));
+    }
+    let mut contexts = Vec::new();
+    for case in golden["contexts"].as_array().ok_or("no contexts")? {
+        let args = case["args"].as_array().ok_or("no args")?;
+        let entries: Vec<Value> = args[0].as_array().cloned().unwrap_or_default();
+        let leaf = match args.get(1) {
+            None => pig_sdk::SessionLeaf::Last,
+            Some(Value::Null) => pig_sdk::SessionLeaf::None,
+            Some(id) => pig_sdk::SessionLeaf::At(id.as_str().ok_or("leaf is not a string")?),
+        };
+        let by_id: Option<serde_json::Map<String, Value>> = args.get(2).map(|pairs| {
+            pairs
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|pair| Some((pair[0].as_str()?.to_string(), pair[1].clone())))
+                .collect()
+        });
+        contexts.push(
+            match pig_sdk::build_session_context(&entries, leaf, by_id.as_ref()) {
+                Ok(result) => json!({"result": result}),
+                Err(error) => {
+                    json!({"throws": error.to_string().trim_start_matches("TypeError: ")})
+                }
+            },
+        );
+    }
+    let mut images = Vec::new();
+    for case in golden["images"].as_array().ok_or("no images")? {
+        let (data, mime) = (
+            case["data"].as_str().unwrap_or_default(),
+            case["mimeType"].as_str().unwrap_or_default(),
+        );
+        if case["op"] == "convert" {
+            images.push(match ctx.convert_to_png(data, mime).map_err(io)? {
+                Some(converted) => {
+                    json!({"mimeType": converted.mime_type, "decodes": !converted.data.is_empty()})
+                }
+                None => Value::Null,
+            });
+            continue;
+        }
+        let options =
+            case.get("options")
+                .filter(|o| o.is_object())
+                .map(|o| pig_sdk::ImageResizeOptions {
+                    max_width: o.get("maxWidth").and_then(Value::as_u64).map(|v| v as u32),
+                    max_height: o.get("maxHeight").and_then(Value::as_u64).map(|v| v as u32),
+                    max_bytes: o.get("maxBytes").and_then(Value::as_u64),
+                    jpeg_quality: o
+                        .get("jpegQuality")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32),
+                });
+        let input = decode_base64(data);
+        images.push(match ctx.resize_image(&input, mime, options.as_ref()).map_err(io)? {
+            Some(resized) => json!({"mimeType": resized.mime_type, "originalWidth": resized.original_width, "originalHeight": resized.original_height, "width": resized.width, "height": resized.height, "wasResized": resized.was_resized, "decodes": !resized.data.is_empty()}),
+            None => Value::Null,
+        });
+    }
+    let credential = |provider: &str, path: Option<&str>| {
+        pig_sdk::read_stored_credential(provider, path)
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null)
+    };
+    let creds = json!({
+        "explicit": credential("anthropic", Some(auth_path)), "default": credential("anthropic", None), "absentProvider": credential("nobody", Some(auth_path)),
+        "missingFile": credential("anthropic", Some(&format!("{auth_path}.missing"))), "notJSON": credential("anthropic", Some(&format!("{auth_path}.bad"))),
+    });
+    ctx.copy_to_clipboard(text).map_err(io)?;
+    Ok(
+        json!({"diffs": diffs, "entries": entries, "contexts": contexts, "images": images, "creds": creds}),
+    )
+}
+
+fn decode_base64(text: &str) -> Vec<u8> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let (mut out, mut buffer, mut bits) = (Vec::new(), 0u32, 0);
+    for byte in text.bytes().filter_map(value) {
+        buffer = (buffer << 6) | u32::from(byte);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+// ── builtin_probe (TestConformance_BuiltinToolDelegationAcrossSDKs) ──────────────────────────────────────────────────────────────────────────────────────────
+
+type CallLog = Arc<Mutex<Vec<String>>>;
+
+fn log_call(log: &CallLog, entry: String) {
+    log.lock().unwrap().push(entry);
+}
+
+fn builtin_report(result: &pig_sdk::AgentToolResult) -> Value {
+    let blocks: Vec<Value> = result
+        .content
+        .iter()
+        .map(|block| match block["type"].as_str() {
+            Some("text") => json!({"type": "text", "text": block["text"].as_str().unwrap_or("")}),
+            other => json!({"type": other, "mimeType": block["mimeType"]}),
+        })
+        .collect();
+    let mut report = json!({"content": blocks, "isError": result.is_error});
+    if !result.details.is_null() {
+        report["details"] = result.details.clone();
+        report["detailsJSON"] = json!(serde_json::to_string(&result.details).unwrap_or_default());
+    }
+    if let Some(structured) = result
+        .structured_content
+        .as_ref()
+        .and_then(Value::as_object)
+    {
+        let keys: Vec<&String> = structured.keys().collect();
+        report["structuredKeys"] = json!(keys);
+        report["exitCode"] = structured.get("exit_code").cloned().unwrap_or(Value::Null);
+    }
+    report
+}
+
+fn path_op<R: 'static>(
+    log: &CallLog,
+    label: &'static str,
+    result: impl Fn(&str) -> Result<R, String> + Send + Sync + 'static,
+) -> pig_sdk::PathOperation<R> {
+    let log = log.clone();
+    Arc::new(move |path| {
+        log_call(&log, format!("{label}:{path}"));
+        result(path)
+    })
+}
+
+fn write_op(log: &CallLog) -> pig_sdk::WriteOperation {
+    let log = log.clone();
+    Arc::new(move |path, content| {
+        log_call(&log, format!("writeFile:{path}:{content}"));
+        Ok(())
+    })
+}
+
+/// The options of the case for `tool`, with callbacks that log into `log`; one value per tool kind so the factories take the right type.
+struct ProbeOptions {
+    read: pig_sdk::ReadToolOptions,
+    write: pig_sdk::WriteToolOptions,
+    edit: pig_sdk::EditToolOptions,
+    ls: pig_sdk::LsToolOptions,
+    grep: pig_sdk::GrepToolOptions,
+    find: pig_sdk::FindToolOptions,
+    bash: pig_sdk::BashToolOptions,
+    powershell: pig_sdk::PowerShellToolOptions,
+}
+
+fn builtin_options(case: &Value, log: &CallLog) -> ProbeOptions {
+    let custom = case["ops"].as_str() == Some("custom");
+    let expose = case["exposeSessionEnvironment"].as_bool();
+    let mut options = ProbeOptions {
+        read: pig_sdk::ReadToolOptions {
+            auto_resize_images: case["autoResizeImages"].as_bool(),
+            ..Default::default()
+        },
+        write: Default::default(),
+        edit: Default::default(),
+        ls: Default::default(),
+        grep: Default::default(),
+        find: Default::default(),
+        bash: pig_sdk::BashToolOptions {
+            command_prefix: case["commandPrefix"]
+                .as_str()
+                .filter(|prefix| !prefix.is_empty())
+                .map(str::to_string),
+            expose_session_environment: expose,
+            ..Default::default()
+        },
+        powershell: pig_sdk::PowerShellToolOptions {
+            expose_session_environment: expose,
+            ..Default::default()
+        },
+    };
+    if case["hook"].as_bool() == Some(true) {
+        let hook_log = log.clone();
+        options.bash.spawn_hook = Some(Arc::new(move |spawn: pig_sdk::BashSpawnContext| {
+            log_call(&hook_log, format!("spawnHook:{}", spawn.command));
+            let mut env = spawn.env.clone();
+            env.insert("HOOK_VAR".to_string(), "hook-env".to_string());
+            Ok(pig_sdk::BashSpawnContext {
+                command: "printf '%s|%s' \"$HOOK_VAR\" \"$PI_SESSION_ID\"".to_string(),
+                cwd: spawn.cwd,
+                env,
+            })
+        }));
+    }
+    if case["ops"].as_str() == Some("localThread") {
+        // The local operations run on another thread and their error comes back unchanged: the shell's exit belongs to the error, not to the thread.
+        let inner = pig_sdk::create_local_bash_operations(None).exec;
+        options.bash.operations = Some(pig_sdk::BashOperations {
+            exec: Arc::new(move |command, cwd, exec_options| {
+                let inner = inner.clone();
+                let (command, cwd) = (command.to_string(), cwd.to_string());
+                std::thread::spawn(move || inner(&command, &cwd, exec_options))
+                    .join()
+                    .unwrap_or_else(|_| Err("the local operations panicked".into()))
+            }),
+        });
+        return options;
+    }
+    if matches!(case["ops"].as_str(), Some("local" | "localWrapped")) {
+        // The bash tool runs on the local operations. "local" returns their error unchanged; "localWrapped" returns a new error with the same message, which is not the
+        // backend's error and keeps nothing of it (Pi matches the backend's class, bash.ts).
+        let wrapped = case["ops"].as_str() == Some("localWrapped");
+        let inner = pig_sdk::create_local_bash_operations(None).exec;
+        options.bash.operations = Some(pig_sdk::BashOperations {
+            exec: Arc::new(move |command, cwd, exec_options| {
+                let result = inner(command, cwd, exec_options);
+                if wrapped {
+                    result.map_err(|error| pig_sdk::BashExecError::from(error.message()))
+                } else {
+                    result
+                }
+            }),
+        });
+        return options;
+    }
+    if case["ops"].as_str() == Some("globlimit") {
+        // Pi main 676af1d77 (#11747): the tool asks glob for one result past its limit.
+        let glob_log = log.clone();
+        options.find.operations = Some(pig_sdk::FindOperations {
+            exists: path_op(log, "exists", |_| Ok(true)),
+            glob: Arc::new(move |pattern, _cwd, glob_options| {
+                log_call(
+                    &glob_log,
+                    format!("glob:{pattern}:limit={}", glob_options.limit as i64),
+                );
+                let all = ["a.txt", "b.txt", "c.txt"];
+                let take = (glob_options.limit as usize).min(all.len());
+                Ok(all[..take].iter().map(|name| name.to_string()).collect())
+            }),
+        });
+    }
+    if case["ops"].as_str() == Some("grepdir") {
+        options.grep.operations = Some(pig_sdk::GrepOperations {
+            is_directory: path_op(log, "isDirectory", |_| Ok(true)),
+            read_file: Some(path_op(log, "readFile", |_| Ok(String::new()))),
+        });
+        return options;
+    }
+    if case["ops"].as_str() == Some("stream") {
+        options.read.operations = Some(pig_sdk::ReadOperations {
+            read_file: path_op(log, "readFile", |path| {
+                Ok(format!("OPS:{path}").into_bytes())
+            }),
+            access: path_op(log, "access", |_| Ok(())),
+            detect_image_mime_type: None,
+            create_read_stream: Some(path_op(log, "createReadStream", |path| {
+                Ok(Box::new(std::io::Cursor::new(
+                    format!("STREAM:{path}\n").into_bytes(),
+                )) as pig_sdk::ReadStream)
+            })),
+        });
+        return options;
+    }
+    if !custom {
+        return options;
+    }
+    options.read.operations = Some(pig_sdk::ReadOperations {
+        read_file: path_op(log, "readFile", |path| {
+            Ok(format!("OPS:{path}").into_bytes())
+        }),
+        access: path_op(log, "access", |_| Ok(())),
+        detect_image_mime_type: None,
+        create_read_stream: None,
+    });
+    options.write.operations = Some(pig_sdk::WriteOperations {
+        write_file: write_op(log),
+        mkdir: path_op(log, "mkdir", |_| Ok(())),
+    });
+    options.edit.operations = Some(pig_sdk::EditOperations {
+        read_file: path_op(log, "readFile", |_| Ok(b"hello world\n".to_vec())),
+        write_file: write_op(log),
+        access: path_op(log, "access", |_| Ok(())),
+    });
+    options.ls.operations = Some(pig_sdk::LsOperations {
+        exists: path_op(log, "exists", |_| Ok(true)),
+        stat: path_op(log, "stat", |path| {
+            Ok(pig_sdk::LsStat {
+                is_directory: !path.contains('.'),
+            })
+        }),
+        readdir: path_op(log, "readdir", |_| {
+            Ok(vec![
+                "b.txt".to_string(),
+                "a.txt".to_string(),
+                "sub".to_string(),
+            ])
+        }),
+    });
+    options.grep.operations = Some(pig_sdk::GrepOperations {
+        is_directory: path_op(log, "isDirectory", |_| {
+            Err("no such path for the probe".to_string())
+        }),
+        read_file: None,
+    });
+    let glob_log = log.clone();
+    options.find.operations = Some(pig_sdk::FindOperations {
+        exists: path_op(log, "exists", |_| Ok(false)),
+        glob: Arc::new(move |pattern, _cwd, _options| {
+            log_call(&glob_log, format!("glob:{pattern}"));
+            Ok(Vec::new())
+        }),
+    });
+    let exec_log = log.clone();
+    options.bash.operations = Some(pig_sdk::BashOperations {
+        exec: Arc::new(move |command, cwd, exec_options| {
+            log_call(&exec_log, format!("exec:{command}|cwd={cwd}"));
+            (exec_options.on_data)(format!("custom:{command}").as_bytes());
+            Ok(Some(0))
+        }),
+    });
+    options
+}
+
+fn builtin_probe(ctx: &pig_sdk::Context, case: &Value) -> Result<Value, String> {
+    let kind = case["kind"].as_str().unwrap_or("");
+    let factory_cwd = case["factoryCwd"].as_str().unwrap_or("").to_string();
+    match kind {
+        "cwd" => return Ok(json!({"cwd": ctx.cwd()})),
+        "register" => return builtin_register(ctx, &factory_cwd),
+        "registerEdit" => return builtin_register_edit(ctx, &factory_cwd),
+        "local" => return Ok(builtin_local(case)),
+        "sets" => {
+            let names = |tools: Vec<pig_sdk::BuiltinTool>| {
+                tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>()
+            };
+            let coding =
+                names(pig_sdk::create_coding_tools(&factory_cwd, None).map_err(|e| e.to_string())?);
+            let read_only = names(
+                pig_sdk::create_read_only_tools(&factory_cwd, None).map_err(|e| e.to_string())?,
+            );
+            return Ok(json!({"coding": coding, "readOnly": read_only}));
+        }
+        _ => {}
+    }
+    let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let options = builtin_options(case, &log);
+    let tool = case["tool"].as_str().unwrap_or("bash");
+    macro_rules! create {
+        ($definition:ident, $tool:ident, $options:expr) => {
+            if kind == "definition" || kind == "prepare" {
+                Created::Definition(
+                    pig_sdk::$definition(&factory_cwd, Some($options))
+                        .map_err(|e| e.to_string())?,
+                )
+            } else if case["noContext"].as_bool() == Some(true) {
+                Created::Tool(
+                    pig_sdk::$tool(&factory_cwd, Some($options)).map_err(|e| e.to_string())?,
+                )
+            } else {
+                Created::Executor(
+                    pig_sdk::$definition(&factory_cwd, Some($options))
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+        };
+    }
+    let created = match tool {
+        "read" => create!(create_read_tool_definition, create_read_tool, options.read),
+        "write" => create!(
+            create_write_tool_definition,
+            create_write_tool,
+            options.write
+        ),
+        "edit" => create!(create_edit_tool_definition, create_edit_tool, options.edit),
+        "ls" => create!(create_ls_tool_definition, create_ls_tool, options.ls),
+        "grep" => create!(create_grep_tool_definition, create_grep_tool, options.grep),
+        "find" => create!(create_find_tool_definition, create_find_tool, options.find),
+        "powershell" => create!(
+            create_powershell_tool_definition,
+            create_powershell_tool,
+            options.powershell
+        ),
+        _ => create!(create_bash_tool_definition, create_bash_tool, options.bash),
+    };
+    if kind == "prepare" {
+        let Created::Definition(built) = created else {
+            unreachable!()
+        };
+        let mut report = json!({"has": built.definition.prepare_arguments.is_some()});
+        if let Some(prepare) = &built.definition.prepare_arguments {
+            match prepare(case.get("params").cloned().unwrap_or_else(|| json!({}))) {
+                Ok(prepared) => report["prepared"] = prepared,
+                Err(error) => report["error"] = json!(error),
+            }
+        }
+        return Ok(report);
+    }
+    if kind == "definition" {
+        let Created::Definition(built) = created else {
+            unreachable!()
+        };
+        let d = &built.definition;
+        let sampling = d
+            .constrained_sampling
+            .as_ref()
+            .map(|sampling| match sampling {
+                pig_sdk::ToolConstrainedSampling::Config(config) => {
+                    serde_json::to_value(config).unwrap_or(Value::Null)
+                }
+                pig_sdk::ToolConstrainedSampling::Disabled => json!(false),
+            });
+        return Ok(json!({"definition": {
+            "name": d.name, "label": d.label, "description": d.description, "promptSnippet": d.prompt_snippet.clone().unwrap_or_default(),
+            "promptGuidelines": if d.prompt_guidelines.is_empty() { Value::Null } else { json!(d.prompt_guidelines) }, "parameters": d.parameters,
+            "outputSchema": d.output_schema.clone().unwrap_or(Value::Null), "constrainedSampling": sampling.unwrap_or(Value::Null),
+            "executionMode": d.execution_mode.clone().unwrap_or_default(), "renderShell": if d.render_shell == ToolRenderShell::SelfShell { "self" } else { "" },
+        }}));
+    }
+    let signal = pig_sdk::ProviderSignal::new();
+    if case["preAborted"].as_bool() == Some(true) {
+        signal.cancel();
+    }
+    let updates: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let abort_on_output = case["abortOnOutput"].as_bool() == Some(true);
+    let on_update: Option<pig_sdk::ExecuteToolUpdate> =
+        (case["updates"].as_bool() == Some(true) || abort_on_output).then(|| {
+            let updates = updates.clone();
+            let signal = signal.clone();
+            Arc::new(move |partial: pig_sdk::AgentToolResult| {
+                let text = partial.text();
+                if abort_on_output && !text.is_empty() {
+                    signal.cancel();
+                }
+                updates.lock().unwrap().push(text);
+            }) as pig_sdk::ExecuteToolUpdate
+        });
+    let params = case.get("params").cloned().unwrap_or_else(|| json!({}));
+    let outcome = match created {
+        Created::Tool(tool) => tool.execute("probe-call", params, Some(&signal), on_update),
+        Created::Executor(built) => {
+            built
+                .executor()
+                .execute_with(ctx, "probe-call", params, Some(&signal), on_update)
+        }
+        Created::Definition(_) => unreachable!(),
+    };
+    let mut report = json!({});
+    match outcome {
+        Ok(result) => report["result"] = builtin_report(&result),
+        Err(error) => report["error"] = json!(error.to_string()),
+    }
+    if case["updates"].as_bool() == Some(true) {
+        report["updates"] = json!(updates.lock().unwrap().clone());
+    }
+    report["calls"] = json!(log.lock().unwrap().clone());
+    Ok(report)
+}
+
+enum Created {
+    Definition(pig_sdk::BuiltinToolDefinition),
+    Executor(pig_sdk::BuiltinToolDefinition),
+    Tool(pig_sdk::BuiltinTool),
+}
+
+fn wrap_first_text(result: &mut pig_sdk::AgentToolResult, wrap: impl Fn(&str) -> String) {
+    if let Some(block) = result.content.first_mut() {
+        let text = block["text"].as_str().unwrap_or("").to_string();
+        block["text"] = json!(wrap(&text));
+    }
+}
+
+/// Overrides the read and bash tools with wrapped built-ins, as Pi's `pi.registerTool({ ...definition, execute })` does: the wrapper runs the built-in through
+/// the SDK and post-processes its result, so only a tool that really ran on the host can produce the sentinel text.
+fn builtin_register(ctx: &pig_sdk::Context, factory_cwd: &str) -> Result<Value, String> {
+    let mut read =
+        pig_sdk::create_read_tool_definition(factory_cwd, None).map_err(|e| e.to_string())?;
+    let run_read = read.executor();
+    read.definition.execute = Box::new(move |ctx, params| match run_read.execute(ctx, params) {
+        Ok(mut result) => {
+            wrap_first_text(&mut result, |text| format!("«delegated:{text}»"));
+            result.details = json!({"delegated": true});
+            result.into_tool_result()
+        }
+        Err(error) => ToolResult::error(error.to_string()),
+    });
+    let read_name = read.definition.name.clone();
+    ctx.register_tool(read.definition)
+        .map_err(|e| e.to_string())?;
+    let mut bash =
+        pig_sdk::create_bash_tool_definition(factory_cwd, None).map_err(|e| e.to_string())?;
+    let run_bash = bash.executor();
+    bash.definition.execute = Box::new(move |ctx, params| match run_bash.execute(ctx, params) {
+        Ok(mut result) => {
+            wrap_first_text(&mut result, |text| format!("«{text}»"));
+            result.into_tool_result()
+        }
+        Err(error) => ToolResult::error(error.to_string()),
+    });
+    let bash_name = bash.definition.name.clone();
+    ctx.register_tool(bash.definition)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"registered": [read_name, bash_name]}))
+}
+
+/// Overrides the edit tool with a wrapped built-in, as `pi.registerTool({ ...createEditToolDefinition(cwd), execute })` does: the definition carries the
+/// built-in's prepareArguments, so the model's legacy shapes reach the wrapper normalised, and only an edit the host really applied can produce the sentinel text.
+fn builtin_register_edit(ctx: &pig_sdk::Context, factory_cwd: &str) -> Result<Value, String> {
+    let mut edit =
+        pig_sdk::create_edit_tool_definition(factory_cwd, None).map_err(|e| e.to_string())?;
+    let run_edit = edit.executor();
+    edit.definition.execute = Box::new(move |ctx, params| match run_edit.execute(ctx, params) {
+        Ok(mut result) => {
+            wrap_first_text(&mut result, |text| format!("«edited:{text}»"));
+            result.into_tool_result()
+        }
+        Err(error) => ToolResult::error(error.to_string()),
+    });
+    let name = edit.definition.name.clone();
+    ctx.register_tool(edit.definition)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"registered": [name]}))
+}
+
+fn builtin_local(case: &Value) -> Value {
+    let operations = if case["shell"].as_str() == Some("powershell") {
+        pig_sdk::create_local_powershell_operations()
+    } else {
+        pig_sdk::create_local_bash_operations(None)
+    };
+    let signal = pig_sdk::ProviderSignal::new();
+    let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = chunks.clone();
+    let abort_signal = signal.clone();
+    let abort_on_output = case["abortOnOutput"].as_bool() == Some(true);
+    let env = case["env"].as_object().map(|object| {
+        object
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().unwrap_or("").to_string()))
+            .collect()
+    });
+    let options = pig_sdk::BashExecOptions {
+        on_data: Arc::new(move |data| {
+            sink.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(data).into_owned());
+            if abort_on_output {
+                abort_signal.cancel();
+            }
+        }),
+        signal,
+        timeout: case["timeout"].as_f64(),
+        env,
+    };
+    let mut report = json!({});
+    match (operations.exec)(
+        case["command"].as_str().unwrap_or(""),
+        case["factoryCwd"].as_str().unwrap_or(""),
+        options,
+    ) {
+        Ok(code) => report["exitCode"] = json!(code),
+        Err(error) => report["error"] = json!(error.message()),
+    }
+    report["output"] = json!(chunks.lock().unwrap().join(""));
+    report
+}
+
+/// Contributes the signal-abort row every SDK fixture carries. Pi's ctx.abort() aborts the run's signal before it returns (agent.ts:340-342), so a handler that holds
+/// the signal and reads it again right after the abort sees it aborted, in the same turn.
+fn register_signal_abort(ext: &mut Extension) {
+    ext.command(
+        "signal-abort",
+        "Abort the run and report ctx.signal",
+        |ctx, _args| {
+            let state = |cancelled: Option<bool>| match cancelled {
+                None => "none",
+                Some(true) => "aborted",
+                Some(false) => "live",
+            };
+            let held = ctx.signal();
+            ctx.abort();
+            let report = format!(
+                "abort:{}:{}",
+                state(held.map(|signal| signal.is_cancelled())),
+                state(ctx.signal().map(|signal| signal.is_cancelled()))
+            );
+            ctx.notify(&report, "info");
+            CommandResult::Ok
+        },
+    );
+}
+
+/// A dialog's string answer: a select, input or editor result is whatever JSON the client sent (Pi's RPC mode does not check its type), and undefined is null.
+fn dialog_text(value: &serde_json::Value) -> String {
+    value.as_str().unwrap_or("").to_string()
+}
+
+/// A Terminal that records what the screen does to it: the callbacks `start` was given, whether it runs, and every write.
+#[derive(Default)]
+struct ProbeTerminal {
+    log: Mutex<Vec<String>>,
+    on_input: Mutex<Option<pig_sdk::TerminalInputFn>>,
+    started: AtomicBool,
+}
+
+impl pig_sdk::Terminal for ProbeTerminal {
+    fn start(&self, on_input: pig_sdk::TerminalInputFn, _on_resize: pig_sdk::TerminalResizeFn) {
+        *self.on_input.lock().unwrap() = Some(on_input);
+        self.started.store(true, Ordering::SeqCst);
+        self.log.lock().unwrap().push("start".to_string());
+    }
+    fn stop(&self) {
+        self.started.store(false, Ordering::SeqCst);
+        self.log.lock().unwrap().push("stop".to_string());
+    }
+    fn drain_input(&self, _max_ms: u64, _idle_ms: u64) {}
+    fn write(&self, data: &str) {
+        self.log.lock().unwrap().push(data.to_string());
+    }
+    fn columns(&self) -> u32 {
+        20
+    }
+    fn rows(&self) -> u32 {
+        6
+    }
+    fn kitty_protocol_active(&self) -> bool {
+        false
+    }
+    fn move_by(&self, _lines: i32) {}
+    fn hide_cursor(&self) {}
+    fn show_cursor(&self) {}
+    fn clear_line(&self) {}
+    fn clear_from_cursor(&self) {}
+    fn clear_screen(&self) {}
+    fn set_title(&self, _title: &str) {}
+    fn set_progress(&self, _active: bool) {}
+    fn set_program_status(&self, _status: &pig_sdk::ProgramStatus) {}
+}
+
+/// A Component that draws the lines its function returns for the width.
+struct ProbeLines(Box<dyn Fn(u32) -> Vec<String> + Send + Sync>);
+
+impl pig_sdk::Component for ProbeLines {
+    fn render(&self, width: u32) -> Vec<String> {
+        (self.0)(width)
+    }
+}
+
+/// A Focusable Component that records the input it receives.
+#[derive(Default)]
+struct ProbeFocus {
+    focused: AtomicBool,
+    inputs: Mutex<Vec<String>>,
+}
+
+impl pig_sdk::Component for ProbeFocus {
+    fn render(&self, _width: u32) -> Vec<String> {
+        vec!["foc".to_string()]
+    }
+    fn handles_input(&self) -> bool {
+        true
+    }
+    fn handle_input(&self, data: &str) {
+        self.inputs.lock().unwrap().push(data.to_string());
+    }
+    fn is_focusable(&self) -> bool {
+        true
+    }
+    fn focused(&self) -> bool {
+        self.focused.load(Ordering::SeqCst)
+    }
+    fn set_focused(&self, focused: bool) {
+        self.focused.store(focused, Ordering::SeqCst);
+    }
+}
+
+/// The text of a screen line without its terminal sequences: CSI sequences and OSC 8 hyperlink openers and closers, as the Pi probe's regex
+/// `\x1b\[[0-9;?]*[A-Za-z]|\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)?` strips them.
+fn visible_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{1b}' {
+            if chars.get(i + 1) == Some(&'[') {
+                let mut j = i + 2;
+                while j < chars.len()
+                    && (chars[j].is_ascii_digit() || chars[j] == ';' || chars[j] == '?')
+                {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j].is_ascii_alphabetic() {
+                    i = j + 1;
+                    continue;
+                }
+            } else if chars.get(i + 1) == Some(&']')
+                && chars.get(i + 2) == Some(&'8')
+                && chars.get(i + 3) == Some(&';')
+                && chars.get(i + 4) == Some(&';')
+            {
+                let mut j = i + 5;
+                while j < chars.len() && chars[j] != '\u{7}' && chars[j] != '\u{1b}' {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'\u{7}') {
+                    j += 1;
+                } else if chars.get(j) == Some(&'\u{1b}') && chars.get(j + 1) == Some(&'\\') {
+                    j += 2;
+                }
+                i = j;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// tui-alt-screen-probe: drives every member of TuiAltScreen through the host and reports the facts the Pi class reports for the same steps.
+fn tui_alt_screen_probe(ctx: &pig_sdk::Context) -> std::io::Result<String> {
+    use pig_sdk::{
+        ComponentRef, InputListener, InputListenerResult, MouseEvent, QueryTerminalColorsOptions,
+        Terminal, TuiAltScreen, TuiAltScreenOptions, TuiOverlayOptions, TuiStopOptions,
+        WheelScrollLines,
+    };
+    use std::sync::atomic::AtomicUsize;
+    let probe = Arc::new(ProbeTerminal::default());
+    let terminal: Arc<dyn Terminal> = probe.clone();
+    let screen = TuiAltScreen::new(
+        ctx,
+        terminal,
+        TuiAltScreenOptions {
+            show_hardware_cursor: Some(false),
+            mouse: Some(false),
+            wheel_scroll_lines: Some(WheelScrollLines::Lines(3.0)),
+            copy_on_select: Some(true),
+            ..Default::default()
+        },
+    )?;
+    let lines =
+        |render: fn(u32) -> Vec<String>| -> ComponentRef { Arc::new(ProbeLines(Box::new(render))) };
+    let doc = lines(|w| (1..=12).map(|i| format!("row {i} w={w}")).collect());
+    screen.add_child(&doc)?;
+    let mut f: Vec<String> = Vec::new();
+    let thin = |component: &ComponentRef| Arc::as_ptr(component) as *const () as usize;
+    f.push(format!("mode={}", screen.mode()));
+    f.push(format!("children={}", screen.children().len()));
+    f.push(format!(
+        "terminal={}",
+        std::ptr::eq(
+            Arc::as_ptr(&screen.terminal()) as *const (),
+            Arc::as_ptr(&probe) as *const ()
+        )
+    ));
+    if !screen.viewport_tui() {
+        return Err(std::io::Error::other("TuiAltScreen is not a viewport TUI"));
+    }
+    screen.start()?;
+    screen.render_now(false)?;
+    let sl = |screen: &TuiAltScreen| -> std::io::Result<Vec<String>> {
+        Ok(screen
+            .get_screen_lines()?
+            .iter()
+            .map(|line| visible_text(line).trim_end().to_string())
+            .collect())
+    };
+    let at = |lines: &[String], index: usize| {
+        lines
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| "undefined".to_string())
+    };
+    f.push(format!(
+        "viewport={}/{}",
+        screen.viewport_top()?,
+        screen.is_following_output()?
+    ));
+    let current = sl(&screen)?;
+    f.push(format!("first={}", at(&current, 0)));
+    f.push(format!("last={}", at(&current, 5)));
+    f.push(format!("redraws={}", screen.full_redraws()? > 0));
+    f.push(format!(
+        "entered={}",
+        probe
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.contains("\u{1b}[?1049h"))
+    ));
+    screen.scroll_by(-2)?;
+    screen.render_now(false)?;
+    f.push(format!(
+        "up={}/{}",
+        screen.viewport_top()?,
+        screen.is_following_output()?
+    ));
+    screen.scroll_to_top()?;
+    screen.render_now(false)?;
+    f.push(format!(
+        "top={}/{}",
+        screen.viewport_top()?,
+        screen.is_following_output()?
+    ));
+    f.push(format!("topfirst={}", at(&sl(&screen)?, 0)));
+    screen.scroll_to_bottom()?;
+    screen.render_now(false)?;
+    f.push(format!(
+        "bottom={}/{}",
+        screen.viewport_top()?,
+        screen.is_following_output()?
+    ));
+    screen.flash("hello", Some(500))?;
+    screen.render_now(false)?;
+    f.push(format!(
+        "flash={}",
+        sl(&screen)?.iter().any(|line| line.contains("hello"))
+    ));
+    let ov = lines(|_| vec!["OVER".to_string()]);
+    let handle = screen.show_overlay(
+        &ov,
+        Some(TuiOverlayOptions {
+            layout: Some(json!({"width": 8, "anchor": "center"})),
+            ..Default::default()
+        }),
+    )?;
+    screen.render_now(false)?;
+    let width = handle.bounds()?.map_or_else(
+        || "undefined".to_string(),
+        |bounds| bounds.width.to_string(),
+    );
+    f.push(format!(
+        "overlay={}/{}/{}/{}",
+        screen.has_overlay()?,
+        screen.has_overlay_entries()?,
+        handle.is_focused()?,
+        width
+    ));
+    handle.set_hidden(true)?;
+    f.push(format!("hidden={}", handle.is_hidden()?));
+    handle.set_hidden(false)?;
+    screen.hide_overlay()?;
+    f.push(format!(
+        "afterHide={}/{}",
+        screen.has_overlay()?,
+        screen.has_overlay_entries()?
+    ));
+    let foc = Arc::new(ProbeFocus::default());
+    let foc_ref: ComponentRef = foc.clone();
+    screen.set_focus(Some(&foc_ref))?;
+    let focused = screen.get_focused_component()?;
+    f.push(format!(
+        "focus={}/{}",
+        focused
+            .as_ref()
+            .is_some_and(|component| thin(component) == thin(&foc_ref)),
+        foc.focused.load(Ordering::SeqCst)
+    ));
+    let on_input = probe
+        .on_input
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| std::io::Error::other("the terminal was not started"))?;
+    on_input("k")?;
+    let listener: InputListener = Arc::new(|data: &str| {
+        (data == "c").then_some(InputListenerResult {
+            consume: true,
+            data: None,
+        })
+    });
+    let remove = screen.add_input_listener(listener.clone())?;
+    on_input("c")?;
+    remove()?;
+    on_input("c")?;
+    let _ = screen.add_input_listener(listener.clone())?;
+    screen.remove_input_listener(&listener)?;
+    f.push(format!("inputs={}", foc.inputs.lock().unwrap().join(",")));
+    let debugs = Arc::new(AtomicUsize::new(0));
+    let counter = debugs.clone();
+    screen.set_on_debug(Some(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    })))?;
+    on_input("\u{1b}[100;6u")?;
+    f.push(format!("debug={}", debugs.load(Ordering::SeqCst)));
+    screen.set_show_hardware_cursor(true)?;
+    screen.set_clear_on_shrink(true)?;
+    f.push(format!(
+        "flags={}/{}",
+        screen.get_show_hardware_cursor()?,
+        screen.get_clear_on_shrink()?
+    ));
+    screen.set_wheel_scroll_lines(WheelScrollLines::Lines(2.0))?;
+    screen.set_copy_on_select(false)?;
+    f.push(format!(
+        "copy={}/{}/{}",
+        screen.get_copy_on_select()?,
+        screen.has_active_selection()?,
+        screen.copy_active_selection_to_clipboard()?
+    ));
+    screen.reset_text_selection()?;
+    let schemes = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let seen = schemes.clone();
+    let _unsubscribe = screen
+        .on_terminal_color_scheme_change(move |scheme| seen.lock().unwrap().push(scheme.as_str()));
+    screen.set_terminal_color_scheme_notifications(true)?;
+    on_input("\u{1b}[?997;1n")?;
+    on_input("\u{1b}[?997;2n")?;
+    f.push(format!("schemes={}", schemes.lock().unwrap().join(",")));
+    let colors = screen.query_terminal_colors(QueryTerminalColorsOptions {
+        timeout_ms: 20.0,
+        on_late_reply: None,
+    })?;
+    f.push(format!("colors={}", colors.to_value()));
+    let wheel = MouseEvent {
+        kind: "wheel".into(),
+        button: "none".into(),
+        width: 20,
+        height: 6,
+        wheel_delta: 1,
+        ..Default::default()
+    };
+    let mouse = screen.handle_mouse(&wheel)?;
+    f.push(format!(
+        "mouse={}",
+        mouse.map_or_else(
+            || "null".to_string(),
+            |result| serde_json::to_string(&result).unwrap_or_default()
+        )
+    ));
+    f.push(format!(
+        "render={}",
+        screen
+            .render(10)?
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|")
+    ));
+    screen.invalidate()?;
+    screen.request_render(false)?;
+    let root = lines(|_| vec!["ROOT".to_string()]);
+    screen.set_layout_root(Some(&root))?;
+    screen.render_now(false)?;
+    f.push(format!("root={}", at(&sl(&screen)?, 0).starts_with("ROOT")));
+    screen.set_layout_root(None)?;
+    screen.remove_child(&doc)?;
+    f.push(format!("removed={}", screen.children().len()));
+    screen.add_child(&doc)?;
+    screen.clear()?;
+    f.push(format!("cleared={}", screen.children().len()));
+    screen.stop(TuiStopOptions::default())?;
+    f.push(format!("stopped={}", !probe.started.load(Ordering::SeqCst)));
+    Ok(format!("tui-alt: {}", f.join("; ")))
+}
+
+/// Contributes tui-alt-screen-probe (TestConformance_TuiAltScreenAgreesAcrossSDKs): one info notify with the facts.
+fn register_tui_alt_screen_probe(ext: &mut Extension) {
+    ext.command(
+        "tui-alt-screen-probe",
+        "Drive every TuiAltScreen member and report the facts",
+        |ctx, _args| match tui_alt_screen_probe(ctx) {
+            Ok(report) => {
+                ctx.notify(&report, "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+}
+
+/// A Component that counts its invalidations, and draws the lines it was given.
+struct CountingLines {
+    lines: Vec<String>,
+    invalidations: std::sync::atomic::AtomicUsize,
+}
+
+impl pig_sdk::Component for CountingLines {
+    fn render(&self, _width: u32) -> Vec<String> {
+        self.lines.clone()
+    }
+    fn invalidate(&self) {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The document of tui-alt-frame-probe: while it renders it reads the screen's state, as a component that asks the screen about its own frame does.
+struct FrameDoc {
+    screen: Arc<std::sync::OnceLock<std::sync::Weak<pig_sdk::TuiAltScreen>>>,
+    seen: Mutex<Vec<String>>,
+    invalidations: std::sync::atomic::AtomicUsize,
+}
+
+impl pig_sdk::Component for FrameDoc {
+    fn render(&self, _width: u32) -> Vec<String> {
+        let state = self.screen.get().and_then(std::sync::Weak::upgrade).map(
+            |screen| -> std::io::Result<String> {
+                Ok(format!(
+                    "{}/{}/{}/{}/{}/{}",
+                    screen.viewport_top()?,
+                    screen.is_following_output()?,
+                    screen.get_screen_lines()?.len(),
+                    screen.has_active_selection()?,
+                    screen.has_overlay()?,
+                    screen.get_show_hardware_cursor()?
+                ))
+            },
+        );
+        let state = match state {
+            Some(Ok(state)) => state,
+            Some(Err(err)) => format!("error: {err}"),
+            None => "no screen".to_string(),
+        };
+        self.seen.lock().unwrap().push(state);
+        (1..=12).map(|i| format!("row {i}")).collect()
+    }
+    fn invalidate(&self) {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The component of tui-alt-frame-probe that changes the screen from inside its own render (once, when armed) and reads each change back.
+struct MutDoc {
+    screen: Arc<std::sync::OnceLock<std::sync::Weak<pig_sdk::TuiAltScreen>>>,
+    armed: AtomicBool,
+    log: Mutex<Vec<String>>,
+    invalidations: std::sync::atomic::AtomicUsize,
+    extra: pig_sdk::ComponentRef,
+    target: pig_sdk::ComponentRef,
+    popup: pig_sdk::ComponentRef,
+}
+
+impl MutDoc {
+    fn flags(screen: &pig_sdk::TuiAltScreen) -> std::io::Result<String> {
+        Ok(format!(
+            "{}/{}/{}",
+            screen.get_show_hardware_cursor()?,
+            screen.get_clear_on_shrink()?,
+            screen.get_copy_on_select()?
+        ))
+    }
+
+    fn mutate(&self, screen: &Arc<pig_sdk::TuiAltScreen>) -> std::io::Result<String> {
+        use pig_sdk::TuiOverlayOptions;
+        let mut r = vec![format!("flags={}", Self::flags(screen)?)];
+        screen.set_show_hardware_cursor(true)?;
+        screen.set_clear_on_shrink(true)?;
+        screen.set_copy_on_select(false)?;
+        r.push(format!("set={}", Self::flags(screen)?));
+        screen.add_child(&self.extra)?;
+        r.push(format!("add={}", screen.children().len()));
+        screen.remove_child(&self.extra)?;
+        r.push(format!("remove={}", screen.children().len()));
+        screen.set_focus(Some(&self.target))?;
+        let focused = screen.get_focused_component()?;
+        r.push(format!(
+            "focus={}",
+            focused
+                .as_ref()
+                .is_some_and(|component| Arc::as_ptr(component) as *const ()
+                    == Arc::as_ptr(&self.target) as *const ())
+        ));
+        let first = Arc::new(Mutex::new(None::<String>));
+        let record = first.clone();
+        let weak = Arc::downgrade(screen);
+        let h = screen.show_overlay(
+            &self.popup,
+            Some(TuiOverlayOptions {
+                layout: Some(json!({"width": 8})),
+                visible: Some(Arc::new(move |_, _| {
+                    let mut slot = record.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(
+                            match weak
+                                .upgrade()
+                                .map(|screen| screen.get_show_hardware_cursor())
+                            {
+                                Some(Ok(value)) => value.to_string(),
+                                _ => "error".to_string(),
+                            },
+                        );
+                    }
+                    true
+                })),
+            }),
+        )?;
+        let first_seen = first
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "undefined".to_string());
+        r.push(format!(
+            "overlay={}/{}/{}/{}",
+            screen.has_overlay()?,
+            screen.has_overlay_entries()?,
+            h.is_focused()?,
+            first_seen
+        ));
+        h.hide()?;
+        r.push(format!("hidden={}", screen.has_overlay_entries()?));
+        screen.scroll_by(-2)?;
+        r.push(format!(
+            "scroll={}/{}",
+            screen.viewport_top()?,
+            screen.is_following_output()?
+        ));
+        self.invalidations.store(0, Ordering::SeqCst);
+        screen.invalidate()?;
+        r.push(format!(
+            "invalidate={}",
+            self.invalidations.load(Ordering::SeqCst)
+        ));
+        r.push(format!("lines={}", screen.get_screen_lines()?.len()));
+        Ok(r.join(","))
+    }
+}
+
+impl pig_sdk::Component for MutDoc {
+    fn render(&self, _width: u32) -> Vec<String> {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return vec!["MUT".to_string()];
+        }
+        let entry = match self.screen.get().and_then(std::sync::Weak::upgrade) {
+            Some(screen) => self
+                .mutate(&screen)
+                .unwrap_or_else(|err| format!("error: {err}")),
+            None => "no screen".to_string(),
+        };
+        self.log.lock().unwrap().push(entry);
+        vec!["MUT".to_string()]
+    }
+    fn invalidate(&self) {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// tui-alt-frame-probe: a component reads the screen's state from inside its own render, and an overlay's `visible` callback is asked the terminal's size.
+fn tui_alt_frame_probe(ctx: &pig_sdk::Context) -> std::io::Result<String> {
+    use pig_sdk::{ComponentRef, Terminal, TuiAltScreen, TuiAltScreenOptions, TuiOverlayOptions};
+    use std::sync::atomic::AtomicUsize;
+    let terminal: Arc<dyn Terminal> = Arc::new(ProbeTerminal::default());
+    let screen = Arc::new(TuiAltScreen::new(
+        ctx,
+        terminal,
+        TuiAltScreenOptions {
+            show_hardware_cursor: Some(false),
+            mouse: Some(false),
+            ..Default::default()
+        },
+    )?);
+    let link = Arc::new(std::sync::OnceLock::new());
+    let doc = Arc::new(FrameDoc {
+        screen: link.clone(),
+        seen: Mutex::new(Vec::new()),
+        invalidations: AtomicUsize::new(0),
+    });
+    let _ = link.set(Arc::downgrade(&screen));
+    let doc_ref: ComponentRef = doc.clone();
+    screen.add_child(&doc_ref)?;
+    screen.start()?;
+    screen.render_now(false)?;
+    screen.render_now(false)?;
+    let (first, last) = {
+        let seen = doc.seen.lock().unwrap();
+        (
+            seen.first()
+                .cloned()
+                .unwrap_or_else(|| "undefined".to_string()),
+            seen.last()
+                .cloned()
+                .unwrap_or_else(|| "undefined".to_string()),
+        )
+    };
+    let mut f = vec![format!("frame1={first}"), format!("frame2={last}")];
+    let widths = Arc::new(Mutex::new(Vec::<String>::new()));
+    let ov = Arc::new(CountingLines {
+        lines: vec!["OVER".to_string()],
+        invalidations: AtomicUsize::new(0),
+    });
+    let ov_ref: ComponentRef = ov.clone();
+    let asked = widths.clone();
+    let on = screen.show_overlay(
+        &ov_ref,
+        Some(TuiOverlayOptions {
+            layout: Some(json!({"width": 8})),
+            visible: Some(Arc::new(move |width, height| {
+                asked.lock().unwrap().push(format!("{width}x{height}"));
+                width >= 20
+            })),
+        }),
+    )?;
+    screen.render_now(false)?;
+    f.push(format!(
+        "visibleOn={}/{}/{}",
+        screen.has_overlay()?,
+        screen.has_overlay_entries()?,
+        widths.lock().unwrap().iter().any(|size| size == "20x6")
+    ));
+    on.hide()?;
+    let hidden: ComponentRef = Arc::new(ProbeLines(Box::new(|_| vec!["X".to_string()])));
+    let off = screen.show_overlay(
+        &hidden,
+        Some(TuiOverlayOptions {
+            layout: None,
+            visible: Some(Arc::new(|_, _| false)),
+        }),
+    )?;
+    f.push(format!(
+        "visibleOff={}/{}",
+        screen.has_overlay()?,
+        screen.has_overlay_entries()?
+    ));
+    off.hide()?;
+    let ov2 = screen.show_overlay(
+        &ov_ref,
+        Some(TuiOverlayOptions {
+            layout: Some(json!({"width": 8})),
+            visible: None,
+        }),
+    )?;
+    doc.invalidations.store(0, Ordering::SeqCst);
+    ov.invalidations.store(0, Ordering::SeqCst);
+    screen.invalidate()?;
+    f.push(format!(
+        "invalidate={}/{}",
+        doc.invalidations.load(Ordering::SeqCst),
+        ov.invalidations.load(Ordering::SeqCst)
+    ));
+    ov2.hide()?;
+    let link = Arc::new(std::sync::OnceLock::new());
+    let mut_doc = Arc::new(MutDoc {
+        screen: link.clone(),
+        armed: AtomicBool::new(false),
+        log: Mutex::new(Vec::new()),
+        invalidations: AtomicUsize::new(0),
+        extra: Arc::new(ProbeLines(Box::new(|_| vec!["EXTRA".to_string()]))),
+        target: Arc::new(ProbeLines(Box::new(|_| vec!["TARGET".to_string()]))),
+        popup: Arc::new(ProbeLines(Box::new(|_| vec!["POP".to_string()]))),
+    });
+    let _ = link.set(Arc::downgrade(&screen));
+    let mut_ref: ComponentRef = mut_doc.clone();
+    screen.add_child(&mut_ref)?;
+    screen.render_now(false)?;
+    mut_doc.armed.store(true, Ordering::SeqCst);
+    screen.render_now(false)?;
+    f.push(format!("mutate={}", mut_doc.log.lock().unwrap().join("|")));
+    f.push(format!(
+        "after={}/{}/{}/{}",
+        screen.get_show_hardware_cursor()?,
+        screen.get_clear_on_shrink()?,
+        screen.get_copy_on_select()?,
+        screen.children().len()
+    ));
+    screen.stop(Default::default())?;
+    Ok(format!("tui-alt-frame: {}", f.join("; ")))
+}
+
+/// Contributes tui-alt-frame-probe (TestConformance_TuiAltScreenAgreesAcrossSDKs): one info notify with the facts.
+fn register_tui_alt_frame_probe(ext: &mut Extension) {
+    ext.command(
+        "tui-alt-frame-probe",
+        "Read screen state from a component render and drive an overlay's visible callback",
+        |ctx, _args| match tui_alt_frame_probe(ctx) {
+            Ok(report) => {
+                ctx.notify(&report, "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+}
+
+/// tui-alt-children-probe: `children` after add_child, remove_child and clear, with three distinct components of equal content.
+fn tui_alt_children_probe(ctx: &pig_sdk::Context) -> std::io::Result<String> {
+    use pig_sdk::{ComponentRef, Terminal, TuiAltScreen, TuiAltScreenOptions};
+    let terminal: Arc<dyn Terminal> = Arc::new(ProbeTerminal::default());
+    let screen = TuiAltScreen::new(
+        ctx,
+        terminal,
+        TuiAltScreenOptions {
+            show_hardware_cursor: Some(false),
+            mouse: Some(false),
+            ..Default::default()
+        },
+    )?;
+    let mk = || -> ComponentRef { Arc::new(ProbeLines(Box::new(|_| vec!["same".to_string()]))) };
+    let (a, b, c) = (mk(), mk(), mk());
+    let addr = |component: &ComponentRef| Arc::as_ptr(component) as *const () as usize;
+    let name = |component: &ComponentRef| {
+        let at = addr(component);
+        if at == addr(&a) {
+            "a"
+        } else if at == addr(&b) {
+            "b"
+        } else if at == addr(&c) {
+            "c"
+        } else {
+            "?"
+        }
+    };
+    let order = |screen: &TuiAltScreen| {
+        let names: String = screen.children().iter().map(name).collect();
+        if names.is_empty() {
+            "-".to_string()
+        } else {
+            names
+        }
+    };
+    let mut f = vec![format!("empty={}", order(&screen))];
+    screen.add_child(&a)?;
+    screen.add_child(&b)?;
+    screen.add_child(&c)?;
+    f.push(format!("added={}", order(&screen)));
+    screen.remove_child(&b)?;
+    f.push(format!("removeB={}", order(&screen)));
+    screen.remove_child(&b)?;
+    f.push(format!("removeAbsent={}", order(&screen)));
+    screen.add_child(&a)?;
+    f.push(format!("duplicate={}", order(&screen)));
+    screen.remove_child(&a)?;
+    f.push(format!("removeFirst={}", order(&screen)));
+    screen.add_child(&b)?;
+    f.push(format!("readd={}", order(&screen)));
+    f.push(format!("render={}", screen.render(10)?.join("|")));
+    screen.set_focus(Some(&b))?;
+    let focused = screen.get_focused_component()?;
+    f.push(format!("focus={}", focused.as_ref().map_or("?", name)));
+    screen.clear()?;
+    f.push(format!("cleared={}", order(&screen)));
+    Ok(format!("tui-alt-children: {}", f.join("; ")))
+}
+
+/// Contributes tui-alt-children-probe (TestConformance_TuiAltScreenAgreesAcrossSDKs): one info notify with the facts.
+fn register_tui_alt_children_probe(ext: &mut Extension) {
+    ext.command("tui-alt-children-probe", "Read TuiAltScreen children after addChild, removeChild and clear, with components of equal content", |ctx, _args| {
+        match tui_alt_children_probe(ctx) {
+            Ok(report) => {
+                ctx.notify(&report, "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        }
+    });
+}
+
+/// The document of tui-alt-reentry-probe: while armed, its render calls the six members that cannot run during a render.
+struct ReentryDoc {
+    screen: Arc<std::sync::OnceLock<std::sync::Weak<pig_sdk::TuiAltScreen>>>,
+    armed: AtomicBool,
+    facts: Mutex<Vec<String>>,
+}
+
+impl pig_sdk::Component for ReentryDoc {
+    fn render(&self, _width: u32) -> Vec<String> {
+        if self.armed.swap(false, Ordering::SeqCst)
+            && let Some(screen) = self.screen.get().and_then(std::sync::Weak::upgrade)
+        {
+            fn verdict<T>(result: std::io::Result<T>) -> &'static str {
+                match result {
+                    Ok(_) => "ok",
+                    Err(err)
+                        if err
+                            .to_string()
+                            .contains("cannot run while a component renders") =>
+                    {
+                        "err"
+                    }
+                    Err(_) => "other",
+                }
+            }
+            let mut facts = vec![
+                format!("render={}", verdict(screen.render(10))),
+                format!("renderNow={}", verdict(screen.render_now(false))),
+                format!("start={}", verdict(screen.start())),
+                format!("stop={}", verdict(screen.stop(Default::default()))),
+                format!(
+                    "copy={}",
+                    verdict(screen.copy_active_selection_to_clipboard())
+                ),
+                format!(
+                    "colors={}",
+                    verdict(
+                        screen.query_terminal_colors(pig_sdk::QueryTerminalColorsOptions {
+                            timeout_ms: 20.0,
+                            on_late_reply: None
+                        })
+                    )
+                ),
+            ];
+            let after = screen
+                .set_show_hardware_cursor(true)
+                .and_then(|()| screen.get_show_hardware_cursor());
+            facts.push(format!(
+                "after={}",
+                after.map_or_else(|err| format!("error: {err}"), |value| value.to_string())
+            ));
+            *self.facts.lock().unwrap() = facts;
+        }
+        vec![
+            "line 1".to_string(),
+            "line 2".to_string(),
+            "line 3".to_string(),
+        ]
+    }
+    fn invalidate(&self) {}
+}
+
+/// tui-alt-reentry-probe: the members that cannot run while a component renders fail from inside a render, and the screen goes on working.
+fn tui_alt_reentry_probe(ctx: &pig_sdk::Context) -> std::io::Result<String> {
+    use pig_sdk::{ComponentRef, Terminal, TuiAltScreen, TuiAltScreenOptions};
+    let terminal: Arc<dyn Terminal> = Arc::new(ProbeTerminal::default());
+    let screen = Arc::new(TuiAltScreen::new(
+        ctx,
+        terminal,
+        TuiAltScreenOptions {
+            show_hardware_cursor: Some(false),
+            mouse: Some(false),
+            ..Default::default()
+        },
+    )?);
+    let link = Arc::new(std::sync::OnceLock::new());
+    let doc = Arc::new(ReentryDoc {
+        screen: link.clone(),
+        armed: AtomicBool::new(false),
+        facts: Mutex::new(Vec::new()),
+    });
+    let _ = link.set(Arc::downgrade(&screen));
+    let doc_ref: ComponentRef = doc.clone();
+    screen.add_child(&doc_ref)?;
+    screen.start()?;
+    screen.render_now(false)?;
+    doc.armed.store(true, Ordering::SeqCst);
+    screen.render_now(false)?;
+    screen.stop(Default::default())?;
+    let facts = doc.facts.lock().unwrap().join("; ");
+    Ok(format!("tui-alt-reentry: {facts}"))
+}
+
+/// Contributes tui-alt-reentry-probe: one info notify with the facts.
+fn register_tui_alt_reentry_probe(ext: &mut Extension) {
+    ext.command(
+        "tui-alt-reentry-probe",
+        "Call the frame's own members from a component's render and report that they fail",
+        |ctx, _args| match tui_alt_reentry_probe(ctx) {
+            Ok(report) => {
+                ctx.notify(&report, "info");
+                CommandResult::Ok
+            }
+            Err(err) => CommandResult::Error(err.to_string()),
+        },
+    );
+}
+
+/// The first line the card's renderer of the same phase returned on its previous run, or "none" on the first run: the value
+/// `ToolRenderContext::last_component` carries (the render_probe rows of the conformance suite bind to it).
+fn last_render_line(render: &pig_sdk::ToolRenderContext) -> String {
+    match &render.last_component {
+        Some(pig_sdk::ToolRenderComponent::Lines(lines)) => {
+            lines.first().cloned().unwrap_or_else(|| "none".to_string())
+        }
+        _ => "none".to_string(),
+    }
+}

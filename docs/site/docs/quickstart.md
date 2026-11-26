@@ -1,0 +1,279 @@
+# Quickstart
+
+PiG is under active development. Install it on macOS or Linux with `curl -fsSL https://pi-in-go.dev/install.sh | sh`, on any supported platform with `npm install -g @pi-in-go/pig` or `go install github.com/MichaelKinsy/PiG/cmd/pig@latest`, or download an archive from [GitHub Releases](https://github.com/MichaelKinsy/PiG/releases). Windows support is a preview. To build from source instead, follow the steps below. Pi 1.6.0 documents its own install routes in [Pi's quickstart](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/quickstart.md).
+
+If you have not used a terminal before, start with [Your first ten minutes](/docs/latest/first-run). It explains each step.
+
+## Install with the install script
+
+On macOS and Linux, the install script downloads the newest published release, checks it against the release's `SHA256SUMS`, and installs `pig` in `~/.local/bin`:
+
+```bash
+curl -fsSL https://pi-in-go.dev/install.sh | sh
+pig --version
+```
+
+When `~/.local/bin` is not on `PATH`, the script prints the `export PATH=...` line to run. [Install troubleshooting](/docs/latest/install-troubleshooting) lists the script's options, for example `PIG_VERSION` to install a given release.
+
+PiG doesn't run on iPhone, iPad, or iSH. Use `ssh` to connect to a computer that has PiG installed, then run `pig` there.
+
+## Requirements
+
+You need these tools only to build PiG from source. Build the `pig` executable with Go 1.27.4. Go 1.27 release binaries for macOS require macOS 13 or later.
+
+The complete verification suite also uses:
+
+- Git;
+- Node.js 24.22.2 and npm 12.2.1;
+- Python 3.12, and CPython 3.11 for `make test-sdk-py-311`, which `make check` runs (`PIG_SDK_PY_311` names the interpreter; the default is `python3.11`);
+- Rust 1.97.1;
+- tmux on Unix.
+
+You do not need every verification tool to run a previously built executable.
+
+## Build from source
+
+Clone the repository and build PiG:
+
+```bash
+git clone https://github.com/MichaelKinsy/PiG.git
+cd PiG
+go build -o bin/pig ./cmd/pig
+./bin/pig --version
+```
+
+Do not install PiG by running an upstream Pi npm command. The package `@earendil-works/pi-coding-agent` installs Pi, not PiG.
+
+## Install with npm
+
+Install the command with npm (Node.js 18 or newer):
+
+```bash
+npm install -g @pi-in-go/pig
+pig --version
+```
+
+Or run it once without installing:
+
+```bash
+npx @pi-in-go/pig --version
+```
+
+`pig` itself is the native binary: npm installs the matching platform package
+(`@pi-in-go/pig-<os>-<cpu>`, for macOS, Linux and Windows on x64 and arm64) as
+an optional dependency, and Node.js runs only a small launcher. Do not install
+with `--omit=optional` or `--no-optional`, which leaves the binary out. Update
+with `npm update -g @pi-in-go/pig` or `pig update`, which runs
+`npm install -g @pi-in-go/pig@<version>` for the release it finds, and uninstall
+with `npm uninstall -g @pi-in-go/pig`.
+
+## Install with Go
+
+Go 1.27 or newer installs the command without cloning the repository (an older Go, 1.21 or newer, downloads the toolchain `go.mod` names unless `GOTOOLCHAIN=local`). Go downloads PiG's source and its dependencies and compiles them on your computer, which can take several minutes the first time:
+
+```bash
+go install github.com/MichaelKinsy/PiG/cmd/pig@latest
+```
+
+Use an exact version for a reproducible installation:
+
+```bash
+go install github.com/MichaelKinsy/PiG/cmd/pig@v0.5.0
+```
+
+Go writes the `pig` executable to `GOBIN`. When `GOBIN` is empty, Go uses the
+`bin` directory below the first path in `GOPATH`: `$(go env GOPATH)/bin`, which
+is `~/go/bin` by default (`%USERPROFILE%\go\bin` on Windows). With an older Go
+1.21 or later and the default `GOTOOLCHAIN=auto`, Go downloads a new enough
+toolchain automatically. Add that directory to `PATH`, then inspect the
+installed module identity:
+
+```bash
+pig version
+go version -m "$(command -v pig)"
+```
+
+Update a Go installation by running `go install` again with a newer exact
+version or with `@latest`. PiG does not treat a Go-installed executable as a
+standalone release download, so `pig update` refuses to replace it without a
+matching installation receipt.
+
+Explicit `pig update` version checks retry transient transport failures and transient HTTP statuses at most twice within one ten-second budget. Startup checks do not retry. Signature and manifest errors stop the update. Native standalone updates reject concurrent replacement of the same executable and hold the installation lock until receipt commit or rollback completes (D39). The `<executable>.update.lock` sidecar exists only while an update runs; the update removes it when it ends.
+
+Each release tags the root module (`v0.5.0`) and the nested Go extension SDK module (`extensions/sdk/v0.5.0`) on the same commit; `go install` needs both.
+
+## Install with Nix
+
+The flake builds PiG from source in the Nix sandbox, with every input pinned by `flake.lock`:
+
+```bash
+nix run github:MichaelKinsy/PiG -- --version
+nix profile add github:MichaelKinsy/PiG
+```
+
+Nix before 2.30 and Lix spell the second command `nix profile install`.
+
+On NixOS or with Home Manager, add the flake as an input and install `inputs.pig.packages.${system}.default`, or apply `inputs.pig.overlays.default` and install `pkgs.pig`.
+
+The package wraps `pig` as Pi's flake does: `fd`, `ripgrep`, and the clipboard commands come first on `PATH`, and Node.js comes last so that `npm` is available for package installs. Extensions build and run as in any other installation, with the toolchains on your `PATH` and the SDKs PiG stages under `~/.pig`. `pig update` does not replace a Nix installation; update the flake input instead. The flake is verified on x86_64-linux; the other systems evaluate but are not yet verified natively.
+
+## Start PiG
+
+Run PiG in the folder of the project you want it to work on:
+
+```bash
+cd /path/to/project
+pig
+```
+
+A source build is at `bin/pig` in the PiG checkout. Run it by its full path, for example `/path/to/PiG/bin/pig`, or add that folder to `PATH`.
+
+PiG stores user state below `~/.pig`. Use `PIG_HOME` only when you need an isolated configuration root.
+
+On an interactive start in the default agent directory that holds no `settings.json` yet, which includes every fresh `PIG_HOME`, PiG shows a first-time setup screen: theme, sprite and usage-analytics choices. `Esc` skips it and saves nothing. A custom agent directory (`PIG_CODING_AGENT_DIR`) and print, JSON and RPC modes skip it (`coding/cli/extensions.go:93-95`). Pi 1.6.0 shows its screen (theme and usage-analytics choices) only when all of these hold (`startup-ui.ts` `shouldRunFirstTimeSetup`): the binary is Pi's own distribution (package `@earendil-works/pi-coding-agent`, app `pi`, config directory `.pi`), `PI_EXPERIMENTAL=1` is set, `PI_CODING_AGENT_DIR` is not set, and `~/.pi/agent/settings.json` does not exist yet. This is divergence D88. Change the theme later with `/settings` and the pig with `/sprite`. [Your first ten minutes](/docs/latest/first-run) shows the screen.
+
+## Authenticate a provider
+
+List login targets available in the current binary:
+
+```bash
+pig login --list
+```
+
+Start an available OAuth login:
+
+```bash
+pig login github-copilot
+```
+
+For an API-key provider, set the provider's documented environment variable:
+
+```bash
+export OPENAI_API_KEY=...
+pig --model openai/gpt-4.1
+```
+
+Use `pig --help` and `pig login --help` as the authority for your binary.
+
+## Start a first session
+
+Type a request and press Enter:
+
+```text
+Summarize this repository and tell me how to run its checks.
+```
+
+Stock PiG gives the model its normal built-in coding tools unless the command line, settings, or an active Piglet narrows them.
+
+## Use print mode
+
+Run one prompt without the interactive TUI:
+
+```bash
+pig -p "Summarize this repository"
+```
+
+Select a model explicitly when needed:
+
+```bash
+pig --model github-copilot/gpt-5-mini -p "Find the test entry points"
+```
+
+## Run PiG Standard
+
+PiG Standard is not part of bare Stock PiG startup. Select it explicitly from a source checkout:
+
+```bash
+pig --piglet piglets/standard/pig-standard.yaml
+```
+
+The current Standard composition provides its PiG login, `/sprite`, `/runner`, and `/pig-runner` through ordinary extension Resources.
+
+## Run your own Piglet
+
+Validate and run one agent application:
+
+```bash
+pig piglet validate ./agents/reviewer.yaml
+pig --piglet ./agents/reviewer.yaml
+```
+
+Register portable Piglet source when you want to invoke it by name:
+
+```bash
+pig piglet add ./agents/reviewer.yaml
+pig --piglet reviewer
+```
+
+See [Piglets](/docs/latest/piglets).
+
+## Build a Piglet Binary
+
+```bash
+pig piglet build ./agents/reviewer.yaml \
+  --format binary \
+  --out ./pig-reviewer
+./pig-reviewer
+```
+
+A Piglet Binary is a target-native executable for one fixed Piglet composition. It can still have explicit external requirements. The build needs Go, or Docker or Podman for the container builder. A `pig` that you built yourself also needs a PiG source checkout named by `PIG_SOURCE_ROOT`; a published release fetches its own source. See [Piglet Binaries](/docs/latest/piglet-binaries).
+
+## Add an extension
+
+A Go extension needs the Go toolchain. `pig setup` shows whether `go` is found, and `pig setup go` installs it. Create and validate a Go factory:
+
+```bash
+pig extension init ./review --lang go
+pig install ./review --validate-only --json
+```
+
+Run it for one session:
+
+```bash
+pig -e ./review
+```
+
+Use a Piglet when the extension belongs to a named agent application. [Your first extension](/docs/latest/first-extension) walks through each step.
+
+## Verify a source checkout
+
+Prepare the exact Pi comparator and source mirror:
+
+```bash
+make upstream-mirror
+```
+
+Run the primary gate:
+
+```bash
+make check
+```
+
+Use the toolchain versions declared by the repository. A green build does not replace parity review, vulnerability review, artifact inventory, or release authorization.
+
+## Choose how to customize PiG
+
+Start with the least powerful mechanism that meets your need. Move to the next rung only when the rung before it cannot do the task. The table shows where the files go and how to check each result.
+
+<!-- gen:begin customize-chooser -->
+| Rung | Pick it when | Where files go | Verify | If you know Pi |
+|---|---|---|---|---|
+| 1. [Context files](/docs/latest/configuration#context-files), [settings](/docs/latest/settings) and [keybindings](/docs/latest/keybindings) | You want standing instructions for a folder, or a built-in behavior needs a different value or key. | `AGENTS.md` in the folder or a parent, or `<agent-dir>/AGENTS.md` for every project. `~/.pig/agent/settings.json` and `~/.pig/agent/keybindings.json`. A project file `.pig/settings.json` loads only in a trusted project. | The `[Context]` line of the startup banner. `/settings` and `/hotkeys`. `pig status --json` and `pig diagnose` show the trust decision as a print run resolves it (`trust.state`, `ignored`). `pig status` has no `--approve`, so pass the same flag to the real run. | `~/.pi` and `.pi/` are never read (D2). |
+| 2. [Prompt templates](/docs/latest/prompt-templates), [skills](/docs/latest/skills) and [themes](/docs/latest/themes) | The task needs a saved prompt, task instructions with supporting files, or colors, and no code. | `~/.pig/agent/prompts/`; `~/.pig/agent/skills/<name>/SKILL.md` or `~/.agents/skills/<name>/SKILL.md`; `~/.pig/agent/themes/`. | `pig status --json`: the resource has `enabled: true`, no `ignored` and an empty `health`. Then `/reload`. | `~/.pig/skills/` is not scanned. |
+| 3. [Extensions](/docs/latest/extensions), [terminal UI](/docs/latest/tui) and [custom providers](/docs/latest/custom-provider) | The task needs a new tool, command, hook, terminal component, provider, or UI. | A project folder from `pig extension init <dir> --lang go\|python\|rust\|lisp`. Load it with `pig -e <dir>` or `pig install <dir>`. | `pig install <dir> --validate-only --json`, then `pig -e <dir>` and `/reload`. | Pi extensions are TypeScript files. Prefer Go, then Rust, then Python. |
+| 4. [Packages](/docs/latest/packages) | Other people or projects need the same Resources. | A folder with `package.json`; install with `pig install <source>`. | `pig list`, `pig package validate`. | A Package never activates a Piglet. |
+| 5. [Piglets](/docs/latest/piglets) | One named agent needs its own tools, skills, prompt, or built-in limits. | One YAML file anywhere; `pig piglet add <file>` registers it. | `pig piglet validate`, `pig piglet show`, `pig --piglet <file>`. | `tools:` is a ceiling, not a list to turn on ([strip built-ins](/docs/latest/piglets#strip-built-ins)). |
+| 6. [Piglet Binaries](/docs/latest/piglet-binaries) | Someone must run the agent as one executable. | `pig piglet build <name> --format binary --out <path>`. | `pig piglet verify`, then run the executable. | A Binary is not always self-contained: see its prerequisites. |
+| 7. PiG source | A generic host feature is missing and no lower rung can supply it. | The PiG source repository, under its own `AGENTS.md`. | The repository gates. | Do not fork PiG to register an extension. |
+<!-- gen:end customize-chooser -->
+
+[Applied use cases](/docs/latest/applied-use-cases) and [How PiG works](/docs/latest/how-pig-works) explain the pieces. [Concepts](/docs/latest/concepts) names the Resources a rung adds.
+
+## Next steps
+
+- [Using PiG](/docs/latest/usage)
+- [PiG concepts](/docs/latest/concepts)
+- [Extensions](/docs/latest/extensions)
+- [Packages](/docs/latest/packages)
+- [Piglets](/docs/latest/piglets)
+- [Build a derivative harness](/docs/latest/derivative-harnesses)

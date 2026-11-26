@@ -1,0 +1,106 @@
+package coding
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	"github.com/MichaelKinsy/PiG/internal/boundarywire"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// Pi keeps extension values as JavaScript strings and persists them with JSON.stringify (session-manager.ts:1160-1185), so a lone UTF-16 unit an extension supplies reaches the session file as the same \udXXX escape.
+
+func TestExtensionCompactionPreservesLoneSurrogates(t *testing.T) {
+	// agent-session.ts compact(): a session_before_compact result's compaction summary and details are saved as given (compaction-extensions.test.ts:173).
+	lone := jsstring.FromUTF16([]uint16{0xd800})
+	p := &scriptedProvider{}
+	for range 4 {
+		p.responses = append(p.responses, fauxReply("complete summary", ai.StopReasonStop, 0))
+	}
+	model := fakeModelWithProvider(p)
+	model.ID = "faux-1"
+	model.Capabilities.ContextWindow = 200000
+	model.Capabilities.MaxOutputTokens = 8192
+	s, err := NewSession(newTestServicesSmallKeep(t), SessionOptions{Model: model, SystemPrompt: "sys"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Events()
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	s.ReplaceRunner(inproc.NewRunner([]extension.Extension{{Path: "ext", Handlers: map[string][]extension.HandlerFn{
+		"session_before_compact": {func(args ...any) (any, error) {
+			prep := args[0].(extension.SessionBeforeCompactEvent).Preparation
+			return extension.SessionBeforeCompactResult{Compaction: &extension.CompactionResult{Summary: "s" + lone, FirstKeptEntryID: prep.FirstKeptEntryID, TokensBefore: prep.TokensBefore, Details: map[string]any{"d": lone}}}, nil
+		}},
+	}}}, t.TempDir()))
+	for _, prompt := range []string{"one", "two"} {
+		if _, err := s.Send(t.Context(), prompt); err != nil {
+			t.Fatal(err)
+		}
+		drainEvents(t, s)
+	}
+	result, err := s.Compact(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary != "s"+lone {
+		t.Fatalf("summary units=%x, want %x", jsstring.ToUTF16(result.Summary), jsstring.ToUTF16("s"+lone))
+	}
+	var line string
+	for _, entry := range s.inner.Load().GetEntries() {
+		if entry.Base().Type == "compaction" {
+			line = string(entry.Raw())
+		}
+	}
+	if !strings.Contains(line, `"summary":"s\ud800"`) || !strings.Contains(line, `"details":{"d":"\ud800"}`) {
+		t.Fatalf("compaction entry=%s, want JSON.stringify escapes", line)
+	}
+}
+
+func TestBoundaryContextEditPreservesLoneSurrogates(t *testing.T) {
+	// session-manager.ts appendContextEdit stores the extension's replacement object; the boundary preview returns each source entry as Pi's parsed object.
+	sess, err := NewSession(newTestServices(t), SessionOptions{Model: fakeModel()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = sess.Events()
+	defer func() { _ = sess.Close() }()
+	target, err := sess.inner.Load().AppendCustomMessageEntry("note", "x"+jsstring.FromUTF16([]uint16{0xdfff}), true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appended, err := applyBoundaryDrafts(sess.inner.Load(), []extension.SessionBoundaryDraft{{Type: "context_edit", TargetID: target, Replacement: json.RawMessage(`{"content":"r\ud800"}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line := string(appended[0].Raw()); !strings.Contains(line, `"replacement":{"content":"r\ud800"}`) {
+		t.Fatalf("context_edit entry=%s, want the replacement escape", line)
+	}
+	// A Go handler receives the preview through Deliver, which decodes each source from its record.
+	_, wire := boundarywire.WithCache(t.Context())
+	preview, err := sess.recordedBoundaryContext(wire, nil, icodingagent.EventTurnEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wire.Deliver(preview); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range preview.ContextEntries {
+		if source, ok := entry.SourceEntry.(map[string]any); ok && source["id"] == target {
+			if content := source["content"]; content != "x"+jsstring.FromUTF16([]uint16{0xdfff}) {
+				t.Fatalf("preview content=%q", content)
+			}
+			return
+		}
+	}
+	t.Fatalf("preview lacks the custom message: %+v", preview.ContextEntries)
+}

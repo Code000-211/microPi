@@ -1,0 +1,286 @@
+# Durable core: executable contract
+
+Status: design, 2026-10-06; section 1 pins Pi 1.3.0 (06a46693: nested tool calls, one document per nested call, Photon images and the bounded scheduler indexes, inputs placed as application entries and display-only writes appended at once, deferred tools; moved from main 97195ec3, before that ea448f45, 42a3497d and da866ada). Owner lane: do-core-design. Consumers: every bake-off lane in [BAKEOFF.md](BAKEOFF.md), the production core described in [ADR-0001](ADR-0001-core-architecture.md), and its hosts ([ABI.md](ABI.md)).
+
+The core is correct when pi-durable, run through the same scenario with the same inputs, writes the same rows at the same commit boundaries and sends the same model contexts. This document defines "same", lists the semantics that produce it, names the corpus, and specifies the capture and diff tooling that decides it. Prose here does not replace the spec; each rule cites it.
+
+## 1. Pin
+
+| item | value |
+|---|---|
+| reference | `packages/durable`, `packages/ai` and `packages/chord` of Pi at the upstream commit below, run from source (`make durable-contract-setup` checks it out; `durable/contract/PIN`) |
+| upstream commit | `e7a0df27c09d11bf4161d3605246cbf57a129cb2` (Pi build 1.4.0+e7a0df27; `durable/contract/PIN` `main`, `durable/contract/corpus.toml` `[pin]`): the reference of every row, tick rows included (F-ticks-\*, F-split-\*) and of the Storage hop tables |
+| normative spec | `packages/durable/docs/spec.md`, sha256 prefix `62f887f2481c22c7`, 5,912 lines |
+| storage conformance | `packages/durable/src/testing/storage-conformance.ts`, sha256 prefix `32b9064e91388750` |
+| scenarios | `packages/durable/test/examples/00-*.ts` through `31-*.ts` (32 programs) |
+| SQLite schema | `src/storage/sqlite/migrations.ts`, schema version 2 |
+| store readability | release `v1.0.4` (`durable/contract/PIN` `release`): stores it writes must open and read. A secondary reference; its rows do not block the gate |
+
+The core writes the record shapes of the pinned commit: task `startedAt`/`endedAt` and message `durationMs` (`packages/durable/src/types.ts`, `packages/ai/src/types.ts` at `06a46693`). It reads stores written by 1.0.4, which lack those fields (section 2.3).
+
+A pin bump is a contract change: re-capture the corpus (section 6) at the new commit, diff the two captures, and treat every changed row shape as a work item.
+
+## 2. What "same" means
+
+### 2.1 Equivalence levels
+
+| level | definition | required |
+|---|---|---|
+| `store` | After the scenario, every Pi table (`durable_schema`, `durable_metadata`, `record_ids`, `conversations`, `entries`, `tasks`, `submissions`, `documents`, `document_revisions`) holds the same rows, column by column, byte for byte. Tables named `pig_*`, Cloudflare's internal `_cf_*` tables (workerd creates `_cf_KV`, `_cf_METADATA` and `_cf_EXTERNALS`; the DO docs call the KV table `__cf_kv`) and SQLite's `sqlite_*` tables are excluded. | yes |
+| `commit` | For every `next_seq` value `s`, the row changes made by commit `s` (inserts, updates with before/after images, deletes) are equal. It catches intermediate task states, superseded deltas, and commit grouping that `store` cannot see. | yes |
+| `statement` | Same SQL statements in the same order. | no |
+| `context` | Every model call receives the same pi-ai `Context` (system prompt, messages, tools) and the same stream options, in the same call order. | yes |
+| `output` | The scenario's observable host output (Harness API results, events, example stdout) is equal. | yes for upstream examples |
+| `order` | The scenario's Harness API calls and the store's commits form one sequence, and it is equal: every call enters between the same two commits as in Pi (section 5.8). It catches a client continuation that resumes before or after a commit Pi orders it against, which every other level misses when the commits themselves are equal. | yes for upstream examples and the interop row |
+
+`statement` is deliberately not required. The core may omit Pi's read statements (it holds `next_seq` in memory) and may skip `INSERT OR IGNORE INTO record_ids` for IDs it knows exist. It must not change a single row.
+
+### 2.2 Determinism instead of normalisation
+
+Capture runs remove nondeterminism at its source, so the default normaliser set is empty:
+
+| source | evidence | control |
+|---|---|---|
+| Harness clock | `HarnessOptions.now` (`src/harness/types.ts:458`) | bound to the virtual clock |
+| progress throttles | tool output `Progress` reads `Date.now()` directly, not the Harness clock (`src/harness/output.ts:310,323`); generation partials wait on `setTimeout(flush, partialIntervalMs)` (`src/harness/generation.ts:372-414`) | virtual `Date.now`/`performance.now`/`setTimeout` |
+| provider session id | `ProviderDoc.initial()` calls pi-ai `uuidv7()` (`src/harness/provider.ts:18`), which reads `Date.now()`, draws 16 bytes from `crypto.getRandomValues` per call and keeps process-global `lastOrdinaryTimestamp` and `sequence` state (`packages/ai/src/utils/uuid.ts`) | virtual clock; every `uuidv7()` value is recorded on the effect tape (section 5.3) and returned by the candidate host's `pig.uuidv7` import (ABI section 4.2). A seeded `getRandomValues` alone does not align the values, because other code in each process draws from it too and the sequence state outlives a Harness reopen in the same process |
+| faux provider | `randomId()` uses `Date.now()` and `Math.random()` (`packages/ai/src/providers/faux.ts:163`); `tokenSize` draws from `Math.random()` (`faux.ts:274`); message timestamps use `Date.now()` (`faux.ts:99,289,304,318,327`) | seeded `Math.random`, `tokenSize.min == max`, virtual clock |
+| faux usage | the faux provider caches the previous prompt per `sessionId` in process memory and derives `cacheRead`/`cacheWrite` from it (`faux.ts:240-254`) | restart points are part of the scenario (section 2.4) |
+| commit interleaving | parallel tools, sub-agents and background tasks settle in effect-completion order | effect completions are scripted (section 5.3) |
+
+A value that cannot be controlled gets a named normaliser in the scenario manifest with a one-line reason. The spike's two normalisers (`"timestamp":\d+` and `faux:\d+:[a-z0-9]+`, `bench/durable/wasm-spike/bench/dump.ts`) become unnecessary under the virtual clock and are not allowed in acceptance runs.
+
+### 2.3 Unknown fields and other versions
+
+1. Reading never fails on an unknown field, an unknown entry kind, or a different key order. The byte scanner (ADR D4) is a structural JSON tokenizer, not a substring search.
+2. Records the core does not rewrite (entries are immutable) are passed through as stored bytes.
+3. Records the core rewrites (task replacements, submission updates, document bases and deltas, `durable_metadata`) follow what pinned pi-durable does with the same input: if the pinned reference carries a field through a spread, the core carries it byte for byte in the same position; if the pinned reference drops it, the core drops it. The corpus proves this with mutation scenarios that inject unknown fields into a store before the run (section 6, X1).
+4. A store written by a newer schema version (`durable_schema.version > 1`) is refused exactly as `applySqliteMigrations` refuses it.
+
+### 2.4 Restart points
+
+Scenario state includes process lifetime. Usage values differ when a process restarts because the faux provider's prompt cache is in memory, and `uuidv7()`'s sequence state is per process; a crash loses the uncommitted throttle window. Every scenario therefore declares its restart points (close/reopen, or crash after commit `k`), and both implementations restart at exactly those points. A comparison across different restart cadences is invalid, not a failure.
+
+## 3. Semantics the core reproduces
+
+Section numbers refer to `docs/spec.md`. "Bench slice" marks what the bake-off lanes implement (BAKEOFF.md section 2); everything else is required of the production core.
+
+### 3.1 Commit rule (bench slice)
+
+- One Session commit is one SQL transaction (§1 invariant 1, §11.2). The commit reads `durable_metadata.next_seq` as its sequence `s` and writes `next_seq = s + 1`: exactly one per commit (`storage.ts` `commit`).
+- `s` is the value stored in `entries.commit_seq`, `document_revisions.seq`, `documents.created_at` and `documents.retired_at` for that commit. Row identity therefore pins every commit boundary: merging or splitting commits is a contract violation, not an optimisation. The researcher measured that collapsing a turn's 77 commits into one saved only 1-2 ms.
+- IDs come from one global counter for every record type (§2, `mintId`). `next_id` is stored as TEXT (`migrations.ts`: node:sqlite safe-integer reason) and becomes `max(stored next_id, in-memory minted counter, max written id + 1)` at each commit, so IDs minted by a rolled-back callback still advance it.
+- Every created conversation, entry, task, submission and document ID is claimed in `record_ids` with its type; a conflicting claim rejects before any durable effect. Pi runs `INSERT OR IGNORE INTO record_ids` on every table write, updates included (`claimId`, `src/storage/sqlite/storage.ts:775-777`), which is why a turn has 104 claims: one per task (84), entry (18) and submission (2) write.
+- Indexed text columns (`tasks.kind`, `submissions.request_id`, `documents.kind`, `documents.key_value`) hold `JSON.stringify(value)`, quotes included (`encodeIndexedString`).
+- Record columns hold `JSON.stringify` output: insertion key order, ECMAScript number formatting (`-0` prints `0`, exponent form from `1e21` and below `1e-6`), only `"`, `\` and C0 controls escaped, lone surrogates as `\udXXX` escapes, U+2028/U+2029 and non-ASCII unescaped. Go's `encoding/json` violates several of these and is not used for records.
+- Documents: one base or delta per changed incarnation per commit (§10); a latest-history document that writes a base first deletes its older revisions (`DELETE FROM document_revisions WHERE document_id = ?`, 35 per measured turn). Delta content is Chord `Op[]` JSON and must equal what `packages/chord` at the pin emits, including its string trim/append detection and 64 KiB overlap search (§8.2).
+
+### 3.2 Turn protocol (bench slice)
+
+An eight-tool durable-bench turn is 77 commits and 372 write statements at every history size (captured from pi-durable 1.0.4 in Miniflare; confirmed independently by the durable-perf lane). Breakdown (research notes 3): 1 commit places the input (submission `placed`, `pi.user` entry, run in `pi.live`, generation task, per the §6 admission table); 9 per tool-calling generation (prepare, request, live delta, response, tool call, tool execute, result, generation resumes, next generation queued); 4 for the final answer. The exact contents of each commit come from the capture, not from this list. Statement shapes per turn: 104 `record_ids`, 84 `tasks`, 77 `durable_metadata`, 52 `document_revisions` inserts, 35 revision deletes, 18 `entries`, 2 `submissions` (`results-capture-3500.json`). Rules: §6 admission and boundaries, §8.2 live document, §8.3 generation phases `prepare/request/retry/poll/tools`, §8.4 tool phases `call/execute`, §8.5 rounds (sequential vs parallel, `pending`), §8.6 usage ledger (complete base on every change).
+
+### 3.3 Context derivation (bench slice: all nine rules)
+
+§2.1, in order: newest head marker `H` at or before the cutoff bounds the range, which starts at the entry `H.head` names, not at `H`; newest edit per target wins (`omit`, `replace`); the marker entry leads; positional system messages keep their section and tool deltas; tool results move directly behind their call in call order, ahead of intervening user or system messages; calls without a result get a synthesized error result, results without a call are dropped; model-less entries and assistant messages with `aborted`, `error` or `deferred` stop reasons are excluded. Fork traversal is child entries then parent entries through each `parent.at` cap. The offered tool set is replayed with pi-ai `getCurrentTools()` over the derived messages (§7.4 step 1; `src/harness/prompt.ts:85`, `src/harness/generation.ts:554`).
+
+The whole derivation is one ~100-line function in Pi (`src/harness/context.ts:59-82` and `orderToolResults` at `:129-151`), so the bench slice implements every rule. Rule 6 applies to every Harness conversation, because the first preparation appends a positional `pi.system` baseline (§7.4); rule 8 is part of the same pass as rule 7 (`orderToolResults`, missing-result text at `:9`); rule 4 applies to edits carried by W4a's head markers.
+
+### 3.4 Tasks
+
+§5: states `pending/running/waiting/completing/terminal`; the six step rules applied before every phase; reservation, reconciliation on open (`running → pending`, abort marks kept), handover, migration at reservation, blocked tasks for missing or older definitions; memos (first writer wins, dropped at terminal); `waiting` with `failFast`/`allSettled` joins; `completing` while owned work is live (§5.5); scheduler-written faults and orphaning (§5.4); background tasks. Custom task phase handlers are host code (ADR D12); the scheduler and its rules are core code.
+
+### 3.5 Documents
+
+§3: definitions, scopes (`session`, `conversation`, `task`), history `latest`/`rewindable`, fork policy, bases and checkpoints, versions and migrations, copy on fork (`document.copy` at the source's stored version), retirement. Built-ins: `pi.live` (§8.2), `pi.usage` (§8.6), `pi.inbox` (§6), the agent document with `tools` (§8.5), the provider document with `sessionId` (1.0.2 changelog).
+
+### 3.6 Hooks and extensions
+
+§7.2 chains with their failure rules: `beforeRequest` (replacement chain), `beforeProviderRequest` (replacement chain over each provider request body, for that request only), `afterResponse` (observers), `onYield` (first continuation wins), `beforeTool` (argument replacement, first block wins), `afterTool` (result replacement; it runs on every tool task result, including calls to tools the request did not offer, which run as their own tool tasks), `afterTools` (observers), `afterRun` (generation task; asks for run-end tasks through `RunEndTaskOf`: the run's inputs settle `done` with the answer at once, the run keeps its busy state while those tasks run, and input sent meanwhile queues; Go `GenerationHooks.AfterRun`), `beforeCompact` (first decision wins). §7.1 registry snapshots per phase; §7.3 tools (validation through pi-ai `validateToolArguments()`, whose converted arguments are stored in the `execute` checkpoint (section 5.6), replay policy, output window, diagnostics, spill); §7.4 system prompt sections and dynamic tools as `pi.system` deltas with `content: ""`; §7.5 reload in place with handover at the next phase boundary. Hooks and tasks read their conversation's entries with `entries()` (fork-aware, a run's own range through `minEntryId`/`maxEntryId`).
+
+### 3.7 Forks, compaction, inbox, sub-agents
+
+- Forks: §3.7 and §2 `parent.at`; a fork starts with an empty inbox and a zero usage ledger.
+- Compaction: §8.7 range selection, summary entry with `head` at the first kept entry, blocking threshold (`contextWindow - reserveTokens`), background threshold, overflow recovery (§8.3: one compaction-backed retry, not counted against the retry policy), stale summaries under §6's head-write rule.
+- Inbox: §6 admission table, `requestId` deduplication, `whenBusy`, `whenIdle` (`reject`, Go `WhenIdleReject`: an input that reaches an idle conversation is refused with `ConversationIdle` and writes nothing, so a message can only join the current run as a steer), steering and follow-up modes, boundary selection order (writes, then user items, by ID), stale head writes, reset at `postTools` behaving as `final`. A `continue` submission (Go `SubmissionTypeContinue`) starts a run without a user message on an idle conversation whose context still owes an answer, never queues (a busy conversation answers `ConversationBusy`), and ends `nothing_to_answer` without a request when the context does not owe one. `Conversation.submit(tx, draft)` (Go `Conversation.SubmitIn`) admits a submission inside the caller's own commit, before that commit's first table write (else `ReadAfterWrite`). The agent's `maxTurns` (Go `AgentState.MaxTurns`, an integer 1 or more, inherited by children and forks) ends a run unanswered with `turn_limit` after that many tool rounds; a continue resumes it with a fresh budget, and `pi.live.runFailure` tells the host why a run stopped.
+- Inbox `onAbort` (Go `OnAbortKeep`): an input submitted with `onAbort: "keep"` stays queued through `Conversation.abort()` and abort cascades (it is stored on its inbox item as `onAbort: "keep"`, never as another value); `Submission.abort()` and a failed run's `afterFailedRun: "withdraw"` still withdraw it; `Conversation.abort()` resolves with no value.
+- Sub-agents: owned conversations (§2 ownership), foreground and background patterns (examples 22, 23), child tasks (example 24), subtree abort and idle traversal.
+
+### 3.8 Recovery (bench slice for generation and tool)
+
+On open: reconciliation (§5.1). Generation `request` converts a committed partial into an aborted `pi.assistant` entry before re-requesting with the pinned model, thinking level and stream options and reruns `beforeRequest`. Tool `execute` re-executes only when stored and current replay policies are both `safe`; otherwise it commits an `interrupted` result from the slot's durable partial output and ends `failed`. Fault and orphan settlement convert partials like abort does (§8.3, §8.4). The wasm-spike lane reproduced these rules for the bench workload and passed crash handoff at all 77 commit boundaries at 50/250/1,000/3,500 turns (handoff `durable-wasm-spike.md`, update 3).
+
+### 3.9 Streaming partials
+
+Generation and tool output use two different throttles; both commit trailing writes with one commit in flight and coalesce changes made meanwhile.
+
+- Generation partials (§8.3, `streamResponse`, `src/harness/generation.ts:360-414`): events of type `done` or `error` and partials with empty `content` are skipped; the first partial arms `setTimeout(flush, partialIntervalMs)` (no immediate commit); `flush` commits a `copyJson` of the newest pending partial into `pi.live.generation.message`; when that commit settles and a newer partial is pending, the next flush is armed `partialIntervalMs` after the settlement. There is no size term. The `finally` block stops the throttle, clears the timer and awaits the commit in flight before classification, so no stale partial lands after the outcome.
+- Tool output (§7.3, §8.2, `Progress` in `src/harness/output.ts:268-340`, created at `src/harness/tool.ts:287`): the first change after an idle period commits at once; each commit then delays the next to `started + max(outputIntervalMs, bytes * 1000 / PROGRESS_BYTES_PER_SECOND)` with `PROGRESS_BYTES_PER_SECOND = 100 KiB` (`output.ts:261`), measured from the commit's start; `details()` resolves only when the commit that includes it settles (`markAndWait`, `tool.ts:211-216`); `stop()` awaits the commit in flight.
+
+Defaults are 100 ms (`settings.progress`, `src/harness/agent.ts:34-35`, 1.0.3 changelog). durable-bench never streams; the contract corpus does (section 6, W3).
+
+### 3.10 Storage read contract
+
+The host serves Harness reads that do not need core state (old history pages, task and submission lookups) straight from Pi's tables. Those reads must satisfy §10 exactly. The core's write encoder, wrapped as a `Storage`, must pass the upstream storage conformance suite unchanged, which proves every `StorageWrite` type independently of the Harness.
+
+## 4. What the core may differ in
+
+Only non-observable behaviour: statements issued, reads, memory layout, time spent, the `pig_*` sidecar tables (ADR D6, recorded as an additive feature when they land), and log output. Anything a Pi Harness client, a pi-durable process opening the same store, or a provider can observe is in scope of sections 2-3. A difference that must stay gets a numbered entry in `docs/parity/DIVERGENCES.md` before it lands.
+
+## 5. How it is checked
+
+### 5.1 Capture
+
+pi-durable runs every scenario over a capturing SQLite adapter (`capsql`, section 7.1). The adapter implements pi-durable's `SqliteDatabase` facade over `node:sqlite`, records every statement with its parameters and transaction boundaries, and records the row changes of each committed transaction. The capture output is a trace (section 7.6). The same scenario then runs against the candidate (Wasm core in a JS host, native Go core, TS control) with the same deterministic environment and the same effect script, producing a trace in the same format.
+
+### 5.2 Comparison
+
+`rowdiff` (section 7.4) compares two traces at the `store`, `commit`, `context` and `output` levels and reports the first divergent commit with a field-level JSON diff of each differing record column. A key-order-only difference and a number-format-only difference are reported as such, because both break `store` although the decoded values match.
+
+### 5.3 Effect script
+
+Model responses, tool results, hook decisions and their completion order are inputs. The capture records them as an effect tape: for each effect, its request (context fingerprint, tool call) and its completion (events, result, virtual time of completion). The candidate run replays the tape and fails on the first request that differs from the recorded one (a `context` failure). Without the tape, parallel rounds and sub-agents are not comparable at the `commit` level.
+
+Pi itself must be deterministic under the tape: every scenario is captured five times and the five traces must be `commit`-equal. A scenario that is not is marked `pi-nondeterministic`, compared at the `store` level only, and reported upstream.
+
+### 5.4 Context fingerprints
+
+Two fingerprints per model call:
+
+- `ctx`: sha256 of the canonical JSON of the pi-ai `Context` and stream options passed to `models.streamSimple` (Pi: wrap `models`; candidate: the `model_context` effect payload, ABI section 6). In the pinned reference that `Context` is `{ messages }` only (`src/harness/generation.ts:402`); the system prompt and tools travel inside it as positional `pi.system` messages (§7.4). The options' `signal` is not hashed. This is the `context` check.
+- `bench`: durable-bench's own `fingerprint()` (8 bytes of sha256 over `[role, text, calls]`, `src/plan.ts`). Known seed fingerprints: 50 `b017b487524e44a4`, 250 `dcea9f30b0917245`, 1,000 `ac520308146f2a8f`, 3,500 `0a8c8e4b0d9a0794` (bench-pig handoff). Required for both scripted-model variants.
+
+For the wire plane (core-built provider bodies, ADR D11) a third fingerprint hashes the HTTP request body and must equal the body pi-ai at the pin builds for the same context and model.
+
+### 5.5 Handoff matrix
+
+For each handoff scenario and each crash point `k` (after commit `k`, every commit of one measured turn; streaming scenarios include every partial commit):
+
+| order | run 1 (to crash or restart) | run 2 (recover and finish) |
+|---|---|---|
+| control | pi-durable | pi-durable |
+| P→X | pi-durable | candidate |
+| X→P | candidate | pi-durable |
+| X→X | candidate | candidate |
+
+Each non-control order must end `store`-equal to the control, and the commits of run 2 must be `commit`-equal to the control's run 2. Crash means the process is abandoned after commit `k` without `close()`. A clean restart (close, reopen) is the `k = end` row. Sizes: 50 and 1,000 for every `k`; 3,500 for a sample of 10 `k` values including the first and last.
+
+### 5.8 Interleaving traces
+
+Pi orders client calls and commits by microtask scheduling, and a candidate must reproduce that order exactly (the owner revoked D106 on 2026-10-12). The commit level compares the order of commits only; the `order` level adds the scenario's own API calls. Every program row (E rows and I) requires it: the gate runs the reference and the candidate a second time with the API trace and compares their token lists exactly (`lib/gate.mjs` `runProgramRow`), so a row passes only when its calls and commits interleave as Pi's do. The traced pair is separate because the tracer observes each returned promise, which marks a rejection as handled; the untraced pair keeps the exit status and output. With `CONTRACT_API_TRACE=1` the public entry point exports a Harness whose methods (and those of the objects they return) write `call` lines when the scenario makes a call; calls the library makes on itself are not traced (`lib/apitrace.mjs`: the first frame outside the file decides). With `CONTRACT_TICKS=1` every call and every commit (start and landing) carries the microtask round, and the tracing does not move Pi's schedule: the observers add no hop (the wrapped `Harness.open` returns open's own promise), so every commit tick is identical with and without the API trace except for a constant offset from loading one more module before the scenario starts. A row's token list is `> call`, `! call that threw` and `# seq tables:ops` in file order; a call's return is not a token. `cli/trace.mjs record` writes the reference's list to `traces/<row>.pi.jsonl` for every program row (E rows and I); `verify` re-runs Pi against them (determinism and pin drift: `test/trace.test.mjs`); `check --impl X` compares a candidate exactly and prints the first difference with the ticks of both sides (`> harness.root().submit().wait @442` where Pi's list has `# 3 tasks:u @467` next and the candidate's has the commit first). U tests: `traces/u-tests.json` lists tests of the reference's own suite; `record-u` and `check-u` run their file with `scenarios/vitest.trace-setup.mjs`, which traces the Harness calls and each `commit(writes)` the storage receives (the facade reports its committed batches to the same method), per test. Golden files are generated: never edit them. `make durable-contract-trace` runs `check` against the goldens and `check-u` for a candidate; it is red until the core schedules like Pi. The gate's `order` level is the same comparison against a live reference run.
+
+### 5.9 Differential ordering rows (F)
+
+Rows `F-<profile>-<seed>` run `durable/contract/scenarios/diff-ordering.mjs`: one seed draws a random schedule of parallel tools (instant, timed, committing, streaming, failing, sequential), generation and tool hooks (some blocking), observers (conversation views, with windows and with slow listeners) and inbox arrivals (follow-ups, steers, writes, rejects, withdrawals, a second conversation), then plays it on SQLite storage. Every random choice is drawn before the Harness opens and printed as the first output line, so a candidate that orders work differently still receives the same inputs and fails on the difference. Waits are microtask ticks and detenv virtual timers. Pi and the candidate play the seed and every level of an E row applies: store, commit, context, output and order. The profile is the storage backend's hop profile (S7): `gate` runs the reference's SqliteStorage over the capture, `node` runs the reference's own Node SQLite adapter (`CONTRACT_STORAGE_PROFILE=node`) for Pi and the candidate alike. The manifest lists seeds 1-16 on both profiles. Rows `F-ticks-<profile>` run `scenarios/client-ticks.mjs`: the exact number of microtask passes each public client call (submit, wait on a running and on a settled submission, entries, inspect, waitForIdle, abort) spends before it settles, printed per call and compared at the output level. A client call that spends fewer or more passes than Pi lets the script's next call overtake, or fall behind, a commit Pi orders the other way, so these counts are what the facade's client surface must reproduce per storage profile (the node profile spends fewer passes than the gate profile in Pi). Row `F-crash` runs `scenarios/crash-conversation.mjs`, the program `contract robust crash` kills after every commit (tools, a foreground sub-agent, the inbox, background compaction, a fork), to the end and compares it with Pi at every level; a commit that moves in that program fails the gate without a restart. Rows `T1-<turns>` (family `timetravel`, owner `dcore-history`; `T1-250` and `T1-3500`) run `scenarios/time-travel.mjs` on a copy of the `pi-main-<turns>` fixture that each run opens as `--db`: locate turn h100, read the context and the agent document as of it, scrub eight as-of contexts and fork there with one turn, compared with Pi at the store, commit, context and output levels. `contract soak --seeds A-B [--profile gate|node|both] --impl X` runs further seeds without rows, and `--shrink` cuts a failing seed to the smallest program that still differs (`--hooks`, `--observers`, `--arrivals`, `--conversations`, `--rounds`, `--calls`, `--streaming` reductions that change no other draw). The rows guard any change to scheduling, step splitting, context handling or storage hops: a change that moves one commit past one client call fails the row of the seed that exercises it.
+
+`durable/contract/baseline.toml` lists the F rows that differ from Pi today, each with its owner, cause and a shrunk repro. A listed row stays red in every report. The gate's exit status ignores exactly those rows: any other failing row fails the run, and a listed row that passes on every build that ran it also fails the run until its entry is deleted, so the file only shrinks. Only differential rows may be listed; no other row, level or test has a relaxation (the owner's decision of 2026-10-08).
+
+### 5.6 Byte-level differential tests
+
+- Encoder: random JSON values (including lone surrogates, `-0`, large and tiny floats, U+2028, deep nesting, insertion orders) encoded by the core's encoder equal `JSON.stringify`.
+- Scanner: random and adversarial records (escaped quotes, nested `role` keys inside tool arguments, images, unknown fields, any key order) yield the same index as `JSON.parse`-based extraction. The spike's `bench/verify-scan.ts` is the seed.
+- Chord: random document edit sequences produce the same `Op[]` as `packages/chord` at the pin.
+- Tool arguments: the arguments stored in a tool task's `execute` checkpoint are the output of pi-ai `validateToolArguments()` (`packages/ai/src/utils/validation.ts:317-350`: `structuredClone`, `normalizeOptionalNulls`, TypeBox `Value.Convert`, and for plain JSON schemas `coerceWithJsonSchema` with key reassignment, which can reorder keys), and its error text becomes a stored result. Random arguments against the corpus's tool schemas must produce equal bytes and equal error text.
+- `uuidv7()`: the native host's Go port equals pi-ai at the pin for the same clock and random bytes, including the sequence carry across calls in one process.
+
+These run as Go fuzz tests with a Node oracle corpus checked into testdata.
+
+### 5.7 Resource bound
+
+A bench row (W, X1, R) also bounds memory. Each run writes one sample after every measured turn to `CONTRACT_MEM` (`{"turn","rss","linear"?}`): the Node harness records the process's resident set and the summed linear memory of the Wasm cores the facade made, and a native host records its resident set (after returning freed memory to the OS). The first measured turn is the warm-up. From the end of turn 0 to the end of the last turn, linear memory may grow by 4 MiB per turn, 32 MiB or twice its turn-0 size (two heap doublings), whichever is largest; a resident set may grow by 4 MiB per turn plus 16 MiB. `CONTRACT_MEM_BOUND_MIB` changes the per-turn figure. A row over its bound fails with the numbers and the reference's growth (the reference is not bounded); a passing row prints `+X MiB/turn linear|rss N MiB over T turns`. A row that restarts the process each turn has no in-process growth and is not measured. This turns allocation churn (the TinyGo core doubled its linear memory to 3 GiB on W1-3500 and trapped) and per-call retention (the native driver kept a decoded history per model call, 18 MiB per turn on W1-1000) into row failures. Tooling: `durable/contract/lib/memory.mjs`, `durable/core/contracttest/memory.go`; negative controls in `test/memory.test.mjs`. The bound judges a candidate. The `pi` control is the reference: its resident set grows 6-10 MiB per turn on W1-1000, W2-1000, W4c-1000 and the 3500-turn rows, so the gate reports its numbers and never fails it on them (`boundApplies`, `lib/memory.mjs`).
+
+## 6. Corpus
+
+| id | source | adaptation | checks |
+|---|---|---|---|
+| E00-E37 | the 38 upstream examples | storage swapped to `capsql` by an ESM resolve hook (the `MemoryStorage` constructor and `openNodeJsonlStorage` return a SqliteStorage over `capsql`; `openNodeSqliteStorage` gets `capsql` directly); `OPENAI_API_KEY` unset so 18, 19, 22 and 23 take their faux path; 16 (real model) replays a recorded cassette and is skipped until the owner records one; examples using `NodeExecutionEnv` record tool results on the tape; candidate runs alias `../../src/index.ts` to the candidate's JS API (ADR D12) | store, commit, context, output |
+| U | upstream `test/*.test.ts` harness tests (47 files) | the Go ports under `durable/...` (for example `spec_usage_upstream_test.go` and `durable/examples`, as tracked in the test mapping) run against the core-backed Harness once it exists | their own assertions |
+| SC | `src/testing/storage-conformance.ts` | the core's write encoder wrapped as `Storage` | suite |
+| I | `durable/interop` scripted session (documents, task-starting tool, fork with init, compaction, reset) | unchanged; extended with a candidate column | store, commit, cross-open |
+| W1 | durable-bench, published scripted model (full transcript walk per call) | fixtures 50/250/1,000/3,500 (`fx/pi-node-*.sqlite`, Pi-written), ten 8-tool measured turns, open/close per sample | store, commit, context, bench fingerprint |
+| W2 | durable-bench, incremental scripted model | same fixtures; per-call work O(new messages); must produce W1's fingerprints | as W1 |
+| W3 | streaming | faux provider streaming each response in 40-60 chunks over 1-2 s virtual time; `partialIntervalMs` 100 and 250; one run with tool output progress | store, commit, context, crash at every partial commit |
+| W4 | real-turn mixes | W4a compaction-bounded history (fixtures written by pi-durable with compaction on and a 200k-token window, so head markers bound the range; the measured turns run with the compaction policy disabled for every implementation, so `prepare` checks no threshold (§8.3) and the bench slice never starts a compaction) at 1,000 and 3,500 turns; W4b every turn cold (runtime restarted between turns); W4c 20-50 KB bounded tool outputs; W4d a parallel round of 3 tools; W4e a foreground sub-agent; W4f recorded OpenAI Responses and Anthropic Messages streams (wire plane); W4g a retryable provider error then success | store, commit, context |
+| X1 | mutation | W1 at 50 with unknown fields injected into one entry, one live task and one document base before the measured turns | store, commit |
+| H | handoff | W1 at 50/1,000/3,500, W3, W4 parallel round | section 5.5 |
+
+The bench slice must pass W1, W2, W3, W4a-c, X1, and H on W1 and W3. The production core must pass the whole table.
+
+## 7. Tooling to build
+
+All Node tooling lives in `durable/contract/` and runs the pinned Pi checkout from source (`tools/setup.sh`) and runs on the Node version that durable-bench uses. Go tooling lives next to the core (`durable/core/contracttest`).
+
+### 7.1 `capsql.mjs`
+
+`SqliteDatabase` and `SqliteExecutor` implementation over `node:sqlite` `DatabaseSync`. Records `{tx: begin|end|rollback}`, `{q, p}` for every statement, and for each committed transaction the row changes. Row changes come from a SQLite session (`DatabaseSync.createSession()`, changeset decoded per table) when the Node build supports it, else from before/after snapshots of the touched rows by primary key. `createSession()` and `changeset()` work on Node 26.7.0, the durable-bench host's Node (probed during review). Open one session per transaction and take its changeset at commit: a session merges every change to a row into one change, and an UPDATE change carries old values only for the changed columns and the primary key, so full `before` images need the snapshot path. Every Pi table has a primary key, which the session extension requires. The same adapter serves Miniflare captures by replaying the recorded statements into `node:sqlite` (the DO SQL API has no session extension).
+
+### 7.2 `detenv.mjs`
+
+Installed with `--import` before any scenario module. Virtual clock starting at a fixed epoch: `Date.now`, `performance.now`, `setTimeout`/`setInterval`/`clearTimeout` on a virtual timer queue that advances to the next due timer only when the microtask queue is empty and no real work is pending (`process.getActiveResourcesInfo()` minus the virtual timers: I/O, child processes until their stdio has closed, and Node timers and immediates scheduled on the real event loop). Seeded `Math.random`, `crypto.getRandomValues`, `crypto.randomUUID`. Exposes the clock to `HarnessOptions.now`.
+
+### 7.3 `tape.mjs`
+
+Wraps `Models` (`streamSimple`, `fetchDeferred`, `cancelDeferred`) and tool `execute` calls. Record mode stores requests, fingerprints, streamed events with virtual timestamps, results and completion order. Replay mode serves them and fails on a request mismatch. A ready-made faux response factory provides the durable-bench script for W1/W2.
+
+### 7.4 `rowdiff.mjs`
+
+`rowdiff a.trace b.trace [--level store,commit,context,output]`. Exit status non-zero on any difference. Report: first divergent commit seq; per table, rows only in A, only in B, and changed rows with a JSON-aware diff of TEXT columns that classifies value, key-order, number-format and escape differences. `--json` emits a machine-readable report for CI.
+
+### 7.5 `matrix.mjs`
+
+Drives section 5.5: for a scenario and implementation pair, enumerates crash points from the control trace, runs each order in fresh temp directories, and summarises pass/fail per `k`. Supports `--impl pi|wasm|native|ts` and `--host node|miniflare`.
+
+### 7.6 Trace format
+
+JSON Lines, one object per event, in order:
+
+```text
+{"t":"meta","scenario":"W1-50","impl":"pi-durable@06a46693","pin":"06a46693","clock":0,"seed":1}
+{"t":"commit","seq":4127,"stmts":[{"q":3,"p":[...]}],"changes":[{"table":"tasks","op":"update","pk":[812],"before":[...],"after":[...]}]}
+{"t":"model","call":17,"ctx":"<sha256>","bench":"<8 bytes hex>"}
+{"t":"restart","kind":"crash","after":4127}
+{"t":"out","api":"submission.wait","value":{...}}
+{"t":"final","tables":{"entries":"<sha256 of ordered rows>",...}}
+```
+
+`q` indexes a statement-text table in the meta line. `final` carries per-table digests so the `store` level can be checked without the full store; the store file is kept next to the trace for diffing.
+
+### 7.7 Scenario manifest
+
+`durable/contract/corpus.toml` lists each scenario: id, source path and sha256 at the pin, adaptation hooks, restart and crash points, allowed normalisers with reasons (empty by default), required levels, and the `pi-nondeterministic` flag. `make durable-contract` runs the manifest against a named implementation; CI runs the bench-slice subset.
+
+### 7.8 Existing seeds
+
+Reuse rather than rewrite: the spike's `pix.ts` counters and `capture.ts` (bundle `pig-do-spike.tar.gz`), the wasm-spike lane's `bench/{verify,handoff,dump,verify-scan,recovery-trace}.ts` and `src/engine.ts`, the bench-pig lane's fixtures and fingerprints, and `durable/interop/{scenario,resume,rawdump}.mjs`.
+
+## 8. Pin bump work items: suspendable work (Pi 473515f9c)
+
+Pi `473515f9c` (`feat(durable): suspendable work: signals, tools that park, gates, hook tasks`, `packages/durable`; spec `docs/suspendable/spec.md`, section numbers below are the upstream spec's) adds work that parks without an invocation and runs again when woken. The core's pin (section 1) is the pin e7a0df27, which has none of it, and the core does not implement it until the pin is bumped (section 1: re-capture, diff, every changed row shape is a work item). The items below are that diff, so the bump is a list and not a survey. Each is a row shape or a rule the core writes or reads differently at `473515f9c`.
+
+| item | row shape or rule at `473515f9c` | where the core stands today |
+|---|---|---|
+| signals, delivery | `tx.signal(taskId, token, key, value)` (spec 5.7): reads the task record and answers `not_found`, `closed` (terminal, `completing`, abort-marked, expired key, or a sleep on the key past its `until`, which also marks the key expired), `invalid` (empty key, value not JSON or not matching the schema), `duplicate`, or `delivered`. A new `Tx` operation before the first table write (`ReadAfterWrite` after it) and `Harness.signal` in a commit of its own that enables scheduling. | `Tx.SignalErased` and `Harness.SignalErased` return `ErrSuspendableWorkNotInCorePin`. |
+| signals, storage | A key's state is a task memo `pi.signal.<signal name>/<key>`: `{ version, value }`, with `consumed: true` once a wake used it, or `{ expired: true }`. Memos are kept through checkpoints, reconciliation, handover and migration, dropped with the terminal or `completing` state; every write to a task record in one transaction keeps the memos of the transaction's latest candidate. `readSignal` of `TaskRuntime`, `HookApi` and `ToolExecutionApi` migrates a stored value with the token's `migrate` and checks the schema. | `ReadSignalErased` of the task runtime, the hook api and the tool api returns the error. The core's task commit keeps memos as at the pin and knows no `pi.signal.` name. |
+| submission notify | `SubmissionRecord.notify` and `SubmissionDraft.notify` `{ taskId, key }`: the commit that settles a submission (`settleSubmission`, a placement that settles a write, a record created settled) delivers `pi.submission-settled` with the settled record, as assembly work after the table writes; `closed` and `not_found` fail nothing. | A draft or create with `notify` fails with the error (`submit`, `SubmitIn`, `CreateSubmission`); no row is written without it. |
+| sleeping on signals | `TaskState` sleeping with optional `until` and `signals: [{ signal, key }]`; a sleep needs `until` or a non-empty `signals`; a sleep on a consumed or expired key rejects. The reservation that wakes it writes `running` (or `pending` at reconciliation) with `wake` and, in the same commit, marks the woken key consumed or every listed key without a value expired. `sleepUntil` commits `until` only. The scheduler's `wake()` counts a sleep that can wake (due, or a listed key holding an unused value); `at` is the earliest `until`; a sleep without `until` counts for neither. `inspect()` shows `until` only when there is one. | A task commit with `signals`, without `until` on a sleep, or with `wake` fails with the error and is not applied. Inspect reads `until` as optional. |
+| waits policy `any` | `JoinPolicy` `"any"`: resumes once at least one task in `on` is terminal; `allSettled`'s rules otherwise (nothing abort-marked, empty `on` resumes at the next pass, the cycle check unchanged, a task not owned requires `allSettled` or `any`). | A task commit with `policy: "any"` fails with the error. |
+| task state `wake` | `pending` and `running` records may carry `wake`: `{ reason: "time" }`, `{ reason: "expired" }`, `{ reason: "signal", signal, key }`, `{ reason: "tasks", ended }`. Written by the reservation, kept by reconciliation, close and handover, kept by a commit of the same checkpoint and dropped by any other state; progress for the restart count compares states without `wake`; an abort invocation gets none. A task never writes its own `wake`. | The core writes no `wake`; a task that commits one fails with the error. |
+| `pi.tool` version 4 | Checkpoint phase `parked` `{ arguments, replay, checkpoint? }` (the park's `sleeping` or `waiting` state holds the same checkpoint); `execute` gains `wake?` and `checkpoint?`; `migrate` keeps version 3 inputs and older checkpoints. `call` commits a gate's sleep as `sleeping` at `{ phase: "call" }`. `parked` runs on the wake: resolves the tool, commits intent (`execute` with arguments, replay, `wake`, `checkpoint`), and runs `execute()` with `api.wake` and `api.checkpoint`. A park's commit closes nested-call admission, stores the latest details and diagnostics, sets the slot `sleeping` or `waiting` with no output, writes `parked`, and commits the state. The `restart` abort-mark rule: a child of a tool task at `call` or `parked` is not marked. | The core's tool task is version 3 and never writes `parked`; `ToolExecutionApi.Wake()` is nil and `Checkpoint()` is `(nil, false)` on every run. |
+| `invalid_park` | Error result with diagnostic code `invalid_park` ("Tool X returned an invalid park: ...") through the `afterTool` chain for a park or gate sleep that breaks a rule (`sleep` and `wait` together, a result field beside a park, the sleep rules, `on` naming a task the call does not own, a wait cycle, a composite's park its base did not return); the task ends `failed` like a throw. | Every park is invalid: the call ends with that result, whose text names the pin (below). |
+| `cancel` | `ToolRegistration.cancel(args, api)` runs in the abort handler for a call at `parked`, or `execute` with `wake`; on a park commit refused for an abort mark; and before the `interrupted` result of a woken run on recovery. `api.wake` is undefined, `api.checkpoint` the last park's, `executeTool` and `createTask` throw; idempotent, a throw is reported. | Never called: a call never parks, so it is never aborted while no tool code runs. |
+| slot statuses | `pi.live` tools and nested slots gain status `sleeping` and `waiting` (no output); `pi.live` migrates with no step; its base is complete whenever no tool slot is `running`. | No slot of the core has them. |
+| `executeTool` with `wait: false` and keyed `createTask` | `NestedToolCall` handle returned at once, its `result()` waits for the stored result. A keyed `createTask` records `{ kind: "task", taskId }` in the call's `NestedCallDoc` (`pi.tool.nested-call`) member map in the creating commit, with the nested-call key rules; a member without `kind` is a nested call's; after a wake a key is required and an unkeyed `createTask` throws. | `ExecuteToolNoWait` and a `createTask` with a key return the error; no task or member is created. |
+| `keepsAbandoned` on restart | A replay-unsafe call parked or not started yet when a restart came wakes as usual and keeps its `abandonOnRestart` children and nested calls (only a restart that cuts off `execute` abandons them); a caller parked on its nested calls' tasks counts no restart. | No parked call exists. |
+| gates | `beforeTool` result `{ sleep: { until?, signals? } }` (first `block` or `sleep` stops the chain, `block` wins): the whole `call` phase reruns on every wake, on a registry publication while it sleeps, when its sleep commits under a replaced snapshot, and at the first scheduling pass after open (woken with no `wake`; an `until` already past takes the deadline path, `expired`). | A hook that returns `sleep` fails with the error, which a `beforeTool` failure turns into a blocked call. |
+| `pi.generation` version 3 | Phases `afterTools` `{ assistant, tools, tasks }` and `yield` `{ answer, tasks }`; the hook tasks are children of the generation, checked as `afterRun`'s and waited for with `allSettled`. `afterTools` tasks may complete with `{ terminate: true }` or submit a steer; `onYield` tasks complete with a `YieldDecision` and the first in creation order that continues provides the continuation. `pi.live.run.yield` `{ answer, tasks }` keeps the inputs open (`placed`) while they run; every exit but a continuation settles them `done` with `run.yield.answer` and records no `runFailure`; the restart limit in `yield` ends the run `completed` with the answer. | The core's generation is version 2. An `onYield` result with tasks, and an `afterTools` result with tasks, fail with the error (reported, the run goes on as if the hook returned nothing). `afterRun` tasks are unchanged and run. |
+| `durationMs` | A tool result's `durationMs` (the `pi.tool-result` entry's message, the nested result, the slot summary) is the span from the task's `startedAt` to the result commit on the Harness clock, gate waits, parks, downtime and reruns included; a record without `startedAt` gets the last attempt's execution time, and none when it did not execute. This changes the value of every tool result row, parked or not. | The core writes the pin's execution time of the attempt, so a bump re-captures every tool row. |
+| kept contexts | A conversation whose live non-background work is all `sleeping`, `waiting` or `completing` counts as inactive for `contextRetentionMs` expiry; idle waits still count it as live. | No such work exists. |
+
+What a user selecting the core backend observes today, for each way into the table (the exact error is `driver.ErrSuspendableWorkNotInCorePin`: `suspendable work (signals, parks, wake, checkpoint, ExecuteToolNoWait, gates, hook tasks) is not in the Durable core's contract pin (the pin e7a0df27, docs/plan/durable-core/CONTRACT.md); a pin bump adds it`, wrapped with the member's name):
+
+- A tool that returns a park: the call ends with an `invalid_park` error result, `Tool <name> returned an invalid park: <the error>`, which the model sees in the transcript, and the run goes on. `Execute` is not run again and `cancel` is never called. A park from an `afterTool` hook result fails that hook (reported, the tool's own result stands).
+- `ExecuteToolNoWait`, `ReadSignalErased` (task, hook or tool api), a keyed `CreateTaskErased`, `Tx.SignalErased`, `Harness.SignalErased` / `harness.Signal`, and a submission with `notify`: the call returns the error; nothing is written. `Wake()` is nil and `Checkpoint()` is `(nil, false)`.
+- A task state with signals, a sleep without `until`, `JoinAny`, or `wake`: the task's commit fails with the error and is not applied.
+- A `beforeTool` hook that sleeps: the hook fails, which blocks the call with `Tool call blocked: <the error>`.
+- An `onYield` result with tasks, an `afterTools` result with tasks: the hook fails, is reported (`extension_error`), and the run goes on; an `afterTools` result with no tasks is not an error. An `afterRun` hook's tasks are a pinned feature and run as before.
+
+A pin bump takes these in order: signals and the memo shapes, sleeping on signals and `wake` with `any` waits (the scheduler's reservation, `wake()` and `inspect`), `pi.tool` version 4 with parks, `cancel` and slot statuses, `wait: false` and keyed tasks, gates, `pi.generation` version 3 with `pi.live.run.yield`, then `durationMs` and kept contexts; the corpus gains the upstream examples 38-46 (signals, ask a person, tool waits for webhook, tool polls, parallel children, subagent waits, approval gate, review on yield, afterTools terminate), and every tool row it already holds changes with `durationMs`. The driver's pin error is removed member by member as each lands, and its test (`suspendable_pin_core_test.go`) is replaced by the ported upstream test of that member.

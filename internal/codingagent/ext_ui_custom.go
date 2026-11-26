@@ -1,0 +1,288 @@
+package codingagent
+
+// Ports InteractiveMode.showExtensionCustom (packages/coding-agent/src/modes/interactive/interactive-mode.ts:2863-2935)
+// for an extension that runs in the host process.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/tui"
+)
+
+type customResult struct {
+	value any
+	err   error
+}
+
+// customCall is one Custom call. mu guards the fields below it; mounted, overlay and savedText belong to the owner loop.
+type customCall struct {
+	u      *ExtUIContext
+	result chan customResult
+
+	mu       sync.Mutex
+	closed   bool // done was called, or the call ended
+	building bool // the factory is running on the owner loop
+	value    any
+
+	component tui.Component
+	handle    *tui.OverlayHandle
+	mounted   bool
+	torn      bool
+	disposed  bool
+	isOverlay bool
+	entry     *extensionDialog // the editor-slot stack entry once mounted
+	savedText string
+	// statusSource is the program status source of a blocking overlay, "" for a call without one.
+	statusSource string
+}
+
+// blockedStatusOf is the status an inline component reports while it is visible: nil for a component that did not opt in.
+func blockedStatusOf(blocked *extension.CustomBlocked) *BlockedStatus {
+	if blocked == nil {
+		return nil
+	}
+	return &BlockedStatus{Kind: blocked.Kind, Message: blocked.Message}
+}
+
+func customOptionsOf(opts *extension.CustomOptions) extension.CustomOptions {
+	if opts == nil {
+		return extension.CustomOptions{}
+	}
+	return *opts
+}
+
+// overlayOptionsOf resolves overlayOptions as upstream does: a function is called when the overlay is shown.
+// upstream: interactive-mode.ts:2902 `typeof options?.overlayOptions === "function" ? options.overlayOptions() : options?.overlayOptions`
+func overlayOptionsOf(source extension.OverlayOptionsSource) tui.OverlayOptions {
+	switch source := source.(type) {
+	case extension.OverlayOptionsValue:
+		return source.Options
+	case extension.OverlayOptionsFunc:
+		return source()
+	}
+	return tui.OverlaySpec{}.Options()
+}
+
+// Custom runs an in-process factory and shows its component in the editor slot, or over the screen, until the
+// factory's done callback ends the call with a result.
+// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:2863-2935 (showExtensionCustom)
+func (u *ExtUIContext) Custom(ctx context.Context, factory extension.CustomFactory, opts *extension.CustomOptions) (any, error) {
+	if factory == nil {
+		return nil, errors.New("custom extension components need an extension.CustomFactory (a subprocess extension uses RunRemoteOverlay)")
+	}
+	create := factory
+	if u.m.tuiInst == nil || u.m.editorContainer == nil || u.m.editor == nil {
+		return nil, errors.New("no TUI available")
+	}
+	options := customOptionsOf(opts)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if u.m.runCtx != nil {
+		stop := context.AfterFunc(u.m.runCtx, cancel)
+		defer stop()
+	}
+	call := &customCall{u: u, result: make(chan customResult, 1), isOverlay: options.Overlay}
+	var posted sync.WaitGroup
+	defer posted.Wait()
+	u.m.runOnMain(ctx, func() { call.build(ctx, create, options, &posted) })
+	// The owner loop builds the component before any task queued after this one, so a later extension call applies
+	// after it, as upstream's synchronous showExtensionCustom does.
+	extension.CallInitiated(ctx)
+
+	select {
+	case res := <-call.result:
+		return res.value, res.err
+	case <-ctx.Done():
+		call.markClosed(nil)
+		cleanupCtx := u.m.runCtx
+		if cleanupCtx == nil {
+			cleanupCtx = context.Background()
+		}
+		u.m.runOnMain(cleanupCtx, func() {
+			call.teardown()
+			call.dispose()
+		})
+		return nil, ctx.Err()
+	}
+}
+
+// markClosed records the first done and reports whether this call was it.
+func (c *customCall) markClosed(value any) (first, building bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false, c.building
+	}
+	c.closed, c.value = true, value
+	return true, c.building
+}
+
+// done is the callback the factory receives. The first call ends the Custom call with its result; later calls do
+// nothing. It runs on any goroutine, including the owner loop.
+func (c *customCall) done(ctx context.Context, posted *sync.WaitGroup) func(any) {
+	return func(value any) {
+		first, building := c.markClosed(value)
+		if !first || building {
+			// While the factory runs, its owner-loop caller finishes the call when the factory returns.
+			return
+		}
+		c.finishAsync(ctx, posted)
+	}
+}
+
+// finishAsync ends the call on the owner loop without blocking a caller that already runs there.
+func (c *customCall) finishAsync(ctx context.Context, posted *sync.WaitGroup) {
+	if c.u.m.postUITask(c.finish) {
+		return
+	}
+	posted.Go(func() { c.u.m.runOnMain(ctx, c.finish) })
+}
+
+// build runs the factory on the owner loop and mounts what it returns.
+func (c *customCall) build(ctx context.Context, create extension.CustomFactory, options extension.CustomOptions, posted *sync.WaitGroup) {
+	m := c.u.m
+	if ctx.Err() != nil {
+		return
+	}
+	c.savedText = m.editor.GetExpandedText()
+	if options.Overlay && options.Blocked != nil {
+		// An overlay stays blocked until its interaction ends, also while setHidden() hides it.
+		c.statusSource = m.nextBlockingOverlaySource()
+	}
+	c.mu.Lock()
+	c.building = true
+	c.mu.Unlock()
+	built, err := c.callFactory(create, c.done(ctx, posted))
+	c.mu.Lock()
+	c.building = false
+	closed, value := c.closed, c.value
+	c.mu.Unlock()
+	if closed {
+		// upstream: close() already ran restoreEditor for an editor-slot component (interactive-mode.ts:2890-2893), and
+		// the factory's component is never mounted (interactive-mode.ts:2900).
+		if !options.Overlay {
+			c.restoreEditor()
+		}
+		c.result <- customResult{value: value}
+		return
+	}
+	component, isComponent := built, built != nil
+	if err == nil && !isComponent {
+		err = fmt.Errorf("custom component factory returned %T, not a component", built)
+	}
+	if err != nil {
+		if first, _ := c.markClosed(nil); !first {
+			// upstream: the rejection handler returns when close() already ran (interactive-mode.ts:2926); the finish
+			// that done posted resolves the call with its result.
+			return
+		}
+		if !options.Overlay {
+			c.restoreEditor()
+		}
+		c.result <- customResult{err: err}
+		return
+	}
+	c.component = component
+	if options.Overlay {
+		c.handle = m.tuiInst.ShowOverlay(component, overlayOptionsOf(options.OverlayOptions))
+		m.addExtensionOverlay(c.handle, c.removeOverlay)
+		if c.statusSource != "" {
+			m.programStatusReporter().SetBlocked(c.statusSource, blockedStatusOf(options.Blocked))
+		}
+		// upstream: interactive-mode.ts:2905 options.onHandle?.(handle)
+		if options.OnHandle != nil {
+			options.OnHandle(c.handle)
+		}
+	} else {
+		// upstream: interactive-mode.ts showExtensionCustom pushExtensionDialog(c, options?.blocked); an overlay is not in the dialog stack.
+		c.entry = &extensionDialog{component: component, dispose: c.dispose, blocked: blockedStatusOf(options.Blocked)}
+		m.pushExtensionDialog(c.entry)
+	}
+	c.mounted = true
+	m.tuiInst.RequestRender()
+}
+
+// callFactory turns a panic in the factory into the error upstream's promise rejection is.
+func (c *customCall) callFactory(create extension.CustomFactory, done func(any)) (built extension.Component, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("custom component factory panicked: %v", r)
+		}
+	}()
+	return create(c.u.m.tuiInst, tui.ActiveTheme(), tui.GetTUIKeybindings(), done)
+}
+
+// finish ends the call on the owner loop: it takes the component down, resolves the call with the result, and only
+// then disposes the component.
+func (c *customCall) finish() {
+	c.teardown()
+	c.mu.Lock()
+	value := c.value
+	c.mu.Unlock()
+	// The first done posts the only finish, and build sends no result once done has run, so this send never waits.
+	c.result <- customResult{value: value}
+	c.dispose()
+}
+
+// teardown restores the editor slot or hides the overlay, once. upstream: close, restoreEditor.
+func (c *customCall) teardown() {
+	if c.torn || !c.mounted {
+		return
+	}
+	if c.isOverlay {
+		c.removeOverlay()
+		return
+	}
+	c.torn = true
+	c.restoreEditor()
+}
+
+// removeOverlay is removeOverlay of showExtensionCustom, shared by done and the reset of the extension UI: it removes the overlay from the
+// open extension overlays first, which makes a second call a no-op, hides it through its own handle, not the topmost one, since another
+// overlay may have opened above it (Pi #10999), clears its blocked status and disposes the component.
+// upstream: interactive-mode.ts showExtensionCustom removeOverlay
+func (c *customCall) removeOverlay() {
+	m := c.u.m
+	c.torn = true
+	if !m.deleteExtensionOverlay(c.handle) {
+		return
+	}
+	c.handle.Hide()
+	if c.statusSource != "" {
+		m.programStatusReporter().SetBlocked(c.statusSource, nil)
+	}
+	c.dispose()
+}
+
+// restoreEditor takes the component out of the editor-slot dialog stack, which shows the previous dialog or the editor, and puts back
+// the text the editor held when the component opened.
+// upstream: interactive-mode.ts showExtensionCustom restoreEditor
+func (c *customCall) restoreEditor() {
+	m := c.u.m
+	if c.entry != nil {
+		m.removeExtensionDialog(c.entry)
+	}
+	m.editor.SetText(c.savedText)
+	m.tuiInst.RequestRender()
+}
+
+// dispose runs the component's Dispose, ignoring what it does. upstream: interactive-mode.ts:2891-2895.
+func (c *customCall) dispose() {
+	if c.disposed || !c.mounted {
+		return
+	}
+	c.disposed = true
+	disposer, ok := c.component.(interface{ Dispose() })
+	if !ok {
+		return
+	}
+	defer func() { _ = recover() }() // upstream: coding-agent/src/modes/interactive/interactive-mode.ts:showExtensionCustom
+	disposer.Dispose()
+}

@@ -1,0 +1,390 @@
+//go:build unix
+
+package cli
+
+import (
+	"bufio"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/testbudget"
+)
+
+// TestPrintModeSignalExitCodes pins print mode's termination contract.
+//
+// Pi 0.87.1 print-mode.ts:49-64 handles SIGTERM/SIGHUP with numeric
+// 128+signum exits but leaves SIGINT to the default signal action. Process
+// wait status distinguishes that action from a normal exit with code 130.
+func TestPrintModeSignalExitCodes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping signal exit-code test in short mode")
+	}
+	bin := buildPigBinaryForSignalTest(t)
+
+	for _, tc := range []struct {
+		name   string
+		signal syscall.Signal
+		want   int
+	}{
+		{"SIGTERM", syscall.SIGTERM, 143},
+		{"SIGHUP", syscall.SIGHUP, 129},
+		{"SIGINT", syscall.SIGINT, -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			cmd := exec.Command(bin, "--model", "test-faux/faux-1", "--no-extensions", "--print", "Run: sleep for a while")
+			cmd.Dir = workDir
+			cmd.Env = append(os.Environ(),
+				"PIG_HOME="+t.TempDir(),
+				"PIG_TEST_FAUX=1",
+				"PIG_TEST_FAUX_SCENARIO=parity-basic",
+			)
+			// Own process group so the signal reaches only this run.
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start pig: %v", err)
+			}
+
+			// Wait for the faux tool to actually be running, so the signal
+			// lands mid-run rather than during startup.
+			marker := filepath.Join(workDir, ai.TestFauxToolStartedMarker)
+			deadline := time.Now().Add(testbudget.Wait(t))
+			for {
+				if _, err := os.Stat(marker); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
+					t.Fatal("faux tool never started; cannot signal a run that is not in flight")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			if err := cmd.Process.Signal(tc.signal); err != nil {
+				t.Fatalf("signal %s: %v", tc.signal, err)
+			}
+			// SIGINT takes the default action, as in Pi: pig dies at once, and the faux call's shell, which runs in its own
+			// process group, keeps sleeping. The test kills what is left of it in its working directory when it ends.
+			t.Cleanup(func() { killProcessesIn(workDir) })
+
+			err := cmd.Wait()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("wait = %v, want an exit error carrying %d", err, tc.want)
+			}
+			if tc.signal == syscall.SIGINT {
+				status, ok := exitErr.Sys().(syscall.WaitStatus)
+				if !ok || !status.Signaled() || status.Signal() != syscall.SIGINT {
+					t.Fatalf("wait status = %v, want SIGINT termination", exitErr.Sys())
+				}
+			}
+			if got := exitErr.ExitCode(); got != tc.want {
+				t.Errorf("exit code = %d, want %d (upstream print-mode contract)", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPrintModeSignalDuringPipedStdinRead pins termination while print mode
+// waits for piped stdin. Upstream main.ts reads piped stdin to its end before
+// print mode registers any signal handler, so a writer that never closes the
+// pipe (a harness that leaves stdin open) keeps it waiting, and SIGTERM ends
+// the process through the default action: status 143, nothing printed. pig
+// read stdin with a blocking io.ReadAll after its own SIGTERM handler had
+// replaced the default action, so the signal only cancelled a context nobody
+// was waiting on and the process hung.
+func TestPrintModeSignalDuringPipedStdinRead(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping signal exit-code test in short mode")
+	}
+	bin := buildPigBinaryForSignalTest(t)
+	cmd := exec.Command(bin, "--model", "test-faux/faux-1", "--no-extensions", "--print", "/probe")
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(), "PIG_HOME="+t.TempDir(), "PIG_TEST_FAUX=1", "PIG_STARTUP_TRACE=1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stdin.Close() }()
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start pig: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+
+	// Signal once pig is waiting on stdin, which the startup trace marks.
+	reading := make(chan struct{})
+	stderrDone := make(chan struct{})
+	var trace strings.Builder
+	go func() {
+		defer close(stderrDone)
+		scanner := bufio.NewScanner(stderr)
+		signalled := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "[startup] ") {
+				trace.WriteString(line + "\n")
+			}
+			if !signalled && strings.Contains(line, "stdin-read-start") {
+				signalled = true
+				close(reading)
+			}
+		}
+	}()
+	select {
+	case <-reading:
+	case <-time.After(testbudget.Wait(t)):
+		t.Fatal("pig never started reading stdin")
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+
+	// stderr reaches EOF when the process exits; Wait must follow the reads.
+	select {
+	case <-stderrDone:
+	case <-time.After(testbudget.Wait(t)):
+		t.Fatal("pig ignored SIGTERM while waiting for piped stdin")
+	}
+	err = cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 143 {
+		t.Fatalf("wait = %v, want exit status 143", err)
+	}
+	if got := trace.String(); got != "" {
+		t.Errorf("stderr = %q, want nothing besides the startup trace", got)
+	}
+}
+
+// TestPrintModeJSONSignalStopsOutputAndPersistence pins what a JSON-mode run leaves after SIGTERM or SIGHUP lands while a
+// tool runs. Pi's handler (print-mode.ts:50-63) kills tracked children and runs disposeRuntime: it unsubscribes the JSON
+// writer first, then awaits runtimeHost.dispose (session_shutdown, then AgentSession.dispose, which disconnects the
+// Session from the Agent before the aborted run settles, agent-session.ts:1393-1414), then exits. So stdout ends with the
+// events written before the signal and the session file gets no tool result and no aborted assistant message. Probed
+// with Pi 1.1.0 (bash `sleep` through an openai-completions mock): stdout ends at tool_execution_update, the session
+// at the toolUse assistant message.
+func TestPrintModeJSONSignalStopsOutputAndPersistence(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the binary")
+	}
+	bin := buildPigBinaryForSignalTest(t)
+	// Pi's runtimeHost.dispose() awaits session.abort() before it emits session_shutdown (agent-session-runtime.ts dispose, Pi main 7a53c310a, #9126),
+	// so the killed tool's turn settles first: the session file gets the tool result and the aborted assistant message in every case, with or without a
+	// slow session_shutdown handler. Pi has unsubscribed the JSON writer first, so stdout still ends at the signal (scenario print/09 compares both).
+	slowShutdown := filepath.Join(t.TempDir(), "slow-shutdown.mjs")
+	if err := os.WriteFile(slowShutdown, []byte(`export default function (pi) { pi.on("session_shutdown", () => new Promise((resolve) => setTimeout(resolve, 1500))); }`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		signal    syscall.Signal
+		want      int
+		extension string
+	}{
+		{"SIGTERM", syscall.SIGTERM, 143, ""},
+		{"SIGHUP", syscall.SIGHUP, 129, ""},
+		{"SIGTERM with a slow session_shutdown handler", syscall.SIGTERM, 143, slowShutdown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir, sessionDir := t.TempDir(), t.TempDir()
+			args := []string{"--model", "test-faux/faux-1", "--no-extensions", "--mode", "json", "--session-dir", sessionDir}
+			if tc.extension != "" {
+				args = append(args, "-e", tc.extension)
+			}
+			cmd := exec.Command(bin, append(args, "-p", "Run: sleep for a while")...)
+			cmd.Dir = workDir
+			agentDir := t.TempDir()
+			cmd.Env = append(os.Environ(), "PIG_HOME="+t.TempDir(), "PIG_CODING_AGENT_DIR="+agentDir, "PI_CODING_AGENT_DIR="+agentDir, "PIG_TEST_FAUX=1", "PIG_TEST_FAUX_SCENARIO=parity-basic")
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			var stdout strings.Builder
+			cmd.Stdout = &stdout
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start pig: %v", err)
+			}
+			t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+			marker := filepath.Join(workDir, ai.TestFauxToolStartedMarker)
+			deadline := time.Now().Add(testbudget.Wait(t))
+			for {
+				if _, err := os.Stat(marker); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("faux tool never started")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if err := cmd.Process.Signal(tc.signal); err != nil {
+				t.Fatalf("signal: %v", err)
+			}
+			err := cmd.Wait()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != tc.want {
+				t.Fatalf("wait = %v, want exit status %d", err, tc.want)
+			}
+			// pig additive (D102): every exit by a termination signal leaves its line, whichever signal handler exits first.
+			if exitLog, _ := os.ReadFile(codingagent.ExitLogPath(agentDir)); !strings.Contains(string(exitLog), "received "+codingagent.SignalName(tc.signal)) {
+				t.Fatalf("exit.log = %q, want a line with %q", exitLog, "received "+codingagent.SignalName(tc.signal))
+			}
+			for line := range strings.SplitSeq(strings.TrimSpace(stdout.String()), "\n") {
+				for _, after := range []string{`"type":"tool_execution_end"`, `"type":"turn_end"`, `"type":"agent_end"`, `"role":"toolResult"`} {
+					if strings.Contains(line, after) {
+						t.Fatalf("stdout has an event written after the signal (%s):\n%s", after, stdout.String())
+					}
+				}
+			}
+			files, _ := filepath.Glob(filepath.Join(sessionDir, "*.jsonl"))
+			if len(files) != 1 {
+				t.Fatalf("session files = %v", files)
+			}
+			data, err := os.ReadFile(files[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), `"role":"toolResult"`) || !strings.Contains(string(data), `"stopReason":"aborted"`) {
+				t.Fatalf("session did not persist the settled aborted run before the exit:\n%s", data)
+			}
+		})
+	}
+}
+
+// TestPrintModeSignalDisposalRunsLikePisEventLoop pins what a run in flight does while a signal's disposal runs. Pi's handler
+// (print-mode.ts:50-63) starts disposeRuntime on its one event loop and exits when it settles; dispose() awaits session.abort()
+// before session_shutdown (agent-session-runtime.ts, Pi main 7a53c310a, #9126):
+//   - The interrupted run settles first, as aborted: the tool result and the aborted assistant message are persisted and no
+//     second request is made, whatever the handler does.
+//   - A handler that throws at once has its error on stderr first; the prompt's continuation then reports the aborted result
+//     ("This operation was aborted") in text mode, before the exit.
+//   - A handler that waits on a timer lets the loop turn, so text mode reports the aborted result while it waits.
+//
+// Probed with the pinned Pi through an openai-completions mock (scenario print/09, the *-shutdown cases).
+func TestPrintModeSignalDisposalRunsLikePisEventLoop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the binary")
+	}
+	bin := buildPigBinaryForSignalTest(t)
+	extensions := t.TempDir()
+	throwing := filepath.Join(extensions, "throwing-shutdown.mjs")
+	slow := filepath.Join(extensions, "slow-shutdown.mjs")
+	for path, source := range map[string]string{
+		throwing: `export default function (pi) { pi.on("session_shutdown", () => { throw new Error("shutdown boom"); }); }`,
+		slow:     `export default function (pi) { pi.on("session_shutdown", () => new Promise((resolve) => setTimeout(resolve, 1500))); }`,
+	} {
+		if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A Python handler runs on its own thread and reports no window. The prompt's continuation (it writes the aborted result)
+	// is held until the handler yields, and a handler that waits for it through a host call must not hang the signal exit.
+	// The handler waits through exec, a call every context may make: waitForIdle is a command-context member (Pi
+	// runner.ts:1016), so a handler's call to it is refused. The command ends when the continuation has written the aborted
+	// result to stderr; without the call's yield the continuation never runs, the command times out and the handler raises.
+	waitsForRun := filepath.Join(extensions, "waits_for_run")
+	if err := os.MkdirAll(waitsForRun, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(waitsForRun, "waits_for_run.py"), []byte(`import os
+
+import pig_sdk
+
+WAIT = 'until grep -q "This operation was aborted" "$1" 2>/dev/null; do sleep 0.05; done'
+
+
+def wait_for_run(ctx, data):
+    done = ctx.exec("sh", ["-c", WAIT, "sh", os.environ["PIG_TEST_STDERR_FILE"]], timeout=20000)
+    if done.exit_code != 0:
+        raise RuntimeError("the aborted result was not reported while the handler waited")
+
+
+def new_extension() -> pig_sdk.Extension:
+    e = pig_sdk.Extension("waits_for_run")
+    e.on_event("session_shutdown", wait_for_run)
+    return e
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, mode, extension string
+		wantStderr            string
+		wantToolResult        bool
+	}{
+		{"throwing handler/text", "text", throwing, "Extension error (" + throwing + "): shutdown boom\nThis operation was aborted\n", true},
+		{"throwing handler/json", "json", throwing, "Extension error (" + throwing + "): shutdown boom\n", true},
+		{"slow handler/text", "text", slow, "This operation was aborted\n", true},
+		{"python handler waiting for the run through exec/text", "text", waitsForRun, "This operation was aborted\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir, agentDir, sessionDir := t.TempDir(), t.TempDir(), t.TempDir()
+			cmd := exec.Command(bin, "--model", "test-faux/faux-1", "--no-extensions", "-e", tc.extension, "--mode", tc.mode, "--session-dir", sessionDir, "-p", "Run: sleep for a while")
+			cmd.Dir = workDir
+			stderrFile := filepath.Join(t.TempDir(), "stderr")
+			cmd.Env = append(os.Environ(), "PIG_HOME="+t.TempDir(), "PIG_CODING_AGENT_DIR="+agentDir, "PI_CODING_AGENT_DIR="+agentDir, "PIG_TEST_FAUX=1", "PIG_TEST_FAUX_SCENARIO=parity-basic", "PIG_TEST_STDERR_FILE="+stderrFile)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			stderrOut, createErr := os.Create(stderrFile)
+			if createErr != nil {
+				t.Fatal(createErr)
+			}
+			defer func() { _ = stderrOut.Close() }()
+			cmd.Stderr = stderrOut
+			stderr := func() string { data, _ := os.ReadFile(stderrFile); return string(data) }
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start pig: %v", err)
+			}
+			t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+			marker := filepath.Join(workDir, ai.TestFauxToolStartedMarker)
+			deadline := time.Now().Add(testbudget.Wait(t))
+			for {
+				if _, err := os.Stat(marker); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("faux tool never started")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatalf("signal: %v", err)
+			}
+			waited := make(chan error, 1)
+			go func() { waited <- cmd.Wait() }()
+			var err error
+			select {
+			case err = <-waited:
+			case <-time.After(testbudget.Wait(t)):
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				<-waited
+				t.Fatalf("pig did not exit after SIGTERM; stderr:\n%s", stderr())
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 143 {
+				t.Fatalf("wait = %v, want exit status 143; stderr:\n%s", err, stderr())
+			}
+			if got := stderr(); got != tc.wantStderr {
+				t.Fatalf("stderr = %q, want %q", got, tc.wantStderr)
+			}
+			files, _ := filepath.Glob(filepath.Join(sessionDir, "*.jsonl"))
+			if len(files) != 1 {
+				t.Fatalf("session files = %v", files)
+			}
+			data, err := os.ReadFile(files[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(string(data), `"role":"toolResult"`); got != tc.wantToolResult {
+				t.Fatalf("session has a tool result = %v, want %v:\n%s", got, tc.wantToolResult, data)
+			}
+		})
+	}
+}

@@ -1,0 +1,369 @@
+package tui
+
+// Ports packages/tui/src/components/editor.ts (the autocomplete provider request and completion lifecycle)
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/tui/widthx"
+)
+
+// AsyncAutocompleteProvider runs a complete provider chain off the editor loop. Provider columns are byte offsets; the native editor converts its UTF-16 positions at this boundary.
+type AsyncAutocompleteProvider struct {
+	TriggerCharacters           []string
+	GetSuggestions              func(context.Context, []string, int, int, bool) (*AutocompleteSuggestions, error)
+	ApplyCompletion             func(context.Context, []string, int, int, AutocompleteItem, string) ([]string, int, int, error)
+	ShouldTriggerFileCompletion func(context.Context, []string, int, int) (bool, error)
+}
+
+// AutocompleteWork runs off-loop and returns a mutation to execute on the owner loop. The host holds subsequent input while input work is pending.
+type AutocompleteWork func(context.Context) (func(), error)
+
+// SetAsyncAutocomplete selects a complete provider, not an additive suggestion source. start owns query workers; input owns ordered completion workers.
+func (e *Editor) SetAsyncAutocomplete(provider *AsyncAutocompleteProvider, lifetime context.Context, start func(func()), input func(AutocompleteWork), report func(error)) {
+	e.AutocompleteCancel()
+	e.asyncAutocomplete = provider
+	e.autocompleteLifetime = lifetime
+	e.startAutocompleteTask = start
+	e.startAutocompleteInput = input
+	e.autocompleteError = report
+}
+
+// AsyncSuggestionPlanner captures the awaited branch of a local provider without executing that branch on the owner loop.
+type AsyncSuggestionPlanner interface {
+	SuggestionTask([]string, int, int, bool) (string, func(context.Context) ([]AutocompleteItem, error), bool)
+}
+
+// SetAutocompleteTaskOwner binds the lifetime, joined worker launcher and owner-loop error reporter for native queries.
+func (e *Editor) SetAutocompleteTaskOwner(ctx context.Context, start func(func()), report func(error)) {
+	e.AutocompleteCancel()
+	e.autocompleteLifetime = ctx
+	e.startAutocompleteTask = start
+	e.autocompleteError = report
+}
+
+// AutocompleteProvider returns the local base captured by extension wrapper factories.
+func (e *Editor) AutocompleteProvider() AutocompleteProvider { return e.autocomplete }
+
+// SetAutocompleteChanged binds the owner's provider rebuild operation.
+func (e *Editor) SetAutocompleteChanged(changed func(AutocompleteProvider)) {
+	e.autocompleteChanged = changed
+}
+
+// AcceptAutocomplete reports whether an accepted slash-name completion submits. Remote completion waits off-loop and calls done only after applying on the owner loop.
+func (e *Editor) AcceptAutocomplete(done func(bool)) {
+	if e.asyncAutocomplete == nil {
+		done(e.AutocompleteAccept())
+		return
+	}
+	e.acceptAsyncAutocomplete(done)
+}
+
+func (e *Editor) acceptAsyncAutocomplete(done func(bool)) {
+	if len(e.autocompleteItems) == 0 || e.cursor != e.autocompleteQueryCursor {
+		if done != nil {
+			done(false)
+		}
+		return
+	}
+	provider := e.asyncAutocomplete
+	lines, cursor := slices.Clone(e.lines), e.cursor
+	queryLines, queryRow, queryCol := e.autocompleteView()
+	queryLines = slices.Clone(queryLines)
+	item, prefix := e.autocompleteItems[e.autocompleteCursor], e.autocompletePrefix
+	e.AutocompleteCancel()
+	e.saveHistory()
+	e.lastAction = ""
+	request := e.autocompleteRequestID
+	e.startAutocompleteInput(func(ctx context.Context) (func(), error) {
+		result, line, col, err := provider.ApplyCompletion(ctx, queryLines, queryRow, queryCol, item, prefix)
+		if err != nil {
+			return nil, err
+		}
+		if err := validAutocompleteCompletion(result, line, col); err != nil {
+			return nil, err
+		}
+		return func() {
+			if request != e.autocompleteRequestID || e.cursor != cursor || !slices.Equal(e.lines, lines) {
+				if done != nil {
+					done(false)
+				}
+				return
+			}
+			e.applyAutocompleteState(result, line, col)
+			e.Invalidate()
+			if e.OnChange != nil {
+				e.OnChange(e.Text())
+			}
+			if done != nil {
+				done(strings.HasPrefix(prefix, "/"))
+			}
+		}, nil
+	})
+}
+
+func validAutocompleteCompletion(lines []string, line, col int) error {
+	//portlint:allow utf16units Go-only guard on the byte cursor column the Go AutocompleteProvider returns; editor.ts applyCompletion has no check, and the Go editor stores byte columns
+	if line < 0 || line >= len(lines) || col < 0 || col > len(lines[line]) {
+		return errors.New("autocomplete provider returned an invalid cursor")
+	}
+	return nil
+}
+
+// Mirrors utils.ts autocompleteSeparatorRegex, including punctuation in CJK Script_Extensions.
+func autocompleteSeparator(r rune) bool {
+	return widthx.IsJSSpace(r) || strings.ContainsRune("，．：；！？（）［］｛｝“”‘’…—", r) || (unicode.IsPunct(r) && widthx.IsCJKBreak(string(r)))
+}
+
+// autocompleteTriggerRunes is editor.ts setAutocompleteTriggerCharacters: the default @ and #, then each provider character that is one UTF-16 unit and neither "/", whitespace nor already listed.
+func autocompleteTriggerRunes(characters []string) []rune {
+	triggers := []rune{'@', '#'}
+	for _, character := range characters {
+		r, size := utf8.DecodeRuneInString(character)
+		//portlint:allow utf16units editor.ts setAutocompleteTriggerCharacters skips a trigger whose length !== 1: size == len(character) is exactly one rune and r <= 0xffff makes it one UTF-16 unit
+		if size > 0 && size == len(character) && r <= 0xffff && r != '/' && !widthx.IsJSSpace(r) && !slices.Contains(triggers, r) {
+			triggers = append(triggers, r)
+		}
+	}
+	return triggers
+}
+
+func autocompleteTriggered(before string, characters []string) bool {
+	return autocompleteTriggeredBy(before, autocompleteTriggerRunes(characters))
+}
+
+// autocompleteTriggeredBy reports whether before ends in a trigger token that starts with one of the trigger characters.
+func autocompleteTriggeredBy(before string, triggers []rune) bool {
+	previousBoundary := true
+	for offset, r := range before {
+		if previousBoundary && slices.Contains(triggers, r) {
+			//portlint:allow utf16units offset is the byte offset the range loop gives for the rune r, so the slice is the text after the trigger, as editor.ts autocompleteTriggerPattern's suffix; the suffix is only scanned for separators
+			suffix := before[offset+utf8.RuneLen(r):]
+			if r == '@' && strings.HasPrefix(suffix, "\"") && !strings.Contains(suffix[1:], "\"") {
+				return true
+			}
+			if strings.IndexFunc(suffix, autocompleteSeparator) < 0 {
+				return true
+			}
+		}
+		previousBoundary = nextAutocompleteBoundary(previousBoundary, r)
+	}
+	return false
+}
+
+// nextAutocompleteBoundary reports whether a trigger token may start after r, given whether one could start before it. A trigger token starts at a boundary, optionally after opening wrappers, e.g. "(@src/foo" or "`@src/foo" (editor.ts autocompleteTokenStartSource).
+func nextAutocompleteBoundary(previousBoundary bool, r rune) bool {
+	return autocompleteSeparator(r) || (previousBoundary && strings.ContainsRune(autocompleteTokenWrappers, r))
+}
+
+// autocompleteTokenWrappers are the opening wrappers that may sit between a boundary and a trigger token.
+const autocompleteTokenWrappers = "([{<`"
+
+func (e *Editor) naturalAsyncAutocomplete() (bool, bool) {
+	before := jsstring.Slice(e.lines[e.cursor[0]], 0, e.cursor[1])
+	triggered := autocompleteTriggered(before, e.asyncAutocomplete.TriggerCharacters)
+	slash := e.cursor[0] == 0 && strings.HasPrefix(strings.TrimLeftFunc(before, widthx.IsJSSpace), "/")
+	return triggered || slash || e.AutocompleteOpen(), triggered
+}
+
+// SetAutocompleteInputHold binds the host's hold on terminal input for extension provider requests. hold runs on the owner loop when
+// a request starts and returns the request's context, whose AutocompleteAwaitsIO releases the hold, and the end function the request calls once
+// its menu is published or it is abandoned.
+func (e *Editor) SetAutocompleteInputHold(hold func(context.Context) (context.Context, func())) {
+	e.autocompleteHold = hold
+}
+
+// requestAsyncAutocomplete is editor.ts requestAutocomplete for the extension provider chain. Like the local provider's request it only
+// records the request: Pi's startAutocompleteRequest runs in the Promise jobs after the terminal read, so only the last request of a read
+// reaches the chain, and FlushAutocomplete starts it. A debounced symbol request waits for its timer (setTimeout is a later task than any
+// read) and a forced one asks shouldTriggerFileCompletion first, both on their own paths.
+func (e *Editor) requestAsyncAutocomplete(force, explicit bool) {
+	provider := e.asyncAutocomplete
+	if e.asyncCancel != nil {
+		e.asyncCancel()
+		e.asyncCancel = nil
+	}
+	if debouncedAutocomplete(e.lines, e.cursor, provider.TriggerCharacters, force, explicit) || (force && provider.ShouldTriggerFileCompletion != nil) {
+		e.nativeAutocomplete = nil
+		e.requestAutocompleteProvider(provider, force, explicit)
+		return
+	}
+	e.nativeAutocomplete = &nativeAutocompleteRequest{provider: provider, force: force, explicit: explicit, request: e.autocompleteRequestID}
+	// A host that does not call FlushAutocomplete after each read still starts the request, on its owner loop.
+	e.scheduleAsyncApply(e.FlushAutocomplete)
+}
+
+// requestAutocompleteProvider is editor.ts requestAutocomplete and startAutocompleteRequest for a provider that answers on a worker. The request is made here and starts on
+// the worker once its debounce timer ran out and the request before it finished. A request that waited reads the editor's text and cursor when it starts, as startAutocompleteRequest
+// snapshots getText() after `await previousTask`, not when requestAutocomplete made it: a key typed meanwhile that triggers nothing (a space, "é", "/" after "@al") leaves it alone.
+func (e *Editor) requestAutocompleteProvider(provider *AsyncAutocompleteProvider, force, explicit bool) {
+	if e.asyncCancel != nil {
+		e.asyncCancel()
+	}
+	lifetime := e.autocompleteLifetime
+	ctx, cancel := context.WithCancel(context.WithoutCancel(lifetime))
+	stopped := make(chan struct{})
+	stopLifetime := context.AfterFunc(e.autocompleteLifetime, func() { cancel(); close(stopped) })
+	if e.autocompleteLifetime.Err() != nil {
+		cancel()
+	}
+	e.asyncCancel = cancel
+	lines, cursor, request := slices.Clone(e.lines), e.cursor, e.autocompleteRequestID
+	queryLines, queryRow, queryCol := e.autocompleteView()
+	queryLines = slices.Clone(queryLines)
+	previous := e.autocompleteTaskDone
+	finished := make(chan struct{})
+	finish := sync.OnceFunc(func() {
+		if !stopLifetime() {
+			<-stopped
+		}
+		close(finished)
+	})
+	e.autocompleteTaskDone = finished
+	var timer *time.Timer
+	if debouncedAutocomplete(lines, cursor, provider.TriggerCharacters, force, explicit) {
+		timer = time.NewTimer(attachmentAutocompleteDebounce)
+	}
+	// A request behind an unfinished one, and a debounced one, start later than they were made, against the text current then.
+	waits := timer != nil || !closedSignal(previous)
+	// the extension provider chain's request holds the host's next read until the chain settles or announces that it awaits I/O. A
+	// request behind an unfinished one, and a debounced one, cannot settle in the checkpoint after the read: neither holds.
+	runCtx, endHold := ctx, func() {}
+	launch := func() {
+		if provider == e.asyncAutocomplete && timer == nil && e.autocompleteHold != nil {
+			runCtx, endHold = e.autocompleteHold(ctx)
+			if !closedSignal(previous) {
+				AutocompleteAwaitsIO(runCtx)
+			}
+		}
+		e.startAutocompleteTask(func() {
+			defer finish()
+			defer endHold()
+			if timer != nil {
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+				}
+			}
+			// Cancelled queued requests still join predecessors before releasing their successors.
+			if previous != nil {
+				<-previous
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if waits {
+				// The request starts on the owner loop, where it takes the text and cursor it asks about; one that was superseded meanwhile (editor.ts startToken) asks nothing.
+				type snapshot struct {
+					ok            bool
+					lines         []string
+					cursor        [2]int
+					queryLines    []string
+					queryRow, col int
+				}
+				taken := make(chan snapshot, 1)
+				e.scheduleAsyncApply(func() {
+					if ctx.Err() != nil || request != e.autocompleteRequestID {
+						taken <- snapshot{}
+						return
+					}
+					view, row, col := e.autocompleteView()
+					taken <- snapshot{true, slices.Clone(e.lines), e.cursor, slices.Clone(view), row, col}
+				})
+				var now snapshot
+				select {
+				case now = <-taken:
+				case <-ctx.Done():
+				case <-lifetime.Done():
+				}
+				if !now.ok {
+					return
+				}
+				lines, cursor, queryLines, queryRow, queryCol = now.lines, now.cursor, now.queryLines, now.queryRow, now.col
+			}
+			result, err := provider.GetSuggestions(runCtx, queryLines, queryRow, queryCol, force)
+			if ctx.Err() != nil {
+				return
+			}
+			applied := make(chan struct{})
+			e.scheduleAsyncApply(func() {
+				defer close(applied)
+				if ctx.Err() != nil || request != e.autocompleteRequestID || e.cursor != cursor || !slices.Equal(e.lines, lines) {
+					return
+				}
+				e.publishAutocomplete(force, explicit, cursor, result, err)
+			})
+			select {
+			case <-applied:
+			case <-lifetime.Done():
+			}
+		})
+	}
+	if force && provider.ShouldTriggerFileCompletion != nil {
+		e.startAutocompleteInput(func(_ context.Context) (func(), error) {
+			should, err := provider.ShouldTriggerFileCompletion(ctx, queryLines, queryRow, queryCol)
+			if err != nil || !should {
+				finish()
+				return nil, err
+			}
+			return func() {
+				if ctx.Err() != nil {
+					finish()
+					return
+				}
+				launch()
+			}, nil
+		})
+	} else {
+		launch()
+	}
+}
+
+// closedSignal reports whether done is nil or closed.
+func closedSignal(done <-chan struct{}) bool {
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+// publishAutocomplete makes a request's answer the open menu: editor.ts applyAutocompleteSuggestions, then tui.requestRender. The caller has checked that the editor still holds the text and cursor the request asked about.
+func (e *Editor) publishAutocomplete(force, explicit bool, cursor [2]int, result *AutocompleteSuggestions, err error) {
+	defer e.requestRender()
+	e.asyncCancel = nil
+	if err != nil {
+		e.autocompleteError(err)
+		return
+	}
+	e.setAutocompleteItems(nil)
+	e.autocompletePrefix = ""
+	e.autocompleteForced = force
+	if result != nil && len(result.Items) > 0 {
+		e.setAutocompleteItems(result.Items)
+		e.autocompletePrefix = result.Prefix
+		e.autocompleteQueryCursor = cursor
+		e.autocompleteCursor = bestAutocompleteMatchIndex(result.Items, result.Prefix)
+		if force && explicit && len(result.Items) == 1 {
+			if e.asyncAutocomplete == nil {
+				e.AutocompleteAccept()
+			} else {
+				e.acceptAsyncAutocomplete(nil)
+			}
+		}
+	}
+	e.Invalidate()
+}

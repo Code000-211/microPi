@@ -1,0 +1,61 @@
+# Gitleaks: the default rules, plus an allowlist for the values below. Each
+# one matches the generic-api-key rule but is not a credential.
+title = "PiG gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures and data that are not credentials"
+regexes = [
+  # Unsigned test JWTs: header {"alg":"none"}, signature "sig".
+  '''^eyJhbGciOiJub25lIn0\.[A-Za-z0-9_-]+\.sig$''',
+  # Anthropic beta header names (the Anthropic-Beta header is a comma-separated list of them).
+  '''^(?:interleaved-thinking|oidc-federation|oauth)-\d{4}-\d{2}-\d{2}$''',
+  # Prose in the upstream test mapping.
+  '''^SSE-and-UTF-8-chunk-splitting$''',
+  # Fake Bedrock bearer token in bedrock_oracle_env_test.go: "ABSK" + base64("BedrockAPIKey-example-token").
+  '''^ABSKQmVkcm9ja0FQSUtleS1leGFtcGxlLXRva2Vu$''',
+  # WebSocket handshake nonces in chord/nextnode/http/upgrades_test.go: sixteen zero bytes, and the RFC 6455 sample nonce.
+  '''^(?:AAAAAAAAAAAAAAAAAAAAAA|dGhlIHNhbXBsZSBub25jZQ)==$''',
+  # Fake ed25519 key blobs ("...One", "...Two") in env's known_hosts tests.
+  '''^AAAAC3NzaC1lZDI1NTE5AAAAI(?:One|Two)$''',
+  # env's fixed test session token, a counting pattern.
+  '''^0123456789abcdef0123456789abcdef$''',
+  # The SHA-256 of the rendered /hotkeys rows on Linux, the golden hash in internal/codingagent/interactive_whole_markdown_test.go (a digest of output, not a key).
+  '''^6c6e446dd091ddae67cc390a41ffa268a9c7418088c7a9c5274abd08eb345e76$''',
+  # The eight SHA-256 digests in the Qwen Token Plan block of automation/gen/pi-post-release-backports.mjs (commit 92340eeb026c): each provider data file's digest in the release's .manifest.json
+  # and in the backported file. Digests of data files, not keys; the blob stays in history, so the values cannot be renamed away.
+  '''^0630bf7fea9d8579c7ac990e32c40c3685f9db20b6dbfaf745b361fe5203113c$''',
+  '''^54b2ec9adf8086e5c96845af2059c3335f89ddae8090f345aba0c283e3b1d74e$''',
+  '''^80824536f0c3cd83ab27424df2d664738cbe3f971b4e568a625432288fa53229$''',
+  '''^89f9e9614e1ea369f849ed3386c6cdcebb37e838f9432e0b94d6b2932874a7d7$''',
+  '''^f83c5ae4dce709924ad03a10c5f9c09a42b3670cb6ee2ed32590b9e0fcbaf8a9$''',
+  '''^28d425d7808187ed75703f2eccb66cb52b047c14e96d73e9c79a2569919045b7$''',
+  '''^fb74899c770572efbb27eb8d3398a07edaa4d62229655f9a0702ae01af22ac95$''',
+  '''^a55b1d2aec45da001d6ad758d1d4f4851885263776e7c7a7d50aa26c571739dd$''',
+  # The documented example Piglet signing key ID in docs/site/docs/cli-examples.md (a public key fingerprint).
+  '''^c74cf1a77b670764e896cfbf2800bb28$''',
+  # A header-name constant in the vendored AWS SDK (third_party/awssdk stays verbatim; see its FORK.md).
+  '''^v4Internal\.AmzSignedHeadersKey$''',
+  # Keybinding lists in Pi's SDK helper fixtures (test/parity/sdk-bulk): modifier combos joined by "/", e.g. "Alt+X/Ctrl+Shift+F5/Alt+/".
+  '''^(?i)(?:(?:ctrl|shift|alt|meta|super|cmd)\+)*(?:escape|enter|tab|up|down|left|right|f\d{1,2}|[a-z0-9]|/)(?:/(?:(?:ctrl|shift|alt|meta|super|cmd)\+)*(?:escape|enter|tab|up|down|left|right|f\d{1,2}|[a-z0-9]|/))+$''',
+  # The fake API token of automation/ci/preflight/record_status_retry_test.go before it became "test-token-fixed" (commit f73299a96d42). The file no longer holds it; a full-history scan still reads it there.
+  '''^tok-SECRET-123$''',
+]
+paths = [
+  # Stored archive fixture: "key" fields are UUIDv7 document keys, not credentials.
+  '''^chord/next/host/testdata/schema-switch/stored/archive\.jsonl$''',
+  # Upstream test-file SHA-256 digests. The tables lived at parity/upstream-sync/ before they moved under test/;
+  # a full-history scan (the push-event run) still reads them there, e.g. the digest of the upstream test
+  # 6324-branch-summary-ambient-auth, which generic-api-key reads as a key.
+  '''^(?:test/)?parity/upstream-sync/[^/]+\.tsv$''',
+  # Pi's vendored, compiled SDK bundle (upstream code shipped verbatim).
+  '''^coding/extension/host/subprocess/runtime-node/shims/pi-dist/pi-ai/sdk-bundle/[^/]+\.js$''',
+  # SHA-256 digests of Pi's vendored provider data files.
+  '''^coding/extension/host/subprocess/runtime-node/shims/pi-dist/pi-ai/providers/data/\.manifest\.json$''',
+  # Generated SHA-256 shape hashes. A gitleaks v8.24.3 directory scan (detect --no-git)
+  # reports the first 40 hex digits of one shapeHash as a sourcegraph-access-token;
+  # the git-mode scan that CI runs does not.
+  '''^test/parity/interfaces/upstream-v0\.87\.1\.json$''',
+]

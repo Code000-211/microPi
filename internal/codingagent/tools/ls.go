@@ -1,0 +1,249 @@
+package tools
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+)
+
+// ─── Ls Tool ─────────────────────────────────────────────────────────────────
+
+type lsParams struct {
+	Path  string   `json:"path,omitempty"`
+	Limit *float64 `json:"limit,omitempty"` // upstream: limit param (default: 500)
+}
+
+// lsDefaultLimit mirrors upstream ls.ts DEFAULT_LIMIT.
+const lsDefaultLimit = 500
+
+// LsTool lists directory contents.
+type LsTool struct {
+	CWD string
+	// Operations delegates the filesystem reads; nil selects the local filesystem (upstream options.operations).
+	Operations *LsOperations
+}
+
+// LsStat is the `{ isDirectory: () => boolean }` that LsOperations.stat resolves (ls.ts:34).
+type LsStat interface {
+	IsDirectory() bool
+}
+
+// fileInfoStat is the LsStat of a local file system entry.
+type fileInfoStat struct{ fs.FileInfo }
+
+func (info fileInfoStat) IsDirectory() bool { return info.IsDir() }
+
+// LsOperations is upstream's LsOperations: pluggable directory reads, for example over SSH. Each callback completes before Execute continues.
+// Ports packages/coding-agent/src/core/tools/ls.ts.
+type LsOperations struct {
+	// Exists reports whether the path exists.
+	Exists func(absolutePath string) (bool, error)
+	// Stat describes a file or directory and fails when it is not found.
+	Stat func(absolutePath string) (LsStat, error)
+	// Readdir lists the entry names of a directory.
+	Readdir func(absolutePath string) ([]string, error)
+}
+
+func (t *LsTool) operations() LsOperations {
+	if t.Operations != nil {
+		return *t.Operations
+	}
+	return LsOperations{
+		Exists: func(path string) (bool, error) { _, err := os.Stat(path); return err == nil, nil },
+		Stat: func(path string) (LsStat, error) {
+			info, err := os.Stat(path)
+			if err != nil {
+				return nil, err
+			}
+			return fileInfoStat{info}, nil
+		},
+		Readdir: func(path string) ([]string, error) {
+			dir, err := os.Open(path)
+			if err != nil {
+				return nil, err
+			}
+			defer func() { _ = dir.Close() }()
+			names, err := dir.Readdirnames(-1)
+			// fs.readdir hands JavaScript the names decoded as UTF-8: each ill-formed subpart is U+FFFD, and the stat that follows then misses the real entry, so ls skips it.
+			for i, name := range names {
+				if !utf8.ValidString(name) {
+					names[i] = jsstring.FromUTF8([]byte(name))
+				}
+			}
+			return names, err
+		},
+	}
+}
+
+func (t *LsTool) Name() string  { return "ls" }
+func (t *LsTool) Label() string { return "" }
+
+func (t *LsTool) Schema() ai.ToolSchema { return t.schema(false) }
+
+// BorrowedSchema is Schema with the parameters shared, not copied: the caller reads them and never modifies them.
+func (t *LsTool) BorrowedSchema() ai.ToolSchema { return t.schema(true) }
+
+func (t *LsTool) schema(borrow bool) ai.ToolSchema {
+	return toolSchemaWithParameters(ai.ToolSchema{
+		Name:        "ls",
+		Description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
+	}, `{"type":"object","properties":{
+		"path":{"type":"string","description":"Directory to list (default: current directory)"},
+		"limit":{"type":"number","description":"Maximum number of entries to return (default: 500)"}
+	}}`, borrow)
+}
+
+func (t *LsTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
+
+// Execute mirrors upstream ls.ts execute.
+func (t *LsTool) Execute(ctx context.Context, _ string, rawParams json.RawMessage, _ agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
+	var p lsParams
+	if err := json.Unmarshal(rawParams, &p); err != nil {
+		return agent.AgentToolResult{}, fmt.Errorf("ls: invalid params: %w", err)
+	}
+	if ctx.Err() != nil {
+		return lsError("Operation aborted"), nil
+	}
+	target := p.Path
+	if target == "" {
+		target = "."
+	}
+	cwd, err := toolCWD(ctx, t.CWD)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+	dirPath, err := resolvePath(cwd, target)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+	effectiveLimit := float64(lsDefaultLimit)
+	if p.Limit != nil {
+		effectiveLimit = *p.Limit
+	}
+	// Pi main 676af1d77 (#11747) reads a limit below 1 as 1 and floors a fractional one.
+	effectiveLimit = math.Max(1, math.Floor(effectiveLimit))
+	ops := t.operations()
+	if exists, err := ops.Exists(dirPath); err != nil || !exists {
+		return lsError("Path not found: " + dirPath), nil
+	}
+	info, err := ops.Stat(dirPath)
+	if err != nil {
+		return lsError("Path not found: " + dirPath), nil
+	}
+	if !info.IsDirectory() {
+		return lsError("Not a directory: " + dirPath), nil
+	}
+	entries, err := ops.Readdir(dirPath)
+	if err != nil {
+		return lsError("Cannot read directory: " + NodeFSError(err, "scandir", dirPath)), nil
+	}
+
+	sortEntriesLikeLocaleCompare(entries)
+	var results []string
+	entryLimitReached := false
+	for _, entry := range entries {
+		if float64(len(results)) >= effectiveLimit {
+			entryLimitReached = true
+			break
+		}
+		// stat follows symlinks; entries that cannot be stat'ed (broken
+		// links) are skipped, as upstream does.
+		entryInfo, err := ops.Stat(filepath.Join(dirPath, entry))
+		if err != nil {
+			continue
+		}
+		if entryInfo.IsDirectory() {
+			entry += "/"
+		}
+		results = append(results, entry)
+	}
+	if ctx.Err() != nil {
+		return lsError("Operation aborted"), nil
+	}
+	if len(results) == 0 {
+		return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "(empty directory)"}}}, nil
+	}
+
+	// Byte truncation only; the entry count is already capped.
+	// Number.MAX_SAFE_INTEGER is observable in the truncation details, even though only bytes cap this tool.
+	tr := TruncateHead(strings.Join(results, "\n"), truncationLimits(DefaultMaxBytes, 1<<53-1))
+	output := tr.Content
+	details := &LsDetails{}
+	var notices []string
+	if entryLimitReached {
+		notices = append(notices, fmt.Sprintf("%s entries limit reached. Use limit=%s for more", jsNumber(effectiveLimit), jsNumber(effectiveLimit*2)))
+		details.EntryLimitReached = effectiveLimit
+	}
+	if tr.Truncated {
+		notices = append(notices, FormatSize(DefaultMaxBytes)+" limit reached")
+		trc := tr
+		details.Truncation = &trc
+	}
+	result := agent.AgentToolResult{}
+	if len(notices) > 0 {
+		output += "\n\n[" + strings.Join(notices, ". ") + "]"
+		result.Details = details
+	}
+	output = sharedOutput(details.Truncation, output)
+	result.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: output}}
+	return result, nil
+}
+
+func lsError(message string) agent.AgentToolResult {
+	return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: message}}, Details: map[string]any{}, IsError: true, Thrown: true}
+}
+
+// sortEntriesLikeLocaleCompare is upstream ls.ts:109 `entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))`:
+// localeCompare is ICU root collation, and Array.prototype.sort is stable. Each name is lowercased and weighed once: comparing collation
+// keys orders names as localecompare.Collator.CompareString does unless a name holds U+FFFD
+// (TestLsCollationKeysOrderLikeCollator checks the two orders agree). Names holding U+FFFD sort by localecompare.Collator itself. Collators
+// keep scratch state, so each call owns one: ls runs in parallel mode.
+func sortEntriesLikeLocaleCompare(entries []string) {
+	type sortEntry struct {
+		name, lower string
+		key         []byte
+	}
+	sorted := make([]sortEntry, len(entries))
+	replacement, lowerBytes := false, 0
+	for i, entry := range entries {
+		lower := jsstring.ToLower(entry)
+		sorted[i] = sortEntry{name: entry, lower: lower}
+		replacement = replacement || strings.Contains(lower, "\uFFFD")
+		lowerBytes += len(lower)
+	}
+	if replacement {
+		collator := localecompare.NewCollator()
+		slices.SortStableFunc(sorted, func(a, b sortEntry) int { return collator.CompareString(a.lower, b.lower) })
+	} else {
+		collator := localecompare.NewCollator()
+		keys := make([]byte, 0, 8*lowerBytes) // a key takes about 5 bytes per ASCII byte of name; growing it by doubling costs 4 MB of copies at 10,000 names
+		ends := make([]int, len(sorted))
+		for i := range sorted {
+			keys = collator.AppendKey(keys, sorted[i].lower)
+			ends[i] = len(keys)
+		}
+		start := 0
+		for i := range sorted {
+			sorted[i].key = keys[start:ends[i]:ends[i]]
+			start = ends[i]
+		}
+		slices.SortStableFunc(sorted, func(a, b sortEntry) int { return bytes.Compare(a.key, b.key) })
+	}
+	for i := range sorted {
+		entries[i] = sorted[i].name
+	}
+}

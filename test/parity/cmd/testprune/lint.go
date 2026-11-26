@@ -1,0 +1,429 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
+
+	"github.com/MichaelKinsy/PiG/automation/ci/preflight/reviewed"
+)
+
+// provenanceFile declares where every golden or snapshot file's expected
+// values come from.
+const provenanceFile = reviewed.ProvenanceFile
+
+type goldenEntry struct {
+	Paths []string `toml:"paths"`
+	// Owner is "pi" for values produced by running Pi (or Node on Pi's code) and
+	// "pig" for values PiG owns.
+	Owner string `toml:"owner"`
+	// Generator is the tracked script or oracle that produces a Pi golden.
+	Generator string `toml:"generator"`
+	// Invariant names the test that asserts the rule a PiG-owned golden pins.
+	Invariant string `toml:"invariant"`
+	Why       string `toml:"why"`
+}
+
+// inputEntry declares files in a golden-writing directory that are inputs, not expectations.
+type inputEntry struct {
+	Paths []string `toml:"paths"`
+}
+
+// The tooling list ([[tooling]] of the provenance file) is reviewed.Tooling: the pre-flight's test-expectation rule reads
+// it through the same package, so both gates leave the same directories out of the expected-value rule.
+
+// checkTooling returns every violation of the tooling list's rules.
+func checkTooling(tooling []reviewed.Tooling, tracked []string) []string {
+	var problems []string
+	for i, e := range tooling {
+		where := fmt.Sprintf("%s: tooling entry %d (%s)", provenanceFile, i+1, e.Prefix)
+		switch {
+		case !strings.HasPrefix(e.Prefix, "automation/") || !strings.HasSuffix(e.Prefix, "/") || strings.Count(e.Prefix, "/") < 3 || strings.Contains(e.Prefix, ".."):
+			problems = append(problems, where+": a tooling prefix is a directory below automation/<area>/ and ends with a slash; product code stays under the rule")
+		case strings.TrimSpace(e.Reason) == "":
+			problems = append(problems, where+": has no reason")
+		case !slices.ContainsFunc(tracked, func(f string) bool { return strings.HasPrefix(f, e.Prefix) }):
+			problems = append(problems, where+": matches no tracked file")
+		}
+	}
+	return problems
+}
+
+type provenance struct {
+	// ExpectationsFrom exempts commits authored before this RFC 3339 time from the
+	// expected-value rule, so history from before the ratchet is not reviewed again.
+	ExpectationsFrom string        `toml:"expectations_from"`
+	Golden           []goldenEntry `toml:"golden"`
+	Input            []inputEntry  `toml:"input"`
+	// Tooling lists the PiG-owned CI tooling directories the expected-value rule does not guard.
+	Tooling []reviewed.Tooling `toml:"tooling"`
+}
+
+// goldenWriterRE matches the switch a test uses to rewrite its own expected files.
+var goldenWriterRE = regexp.MustCompile(`UPDATE_GOLDEN|UPDATE_SNAPSHOTS|flag\.Bool\("(?:update|golden|regen)[a-z0-9-]*"`)
+
+// goldenWriterDirs returns the testdata directories of Go files that rewrite their own expected files.
+func goldenWriterDirs(root string, tracked []string) map[string]bool {
+	dirs := map[string]bool{}
+	for _, f := range tracked {
+		if !strings.HasSuffix(f, ".go") || path.Base(f) == "main.go" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, f))
+		if err != nil || !goldenWriterRE.Match(data) {
+			continue
+		}
+		dirs[path.Dir(f)+"/testdata/"] = true
+	}
+	return dirs
+}
+
+var goldenPathRE = regexp.MustCompile(`(?i)golden|\.snap$|__snapshots__|snapshot`)
+
+var goldenSkipExt = map[string]bool{".go": true, ".mjs": true, ".js": true, ".ts": true, ".py": true, ".sh": true, ".md": true, ".rs": true, ".cjs": true}
+
+// vendored reports whether a path is in third_party/, vendored upstream code (like node_modules):
+// its fixtures are the upstream library's own, not PiG goldens.
+func vendored(p string) bool { return strings.HasPrefix(p, "third_party/") }
+
+// isGoldenFile reports whether a tracked path is a golden or snapshot data file.
+func isGoldenFile(p string) bool {
+	if vendored(p) || strings.Contains(p, "node_modules/") || strings.Contains(p, "/shims/") || strings.HasPrefix(p, "test/parity/scenarios/") || strings.HasPrefix(p, "docs/") {
+		return false
+	}
+	if goldenSkipExt[path.Ext(p)] || !goldenPathRE.MatchString(p) {
+		return false
+	}
+	return strings.Contains(p, "/testdata/") || strings.HasPrefix(p, "testdata/") || strings.Contains(p, "__snapshots__")
+}
+
+func gitFiles(root string, args ...string) ([]string, error) {
+	//nolint:gosec // G204 (class a): program is literal git; args are fixed per caller (ls-files -z).
+	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for f := range strings.SplitSeq(string(out), "\x00") {
+		if f != "" {
+			files = append(files, f)
+		}
+	}
+	return files, nil
+}
+
+// checkProvenance returns every violation of the golden provenance rule.
+func checkProvenance(root string, tracked []string, prov provenance, hasTest func(name string) bool) []string {
+	writerDirs := goldenWriterDirs(root, tracked)
+	var problems []string
+	exists := map[string]bool{}
+	for _, f := range tracked {
+		exists[f] = true
+	}
+	matched := map[string]bool{}
+	for i, e := range prov.Golden {
+		where := fmt.Sprintf("%s: golden entry %d (%v)", provenanceFile, i+1, e.Paths)
+		switch e.Owner {
+		case "pi":
+			if e.Generator == "" {
+				problems = append(problems, where+": a Pi golden names the generator that produces it from Pi")
+			} else if !exists[e.Generator] {
+				problems = append(problems, where+": generator "+e.Generator+" is not a tracked file")
+			}
+		case "pig":
+			if e.Invariant == "" || e.Why == "" {
+				problems = append(problems, where+": a PiG-owned golden names the invariant test that asserts its rule and why a value snapshot is needed")
+			} else if !hasTest(e.Invariant) {
+				problems = append(problems, where+": invariant test "+e.Invariant+" does not exist")
+			}
+		default:
+			problems = append(problems, where+": owner must be pi or pig")
+		}
+		hit := false
+		for _, pat := range e.Paths {
+			for _, f := range tracked {
+				if ok, _ := path.Match(pat, f); ok || pat == f {
+					matched[f] = true
+					hit = true
+				}
+			}
+		}
+		if !hit {
+			problems = append(problems, where+": matches no tracked file")
+		}
+	}
+	for _, in := range prov.Input {
+		for _, pat := range in.Paths {
+			for _, f := range tracked {
+				if ok, _ := path.Match(pat, f); ok || pat == f {
+					matched[f] = true
+				}
+			}
+		}
+	}
+	inWriterDir := func(f string) bool {
+		for d := range writerDirs {
+			if strings.HasPrefix(f, d) && !goldenSkipExt[path.Ext(f)] {
+				return true
+			}
+		}
+		return false
+	}
+	for _, f := range tracked {
+		if !vendored(f) && (isGoldenFile(f) || inWriterDir(f)) && !matched[f] {
+			problems = append(problems, f+": golden or snapshot file without provenance in "+provenanceFile)
+		}
+	}
+	problems = append(problems, checkTooling(prov.Tooling, tracked)...)
+	sort.Strings(problems)
+	return problems
+}
+
+var testFuncRE = regexp.MustCompile(`(?m)^func (Test\w+|Fuzz\w+)\(`)
+
+// testNames returns every Test or Fuzz function name in the tracked test files.
+func testNames(root string, tracked []string) map[string]bool {
+	names := map[string]bool{}
+	for _, f := range tracked {
+		if !strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, f))
+		if err != nil {
+			continue
+		}
+		for _, m := range testFuncRE.FindAllSubmatch(data, -1) {
+			names[string(m[1])] = true
+		}
+	}
+	return names
+}
+
+var piCiteRE = regexp.MustCompile(`(?m)^Pi-Behavior-Change:\s*(\S*\.ts):\d+`)
+
+// piInventories are the tracked files that name every upstream Pi source and test file by its packages/ path.
+var piInventories = []string{"docs/parity/PORT_MAP.md", "test/parity/interfaces/test-mapping-v*.json", "test/parity/upstream-sync/*.toml"}
+
+var piPathRE = regexp.MustCompile(`packages/[A-Za-z0-9_./-]+\.ts\b`)
+
+// piSourceNames returns the file names of the Pi sources and tests the tracked inventories name. A citation counts only
+// when it names one of them, so a PiG TypeScript file or an invented name does not satisfy the expected-value rule.
+func piSourceNames(root string) (map[string]bool, error) {
+	names := map[string]bool{}
+	for _, pattern := range piInventories {
+		files, err := filepath.Glob(filepath.Join(root, pattern))
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range files {
+			data, err := os.ReadFile(f)
+			if err != nil {
+				return nil, err
+			}
+			for _, p := range piPathRE.FindAllString(string(data), -1) {
+				names[path.Base(p)] = true
+			}
+		}
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("no Pi source names in %v", piInventories)
+	}
+	return names, nil
+}
+
+// checkCoEdits returns each commit that edits an expectation value in a test
+// file while changing production code of the same directory, unless the commit
+// message or a line the commit adds to the test file cites a Pi source line
+// (a file piNames holds) whose behavior changed, unless the test file lies in a tooling directory (reviewed.InTooling), or the reviewed ledger holds an entry for the commit and path. An entry
+// is read first: it can record that a commit's own citation names a Pi line that did not change, which history cannot
+// rewrite.
+func checkCoEdits(root string, rangeSpec string, from time.Time, piNames map[string]bool, ledger []reviewed.Entry, tooling []reviewed.Tooling) ([]string, error) {
+	edits, err := scanCoEdits(root, []string{rangeSpec, "--", "*.go"})
+	if err != nil {
+		return nil, err
+	}
+	var problems []string
+	seen := map[string]bool{}
+	used := make([]bool, len(ledger))
+	for _, e := range edits {
+		if e.ValueEdits == 0 || seen[e.Commit+e.Path] {
+			continue
+		}
+		if _, ok := reviewed.InTooling(tooling, e.Path); ok {
+			continue
+		}
+		if authored, err := time.Parse(time.RFC3339, e.Authored); err == nil && authored.Before(from) {
+			continue
+		}
+		seen[e.Commit+e.Path] = true
+		//nolint:gosec // G204 (class a): program is literal git; e.Commit is a hash parsed from git log output.
+		msg, err := exec.Command("git", "-C", root, "show", "-s", "--format=%B", e.Commit).Output()
+		if err != nil {
+			return nil, err
+		}
+		admitted := false
+		for i, r := range ledger {
+			if !r.Matches(e.Commit, e.Path) {
+				continue
+			}
+			used[i] = true
+			if err := r.Validate(piNames, divergenceRecorded(root)); err != nil {
+				problems = append(problems, fmt.Sprintf("%s %s: ledger entry %s", shortSHA(e.Commit), e.Path, err))
+			}
+			admitted = true
+		}
+		if admitted {
+			continue
+		}
+		cited := slices.ContainsFunc(e.Cited, func(name string) bool { return piNames[name] })
+		for _, m := range piCiteRE.FindAllSubmatch(msg, -1) {
+			cited = cited || piNames[path.Base(string(m[1]))]
+		}
+		if cited {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf("%s %s: changes %d expected value(s) in %s together with %s; cite the Pi behavior that changed (a `Pi-Behavior-Change: <pi file.ts:line>` trailer, or a `name.ts:line` comment on a changed test line, naming a Pi file of %s), or leave the expectation alone",
+			shortSHA(e.Commit), e.Subject, e.ValueEdits, e.Path, strings.Join(e.Code, ", "), piInventories[0]))
+	}
+	inRange, err := commitsInRange(root, rangeSpec)
+	if err != nil {
+		return nil, err
+	}
+	for i, r := range ledger {
+		if !used[i] && (!r.Pinned() || entryInRange(r, inRange)) {
+			problems = append(problems, fmt.Sprintf("%s: stale ledger entry %s %s matches no finding", reviewed.File, shortSHA(r.Commit), r.Path))
+		}
+	}
+	return problems, nil
+}
+
+// commitsInRange returns the full SHA of every commit rangeSpec selects.
+func commitsInRange(root, rangeSpec string) ([]string, error) {
+	//nolint:gosec // G204 (class a): program is literal git; rangeSpec is the operator -base/-head value concatenated as "base..head" and passed to rev-list without `--`.
+	out, err := exec.Command("git", "-C", root, "rev-list", rangeSpec).Output()
+	if err != nil {
+		return nil, fmt.Errorf("git rev-list %s: %w", rangeSpec, err)
+	}
+	return strings.Fields(string(out)), nil
+}
+
+func entryInRange(r reviewed.Entry, inRange []string) bool {
+	return slices.ContainsFunc(inRange, r.NamesCommit)
+}
+
+// prunableEntries lists the ledger entries whose commit is not in rangeSpec. A squash merge replaces the reviewed
+// commit with a new one, so on main and on every later branch such an entry can never match a finding again; it
+// does not fail the lint, a maintainer deletes it.
+func prunableEntries(root, rangeSpec string, ledger []reviewed.Entry) ([]string, error) {
+	inRange, err := commitsInRange(root, rangeSpec)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, r := range ledger {
+		if r.Pinned() && !entryInRange(r, inRange) {
+			out = append(out, fmt.Sprintf("%s %s", shortSHA(r.Commit), r.Path))
+		}
+	}
+	return out, nil
+}
+
+// divergenceRecorded tells whether the tree at root holds the record of divergence id.
+func divergenceRecorded(root string) func(string) bool {
+	return func(id string) bool {
+		_, err := os.Stat(filepath.Join(root, reviewed.DivergenceFile(id)))
+		return err == nil
+	}
+}
+
+func shortSHA(s string) string {
+	if len(s) > 10 {
+		return s[:10]
+	}
+	return s
+}
+
+func runLint(root string, args []string) error {
+	fs := flag.NewFlagSet("lint", flag.ExitOnError)
+	provOnly := fs.Bool("provenance", false, "check only golden and snapshot provenance")
+	base := fs.String("base", "", "check commits in base..head for expectations edited together with code")
+	head := fs.String("head", "HEAD", "range tip")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var problems []string
+	if *base == "" || *provOnly {
+		listed, err := gitFiles(root, "ls-files", "-z")
+		if err != nil {
+			return err
+		}
+		var tracked []string
+		for _, f := range listed {
+			if _, err := os.Lstat(filepath.Join(root, f)); err == nil {
+				tracked = append(tracked, f)
+			}
+		}
+		var prov provenance
+		if _, err := toml.DecodeFile(filepath.Join(root, provenanceFile), &prov); err != nil {
+			return err
+		}
+		names := testNames(root, tracked)
+		problems = append(problems, checkProvenance(root, tracked, prov, func(n string) bool { return names[n] })...)
+	}
+	if *base != "" && !*provOnly {
+		var prov provenance
+		if _, err := toml.DecodeFile(filepath.Join(root, provenanceFile), &prov); err != nil {
+			return err
+		}
+		var from time.Time
+		if prov.ExpectationsFrom != "" {
+			var err error
+			if from, err = time.Parse(time.RFC3339, prov.ExpectationsFrom); err != nil {
+				return fmt.Errorf("%s: expectations_from: %w", provenanceFile, err)
+			}
+		}
+		piNames, err := piSourceNames(root)
+		if err != nil {
+			return err
+		}
+		raw, err := os.ReadFile(filepath.Join(root, reviewed.File))
+		if err != nil {
+			return err
+		}
+		ledger, err := reviewed.Parse(string(raw))
+		if err != nil {
+			return err
+		}
+		rangeSpec := *base + ".." + *head
+		p, err := checkCoEdits(root, rangeSpec, from, piNames, ledger, prov.Tooling)
+		if err != nil {
+			return err
+		}
+		prunable, err := prunableEntries(root, rangeSpec, ledger)
+		if err != nil {
+			return err
+		}
+		for _, e := range prunable {
+			fmt.Fprintf(os.Stderr, "note: %s: prunable ledger entry %s: its commit is not in %s (squash-merged or rewritten); delete it\n", reviewed.File, e, rangeSpec)
+		}
+		problems = append(problems, p...)
+	}
+	for _, p := range problems {
+		fmt.Fprintln(os.Stderr, p)
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("%d test provenance problems", len(problems))
+	}
+	return nil
+}

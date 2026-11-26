@@ -1,0 +1,246 @@
+package surfaces
+
+// pi: packages/chord/src/node/surfaces/bundle.ts
+
+import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins/model"
+	"github.com/MichaelKinsy/PiG/internal/testenv"
+)
+
+// Tests of base bundles' resolution (p3 step 0a): packages resolve with the given conditions (a source checkout's source,
+// not its `dist/`), by default the server process's (`--conditions`/`-C` of its flags and of a quoted `NODE_OPTIONS`), a
+// browser build keeping its `module` condition and `browser` field, every file read recorded with its bytes' hash, and the fonts and
+// images its stylesheet names collected as assets. Ports packages/chord/test/node/surfaces/bundle.test.ts.
+
+// project is a directory with files and the workspace packages under `workspace/` linked into its `node_modules`: its real path.
+func project(t *testing.T, files map[string]string, linked ...string) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range files {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range linked {
+		testenv.RequireDirectoryLink(t, filepath.Join(dir, "workspace", name), filepath.Join(dir, "node_modules", name))
+	}
+	return dir
+}
+
+// chordish is a workspace package `chordish` exporting its source under the `source` condition and its build otherwise.
+func chordish() map[string]string {
+	return map[string]string{
+		// Written as text: the order of an `exports` object's conditions matters.
+		"workspace/chordish/package.json":  `{"name":"chordish","type":"module","exports":{".":{"source":"./src/index.ts","default":"./dist/index.js"}}}`,
+		"workspace/chordish/src/index.ts":  "export const from: string = \"source\";\n",
+		"workspace/chordish/dist/index.js": "export const from = \"dist\";\n",
+		"main.ts":                          "import { from } from \"chordish\";\nconsole.log(from);\n",
+	}
+}
+
+// scriptOf is the bundle's script text.
+func scriptOf(bundle *BaseBundle) string { return string(bundle.Files[bundle.Script].Bytes) }
+
+func sortedKeys(inputs model.BaseInputs) []string {
+	keys := make([]string, 0, len(inputs))
+	for key := range inputs {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+func TestConditionsResolvesWithTheGivenConditionsTheSourceAsInputNotDistEachWithItsBytesHash(t *testing.T) {
+	dir := project(t, chordish(), "chordish")
+	for _, platform := range []BasePlatform{PlatformBrowser, PlatformSandbox} {
+		bundle, err := BuildBase(filepath.Join(dir, "main.ts"), platform, "/p/", BaseResolution{Conditions: []string{"source"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := filepath.Join(dir, "workspace", "chordish", "src", "index.ts")
+		want := []string{filepath.Join(dir, "main.ts"), source}
+		slices.Sort(want)
+		if got := sortedKeys(bundle.Inputs); !slices.Equal(got, want) {
+			t.Fatalf("%s: inputs = %v, want %v", platform, got, want)
+		}
+		bytes, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := bundle.Inputs[source]; got != model.ContentHash(bytes) {
+			t.Fatalf("%s: hash = %s, want %s", platform, got, model.ContentHash(bytes))
+		}
+		if !strings.Contains(scriptOf(bundle), `"source"`) {
+			t.Fatalf("%s: the script does not contain the source: %s", platform, scriptOf(bundle))
+		}
+	}
+	plain, err := BuildBase(filepath.Join(dir, "main.ts"), PlatformBrowser, "/p/", BaseResolution{Conditions: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := plain.Inputs[filepath.Join(dir, "workspace", "chordish", "dist", "index.js")]; !ok {
+		t.Fatalf("without conditions the build did not read dist: %v", sortedKeys(plain.Inputs))
+	}
+}
+
+// Pi 53af02378 (test "resolves through a given tsconfig's paths, a package exporting only an unbuilt dist/; else ignores tsconfigs"):
+// the same project and expectations. aiish exports only ./dist/utils/*, so conditions alone cannot resolve it in a checkout that never
+// built dist/; the given tsconfig's `paths` map it to the source, which is the one input besides main.ts, and without Tsconfig no
+// tsconfig.json is read, so the import does not resolve.
+func aiishProject(t *testing.T) string {
+	return project(t, map[string]string{
+		"workspace/aiish/package.json":          `{"name":"aiish","type":"module","exports":{"./utils/*":{"import":"./dist/utils/*.js"}}}`,
+		"workspace/aiish/src/utils/estimate.ts": "export const from: string = \"paths\";\n",
+		"tsconfig.json":                         `{"compilerOptions":{"paths":{"aiish/*":["./workspace/aiish/src/*.ts"]}}}`,
+		"main.ts":                               "import { from } from \"aiish/utils/estimate\";\nconsole.log(from);\n",
+	}, "aiish")
+}
+
+func TestConditionsResolvesThroughAGivenTsconfigsPathsAPackageExportingOnlyAnUnbuiltDistElseIgnoresTsconfigsPi53af02378(t *testing.T) {
+	dir := aiishProject(t)
+	source := filepath.Join(dir, "workspace", "aiish", "src", "utils", "estimate.ts")
+	bundle, err := BuildBase(filepath.Join(dir, "main.ts"), PlatformBrowser, "/p/", BaseResolution{Tsconfig: filepath.Join(dir, "tsconfig.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(dir, "main.ts"), source}
+	slices.Sort(want)
+	if got := sortedKeys(bundle.Inputs); !slices.Equal(got, want) {
+		t.Fatalf("inputs = %v, want %v", got, want)
+	}
+	if !strings.Contains(scriptOf(bundle), `"paths"`) {
+		t.Fatalf("the script does not contain the paths source: %s", scriptOf(bundle))
+	}
+	_, err = BuildBase(filepath.Join(dir, "main.ts"), PlatformBrowser, "/p/", BaseResolution{Conditions: []string{}})
+	if err == nil || !strings.Contains(err.Error(), `Could not resolve "aiish/utils/estimate"`) {
+		t.Fatalf("without a tsconfig err = %v, want Could not resolve \"aiish/utils/estimate\"", err)
+	}
+}
+
+func TestConditionsTakesTheServerProcessesConditionsByDefaultItsFlagsAndAQuotedNODEOPTIONS(t *testing.T) {
+	got := ProcessConditions(
+		[]string{"--no-warnings", "--conditions=source", "-C", "edge"},
+		`--max-old-space-size=100 --conditions="dev ish" -C "a\"b" -C=c`,
+	)
+	if want := []string{"dev ish", `a"b`, "c", "source", "edge"}; !slices.Equal(got, want) {
+		t.Fatalf("conditions = %q, want %q", got, want)
+	}
+	if got := ProcessConditions(nil, ""); len(got) != 0 {
+		t.Fatalf("conditions = %q, want none", got)
+	}
+	dir := project(t, chordish(), "chordish")
+	t.Setenv("NODE_OPTIONS", `--conditions "source"`)
+	bundle, err := BuildBase(filepath.Join(dir, "main.ts"), PlatformBrowser, "/p/", BaseResolution{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(scriptOf(bundle), `"source"`) {
+		t.Fatalf("the script does not contain the source: %s", scriptOf(bundle))
+	}
+}
+
+// Intention of workers/base.test.ts "what stays external › resolves with the child's --conditions (both spellings)" (a Go
+// worker has no esbuild base, language mechanics; the bundles a PiG server builds from Node code are the surfaces' bases, whose conditions are
+// the server process's, read by ProcessConditions): a package's `exports` resolve with the process's `--conditions`, in each
+// spelling Node takes (`--conditions=x`, `--conditions x`, `-C x`, `-C=x`, and the same in NODE_OPTIONS), to its source, and
+// with none to its default.
+func TestConditionsResolvePackageExportsWithEachSpellingOfTheFlagTheDefaultWithNone(t *testing.T) {
+	dir := project(t, chordish(), "chordish")
+	entry := filepath.Join(dir, "main.ts")
+	built := func(execArgv []string, nodeOptions string) string {
+		t.Helper()
+		bundle, err := BuildBase(entry, PlatformSandbox, "/p/", BaseResolution{Conditions: ProcessConditions(execArgv, nodeOptions)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return scriptOf(bundle)
+	}
+	if script := built([]string{"--no-warnings"}, ""); !strings.Contains(script, `"dist"`) || strings.Contains(script, `"source"`) {
+		t.Fatalf("with no condition the bundle is not the default's: %s", script)
+	}
+	for _, spelling := range [][]string{{"--conditions=source"}, {"--conditions", "source"}, {"-C", "source"}, {"-C=source"}} {
+		for name, bundle := range map[string]string{
+			"execArgv":     built(spelling, ""),
+			"NODE_OPTIONS": built(nil, strings.Join(spelling, " ")),
+		} {
+			if !strings.Contains(bundle, `"source"`) || strings.Contains(bundle, `"dist"`) {
+				t.Errorf("%s %q: the bundle is not the source's: %s", name, spelling, bundle)
+			}
+		}
+	}
+}
+
+func TestConditionsKeepsABrowserBuildsModuleConditionAndBrowserFieldWithCustomConditions(t *testing.T) {
+	dir := project(t, map[string]string{
+		"workspace/dual/package.json":    `{"name":"dual","exports":{".":{"module":"./esm.js","default":"./cjs.js"}}}`,
+		"workspace/dual/esm.js":          "export const dual = \"module\";\n",
+		"workspace/dual/cjs.js":          "exports.dual = \"default\";\n",
+		"workspace/fielded/package.json": `{"name":"fielded","main":"./node.js","browser":{"./node.js":"./browser.js"}}`,
+		"workspace/fielded/node.js":      "exports.fielded = \"node\";\n",
+		"workspace/fielded/browser.js":   "exports.fielded = \"browser\";\n",
+		"main.ts":                        "import { dual } from \"dual\";\nimport { fielded } from \"fielded\";\nconsole.log(dual, fielded);\n",
+	}, "dual", "fielded")
+	bundle, err := BuildBase(filepath.Join(dir, "main.ts"), PlatformBrowser, "/p/", BaseResolution{Conditions: []string{"source"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := scriptOf(bundle)
+	if !strings.Contains(script, `"module"`) || !strings.Contains(script, `"browser"`) || strings.Contains(script, `"node"`) {
+		t.Fatalf("script = %s", script)
+	}
+}
+
+func TestAssetsCollectsTheFontsAndImagesTheBasesStylesheetNamesAsFilesUnderAssetsNamedByTheirContent(t *testing.T) {
+	dir := project(t, map[string]string{
+		"main.ts":    "import \"./style.css\";\nglobalThis.started = true;\n",
+		"style.css":  "@font-face { font-family: Body; src: url(\"./body.woff2\"); }\n.logo { background: url(\"./logo.png\"); }\n",
+		"body.woff2": "font bytes",
+		"logo.png":   "png bytes",
+	})
+	base, err := BuildBase(filepath.Join(dir, "main.ts"), PlatformBrowser, "/_chord/web/", BaseResolution{Conditions: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var assets []string
+	for path := range base.Files {
+		if strings.HasPrefix(path, "/_chord/web/assets/") {
+			assets = append(assets, path)
+		}
+	}
+	slices.Sort(assets)
+	wants := []string{`^/_chord/web/assets/body-[A-Z0-9]+\.woff2$`, `^/_chord/web/assets/logo-[A-Z0-9]+\.png$`}
+	if len(assets) != len(wants) {
+		t.Fatalf("assets = %v, want one for each of the font and the image", assets)
+	}
+	for i, want := range wants {
+		if !regexp.MustCompile(want).MatchString(assets[i]) {
+			t.Fatalf("asset %d = %q, want %s", i, assets[i], want)
+		}
+	}
+	css := string(base.Files[base.Style].Bytes)
+	for _, path := range assets {
+		if !strings.Contains(css, path) {
+			t.Fatalf("the stylesheet does not name %s: %s", path, css)
+		}
+	}
+	if got := base.Files[assets[0]].Mime; got != "font/woff2" {
+		t.Fatalf("mime = %q, want font/woff2", got)
+	}
+}

@@ -1,0 +1,112 @@
+package surfaces
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// pi: packages/chord/src/react/hooks.ts
+// pi: packages/chord/src/react/stores.ts
+// pi: packages/chord/src/web/page.ts
+// pi: packages/chord/src/web/environment.ts
+// pi: packages/chord/src/web/language.ts
+// pi: packages/chord/src/web/themes.ts
+// client/manifest.json records the Pi commit and the hash of every file vendored under client/pi (D601): a file edited by
+// hand, or one the manifest does not list, fails here (automation/gen/vendor-chord-surfaces-client.sh regenerates both). The
+// commit is the pin's (`.upstream/pin`), unless the manifest names it as an explicit `catchup`, as the plugins component's
+// vendored tree is checked. A manifest that lists `carried` Pi commits was vendored from the pin's tree with exactly those commits
+// cherry-picked onto it (PI_CARRIED of automation/gen/vendor-chord-common.sh): each is a full Pi commit id, and the list is a derived
+// input of the copy that goes away when a re-vendor at a later Pi commit takes over. `make vendor-chord-carried-check` rebuilds that
+// tree and compares what it vendors with this manifest, for this copy and the plugins component's.
+func TestClientVendoredFilesAreExactlyTheManifests(t *testing.T) {
+	text, err := os.ReadFile(filepath.Join("client", "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Commit  string   `json:"commit"`
+		Pin     string   `json:"pin"`
+		Catchup string   `json:"catchup"`
+		Carried []string `json:"carried"`
+		Patches *[]struct {
+			Name   string `json:"name"`
+			Sha256 string `json:"sha256"`
+		} `json:"patches"`
+		Files []struct {
+			Path   string `json:"path"`
+			Sha256 string `json:"sha256"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(text, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Commit) != 40 {
+		t.Fatalf("commit = %q", manifest.Commit)
+	}
+	if manifest.Patches == nil {
+		t.Fatal("the manifest has no patches list (an empty one when there is none)")
+	}
+	var patches []vendoredPatch
+	for _, patch := range *manifest.Patches {
+		patches = append(patches, vendoredPatch{Name: patch.Name, Sha256: patch.Sha256})
+	}
+	for _, problem := range patchProblems(chordPatches, patches) {
+		t.Error(problem)
+	}
+	pinFile, err := os.ReadFile(filepath.Join("..", "..", "..", ".upstream", "pin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pin string
+	for line := range strings.Lines(string(pinFile)) {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "commit="); ok {
+			pin = value
+		}
+	}
+	if pin == "" {
+		t.Fatal(".upstream/pin names no commit")
+	}
+	if manifest.Pin != pin {
+		t.Errorf("the pin moved to %s since the copy was made against %s: make vendor-chord-surfaces-client", pin, manifest.Pin)
+	}
+	if manifest.Commit != pin && manifest.Catchup != manifest.Commit {
+		t.Errorf("the copy is Pi %s, the pin %s, and the manifest names no catch-up for it (catchup = %q)", manifest.Commit, pin, manifest.Catchup)
+	}
+	for _, carried := range manifest.Carried {
+		if _, err := hex.DecodeString(carried); err != nil || len(carried) != 40 {
+			t.Errorf("carried commit %q is not a full Pi commit id", carried)
+		}
+	}
+	if manifest.Commit == pin && manifest.Catchup != "" {
+		t.Errorf("the copy is the pin's, yet the manifest names the catch-up %s", manifest.Catchup)
+	}
+	listed := map[string]bool{}
+	for _, file := range manifest.Files {
+		listed[file.Path] = true
+		content, err := os.ReadFile(filepath.Join("client", filepath.FromSlash(file.Path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(content)
+		if got := hex.EncodeToString(sum[:]); got != file.Sha256 {
+			t.Errorf("%s: sha256 %s, manifest %s", file.Path, got, file.Sha256)
+		}
+	}
+	err = filepath.WalkDir(filepath.Join("client", "pi"), func(path string, entry fs.DirEntry, err error) error {
+		relative, _ := filepath.Rel("client", path)
+		// pi/go.mod is the data-only directory's own module file (automation/gen/vendor-chord-surfaces-client.mjs writes it), not Pi's.
+		if err == nil && !entry.IsDir() && relative != filepath.Join("pi", "go.mod") && !listed[filepath.ToSlash(relative)] {
+			t.Errorf("%s is vendored but not in the manifest", path)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

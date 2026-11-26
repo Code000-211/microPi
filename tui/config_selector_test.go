@@ -1,0 +1,251 @@
+package tui
+
+// pi: packages/coding-agent/src/modes/interactive/components/config-selector.ts
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestConfigSelectorScopeSwitchReappliesSearch(t *testing.T) {
+	global := []ResourceItem{
+		{Path: "/global/prompts/alpha.md", ResourceType: ResourcePrompts, DisplayName: "alpha.md", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto"},
+		{Path: "/global/prompts/beta.md", ResourceType: ResourcePrompts, DisplayName: "beta.md", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto"},
+	}
+	project := []ResourceItem{
+		{Path: "/project/prompts/alpha-local.md", ResourceType: ResourcePrompts, DisplayName: "alpha-local.md", Enabled: true, Scope: "project", Origin: "top-level", Source: "auto"},
+		{Path: "/project/prompts/gamma.md", ResourceType: ResourcePrompts, DisplayName: "gamma.md", Enabled: true, Scope: "project", Origin: "top-level", Source: "auto"},
+	}
+	cs := NewScopedConfigSelector(BuildResourceGroups(global), BuildResourceGroups(project), 0, "global", true)
+	cs.HandleInput("alpha")
+	assertFiltered := func(want, unwanted string) {
+		t.Helper()
+		rendered := strings.Join(cs.Render(100), "\n")
+		if !strings.Contains(rendered, "> ") || !strings.Contains(rendered, want) {
+			t.Fatalf("scope filter missing first match %q:\n%s", want, rendered)
+		}
+		if strings.Contains(rendered, unwanted) {
+			t.Fatalf("scope filter retained nonmatch %q:\n%s", unwanted, rendered)
+		}
+	}
+	assertFiltered("alpha.md", "beta.md")
+	cs.HandleInput("\t")
+	assertFiltered("alpha-local.md", "gamma.md")
+	cs.HandleInput("\t")
+	assertFiltered("alpha.md", "beta.md")
+}
+
+func TestConfigSelectorProjectStatesMatchUpstreamRendering(t *testing.T) {
+	items := []ResourceItem{
+		{Path: "/global/prompts/inherited.md", ResourceType: ResourcePrompts, DisplayName: "inherited.md", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto", Override: "inherit", Inherited: true, InheritedEnabled: true},
+		{Path: "/global/prompts/load.md", ResourceType: ResourcePrompts, DisplayName: "load.md", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto", Override: "load", Inherited: true, InheritedEnabled: false},
+		{Path: "/global/prompts/unload.md", ResourceType: ResourcePrompts, DisplayName: "unload.md", Enabled: false, Scope: "user", Origin: "top-level", Source: "auto", Override: "unload", Inherited: true, InheritedEnabled: true},
+	}
+	groups := BuildResourceGroups(items)
+	cs := NewScopedConfigSelector(groups, groups, 0, "project", true)
+	rendered := strings.Join(cs.Render(120), "\n")
+	theme := ActiveTheme()
+	reset := "\x1b[39m" // theme.fg closes with SGR 39, as in Pi
+	for _, want := range []string{
+		theme.Dim + "[x]" + reset + " " + theme.Dim + "inherited.md" + reset + theme.Dim + "  inherited global" + reset,
+		theme.Success + "[+]" + reset + " load.md" + theme.Muted + "  project load" + reset,
+		theme.Warning + "[-]" + reset + " unload.md" + theme.Muted + "  project unload" + reset,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("project-state render missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestConfigSelectorTypedFilterNarrowsToMatchingResource(t *testing.T) {
+	resources := []ResourceItem{
+		{Path: "/agent/skills/sample-skill/SKILL.md", ResourceType: ResourceSkills, DisplayName: "sample-skill", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto"},
+		{Path: "/agent/prompts/alpha.md", ResourceType: ResourcePrompts, DisplayName: "alpha.md", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto"},
+		{Path: "/agent/prompts/beta.md", ResourceType: ResourcePrompts, DisplayName: "beta.md", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto"},
+		{Path: "/agent/themes/zinc.json", ResourceType: ResourceThemes, DisplayName: "zinc.json", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto"},
+	}
+	cs := NewConfigSelector(BuildResourceGroups(resources), 0)
+
+	cs.HandleInput("alpha")
+
+	joined := strings.Join(cs.Render(100), "\n")
+	for _, want := range []string{"> alpha", "Prompts", "alpha.md"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("filtered render missing %q:\n%s", want, joined)
+		}
+	}
+	for _, unwanted := range []string{"Skills", "Themes", "sample-skill", "beta.md", "zinc.json"} {
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("filtered render unexpectedly contains %q:\n%s", unwanted, joined)
+		}
+	}
+}
+
+func TestConfigSelectorScrollIndicatorCountsOnlyItems(t *testing.T) {
+	resources := []ResourceItem{
+		{Path: "/pkg/ext-a.ts", ResourceType: ResourceExtensions, DisplayName: "ext-a", Scope: "user", Origin: "package", Source: "pkg-a"},
+		{Path: "/pkg/ext-b.ts", ResourceType: ResourceExtensions, DisplayName: "ext-b", Scope: "user", Origin: "package", Source: "pkg-a"},
+		{Path: "/pkg/skill/SKILL.md", ResourceType: ResourceSkills, DisplayName: "skill-a", Scope: "user", Origin: "package", Source: "pkg-a"},
+	}
+	cs := NewConfigSelector(BuildResourceGroups(resources), 0)
+	cs.maxVisible = 2
+	cs.filtered = append([]flatEntry{}, cs.flatItems...)
+
+	// Move selection to the second actual item. filtered includes headers, so this
+	// would be larger than 2 if headers were incorrectly counted.
+	itemSeen := 0
+	for i, e := range cs.filtered {
+		if e.entryType != "item" {
+			continue
+		}
+		itemSeen++
+		if itemSeen == 2 {
+			cs.cursor = i
+			break
+		}
+	}
+
+	lines := cs.Render(80)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "(2/3)") {
+		t.Fatalf("expected item-only scroll indicator '(2/3)', got:\n%s", joined)
+	}
+}
+
+func TestConfigSelectorMaxVisibleTracksTerminalRows(t *testing.T) {
+	resources := []ResourceItem{{Path: "/pkg/ext-a.ts", ResourceType: ResourceExtensions, DisplayName: "ext-a", Scope: "user", Origin: "package", Source: "pkg-a"}}
+	cs := NewConfigSelector(BuildResourceGroups(resources), 12)
+	if got := cs.maxVisible; got != 5 {
+		t.Fatalf("maxVisible = %d, want 5", got)
+	}
+	cs.SetTerminalRows(30)
+	if got := cs.maxVisible; got != 22 {
+		t.Fatalf("maxVisible after resize = %d, want 22", got)
+	}
+	fallback := NewConfigSelector(BuildResourceGroups(resources), 0)
+	if got := fallback.maxVisible; got != 16 {
+		t.Fatalf("fallback maxVisible = %d, want 16", got)
+	}
+}
+
+func TestBuildResourceGroups_GroupByBaseDirAndFormatAutoLabels(t *testing.T) {
+	oldHome := t.TempDir()
+	// The home directory is HOME on Unix and USERPROFILE on Windows, as for
+	// upstream's os.homedir().
+	t.Setenv("HOME", oldHome)
+	t.Setenv("USERPROFILE", oldHome)
+
+	resources := []ResourceItem{
+		{Path: filepath.Join(oldHome, ".pig", "agent", "prompts", "a.md"), ResourceType: ResourcePrompts, Scope: "user", Origin: "top-level", Source: "auto", BaseDir: filepath.Join(oldHome, ".pig", "agent")},
+		{Path: filepath.Join(oldHome, ".config", "pig", "prompts", "b.md"), ResourceType: ResourcePrompts, Scope: "user", Origin: "top-level", Source: "auto", BaseDir: filepath.Join(oldHome, ".config", "pig")},
+		{Path: filepath.Join(oldHome, "work", ".pig", "themes", "c.json"), ResourceType: ResourceThemes, Scope: "project", Origin: "top-level", Source: "auto", BaseDir: filepath.Join(oldHome, "work", ".pig")},
+	}
+
+	groups := BuildResourceGroups(resources)
+	if len(groups) != 3 {
+		t.Fatalf("len(groups) = %d, want 3", len(groups))
+	}
+
+	labels := []string{groups[0].Label, groups[1].Label, groups[2].Label}
+	joined := strings.Join(labels, "\n")
+	for _, want := range []string{
+		"User (~/.config/pig/)",
+		"User (~/.pig/agent/)",
+		"Project (~/work/.pig/)",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("labels missing %q:\n%s", want, joined)
+		}
+	}
+
+	seen := map[string]bool{}
+	for _, g := range groups {
+		if seen[g.Key] {
+			t.Fatalf("duplicate group key %q", g.Key)
+		}
+		seen[g.Key] = true
+	}
+}
+
+// config-selector.ts:487-493 checks tui.select.cancel before matchesKey(data, "ctrl+c"):
+// by default (escape, ctrl+c) both keys cancel, and once the user rebinds cancel
+// Ctrl+C still exits, in legacy and Kitty CSI-u encodings.
+func TestConfigSelectorCancelAndExitKeys(t *testing.T) {
+	prev := GetTUIKeybindings()
+	defer SetTUIKeybindings(prev)
+	kitty := IsKittyProtocolActive()
+	defer SetKittyProtocolActive(kitty)
+	for _, tc := range []struct {
+		name       string
+		bindings   map[string][]string
+		kitty      bool
+		key        string
+		wantCancel bool
+		wantExit   bool
+	}{
+		{"default escape", nil, false, "\x1b", true, false},
+		{"default ctrl+c cancels first", nil, false, "\x03", true, false},
+		{"default kitty ctrl+c cancels first", nil, true, "\x1b[99;5u", true, false},
+		{"default kitty escape", nil, true, "\x1b[27u", true, false},
+		{"rebound legacy ctrl+c exits", map[string][]string{"tui.select.cancel": {"escape"}}, false, "\x03", false, true},
+		{"rebound kitty ctrl+c exits", map[string][]string{"tui.select.cancel": {"escape"}}, true, "\x1b[99;5u", false, true},
+		{"rebound kitty ctrl+c press event exits", map[string][]string{"tui.select.cancel": {"escape"}}, true, "\x1b[99;5:1u", false, true},
+		{"rebound escape cancels", map[string][]string{"tui.select.cancel": {"escape"}}, true, "\x1b[27u", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restoreKeybindingsAfterTest(t)
+			SetTUIKeybindings(NewTUIKeybindingsManager(tc.bindings))
+			SetKittyProtocolActive(tc.kitty)
+			cs := NewConfigSelector(nil, 0)
+			var cancelled, exited bool
+			cs.OnCancel = func() { cancelled = true }
+			cs.OnExit = func() { exited = true }
+			cs.HandleInput(tc.key)
+			if cancelled != tc.wantCancel || exited != tc.wantExit {
+				t.Fatalf("%q: cancelled=%v exited=%v, want %v/%v", tc.key, cancelled, exited, tc.wantCancel, tc.wantExit)
+			}
+		})
+	}
+}
+
+// config-selector.ts:910-939: ConfigSelectorComponent extends Container with spacer, border, spacer, header, spacer, resource list, spacer, border.
+func TestConfigSelectorIsAContainerOfPisConstructorChildren(t *testing.T) {
+	items := []ResourceItem{{Path: "/g/a.md", ResourceType: ResourcePrompts, DisplayName: "a.md", Enabled: true, Scope: "user", Origin: "top-level", Source: "auto"}}
+	cs := NewScopedConfigSelector(BuildResourceGroups(items), BuildResourceGroups(items), 0, "global", true)
+	if got := len(cs.Children()); got != 8 {
+		t.Fatalf("children = %d, want 8", got)
+	}
+	if got := strings.Join(cs.Render(60), "\n"); !strings.Contains(got, "Global Resources") {
+		t.Fatalf("missing global header: %s", got)
+	}
+	cs.HandleInput("\t")
+	if got := strings.Join(cs.Render(60), "\n"); !strings.Contains(got, "Project Local Resources") {
+		t.Fatalf("scope switch not visible in the header child: %s", got)
+	}
+}
+
+// config-selector.ts:105,166-173: groups come from a Map in first-seen order and
+// Array.sort is stable, so groups that tie on origin, scope and source (auto
+// resources from different base directories) keep the order of their first resource.
+func TestBuildResourceGroupsTiesKeepFirstSeenOrder(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	var resources []ResourceItem
+	var want []string
+	for i := range 12 {
+		dir := filepath.Join(os.Getenv("HOME"), fmt.Sprintf("d%02d", 11-i), ".pig")
+		resources = append(resources, ResourceItem{Path: filepath.Join(dir, "prompts", "a.md"), ResourceType: ResourcePrompts, Scope: "user", Origin: "top-level", Source: "auto", BaseDir: dir})
+		want = append(want, "User (~/"+fmt.Sprintf("d%02d", 11-i)+"/.pig/)")
+	}
+	for run := range 20 {
+		groups := BuildResourceGroups(append([]ResourceItem(nil), resources...))
+		for i, g := range groups {
+			if g.Label != want[i] {
+				t.Fatalf("run %d: group %d = %q, want %q", run, i, g.Label, want[i])
+			}
+		}
+	}
+}

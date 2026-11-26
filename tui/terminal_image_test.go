@@ -1,0 +1,479 @@
+package tui
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"image"
+	"image/color"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func makePNGBase64(t *testing.T, w, h int) string {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := range h {
+		for x := range w {
+			img.Set(x, y, color.RGBA{255, 0, 0, 255})
+		}
+	}
+	var b strings.Builder
+	enc := base64.NewEncoder(base64.StdEncoding, &b)
+	if err := png.Encode(enc, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
+}
+
+func makeJPEGBase64(t *testing.T, w, h int) string {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	var sb strings.Builder
+	enc := base64.NewEncoder(base64.StdEncoding, &sb)
+	if err := jpeg.Encode(enc, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return sb.String()
+}
+
+func makeGIFBase64(t *testing.T, w, h int) string {
+	t.Helper()
+	img := image.NewPaletted(image.Rect(0, 0, w, h), []color.Color{color.Black, color.White})
+	var sb strings.Builder
+	enc := base64.NewEncoder(base64.StdEncoding, &sb)
+	if err := gif.Encode(enc, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return sb.String()
+}
+
+func TestDetectCapabilities(t *testing.T) {
+	cases := []struct {
+		name          string
+		env           map[string]string
+		wantImg       ImageProtocol
+		wantTrueColor bool
+		wantHL        bool
+	}{
+		{"tmux disables images and hyperlinks without forwarding", map[string]string{"TMUX": "1", "COLORTERM": "truecolor"}, "", true, false},
+		{"kitty", map[string]string{"KITTY_WINDOW_ID": "1"}, ImageProtocolKitty, true, true},
+		{"ghostty", map[string]string{"TERM_PROGRAM": "ghostty"}, ImageProtocolKitty, true, true},
+		{"herdr inherited ghostty without graphics", map[string]string{"HERDR_ENV": "1", "TERM_PROGRAM": "ghostty"}, "", false, false},
+		{"herdr positively advertises graphics", map[string]string{"HERDR_ENV": "1", "HERDR_KITTY_GRAPHICS": "1", "TERM_PROGRAM": "ghostty"}, ImageProtocolKitty, true, true},
+		{"wezterm", map[string]string{"WEZTERM_PANE": "1"}, ImageProtocolKitty, true, true},
+		{"iterm2", map[string]string{"ITERM_SESSION_ID": "1"}, ImageProtocolITerm2, true, true},
+		{"apple terminal without a truecolor hint", map[string]string{"TERM_PROGRAM": "Apple_Terminal"}, "", false, false},
+		{"windows terminal enables truecolor and hyperlinks", map[string]string{"WT_SESSION": "1"}, "", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateCapabilityEnv(t)
+			for name, value := range tc.env {
+				t.Setenv(name, value)
+			}
+			got := DetectCapabilities(func() bool { return false })
+			if got.Images != tc.wantImg || got.TrueColor != tc.wantTrueColor || got.Hyperlinks != tc.wantHL {
+				t.Fatalf("DetectCapabilities() = %+v want images=%q trueColor=%v hyperlinks=%v", got, tc.wantImg, tc.wantTrueColor, tc.wantHL)
+			}
+		})
+	}
+}
+
+func TestGetCapabilitiesConcurrentInitialization(t *testing.T) {
+	isolateCapabilityEnv(t)
+	t.Setenv("TERM_PROGRAM", "kitty")
+	ResetCapabilitiesCache()
+	t.Cleanup(ResetCapabilitiesCache)
+
+	const workers = 32
+	start := make(chan struct{})
+	results := make(chan TerminalCapabilities, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			<-start
+			results <- GetCapabilities()
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	for caps := range results {
+		if caps.Images != ImageProtocolKitty || !caps.TrueColor || !caps.Hyperlinks {
+			t.Fatalf("GetCapabilities() = %+v, want kitty capabilities", caps)
+		}
+	}
+}
+
+func TestAC51HerdrImageCapabilityOwnsRowReservation(t *testing.T) {
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("TERM_PROGRAM", "ghostty")
+	t.Setenv("HERDR_KITTY_GRAPHICS", "")
+	ResetCapabilitiesCache()
+	t.Cleanup(ResetCapabilitiesCache)
+
+	image := NewImage("eA==", "image/png", DefaultImageTheme(), ImageOptions{Filename: "probe.png"}, &ImageDimensions{WidthPx: 800, HeightPx: 600})
+	lines := image.Render(80)
+	if len(lines) != 1 {
+		t.Fatalf("Herdr fallback reserved %d rows: %#v", len(lines), lines)
+	}
+	if strings.Contains(lines[0], "\x1b_G") || !strings.Contains(lines[0], "probe.png") {
+		t.Fatalf("Herdr fallback = %q", lines[0])
+	}
+}
+
+func TestHerdrWithGraphicsSignalRendersKittyImage(t *testing.T) {
+	// tmux and screen turn images off before Herdr is checked (terminal-image.ts detectCapabilitiesFromEnvironment); a run inside tmux must not decide this case.
+	t.Setenv("TMUX", "")
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("HERDR_KITTY_GRAPHICS", "1")
+	t.Setenv("TERM_PROGRAM", "ghostty")
+	ResetCapabilitiesCache()
+	t.Cleanup(ResetCapabilitiesCache)
+
+	image := NewImage("eA==", "image/png", DefaultImageTheme(), ImageOptions{Filename: "probe.png"}, &ImageDimensions{WidthPx: 800, HeightPx: 600})
+	lines := image.Render(80)
+	if len(lines) < 2 || !strings.Contains(lines[0], "\x1b_G") {
+		t.Fatalf("positive Herdr graphics render = %#v", lines)
+	}
+}
+
+func TestImageDimensionsParsers(t *testing.T) {
+	pngData := makePNGBase64(t, 10, 5)
+	if dims := GetImageDimensions(pngData, "image/png"); dims == nil || dims.WidthPx != 10 || dims.HeightPx != 5 {
+		t.Fatalf("png dims = %+v", dims)
+	}
+	jpegData := makeJPEGBase64(t, 12, 7)
+	if dims := GetImageDimensions(jpegData, "image/jpeg"); dims == nil || dims.WidthPx != 12 || dims.HeightPx != 7 {
+		t.Fatalf("jpeg dims = %+v", dims)
+	}
+	gifData := makeGIFBase64(t, 9, 4)
+	if dims := GetImageDimensions(gifData, "image/gif"); dims == nil || dims.WidthPx != 9 || dims.HeightPx != 4 {
+		t.Fatalf("gif dims = %+v", dims)
+	}
+}
+
+func TestEncodeKittyAndITerm2(t *testing.T) {
+	seq := EncodeKitty(strings.Repeat("a", 5000), 10, 5, 42)
+	if !strings.Contains(seq, "a=T") || !strings.Contains(seq, "i=42") || !strings.Contains(seq, "m=1") || !strings.Contains(seq, "m=0") {
+		t.Fatalf("kitty sequence malformed: %q", seq[:80])
+	}
+	iterm := EncodeITerm2("Zm9v", ITerm2Options{Width: 10, Height: "auto", Name: "x.png"})
+	if !strings.HasPrefix(iterm, "\x1b]1337;File=") || !strings.Contains(iterm, "inline=1") || !strings.Contains(iterm, ":Zm9v\x07") {
+		t.Fatalf("iterm sequence malformed: %q", iterm)
+	}
+}
+
+func TestEncodeKitty_ExactByteParity(t *testing.T) {
+	t.Run("single chunk exact bytes", func(t *testing.T) {
+		got := EncodeKitty("YWJj", 10, 5, 42)
+		want := "\x1b_Ga=T,f=100,q=2,c=10,r=5,i=42;YWJj\x1b\\"
+		if got != want {
+			t.Fatalf("single chunk mismatch\n got: %q\nwant: %q", got, want)
+		}
+	})
+
+	t.Run("multi chunk sha256", func(t *testing.T) {
+		got := EncodeKitty(strings.Repeat("a", 4097), 10, 5, 42)
+		sum := sha256.Sum256([]byte(got))
+		if gotHash := hex.EncodeToString(sum[:]); gotHash != "86243d6c8fb63f0479b1418400c7e76e1a1b8bbe927c7d5683080934c358e7e4" {
+			t.Fatalf("multi chunk sha256 = %s", gotHash)
+		}
+	})
+}
+
+func TestEncodeITerm2_ExactByteParity(t *testing.T) {
+	got := EncodeITerm2("Zm9v", ITerm2Options{Width: 10, Height: "auto", Name: "x.png"})
+	// packages/tui/src/terminal-image.ts:294 includes Buffer.byteLength("Zm9v", "base64") = 3.
+	want := "\x1b]1337;File=inline=1;size=3;width=10;height=auto;name=eC5wbmc=:Zm9v\x07"
+	if got != want {
+		t.Fatalf("iterm2 mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestDeleteKittySequences_ExactByteParity(t *testing.T) {
+	if got := DeleteKittyImage(42); got != "\x1b_Ga=d,d=I,i=42,q=2\x1b\\" {
+		t.Fatalf("DeleteKittyImage mismatch: %q", got)
+	}
+	if got := DeleteAllKittyImages(); got != "\x1b_Ga=d,d=A,q=2\x1b\\" {
+		t.Fatalf("DeleteAllKittyImages mismatch: %q", got)
+	}
+}
+
+func TestIsImageLine(t *testing.T) {
+	if !IsImageLine("\x1b_Ga=T;abc\x1b\\") {
+		t.Fatal("kitty line not detected")
+	}
+	if !IsImageLine("\x1b[2A\x1b]1337;File=inline=1:Zm9v\x07") {
+		t.Fatal("iterm2 line not detected")
+	}
+	if IsImageLine("plain text") {
+		t.Fatal("false positive image line")
+	}
+}
+
+// TestIsImageLineStartsWithBug preserves every case in packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts.
+func TestIsImageLineStartsWithBug(t *testing.T) {
+	// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:20.
+	t.Run("old implementation would return false, causing crash", func(t *testing.T) {
+		oldIsImageLine := func(line string, prefix *string) bool {
+			return prefix != nil && strings.HasPrefix(line, *prefix)
+		}
+		line := "Read image file [image/jpeg]\x1b]1337;File=size=800,600;inline=1:base64data...\x07"
+		if oldIsImageLine(line, nil) {
+			t.Fatal("old implementation must miss the sequence without terminal image support")
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  bool
+	}{
+		// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:58.
+		{"new implementation returns true correctly", []string{
+			"Read image file [image/jpeg]\x1b]1337;File=size=800,600;inline=1:base64data...\x07",
+		}, true},
+		// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:70.
+		{"new implementation detects Kitty sequences in any position", []string{
+			"At start: \x1b_Ga=T,f=100,data...\x1b\\",
+			"Prefix \x1b_Ga=T,data...\x1b\\",
+			"Suffix text \x1b_Ga=T,data...\x1b\\ suffix",
+			"Middle \x1b_Ga=T,data...\x1b\\ more text",
+			"Text before \x1b_Ga=T,f=100" + strings.Repeat("A", 300000) + " text after",
+		}, true},
+		// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:87.
+		{"new implementation detects iTerm2 sequences in any position", []string{
+			"At start: \x1b]1337;File=size=100,100:base64...\x07",
+			"Prefix \x1b]1337;File=inline=1:data==\x07",
+			"Suffix text \x1b]1337;File=inline=1:data==\x07 suffix",
+			"Middle \x1b]1337;File=inline=1:data==\x07 more text",
+			"Text before \x1b]1337;File=size=800,600;inline=1:" + strings.Repeat("B", 300000) + " text after",
+		}, true},
+		// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:123. Pi simulates the read-tool output rather than invoking the tool.
+		{"detects image sequences in read tool output", []string{
+			"Read image file [image/jpeg]\x1b]1337;File=size=800,600;inline=1:base64image...\x07",
+		}, true},
+		// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:133. Pi supplies the Image component's output as a literal.
+		{"detects Kitty sequences from Image component", []string{
+			"\x1b_Ga=T,f=100,t=f,d=base64data...\x1b\\\x1b_Gm=i=1;\x1b\\",
+		}, true},
+		// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:142.
+		{"handles ANSI codes before image sequences", []string{
+			"\x1b[31mError\x1b[0m: \x1b]1337;File=inline=1:base64==\x07",
+			"\x1b[33mWarning\x1b[0m: \x1b_Ga=T,data...\x1b\\",
+			"\x1b[1mBold\x1b[0m \x1b]1337;File=:base64==\x07\x1b[0m",
+		}, true},
+		// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:213.
+		{"does not detect images in regular long text", []string{strings.Repeat("A", 100000)}, false},
+		// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:222.
+		{"does not detect images in lines with file paths", []string{
+			"/path/to/1337/image.jpg",
+			"/usr/local/bin/File_converter",
+			"~/Documents/1337File_backup.png",
+			"./_G_test_file.txt",
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i, line := range tc.lines {
+				if got := IsImageLine(line); got != tc.want {
+					t.Errorf("line %d (%d bytes): IsImageLine = %v, want %v", i, len(line), got, tc.want)
+				}
+			}
+		})
+	}
+
+	// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:163.
+	t.Run("does NOT crash on very long lines with image sequences", func(t *testing.T) {
+		base64Char := strings.Repeat("A", 100)
+		sequence := "\x1b]1337;File=size=800,600;inline=1:"
+		line := "Output: " + sequence + strings.Repeat(base64Char, 3040) + " end of output"
+		if len(line) <= 300000 {
+			t.Fatalf("test line should be > 300KB, got %d bytes", len(line))
+		}
+		if !IsImageLine(line) {
+			t.Fatal("image sequence in very long line not detected")
+		}
+	})
+	// packages/tui/test/bug-regression-isimageline-startswith-bug.test.ts:192.
+	t.Run("handles lines exactly matching crash log dimensions", func(t *testing.T) {
+		const targetWidth = 58649
+		prefix, sequence, suffix := "Text", "\x1b_Ga=T,f=100", "End"
+		padding := strings.Repeat("A", targetWidth-len(prefix)-len(sequence)-len(suffix))
+		line := prefix + sequence + padding + suffix
+		if len(line) != targetWidth {
+			t.Fatalf("line length = %d, want %d", len(line), targetWidth)
+		}
+		if !IsImageLine(line) {
+			t.Fatal("image sequence in 58649-char line not detected")
+		}
+	})
+}
+
+func TestAllocateImageID_NonZero(t *testing.T) {
+	for range 128 {
+		if got := AllocateImageID(); got <= 0 {
+			t.Fatalf("AllocateImageID() = %d, want > 0", got)
+		}
+	}
+}
+
+func TestCalculateImageCellSize(t *testing.T) {
+	dims := ImageDimensions{WidthPx: 200, HeightPx: 100}
+	cell := CellDimensions{WidthPx: 10, HeightPx: 20}
+
+	got := CalculateImageCellSize(dims, 10, 0, cell)
+	if got.Columns != 10 || got.Rows != 3 {
+		t.Fatalf("CalculateImageCellSize() = %+v want {Columns:10 Rows:3}", got)
+	}
+
+	clamped := CalculateImageCellSize(dims, 10, 2, cell)
+	if clamped.Columns != 8 || clamped.Rows != 2 {
+		t.Fatalf("CalculateImageCellSize() with maxHeight = %+v want {Columns:8 Rows:2}", clamped)
+	}
+}
+
+func TestRenderImage_UsesMaxHeightAndOmitsITermName(t *testing.T) {
+	pngData := makePNGBase64(t, 200, 100)
+	dims := GetImageDimensions(pngData, "image/png")
+	if dims == nil {
+		t.Fatal("nil dims")
+		return
+	}
+
+	SetCapabilities(TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true})
+	kitty := RenderImage(pngData, *dims, ImageRenderOptions{MaxWidthCells: 10, MaxHeightCells: 1, ImageID: 7})
+	if kitty == nil {
+		t.Fatal("kitty render nil")
+		return
+	}
+	if kitty.Rows != 1 {
+		t.Fatalf("Rows = %d, want clamped 1", kitty.Rows)
+	}
+	if !strings.Contains(kitty.Sequence, "c=4") || !strings.Contains(kitty.Sequence, "r=1") {
+		t.Fatalf("kitty sequence should use clamped size: %q", kitty.Sequence)
+	}
+
+	SetCapabilities(TerminalCapabilities{Images: ImageProtocolITerm2, TrueColor: true, Hyperlinks: true})
+	iterm := RenderImage(pngData, *dims, ImageRenderOptions{MaxWidthCells: 10, Name: "ignored.png", PreserveAspectRatio: new(true)})
+	if iterm == nil {
+		t.Fatal("iterm render nil")
+		return
+	}
+	if strings.Contains(iterm.Sequence, "name=") {
+		t.Fatalf("iTerm2 sequence should not include filename metadata: %q", iterm.Sequence)
+	}
+	ResetCapabilitiesCache()
+}
+
+func TestImageComponent_RenderPlacementByProtocol(t *testing.T) {
+	pngData := makePNGBase64(t, 20, 10)
+	dims := GetImageDimensions(pngData, "image/png")
+	if dims == nil {
+		t.Fatal("nil dims")
+	}
+
+	SetCapabilities(TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true})
+	kitty := NewImage(pngData, "image/png", DefaultImageTheme(), ImageOptions{MaxWidthCells: 10}, dims)
+	kittyLines := kitty.Render(20)
+	if len(kittyLines) == 0 {
+		t.Fatal("kitty render returned no lines")
+	}
+	if !strings.Contains(kittyLines[0], "\x1b_G") {
+		t.Fatalf("first kitty line missing image sequence: %q", kittyLines[0])
+	}
+	for _, line := range kittyLines[1:] {
+		if line != "" {
+			t.Fatalf("kitty continuation lines should be empty: %q", line)
+		}
+	}
+
+	SetCapabilities(TerminalCapabilities{Images: ImageProtocolITerm2, TrueColor: true, Hyperlinks: true})
+	iterm := NewImage(pngData, "image/png", DefaultImageTheme(), ImageOptions{MaxWidthCells: 10}, dims)
+	itermLines := iterm.Render(20)
+	if len(itermLines) == 0 {
+		t.Fatal("iterm render returned no lines")
+	}
+	if !strings.Contains(itermLines[len(itermLines)-1], "\x1b]1337;File=") {
+		t.Fatalf("last iterm line missing image sequence: %q", itermLines[len(itermLines)-1])
+	}
+	if len(itermLines) > 1 && !strings.HasPrefix(itermLines[len(itermLines)-1], "\x1b[") {
+		t.Fatalf("iterm last line should move cursor up before drawing: %q", itermLines[len(itermLines)-1])
+	}
+	ResetCapabilitiesCache()
+}
+
+func TestRenderImageAndImageComponent(t *testing.T) {
+	SetCapabilities(TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true, Hyperlinks: true})
+	defer ResetCapabilitiesCache()
+	pngData := makePNGBase64(t, 20, 10)
+	dims := GetImageDimensions(pngData, "image/png")
+	if dims == nil {
+		t.Fatal("nil dims")
+		return
+	}
+	got := RenderImage(pngData, *dims, ImageRenderOptions{MaxWidthCells: 10, ImageID: 7})
+	if got == nil || got.Rows < 1 || !strings.Contains(got.Sequence, "\x1b_G") {
+		t.Fatalf("RenderImage() = %+v", got)
+	}
+	img := NewImage(pngData, "image/png", DefaultImageTheme(), ImageOptions{MaxWidthCells: 10}, dims)
+	lines := img.Render(20)
+	if len(lines) == 0 {
+		t.Fatal("image render returned no lines")
+	}
+	if !strings.Contains(lines[0], "\x1b_G") {
+		t.Fatalf("first image line missing kitty sequence: %q", lines[0])
+	}
+}
+
+func TestImageFallbackAndHyperlink(t *testing.T) {
+	got := ImageFallback("image/png", &ImageDimensions{WidthPx: 10, HeightPx: 5}, "a.png")
+	if got != "[Image: a.png [image/png] 10x5]" {
+		t.Fatalf("ImageFallback() = %q", got)
+	}
+	link := Hyperlink("x", "https://example.com")
+	if !strings.Contains(link, "https://example.com") || !strings.Contains(link, "x") {
+		t.Fatalf("Hyperlink() malformed: %q", link)
+	}
+}
+
+// calculateImageRows (terminal-image.ts:515) is calculateImageCellSize(...).rows.
+func TestCalculateImageRows(t *testing.T) {
+	cell := CellDimensions{WidthPx: 10, HeightPx: 20}
+	for _, tc := range []struct {
+		name  string
+		dims  ImageDimensions
+		width int
+		cell  CellDimensions
+		want  int
+	}{
+		{"landscape", ImageDimensions{WidthPx: 200, HeightPx: 100}, 10, cell, 3},
+		{"square", ImageDimensions{WidthPx: 100, HeightPx: 100}, 10, cell, 5},
+		{"tall", ImageDimensions{WidthPx: 100, HeightPx: 400}, 10, cell, 20},
+		// terminal-image.ts's default cell size is 9x18.
+		{"default cell size", ImageDimensions{WidthPx: 90, HeightPx: 180}, 10, CellDimensions{WidthPx: 9, HeightPx: 18}, 10},
+	} {
+		if got := CalculateImageRows(tc.dims, tc.width, tc.cell); got != tc.want {
+			t.Errorf("%s: CalculateImageRows = %d, want %d", tc.name, got, tc.want)
+		}
+		if got, want := CalculateImageRows(tc.dims, tc.width, tc.cell), CalculateImageCellSize(tc.dims, tc.width, 0, tc.cell).Rows; got != want {
+			t.Errorf("%s: CalculateImageRows %d differs from CalculateImageCellSize rows %d", tc.name, got, want)
+		}
+	}
+}

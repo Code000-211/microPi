@@ -1,0 +1,319 @@
+import {
+  AgentSession,
+  AgentSessionRuntime,
+  CacheWarmer,
+  DEFAULT_THINKING_LEVEL,
+  DEFAULT_TOOL_NAMES,
+  DefaultResourceLoader,
+  SessionImportFileNotFoundError,
+  SessionManager,
+  SettingsManager,
+  applyToolModifiers,
+  convertToLlm,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  findInitialModel,
+  formatNoModelsAvailableMessage,
+  getDefaultSessionDir,
+  getToolListError,
+  isInstallTelemetryEnabled,
+  isToolModifier,
+  markRuntimeStreamFunction,
+  time
+} from "./chunk-OSE7DX4D.js";
+import {
+  ModelRuntime,
+  getBranchSelection
+} from "./chunk-LWMW44S6.js";
+import {
+  createBashTool,
+  createCodingTools,
+  createEditTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  createPowerShellTool,
+  createReadOnlyTools,
+  createReadTool,
+  createWriteTool,
+  withFileMutationQueue
+} from "./chunk-W25FOIG4.js";
+import "./chunk-PNTN457B.js";
+import "./chunk-2VCX4NLH.js";
+import "./chunk-QSKV7LUU.js";
+import "./chunk-F4Z3QMHU.js";
+import {
+  createToolNameMatcher
+} from "./chunk-4Q37KZ2Z.js";
+import "./chunk-RWSVZTAH.js";
+import {
+  VERSION,
+  getAgentDir,
+  resolvePath
+} from "./chunk-JGRZB36T.js";
+import {
+  __name
+} from "./chunk-FIOAHQVQ.js";
+
+// pi-dist/pi-coding-agent/core/sdk.js
+import { join } from "node:path";
+import { Agent, setDefaultStreamFn } from "../../pi-agent-core/index.js";
+import { clampThinkingLevel, streamSimple } from "../../pi-ai/sdk-bundle/compat.js";
+
+// pi-dist/pi-coding-agent/core/client-identity.js
+import { PI_ATTRIBUTION } from "../../pi-ai/sdk-bundle/index.js";
+function getClientIdentity(settingsManager) {
+  return {
+    userAgent: "detailed",
+    // pig divergence (D26, D65): PiG's product identity replaces Pi's; see automation/gen/pi-identity-patches.mjs.
+    version: process.env.PIG_PRODUCT_VERSION ?? VERSION,
+    attribution: isInstallTelemetryEnabled(settingsManager) ? PI_ATTRIBUTION : null
+  };
+}
+__name(getClientIdentity, "getClientIdentity");
+
+// pi-dist/pi-coding-agent/core/sdk.js
+setDefaultStreamFn(streamSimple);
+function getDefaultAgentDir() {
+  return getAgentDir();
+}
+__name(getDefaultAgentDir, "getDefaultAgentDir");
+async function createAgentSession(options = {}) {
+  const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
+  const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
+  let resourceLoader = options.resourceLoader;
+  const authPath = options.agentDir ? join(agentDir, "auth.json") : void 0;
+  const modelsPath = options.agentDir ? join(agentDir, "models.json") : void 0;
+  const modelRuntime = options.modelRuntime ?? await ModelRuntime.create({ authPath, modelsPath });
+  const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+  const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+  if (!resourceLoader) {
+    resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+    await resourceLoader.reload();
+    time("resourceLoader.reload");
+  }
+  const existingSession = sessionManager.buildSessionContext();
+  const hasExistingSession = existingSession.messages.length > 0;
+  const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+  let model = options.model;
+  let modelFallbackMessage;
+  const sessionModel = getBranchSelection(sessionManager.getBranch(), (provider, modelId) => modelRuntime.getModel(provider, modelId));
+  if (!model && hasExistingSession && sessionModel) {
+    const restoredModel = modelRuntime.getModel(sessionModel.provider, sessionModel.modelId);
+    if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
+      model = restoredModel;
+    }
+    if (!model) {
+      modelFallbackMessage = `Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`;
+    }
+  }
+  if (!model) {
+    const result = await findInitialModel({
+      scopedModels: [],
+      isContinuing: hasExistingSession,
+      defaultProvider: settingsManager.getDefaultProvider(),
+      defaultModelId: settingsManager.getDefaultModel(),
+      defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
+      modelThinkingLevels: settingsManager.getAllModelThinkingLevels(),
+      modelRuntime
+    });
+    model = result.model;
+    if (!model) {
+      modelFallbackMessage = formatNoModelsAvailableMessage();
+    } else if (modelFallbackMessage) {
+      modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+    }
+  }
+  let thinkingLevel = options.thinkingLevel;
+  if (thinkingLevel === void 0 && hasExistingSession) {
+    thinkingLevel = hasThinkingEntry ? existingSession.thinkingLevel : settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+  }
+  if (thinkingLevel === void 0 && model) {
+    const perModel = settingsManager.getModelThinkingLevel(model.provider, model.id);
+    if (perModel) {
+      thinkingLevel = perModel;
+    }
+  }
+  if (thinkingLevel === void 0) {
+    thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+  }
+  if (!model) {
+    thinkingLevel = "off";
+  } else {
+    thinkingLevel = clampThinkingLevel(model, thinkingLevel);
+  }
+  const toolListError = options.tools ? getToolListError(options.tools) : void 0;
+  if (toolListError)
+    throw new Error(`Invalid tools option: ${toolListError}`);
+  const defaultToolNames = options.noTools ? [] : settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES;
+  const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : void 0;
+  const selectedToolNames = toolModifiers ? applyToolModifiers(defaultToolNames, toolModifiers) : options.tools;
+  const allowedToolNames = toolModifiers ? options.noTools === "all" ? selectedToolNames : void 0 : options.tools ?? (options.noTools === "all" ? [] : void 0);
+  const excludedToolNames = options.excludeTools;
+  const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : void 0;
+  const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
+  const convertToLlmWithBlockImages = /* @__PURE__ */ __name((messages) => {
+    const converted = convertToLlm(messages);
+    if (!settingsManager.getBlockImages()) {
+      return converted;
+    }
+    return converted.map((msg) => {
+      if (msg.role === "user" || msg.role === "toolResult") {
+        const content = msg.content;
+        if (Array.isArray(content)) {
+          const hasImages = content.some((c) => c.type === "image");
+          if (hasImages) {
+            const filteredContent = content.map((c) => c.type === "image" ? { type: "text", text: "Image reading is disabled." } : c).filter((c, i, arr) => (
+              // Dedupe consecutive "Image reading is disabled." texts
+              !(c.type === "text" && c.text === "Image reading is disabled." && i > 0 && arr[i - 1].type === "text" && arr[i - 1].text === "Image reading is disabled.")
+            ));
+            return { ...msg, content: filteredContent };
+          }
+        }
+      }
+      return msg;
+    });
+  }, "convertToLlmWithBlockImages");
+  const extensionRunnerRef = {};
+  const cacheWarmer = new CacheWarmer(modelRuntime, sessionManager, () => settingsManager.getCacheWarmingMode(), async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action);
+  const buildRequestOptions = /* @__PURE__ */ __name((options2 = {}) => {
+    const providerRetrySettings = settingsManager.getProviderRetrySettings();
+    const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+    const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+    const headerRunner = extensionRunnerRef.current;
+    return {
+      ...options2,
+      timeoutMs: options2.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
+      websocketConnectTimeoutMs: options2.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
+      maxRetries: options2.maxRetries ?? providerRetrySettings.maxRetries,
+      maxRetryDelayMs: options2.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+      // Replaces the agent loop's default identity; read per request so telemetry changes apply at once.
+      identity: getClientIdentity(settingsManager),
+      transformHeaders: /* @__PURE__ */ __name(async (headers) => headerRunner?.hasHandlers("before_provider_headers") ? headerRunner.emitBeforeProviderHeaders(headers) : headers, "transformHeaders")
+    };
+  }, "buildRequestOptions");
+  const cacheContextIsCurrent = /* @__PURE__ */ __name((requestModel) => {
+    const messages = agent.state.messages;
+    return () => {
+      const currentModel = agent.state.model;
+      const currentMessages = agent.state.messages;
+      return currentModel.provider === requestModel.provider && currentModel.id === requestModel.id && messages.length <= currentMessages.length && messages.every((message, index) => currentMessages[index] === message);
+    };
+  }, "cacheContextIsCurrent");
+  const transformProviderPayload = /* @__PURE__ */ __name(async (payload) => {
+    const runner = extensionRunnerRef.current;
+    if (!runner?.hasHandlers("before_provider_request"))
+      return payload;
+    return runner.emitBeforeProviderRequest(payload);
+  }, "transformProviderPayload");
+  const handleProviderResponse = /* @__PURE__ */ __name(async (response) => {
+    const runner = extensionRunnerRef.current;
+    if (!runner?.hasHandlers("after_provider_response"))
+      return;
+    await runner.emit({
+      type: "after_provider_response",
+      status: response.status,
+      headers: response.headers
+    });
+  }, "handleProviderResponse");
+  const handleProviderStreamEvent = /* @__PURE__ */ __name(async (data, model2) => {
+    const runner = extensionRunnerRef.current;
+    if (!runner?.hasHandlers("provider_stream_event"))
+      return;
+    await runner.emit({
+      data,
+      type: "provider_stream_event",
+      provider: model2.provider,
+      api: model2.api,
+      model: model2.id
+    });
+  }, "handleProviderStreamEvent");
+  const agent = new Agent({
+    initialState: {
+      systemPrompt: "",
+      model,
+      thinkingLevel,
+      tools: [],
+      messages: existingSession.messages
+    },
+    convertToLlm: convertToLlmWithBlockImages,
+    streamFn: /* @__PURE__ */ __name(async (model2, context, options2) => {
+      const requestOptions = buildRequestOptions(options2);
+      if (options2?.sessionId === sessionManager.getSessionId()) {
+        cacheWarmer.start({ model: model2, context, options: requestOptions }, cacheContextIsCurrent(model2));
+      }
+      return modelRuntime.streamSimple(model2, context, requestOptions);
+    }, "streamFn"),
+    onPayload: transformProviderPayload,
+    onResponse: handleProviderResponse,
+    onProviderStreamEvent: handleProviderStreamEvent,
+    sessionId: sessionManager.getSessionId(),
+    transformContext: /* @__PURE__ */ __name(async (messages) => {
+      const runner = extensionRunnerRef.current;
+      if (!runner)
+        return messages;
+      return runner.emitContext(messages);
+    }, "transformContext"),
+    steeringMode: settingsManager.getSteeringMode(),
+    followUpMode: settingsManager.getFollowUpMode(),
+    transport: settingsManager.getTransport(),
+    thinkingBudgets: settingsManager.getThinkingBudgets(),
+    maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs
+  });
+  markRuntimeStreamFunction(agent.streamFunction, modelRuntime);
+  if (hasExistingSession) {
+    if (!hasThinkingEntry) {
+      sessionManager.appendThinkingLevelChange(thinkingLevel);
+    }
+  } else {
+    if (model) {
+      sessionManager.appendModelChange(model.provider, model.id);
+    }
+    sessionManager.appendThinkingLevelChange(thinkingLevel);
+  }
+  const session = new AgentSession({
+    agent,
+    sessionManager,
+    settingsManager,
+    cwd,
+    scopedModels: options.scopedModels,
+    resourceLoader,
+    customTools: options.customTools,
+    modelRuntime,
+    cacheWarmer,
+    initialActiveToolNames,
+    usesDefaultTools: (options.tools === void 0 || toolModifiers !== void 0) && !options.noTools,
+    defaultToolModifiers: toolModifiers,
+    allowedToolNames,
+    excludedToolNames,
+    extensionRunnerRef,
+    sessionStartEvent: options.sessionStartEvent
+  });
+  const extensionsResult = resourceLoader.getExtensions();
+  return {
+    session,
+    extensionsResult,
+    modelFallbackMessage
+  };
+}
+__name(createAgentSession, "createAgentSession");
+export {
+  AgentSessionRuntime,
+  SessionImportFileNotFoundError,
+  createAgentSession,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  createBashTool,
+  createCodingTools,
+  createEditTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  createPowerShellTool,
+  createReadOnlyTools,
+  createReadTool,
+  createWriteTool,
+  withFileMutationQueue
+};

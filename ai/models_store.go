@@ -1,0 +1,546 @@
+package ai
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
+	"fmt"
+	"io/fs"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"sync"
+
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
+	"github.com/MichaelKinsy/PiG/internal/jsonparse"
+	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/pilock"
+)
+
+// ModelsStoreEntry mirrors pi-ai ModelsStoreEntry (models-store.ts:3-15). Models are typed and lossless: a model decoded from a catalog keeps the
+// fields it has no member for and re-encodes them in their original order. A record of a model type this version does not know is kept aside and
+// written back at its position, so reading and rewriting a catalog never drops it; it is not part of Models.
+type ModelsStoreEntry struct {
+	Models []AnyModel
+	// LastModified is the Unix timestamp from the remote catalog's
+	// Last-Modified header.
+	LastModified *float64
+	// CheckedAt is the Unix timestamp of the last completed remote check.
+	CheckedAt *float64
+	// ETag is the remote catalog's opaque validator, stored verbatim.
+	ETag string
+
+	unknown []unknownCatalogModel
+	// members is the order of the members in the object the entry was decoded from; a rewrite keeps it, and an entry built in memory has Pi's order.
+	members []string
+}
+
+// unknownCatalogModel is a stored record of a model type this version does not know, with its position among the stored records.
+type unknownCatalogModel struct {
+	index int
+	raw   json.RawMessage
+}
+
+type modelsStoreEntryWire struct {
+	Models       []json.RawMessage `json:"models"`
+	CheckedAt    *float64          `json:"checkedAt,omitempty"`
+	LastModified *float64          `json:"lastModified,omitempty"`
+	ETag         string            `json:"etag,omitempty"`
+}
+
+// MarshalJSON writes the entry as the persisted object: every model through its catalog record, unknown-type records at their positions.
+func (entry ModelsStoreEntry) MarshalJSON() ([]byte, error) {
+	wire := modelsStoreEntryWire{Models: make([]json.RawMessage, 0, len(entry.Models)+len(entry.unknown)), LastModified: entry.LastModified, CheckedAt: entry.CheckedAt, ETag: entry.ETag}
+	next := 0
+	insertUnknown := func(limit int) {
+		for next < len(entry.unknown) && entry.unknown[next].index <= limit {
+			wire.Models = append(wire.Models, entry.unknown[next].raw)
+			next++
+		}
+	}
+	for _, model := range entry.Models {
+		insertUnknown(len(wire.Models))
+		data, err := marshalCatalogModel(model)
+		if err != nil {
+			return nil, err
+		}
+		wire.Models = append(wire.Models, data)
+	}
+	insertUnknown(int(^uint(0) >> 1))
+	data, err := marshalStoreJSON(wire)
+	if err != nil || len(entry.members) == 0 {
+		return data, err
+	}
+	return credentialKeyOrder{keys: entry.members}.apply(data)
+}
+
+// UnmarshalJSON reads the persisted object; each model keeps its unknown fields, and records of unknown model types are set aside.
+func (entry *ModelsStoreEntry) UnmarshalJSON(data []byte) error {
+	var wire modelsStoreEntryWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*entry = ModelsStoreEntry{Models: make([]AnyModel, 0, len(wire.Models)), LastModified: wire.LastModified, CheckedAt: wire.CheckedAt, ETag: wire.ETag}
+	entry.members, _ = authStorageObjectKeys(data)
+	for index, raw := range wire.Models {
+		model, known, err := decodeCatalogModel(raw)
+		if err != nil {
+			return err
+		}
+		if !known {
+			entry.unknown = append(entry.unknown, unknownCatalogModel{index: index, raw: bytes.Clone(raw)})
+			continue
+		}
+		entry.Models = append(entry.Models, model)
+	}
+	return nil
+}
+
+// Clone returns a deep copy, mirroring upstream's structuredClone at the
+// store boundary.
+func (entry ModelsStoreEntry) Clone() ModelsStoreEntry {
+	data, err := entry.MarshalJSON()
+	if err == nil {
+		var copied ModelsStoreEntry
+		if err = json.Unmarshal(data, &copied); err == nil {
+			return copied
+		}
+	}
+	// A model that cannot be encoded cannot be stored either; share it rather than drop it.
+	entry.Models = slices.Clone(entry.Models)
+	entry.unknown = slices.Clone(entry.unknown)
+	if entry.LastModified != nil {
+		entry.LastModified = new(*entry.LastModified)
+	}
+	if entry.CheckedAt != nil {
+		entry.CheckedAt = new(*entry.CheckedAt)
+	}
+	return entry
+}
+
+// ModelsStore mirrors pi-ai ModelsStore: persistent model catalogs keyed by
+// provider ID. A cancelled ctx plays the role of options.signal.
+type ModelsStore interface {
+	Read(ctx context.Context, providerID string) (*ModelsStoreEntry, error)
+	Write(ctx context.Context, providerID string, entry ModelsStoreEntry) error
+	Delete(ctx context.Context, providerID string) error
+}
+
+// InMemoryModelsStore mirrors pi-ai InMemoryModelsStore (and the coding
+// agent's InMemoryCodingAgentModelsStore): a process-local ModelsStore.
+type InMemoryModelsStore struct {
+	mu      sync.Mutex
+	entries map[string]ModelsStoreEntry
+}
+
+// NewInMemoryModelsStore returns an empty in-memory store.
+func NewInMemoryModelsStore() *InMemoryModelsStore {
+	return &InMemoryModelsStore{entries: map[string]ModelsStoreEntry{}}
+}
+
+// Read returns a copy of the provider's catalog, or nil when none is stored.
+func (s *InMemoryModelsStore) Read(ctx context.Context, providerID string) (*ModelsStoreEntry, error) {
+	if ctx.Err() != nil {
+		return nil, context.Cause(ctx)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[providerID]
+	if !ok {
+		return nil, nil
+	}
+	cloned := entry.Clone()
+	return &cloned, nil
+}
+
+// Write stores a copy of the provider's catalog.
+func (s *InMemoryModelsStore) Write(ctx context.Context, providerID string, entry ModelsStoreEntry) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries[providerID] = entry.Clone()
+	return nil
+}
+
+// Delete removes the provider's catalog.
+func (s *InMemoryModelsStore) Delete(ctx context.Context, providerID string) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.entries, providerID)
+	return nil
+}
+
+// FileModelsStore mirrors coding-agent core/models-store.ts FileModelsStore:
+// locked JSON storage for dynamically refreshed provider catalogs, keyed by
+// provider id, at <agentDir>/models-store.json by default.
+type FileModelsStore struct {
+	path      string
+	readState *modelsFileReadState
+	lock      func(context.Context, string, func(func() error) error) error
+}
+
+// NewFileModelsStore opens the store at path.
+func NewFileModelsStore(path string) *FileModelsStore {
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	return &FileModelsStore{path: path, readState: modelsReadStateForPath(path), lock: withSidecarLock}
+}
+
+// Path returns the store file path.
+func (s *FileModelsStore) Path() string { return s.path }
+
+// Read returns a fresh copy of the provider's stored catalog. Concurrent readers share reloads and cancel their waits independently; unchanged files use the cached revision.
+func (s *FileModelsStore) Read(ctx context.Context, providerID string) (*ModelsStoreEntry, error) {
+	entries, err := s.readLatest(ctx)
+	if errors.Is(err, errModelsNullRoot) {
+		return nil, fmt.Errorf("Cannot read properties of null (reading '%s')", providerID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, stored := range entries {
+		if stored.providerID == providerID {
+			// An entry that is JSON null reads as absent (models-store.ts read: `entry ? structuredClone(entry) : undefined`).
+			if bytes.Equal(bytes.TrimSpace(stored.raw), []byte("null")) {
+				return nil, nil
+			}
+			var entry ModelsStoreEntry
+			if err := json.Unmarshal(stored.raw, &entry); err != nil {
+				return nil, fmt.Errorf("models store: parse %s: %w", providerID, err)
+			}
+			return &entry, nil
+		}
+	}
+	return nil, nil
+}
+
+// Write replaces the provider's stored catalog.
+func (s *FileModelsStore) Write(ctx context.Context, providerID string, entry ModelsStoreEntry) error {
+	raw, err := marshalStoreJSON(entry)
+	if err != nil {
+		return err
+	}
+	err = s.withLockRoot(ctx, func(entries []storedModels, root modelsRoot) ([]storedModels, error) {
+		if root.kind == modelsRootScalar {
+			return nil, fmt.Errorf("Cannot create property '%s' on %s '%s'", providerID, root.scalarType, root.scalar)
+		}
+		for index := range entries {
+			if entries[index].providerID == providerID {
+				entries[index].raw = raw
+				return entries, nil
+			}
+		}
+		return append(entries, storedModels{providerID: providerID, raw: raw}), nil
+	})
+	if errors.Is(err, errModelsNullRoot) {
+		return fmt.Errorf("Cannot set properties of null (setting '%s')", providerID)
+	}
+	return err
+}
+
+// Delete removes the provider's stored catalog. Like upstream it rewrites
+// the file even when the provider has no entry.
+func (s *FileModelsStore) Delete(ctx context.Context, providerID string) error {
+	err := s.withLock(ctx, func(entries []storedModels) ([]storedModels, error) {
+		return slices.DeleteFunc(append([]storedModels{}, entries...), func(stored storedModels) bool {
+			return stored.providerID == providerID
+		}), nil
+	})
+	if errors.Is(err, errModelsNullRoot) {
+		return errors.New("Cannot convert undefined or null to object")
+	}
+	return err
+}
+
+// storedModels is one provider entry; a slice keeps the file's key order the
+// way the upstream JSON object does.
+type storedModels struct {
+	providerID string
+	raw        json.RawMessage
+}
+
+// withLock mirrors FileAuthStorageBackend.withLockAsync: it creates the
+// directory and the file as "{}" when existsSync finds neither, before it
+// waits for the lock (auth-storage.ts:55-68,158-163), holds the lock across
+// read-modify-write, writes only when fn returns entries, and returns Node's
+// fs errors.
+func (s *FileModelsStore) withLock(ctx context.Context, fn func([]storedModels) ([]storedModels, error)) error {
+	return s.withLockRoot(ctx, func(entries []storedModels, _ modelsRoot) ([]storedModels, error) { return fn(entries) })
+}
+
+// withLockRoot is withLock for a callback that needs the shape of the file's top-level JSON value.
+func (s *FileModelsStore) withLockRoot(ctx context.Context, fn func([]storedModels, modelsRoot) ([]storedModels, error)) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dir := filepath.Dir(s.path); !pathExists(dir) {
+		if err := nodeerrno.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	if !pathExists(s.path) {
+		// A symlink whose target is missing gets its target created, as Pi's writeFileSync does, because the lock follows the link to the real file.
+		file, err := createNewFollowingLinks(s.path, func(path string) (*os.File, error) {
+			return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		})
+		if err == nil {
+			_, writeErr := file.WriteString("{}")
+			closeErr := file.Close()
+			if err := errors.Join(writeErr, closeErr); err != nil {
+				return nodeerrno.FromPathError(err)
+			}
+		} else if !errors.Is(err, fs.ErrExist) {
+			return nodeerrno.FromPathError(err)
+		}
+	}
+	return s.lock(ctx, s.path, func(check func() error) error {
+		data, err := os.ReadFile(s.path)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nodeerrno.FromPathError(err)
+		}
+		entries, root, err := parseStoredModels(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")))
+		if err != nil {
+			return err
+		}
+		next, err := fn(entries, root)
+		if err != nil {
+			return err
+		}
+		// withLockAsync's checkpoints: after fn, the compromise and then the abort; after the write, the compromise alone (auth-storage.ts:183-189).
+		if err := check(); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if next == nil {
+			return nil
+		}
+		if err := writeStoredModels(s.path, next, root); err != nil {
+			return err
+		}
+		if err := check(); err != nil {
+			return err
+		}
+		s.readState.mu.Lock()
+		s.readState.data = next
+		s.readState.revision = fileRevision{}
+		s.readState.mu.Unlock()
+		return nil
+	})
+}
+
+// errModelsNullRoot reports a store file whose JSON is null: JSON.parse accepts it and every operation then throws its own TypeError.
+var errModelsNullRoot = errors.New("models store: the file holds null")
+
+// modelsRoot is the top-level JSON kind of a store file. Like auth.json, models-store.json is whatever JSON.parse returns: an array reads as an object keyed by
+// index and is written back as an array (a deleted or unset element is null), a number or boolean reads as an empty object, a delete rewrites it as itself, and a write throws.
+type modelsRootKind int
+
+const (
+	modelsRootObject modelsRootKind = iota
+	modelsRootArray
+	modelsRootScalar
+)
+
+type modelsRoot struct {
+	kind       modelsRootKind
+	arrayLen   int
+	scalar     string
+	scalarType string
+}
+
+func parseStoredModels(data []byte) ([]storedModels, modelsRoot, error) {
+	if len(data) == 0 {
+		return nil, modelsRoot{}, nil
+	}
+	// JSON.parse's SyntaxError is what the caller reports, with V8's message.
+	if err := jsonparse.Validate(data); err != nil {
+		return nil, modelsRoot{}, err
+	}
+	switch first := bytes.TrimSpace(data)[0]; first {
+	case 'n':
+		return nil, modelsRoot{}, errModelsNullRoot
+	case '[':
+		var items []json.RawMessage
+		if err := json.Unmarshal(data, &items); err != nil {
+			return nil, modelsRoot{}, fmt.Errorf("models store: parse: %w", err)
+		}
+		entries := make([]storedModels, 0, len(items))
+		for i, item := range items {
+			entries = append(entries, storedModels{providerID: strconv.Itoa(i), raw: item})
+		}
+		return entries, modelsRoot{kind: modelsRootArray, arrayLen: len(items)}, nil
+	case 't', 'f':
+		return []storedModels{}, modelsRoot{kind: modelsRootScalar, scalar: string(bytes.TrimSpace(data)), scalarType: "boolean"}, nil
+	case '{':
+	default:
+		if first != '"' {
+			canonical, err := jsonstringify.Canonicalize(data)
+			if err != nil {
+				return nil, modelsRoot{}, err
+			}
+			return []storedModels{}, modelsRoot{kind: modelsRootScalar, scalar: string(canonical), scalarType: "number"}, nil
+		}
+	}
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	if token, err := decoder.ReadToken(); err != nil || token.Kind() != '{' {
+		return nil, modelsRoot{}, fmt.Errorf("models store: parse: expected a JSON object")
+	}
+	var entries []storedModels
+	positions := make(map[string]int)
+	for decoder.PeekKind() != '}' {
+		name, err := jsonopts.ReadName(decoder) // the JavaScript key: "\ud800" and "\ud801" stay two keys, as in JSON.parse
+		if err != nil {
+			return nil, modelsRoot{}, fmt.Errorf("models store: parse: %w", err)
+		}
+		rawValue, err := decoder.ReadValue()
+		if err != nil {
+			return nil, modelsRoot{}, fmt.Errorf("models store: parse: %w", err)
+		}
+		raw := json.RawMessage(bytes.Clone(rawValue))
+		if index, exists := positions[name]; exists {
+			entries[index].raw = raw
+		} else {
+			positions[name] = len(entries)
+			entries = append(entries, storedModels{providerID: jsonopts.ValidName(name), raw: raw})
+		}
+	}
+	return entries, modelsRoot{}, nil
+}
+
+// writeStoredModels mirrors JSON.stringify(current, null, 2).
+func writeStoredModels(path string, entries []storedModels, root modelsRoot) error {
+	var object bytes.Buffer
+	switch root.kind {
+	case modelsRootScalar:
+		object.WriteString(root.scalar)
+	case modelsRootArray:
+		length := root.arrayLen
+		elements := map[int]json.RawMessage{}
+		for _, entry := range entries {
+			if index, ok := arrayIndex(entry.providerID); ok {
+				elements[index] = entry.raw
+				length = max(length, index+1)
+			}
+		}
+		object.WriteByte('[')
+		for i := range length {
+			if i > 0 {
+				object.WriteByte(',')
+			}
+			if raw, ok := elements[i]; ok {
+				object.Write(raw)
+			} else {
+				object.WriteString("null")
+			}
+		}
+		object.WriteByte(']')
+	default:
+		if err := writeStoredModelsObject(&object, entries); err != nil {
+			return err
+		}
+	}
+	// JSON.stringify writes the parsed values: escapes decode, numbers take their shortest form, '<', '>', '&' and the line separators stay literal.
+	canonical, err := jsonstringify.Canonicalize(object.Bytes())
+	if err != nil {
+		return fmt.Errorf("models store: encode: %w", err)
+	}
+	var indented bytes.Buffer
+	if err := json.Indent(&indented, canonical, "", "  "); err != nil {
+		return fmt.Errorf("models store: encode: %w", err)
+	}
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+	if err := atomicfile.WriteFile(path, indented.Bytes(), 0o600); err != nil {
+		return nodeerrno.FromPathError(err)
+	}
+	return nil
+}
+
+// arrayIndex reports whether key is a JavaScript array index (a canonical decimal below 2^32-1) and its value.
+func arrayIndex(key string) (int, bool) {
+	n, err := strconv.ParseUint(key, 10, 32)
+	if err != nil || n == math.MaxUint32 || n > math.MaxInt || strconv.FormatUint(n, 10) != key {
+		return 0, false
+	}
+	return int(n), true
+}
+
+func writeStoredModelsObject(object *bytes.Buffer, entries []storedModels) error {
+	object.WriteByte('{')
+	for index, entry := range entries {
+		if index > 0 {
+			object.WriteByte(',')
+		}
+		key, err := marshalStoreJSON(entry.providerID)
+		if err != nil {
+			return err
+		}
+		object.Write(key)
+		object.WriteByte(':')
+		object.Write(entry.raw)
+	}
+	object.WriteByte('}')
+	return nil
+}
+
+// appendStoreString appends the JSON encoding of s as marshalStoreJSON writes it. A string of printable ASCII without a quote or a backslash is its own
+// body, which is every catalog key and nearly every provider id, API and base URL; any other string takes the encoder.
+func appendStoreString(dst []byte, s string) ([]byte, error) {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e || c == '"' || c == '\\' {
+			encoded, err := marshalStoreJSON(s)
+			return append(dst, encoded...), err
+		}
+	}
+	dst = append(dst, '"')
+	dst = append(dst, s...)
+	return append(dst, '"'), nil
+}
+
+func marshalStoreJSON(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, fmt.Errorf("models store: encode: %w", err)
+	}
+	encoded := bytes.TrimSuffix(buffer.Bytes(), []byte("\n"))
+	// encoding/json writes each byte of a lone UTF-16 surrogate as U+FFFD; JSON.stringify writes the unit as its escape.
+	if bytes.Contains(encoded, []byte("\xef\xbf\xbd")) {
+		if kept, err := jsstring.MarshalKeepingSurrogates(value); err == nil && jsstring.HasSurrogateEscape(kept) {
+			return kept, nil
+		}
+	}
+	return encoded, nil
+}
+
+// withSidecarLock holds the shared Pi directory lease, checks it once acquired as withLockAsync does (compromise, then abort), and hands fn the lease's compromise check, withLockAsync's throwIfCompromised. Like FileAuthStorageBackend.withLockAsync (auth-storage.ts:191-198), it ignores a failure to release the lease.
+func withSidecarLock(ctx context.Context, path string, fn func(func() error) error) (err error) {
+	lock, err := pilock.Acquire(ctx, path)
+	if err != nil {
+		// FileModelsStore locks through FileAuthStorageBackend, which rethrows proper-lockfile's error unchanged (auth-storage.ts:141).
+		return err
+	}
+	defer func() { _ = lock.Release() }()
+	if err := lock.Check(); err != nil {
+		return err
+	}
+	return fn(lock.Compromised)
+}

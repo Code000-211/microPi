@@ -1,0 +1,138 @@
+package subprocess
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/MichaelKinsy/PiG/ai"
+)
+
+// nativeOAuthProxy adapts the login picker to the native Provider auth surface.
+// Request-time resolution uses the canonical credential-store path instead.
+type nativeOAuthProxy struct {
+	proxy *nativeProviderProxy
+	host  *Host
+	owner string
+}
+
+func (p *nativeOAuthProxy) ID() string               { return p.proxy.declaration.ID }
+func (p *nativeOAuthProxy) Name() string             { return p.proxy.declaration.OAuth.Name }
+func (p *nativeOAuthProxy) UsesCallbackServer() bool { return false }
+func (p *nativeOAuthProxy) IsSubscription() bool     { return p.proxy.declaration.OAuth.IsSubscription }
+func (p *nativeOAuthProxy) Login(callbacks ai.OAuthLoginCallbacks) (ai.OAuthCredentials, error) {
+	return p.LoginContext(context.Background(), callbacks)
+}
+func (p *nativeOAuthProxy) LoginContext(ctx context.Context, callbacks ai.OAuthLoginCallbacks) (ai.OAuthCredentials, error) {
+	p.host.setOAuthLoginSession(p.owner, callbacks)
+	defer p.host.clearOAuthLoginSession(p.owner)
+	options := ai.LoginOptions{GetDeviceID: callbacks.GetDeviceID, AgentName: callbacks.AgentName}
+	data, err := p.proxy.objectCall(ctx, "auth.oauth.login", nativeLoginParams(options), func(data json.RawMessage) (json.RawMessage, error) {
+		callback, err := decodeNativeLoginCallback(data)
+		if err != nil {
+			return nil, err
+		}
+		if callback.deviceID {
+			return nativeDeviceID(callbacks.GetDeviceID)
+		}
+		var method string
+		switch callback.prompt.(type) {
+		case nil:
+		case ai.AuthTextPrompt, ai.AuthSecretPrompt:
+			method = CallOAuthOnPrompt
+		case ai.AuthSelectPrompt:
+			method = CallOAuthOnSelect
+		case ai.AuthManualCodePrompt:
+			method = CallOAuthOnManualCodeInput
+		default:
+			return nil, fmt.Errorf("unhandled login prompt type %q", callback.prompt.Type())
+		}
+		switch callback.event.(type) {
+		case nil:
+		case ai.AuthURLEvent:
+			method = CallOAuthOnAuth
+		case ai.AuthDeviceCodeEvent:
+			method = CallOAuthOnDeviceCode
+		// The bridge's login session shows an info or progress message through its progress callback.
+		case ai.AuthInfoEvent, ai.AuthProgressEvent:
+			method = CallOAuthOnProgress
+		default:
+			return nil, fmt.Errorf("unhandled login event type %q", callback.event.Type())
+		}
+		result, err := p.host.handleOAuthCallback(ctx, p.owner, &CallPayload{Method: method, Args: callback.payload})
+		if err != nil {
+			return nil, err
+		}
+		if result.Error != nil {
+			return nil, result.Error.ToError()
+		}
+		if callback.event != nil {
+			return json.RawMessage("null"), nil
+		}
+		var answer struct {
+			Value  string `json:"value"`
+			Cancel bool   `json:"cancel"`
+		}
+		if err := json.Unmarshal(result.Result, &answer); err != nil {
+			return nil, err
+		}
+		if answer.Cancel {
+			return nil, errors.New("Login cancelled")
+		}
+		return json.Marshal(answer.Value)
+	})
+	if err != nil {
+		return ai.OAuthCredentials{}, err
+	}
+	var result ai.OAuthCredentials
+	err = json.Unmarshal(data, &result)
+	return result, err
+}
+
+// LoginInteraction runs the provider object's auth.oauth.login with Pi's AuthInteraction, as Pi's login dialog does (interactive-mode.ts:6315-6336 loginProvider): each prompt and event reaches the interaction as the flow sent it, an info event with its links included.
+func (p *nativeOAuthProxy) LoginInteraction(ctx context.Context, interaction ai.AuthInteraction, options ai.LoginOptions) (ai.OAuthCredentials, error) {
+	data, err := p.proxy.objectCall(ctx, "auth.oauth.login", nativeLoginParams(options), nativeAuthInteraction(ctx, interaction, options))
+	if err != nil {
+		return ai.OAuthCredentials{}, err
+	}
+	var result ai.OAuthCredentials
+	err = json.Unmarshal(data, &result)
+	return result, err
+}
+func (p *nativeOAuthProxy) RefreshToken(credential ai.OAuthCredentials) (ai.OAuthCredentials, error) {
+	return p.RefreshTokenContext(context.Background(), credential)
+}
+func (p *nativeOAuthProxy) RefreshTokenContext(ctx context.Context, credential ai.OAuthCredentials) (ai.OAuthCredentials, error) {
+	raw, err := json.Marshal(credential)
+	if err != nil {
+		return ai.OAuthCredentials{}, err
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return ai.OAuthCredentials{}, err
+	}
+	fields["type"] = "oauth"
+	data, err := p.proxy.objectCall(ctx, "auth.oauth.refresh", map[string]any{"credential": fields}, nil)
+	if err != nil {
+		return ai.OAuthCredentials{}, err
+	}
+	var result ai.OAuthCredentials
+	err = json.Unmarshal(data, &result)
+	return result, err
+}
+func (p *nativeOAuthProxy) GetAPIKey(credential ai.OAuthCredentials) string {
+	key, _ := p.GetAPIKeyContext(context.Background(), credential)
+	return key
+}
+func (p *nativeOAuthProxy) GetAPIKeyContext(ctx context.Context, credential ai.OAuthCredentials) (string, error) {
+	data, err := p.proxy.objectCall(ctx, "auth.oauth.toAuth", map[string]any{"credential": credential}, nil)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		APIKey string `json:"apiKey"`
+	}
+	err = json.Unmarshal(data, &result)
+	return result.APIKey, err
+}

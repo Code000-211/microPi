@@ -1,0 +1,179 @@
+// tools/bash_executor.go: user bash execution (!cmd, RPC bash, SDK
+// ExecuteBash).
+//
+// Upstream reference:
+//
+//	.upstream/current/packages/coding-agent/src/core/bash-executor.ts
+//	executeBashWithOperations.
+//
+// The LLM bash tool does not use this path: like upstream it feeds raw output
+// to an OutputAccumulator (shell_tool.go). User bash sanitizes each decoded
+// chunk for display and storage.
+package tools
+
+import (
+	"bufio"
+	"context"
+	"os"
+	"strings"
+	"unicode/utf16"
+
+	"github.com/MichaelKinsy/PiG/internal/outputfiles"
+	"github.com/MichaelKinsy/PiG/internal/text"
+	"github.com/MichaelKinsy/PiG/internal/utf8stream"
+)
+
+// BashResult mirrors upstream BashResult (bash-executor.ts).
+type BashResult struct {
+	// Output is combined stdout+stderr after sanitize + truncate.
+	Output string
+	// ExitCode is the process exit code, or nil if killed/cancelled.
+	ExitCode *int
+	// Cancelled is true when the context was cancelled mid-run.
+	Cancelled bool
+	// Truncated is true when Output is shorter than the full process output.
+	Truncated bool
+	// FullOutputPath, when non-empty, is a temp-file path holding the
+	// untruncated output. Caller is responsible for deletion.
+	FullOutputPath string
+}
+
+// BashExecOptions mirrors upstream BashExecutorOptions; cancellation comes
+// from the context.
+type BashExecOptions struct {
+	// OnChunk receives each sanitized chunk as it arrives. Nil = disabled.
+	OnChunk func(chunk string)
+	// BinDir is prepended to PATH (upstream getShellEnv's getBinDir).
+	BinDir string
+}
+
+// ExecuteBash runs command under shell in cwd through local shell operations.
+// ctx cancellation kills the process group.
+func ExecuteBash(ctx context.Context, command, cwd string, shell ShellConfig, opts BashExecOptions) (BashResult, error) {
+	ops := &LocalShellOperations{ShellName: "bash", BinDir: opts.BinDir, ResolveShell: func() (ShellConfig, error) { return shell, nil }}
+	return ExecuteBashWithOperations(ctx, command, cwd, ops, opts)
+}
+
+// ExecuteBashWithOperations mirrors upstream executeBashWithOperations: each
+// chunk is decoded with a streaming UTF-8 decoder, ANSI-stripped, sanitized,
+// and stripped of carriage returns; a rolling window of chunks is kept, and a
+// temp file receives the sanitized text once the output passes the byte
+// limit. A cancelled run returns its output with Cancelled set; any other
+// operations error is returned.
+//
+// A clean chunk costs one string, the decoded text it keeps: the strip and
+// sanitize steps return text they do not change as it is, and the temp file
+// is written through a buffer rather than a write per chunk.
+func ExecuteBashWithOperations(ctx context.Context, command, cwd string, operations BashOperations, opts BashExecOptions) (BashResult, error) {
+	const maxOutputBytes = DefaultMaxBytesUpstream * 2
+	var (
+		outputChunks   []string
+		outputBytes    int
+		totalBytes     int
+		tempFilePath   string
+		tempFile       *os.File
+		tempWriter     *bufio.Writer
+		tempFileOpened bool
+		// discardedOutput is set once the rolling window dropped a chunk, so the
+		// result is truncated even if the retained tail fits the limits.
+		discardedOutput bool
+		// TextDecoder, like upstream's: a leading BOM is dropped.
+		decoder = utf8stream.Decoder{StripBOM: true}
+	)
+	ensureTempFile := func() {
+		if tempFileOpened {
+			return
+		}
+		tempFileOpened = true
+		path, f, err := outputfiles.CreateStream("pi-bash", ".log")
+		tempFilePath = path
+		if err == nil {
+			tempFile = f
+			tempWriter = bufio.NewWriter(f)
+			for _, chunk := range outputChunks {
+				_, _ = tempWriter.WriteString(chunk)
+			}
+		}
+	}
+	closeTempFile := func() {
+		if tempFile != nil {
+			_ = tempWriter.Flush()
+			_ = tempFile.Close()
+		}
+	}
+	// Unfinished escape sequence at the end of the previous chunk, completed by the next chunk (bash-executor.ts pendingAnsi).
+	pendingAnsi := ""
+	appendText := func(rawText string) {
+		chunk := strings.ReplaceAll(text.SanitizeBinaryOutput(text.StripANSIString(rawText)), "\r", "")
+		if chunk == "" {
+			return
+		}
+		if totalBytes > DefaultMaxBytesUpstream {
+			ensureTempFile()
+		}
+		if tempWriter != nil {
+			_, _ = tempWriter.WriteString(chunk)
+		}
+		outputChunks = append(outputChunks, chunk)
+		outputBytes += jsLength(chunk)
+		for outputBytes > maxOutputBytes && len(outputChunks) > 1 {
+			outputBytes -= jsLength(outputChunks[0])
+			outputChunks = outputChunks[1:]
+			discardedOutput = true
+		}
+		if opts.OnChunk != nil {
+			opts.OnChunk(chunk)
+		}
+	}
+	onData := func(data []byte) {
+		totalBytes += len(data)
+		decoded := decoder.Decode(data, true)
+		if pendingAnsi != "" {
+			decoded = pendingAnsi + decoded
+		}
+		var complete string
+		complete, pendingAnsi = SplitIncompleteAnsiSuffix(decoded)
+		appendText(complete)
+	}
+	flushOutput := func() {
+		rest := pendingAnsi + decoder.Decode(nil, false)
+		pendingAnsi = ""
+		appendText(rest)
+	}
+	finish := func(exitCode *int, cancelled bool) BashResult {
+		fullOutput := strings.Join(outputChunks, "")
+		tr := TruncateTail(fullOutput, TruncationOptions{})
+		if tr.Truncated {
+			ensureTempFile()
+		}
+		closeTempFile()
+		output := fullOutput
+		if tr.Truncated {
+			// The kept tail is a substring of the joined window; copy it so the result does not hold the whole window.
+			output = strings.Clone(tr.Content)
+		}
+		return BashResult{Output: output, ExitCode: exitCode, Cancelled: cancelled, Truncated: discardedOutput || tr.Truncated, FullOutputPath: tempFilePath}
+	}
+
+	result, err := operations.Exec(ctx, command, cwd, BashOperationsExecOptions{OnData: onData})
+	cancelled := ctx.Err() != nil
+	if err != nil && !cancelled {
+		closeTempFile()
+		return BashResult{}, err
+	}
+	flushOutput()
+	exitCode := result.ExitCode
+	if cancelled {
+		exitCode = nil
+	}
+	return finish(exitCode, cancelled), nil
+}
+
+// jsLength is JavaScript String.length: UTF-16 code units.
+func jsLength(s string) int {
+	n := 0
+	for _, r := range s {
+		n += utf16.RuneLen(r)
+	}
+	return n
+}

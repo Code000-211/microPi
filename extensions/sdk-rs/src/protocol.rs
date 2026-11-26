@@ -1,0 +1,1871 @@
+//! Wire protocol types matching the Go host's `subprocess/protocol.go`.
+//! 4-byte big-endian length prefix + JSON payload.
+
+use crate::JsString;
+use crate::context::SourceInfo;
+use crate::transport::UnixStream;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+#[path = "surrogate_tests.rs"]
+mod surrogate_tests;
+
+#[cfg(test)]
+#[path = "frame_write_tests.rs"]
+mod frame_write_tests;
+
+#[cfg(test)]
+#[path = "float_roundtrip_tests.rs"]
+mod float_roundtrip_tests;
+
+#[cfg(all(test, unix))]
+#[path = "request_lifetime_tests.rs"]
+mod request_lifetime_tests;
+
+/// Maximum frame size (128 MB). Bounds a single length-prefixed frame to guard
+/// against unbounded allocation while allowing large host responses such as
+/// getBranch on a long session. Must match the host and other-language SDK
+/// MaxFrameSize constants.
+pub const MAX_FRAME_SIZE: u32 = 128 * 1024 * 1024;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// JSON Schema type alias.
+pub type Schema = Value;
+
+/// Helper for creating empty schemas.
+pub fn empty_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+    })
+}
+
+// ─── Wire message types ──────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct Envelope<R = Value> {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub register: Option<RegisterMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready: Option<ReadyMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<RequestMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponseMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifyMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<CancelMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call: Option<CallMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_result: Option<CallResultMsg<R>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub widget_push: Option<WidgetPushMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<ShutdownMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ping: Option<PingMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pong: Option<PongMsg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_state: Option<RequestStateMsg>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RegisterMsg {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<CmdDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortcuts: Vec<ShortcutDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<HandlerDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<FlagDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderDef>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "message_renderers"
+    )]
+    pub renderers: Vec<RendererDef>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "entry_renderers"
+    )]
+    pub entry_renderers: Vec<RendererDef>,
+    /// A registered Markdown transformer; the host runs it with
+    /// `markdown_transform` requests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub markdown_transformer: bool,
+    /// The surfaces the transformer runs on, listed whenever one is registered (an empty list runs it nowhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_message_types: Option<Vec<String>>,
+    /// PiG-only: the extension owns the thinking runs of assistant messages, so a hidden or zero-row run leaves no spacer rows. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owns_thinking_runs: bool,
+    /// The number of tool renderer resolvers (upstream `registerToolRenderer`); the host asks them with
+    /// `resolve_tool_renderers` requests.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub tool_renderers: usize,
+    /// MCP servers registered while loading (upstream `registerMcpServer` in the factory). The host validates them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerDecl>,
+    /// Virtual models registered while loading. Routing calls back with `virtual_model_route`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_models: Vec<VirtualModelDecl>,
+    /// Virtual models unregistered while loading, in call order. Upstream's `unregisterVirtualModel` filters the runtime-wide queue of models registered before the runner binds, including another extension's (`loader.ts:228-232`); the host applies these to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unregister_virtual_models: Vec<VirtualModelRef>,
+}
+
+/// One partial result of a nested call and the channel for the answer the host waits for: `None`, or the message the callback panicked with.
+pub(crate) type ExecuteUpdate = (crate::AgentToolResult, mpsc::Sender<Option<String>>);
+
+/// Names one virtual model.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct VirtualModelRef {
+    pub provider: String,
+    pub id: String,
+}
+
+/// One MCP server an extension registered: the `registerMcpServer` call and `register` payload entry.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct McpServerDecl {
+    pub name: String,
+    pub config: Value,
+}
+
+/// A virtual model declaration: every `VirtualModelDefinition` field but `route`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VirtualModelDecl {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+    #[serde(
+        default,
+        rename = "thinkingLevels",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub thinking_levels: Vec<String>,
+    #[serde(default, rename = "contextWindow", skip_serializing_if = "is_zero_u64")]
+    pub context_window: u64,
+    #[serde(default, rename = "maxTokens", skip_serializing_if = "is_zero_u64")]
+    pub max_tokens: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ToolDef {
+    pub name: String,
+    /// Upstream ToolDefinition.label: the tool's display name.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub label: String,
+    pub description: String,
+    pub parameters: Value,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub constrained_sampling: Option<crate::ToolConstrainedSampling>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub prompt_guidelines: Vec<String>,
+    /// Upstream ToolDefinition.promptSnippet.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub prompt_snippet: String,
+    /// Upstream ToolDefinition.executionMode: "sequential" or "parallel".
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub execution_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source: Option<String>,
+    /// "self" when the tool's renderers draw their own framing.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub render_shell: Option<String>,
+    /// The tool has a call renderer.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub renders_call: bool,
+    /// The tool has a result renderer.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub renders_result: bool,
+    /// Upstream ToolDefinition.outputSchema.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output_schema: Option<Value>,
+    /// Upstream ToolDefinition.exposure; absent is "direct".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exposure: Option<crate::ToolExposure>,
+    /// Upstream ToolDefinition.namespace.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub namespace: Option<crate::ToolNamespace>,
+    /// Upstream ToolDefinition.annotations.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub annotations: Option<crate::ToolAnnotations>,
+    /// Upstream ToolDefinition.defaultActive; absent is the exposure's default.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub default_active: Option<bool>,
+    /// The tool defines prepareLoadout; the host asks with `tool_prepare_loadout`.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub prepares_loadout: bool,
+    /// The tool defines reachesTools; the host asks with `tool_reaches_tools`.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub reaches_tools: bool,
+    /// The tool defines prepareArguments; the host asks with `tool_prepare_arguments` before it validates the arguments.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub prepares_arguments: bool,
+}
+
+/// Provider-side constrained sampling request for a tool. `type` is "json_schema"
+/// or "grammar"; for json_schema `strict` is "prefer" or "require"; for grammar
+/// `variants` maps a grammar format ("openai_lark", "openai_regex") to its
+/// definition. Mirrors upstream ConstrainedSamplingConfig.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ConstrainedSampling {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub strict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub variants: Option<std::collections::BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HandlerDef {
+    pub event: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub handler_id: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CmdDef {
+    pub name: String,
+    pub description: String,
+    /// The command defines upstream getArgumentCompletions; the host asks for
+    /// it with the command_argument_completions request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub argument_completions: bool,
+}
+
+/// Upstream pi-tui `AutocompleteItem`: `value` is inserted, `label` is shown
+/// in its place when set.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub struct AutocompleteItem {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShortcutDef {
+    pub key: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FlagDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(rename = "type")]
+    pub flag_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProviderDef {
+    pub name: String,
+    pub config: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<Value>,
+    #[serde(default)]
+    pub stream_simple: bool,
+    /// The APIs whose image and classifier implementations run in the extension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_apis: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classifier_apis: Vec<String>,
+    /// The config's `refreshModels` callback runs in the extension (types.ts:1930).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refresh_models: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RendererDef {
+    #[serde(rename = "custom_type")]
+    pub custom_type: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct ReadyMsg {
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    /// The provenance the loader stamped on this extension (`Context::extension_source_info`).
+    #[serde(default, rename = "sourceInfo")]
+    pub source_info: Option<SourceInfo>,
+    /// Initial state snapshot, including session entries.
+    #[serde(default, deserialize_with = "deserialize_state_replica")]
+    pub state: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(try_from = "RawRequestMsg", into = "RawRequestMsg")]
+pub struct RequestMsg {
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub handler_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Names the parallel batch a `tool_call` belongs to: the same non-empty value on every call of one batch, absent for a sequential batch, a nested call and every other request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+    /// The child agent session whose customTools define `tool` (`tool_call`, `tool_prepare_arguments`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session: Option<String>,
+    pub terminal_input: Option<TerminalInputArgs>,
+    /// Numbers one connection's payloads of an event name and key (`EventStream` in the host's protocol.go).
+    pub stream: Option<EventStream>,
+    /// Why `apply_event_stream` could not produce the payload.
+    pub stream_error: Option<String>,
+    /// On `tool_call`: the call's position among the tool calls of the assistant message that issued it (the host's `tool_call_index`).
+    pub tool_call_index: Option<u32>,
+    /// On `session_before_compact`, `session_before_tree` and `tool_call`: the request's AbortSignal had already aborted when the host dispatched the handler (the host's `signal_aborted`).
+    pub signal_aborted: bool,
+    /// On `tool_call`: the JSON text of `args` as the host wrote it.
+    pub args_raw: Option<String>,
+    /// Why the arguments were not decoded: they nest deeper than `MAX_NESTING_DEPTH`, which is Pi's `RangeError` (`Maximum call stack size exceeded`) and not a reason to end the connection. The request is answered with this error.
+    pub args_error: Option<String>,
+    /// The arguments nest past serde_json's limit and were decoded on the deep stack: the request runs on a stack made for them (`request_stack_size`).
+    pub deep_args: bool,
+}
+
+/// The delta of an event payload: a request with args is a keyframe the extension keeps, one without applies `ops` to the payload numbered `base`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct EventStream {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub base: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Value>,
+    /// Names the sequence of the event this payload belongs to: a `tool_execution_update` has one for each tool call.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    /// Keys of the event whose payloads are dropped once this frame is applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evict: Vec<String>,
+}
+
+/// The ordered chunk and owner snapshot use JS strings, not Unicode-scalar strings.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalInputArgs {
+    pub data: JsString,
+    #[serde(default)]
+    pub editor_text: JsString,
+    #[serde(default)]
+    pub tools_expanded: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawRequestMsg {
+    method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    handler_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    batch: Option<String>,
+    tool_call_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    signal_aborted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    args: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream: Option<RawEventStream>,
+}
+
+/// [`EventStream`] with `ops` as the JSON text the host wrote: a `set` operation carries a whole new subtree (a tool call's arguments), which nests as deep as the host's
+/// marshal allows, and decoding it inside the frame would stop at serde_json's 128 levels and end the connection. `TryFrom<RawRequestMsg>` decodes it with `decode_json_str`.
+#[derive(Serialize, Deserialize)]
+struct RawEventStream {
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    base: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ops: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    evict: Vec<String>,
+}
+
+/// The message of the error a value nested past `MAX_NESTING_DEPTH` is answered with: V8's `RangeError`, as Pi's JavaScript parser or stringify throws it.
+pub(crate) const TOO_DEEP_MESSAGE: &str = "Maximum call stack size exceeded";
+
+/// Whether `err` is a value refused for its nesting (`from_json_str` leaves serde_json's recursion error for a value past the bound).
+fn is_too_deep(err: &serde_json::Error) -> bool {
+    err.to_string().starts_with("recursion limit exceeded")
+}
+
+impl TryFrom<RawRequestMsg> for RequestMsg {
+    type Error = serde_json::Error;
+    fn try_from(raw: RawRequestMsg) -> Result<Self, Self::Error> {
+        let mut terminal_input = None;
+        let mut args_error = None;
+        let mut deep_args = false;
+        let args = if raw.method == "terminal_input" {
+            match raw
+                .args
+                .as_ref()
+                .map(|a| decode_json_str(a.get(), &mut deep_args))
+                .transpose()
+            {
+                Ok(decoded) => terminal_input = decoded,
+                Err(err) if is_too_deep(&err) => args_error = Some(TOO_DEEP_MESSAGE.to_string()),
+                Err(err) => return Err(err),
+            }
+            None
+        } else {
+            match raw
+                .args
+                .as_ref()
+                .map(|a| decode_json_str(a.get(), &mut deep_args))
+                .transpose()
+            {
+                Ok(decoded) => decoded,
+                Err(err) if is_too_deep(&err) => {
+                    args_error = Some(TOO_DEEP_MESSAGE.to_string());
+                    None
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let stream = match raw.stream {
+            Some(RawEventStream {
+                seq,
+                base,
+                ops,
+                key,
+                evict,
+            }) => {
+                let ops = match ops
+                    .as_ref()
+                    .map(|ops| decode_json_str(ops.get(), &mut deep_args))
+                    .transpose()
+                {
+                    Ok(ops) => ops,
+                    Err(err) if is_too_deep(&err) => {
+                        args_error = Some(TOO_DEEP_MESSAGE.to_string());
+                        None
+                    }
+                    Err(err) => return Err(err),
+                };
+                Some(EventStream {
+                    seq,
+                    base,
+                    ops,
+                    key,
+                    evict,
+                })
+            }
+            None => None,
+        };
+        let args_raw = if raw.method == "tool_call" {
+            raw.args.as_ref().map(|a| a.get().to_string())
+        } else {
+            None
+        };
+        Ok(Self {
+            method: raw.method,
+            tool: raw.tool,
+            event: raw.event,
+            handler_id: raw.handler_id,
+            tool_call_id: raw.tool_call_id,
+            batch: raw.batch,
+            args,
+            child_session: raw.child_session,
+            terminal_input,
+            stream,
+            stream_error: None,
+            tool_call_index: raw.tool_call_index,
+            signal_aborted: raw.signal_aborted,
+            args_raw,
+            args_error,
+            deep_args,
+        })
+    }
+}
+
+impl From<RequestMsg> for RawRequestMsg {
+    fn from(req: RequestMsg) -> Self {
+        let args = match req.terminal_input {
+            Some(args) => {
+                Some(serde_json::value::to_raw_value(&args).expect("terminal input is JSON"))
+            }
+            None => req
+                .args
+                .map(|args| serde_json::value::to_raw_value(&args).expect("Value is JSON")),
+        };
+        Self {
+            method: req.method,
+            tool: req.tool,
+            event: req.event,
+            handler_id: req.handler_id,
+            tool_call_id: req.tool_call_id,
+            batch: req.batch,
+            tool_call_index: req.tool_call_index,
+            signal_aborted: req.signal_aborted,
+            args,
+            child_session: req.child_session,
+            stream: req.stream.map(|stream| RawEventStream {
+                seq: stream.seq,
+                base: stream.base,
+                ops: stream
+                    .ops
+                    .map(|ops| serde_json::value::to_raw_value(&ops).expect("Value is JSON")),
+                key: stream.key,
+                evict: stream.evict,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ResponseMsg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorInfo>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(try_from = "RawNotifyMsg")]
+pub struct NotifyMsg {
+    #[serde(default)]
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+    #[serde(skip)]
+    pub custom_input: Option<CustomInputArgs>,
+    /// Why the arguments were not decoded: they nest deeper than `MAX_NESTING_DEPTH` (a frame the host cannot send). The notification is dropped with a diagnostic, and the connection keeps serving.
+    #[serde(skip)]
+    pub args_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CustomInputArgs {
+    pub key: String,
+    #[serde(alias = "text")]
+    pub data: JsString,
+    /// The host's state of the mounted overlay (`ui.custom.input` only).
+    #[serde(default)]
+    pub state: Option<Value>,
+}
+
+// Rust queries editor text through the typed host call; it does not consume that
+// replica field. Decode it as a JS string before projecting the consumed fields.
+fn deserialize_state_replica<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    #[derive(Deserialize)]
+    struct State {
+        #[serde(default, rename = "editorText")]
+        _editor_text: Option<JsString>,
+        #[serde(flatten)]
+        fields: serde_json::Map<String, Value>,
+    }
+    Ok(Option::<State>::deserialize(deserializer)?.map(|s| Value::Object(s.fields)))
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawNotifyMsg {
+    #[serde(default)]
+    method: String,
+    args: Option<Box<serde_json::value::RawValue>>,
+}
+impl TryFrom<RawNotifyMsg> for NotifyMsg {
+    type Error = serde_json::Error;
+    fn try_from(raw: RawNotifyMsg) -> Result<Self, Self::Error> {
+        let too_deep = |method: String| {
+            Ok(NotifyMsg {
+                method,
+                args: None,
+                custom_input: None,
+                args_error: Some(TOO_DEEP_MESSAGE.to_string()),
+            })
+        };
+        if matches!(
+            raw.method.as_str(),
+            "ui.custom.input"
+                | "ui.editor.input"
+                | "ui.editor.setText"
+                | "ui.editor.insertText"
+                | "ui.editor.addToHistory"
+        ) {
+            let custom_input = match raw
+                .args
+                .as_ref()
+                .map(|args| from_json_str(args.get()))
+                .transpose()
+            {
+                Ok(decoded) => decoded,
+                Err(err) if is_too_deep(&err) => return too_deep(raw.method),
+                Err(err) => return Err(err),
+            };
+            return Ok(Self {
+                method: raw.method,
+                args: None,
+                custom_input,
+                args_error: None,
+            });
+        }
+        let args = match raw
+            .args
+            .map(|args| {
+                if raw.method == "state_update" {
+                    #[derive(Deserialize, Serialize)]
+                    struct Update {
+                        #[serde(default, deserialize_with = "deserialize_state_replica")]
+                        state: Option<Value>,
+                    }
+                    let update: Update = from_json_str(args.get())?;
+                    serde_json::to_value(update)
+                } else {
+                    from_json_str(args.get())
+                }
+            })
+            .transpose()
+        {
+            Ok(decoded) => decoded,
+            Err(err) if is_too_deep(&err) => return too_deep(raw.method),
+            Err(err) => return Err(err),
+        };
+        Ok(Self {
+            method: raw.method,
+            args,
+            custom_input: None,
+            args_error: None,
+        })
+    }
+}
+
+impl Serialize for NotifyMsg {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut object = serializer.serialize_struct("NotifyMsg", 2)?;
+        object.serialize_field("method", &self.method)?;
+        if let Some(args) = &self.custom_input {
+            object.serialize_field("args", args)?;
+        } else if let Some(args) = &self.args {
+            object.serialize_field("args", args)?;
+        }
+        object.end()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CancelMsg {
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub reason: String,
+    /// Only the request's AbortSignal ended (`session_before_compact`, `session_before_tree`) and the request goes on: the signal the handler holds aborts and no host call is cancelled.
+    #[serde(default)]
+    pub signal_only: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CallMsg {
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_request_id: Option<String>,
+    /// Set on a call made through a command context (a command handler's or a withSession callback's), kept with the context after its request ended: Pi gives `newSession`, `fork`, `navigateTree`, `switchSession` and `reload` to no other context, and the host refuses them from any call that does not carry this mark.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command_context: bool,
+    /// Set on a call made through a request's scope after its handler returned: deferred work, which the host runs once Pi's loop turns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timer: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(bound(deserialize = "R: Deserialize<'de>"))]
+pub struct CallResultMsg<R = Value> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<R>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorInfo>,
+}
+
+/// A widget frame: a string list without a width, which the host lays out at
+/// its own width as Pi does for `setWidget(key, string[])`, or a kit view
+/// (D107) with the lines absent, which the host renders.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WidgetPushMsg {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PingMsg {
+    pub nonce: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PongMsg {
+    pub nonce: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RequestStateMsg {
+    pub request_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShutdownMsg {
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ErrorInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub message: String,
+    /// Pi's `ShellTimeoutError.shellExit`: on the error of a local shell command that timed out after its shell had exited.
+    #[serde(default, rename = "shellExit", skip_serializing_if = "Option::is_none")]
+    pub shell_exit: Option<ShellExit>,
+}
+
+/// The shell's own exit code and the seconds it ran, rounded to a tenth as Pi rounds them.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct ShellExit {
+    #[serde(rename = "exitCode")]
+    pub exit_code: i64,
+    #[serde(rename = "afterSeconds")]
+    pub after_seconds: f64,
+}
+
+// ─── Connection ──────────────────────────────────────────────────────────────
+
+// pig additive (D19): normal response publication retires only the request parent, not a retained Context's connection.
+pub(crate) struct RequestParent {
+    id: String,
+    state: AtomicU8,
+    finished: AtomicBool,
+    /// Set when the request hands its handler a command context (a command handler, a withSession callback). The context keeps the kind after the request ended.
+    command: AtomicBool,
+    /// A `tool_call` request's place in the batch orders (`ToolStartOrder`), set once by the read loop. Its host calls are awaits of
+    /// the handler, so the ones carrying this request's id keep the place.
+    start: std::sync::OnceLock<Arc<crate::tool_start_order::ToolStart>>,
+}
+
+impl RequestParent {
+    pub(crate) fn completed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+    pub(crate) fn cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 2
+    }
+    // pig divergence (D617): the Rust SDK has one static Context type, so the method exists on every context; the host answers a command-only call from a context that did not send this mark with not_a_command_context.
+    /// Marks the request as one whose handler receives a command context. The read loop calls it once, before the request's thread starts.
+    pub(crate) fn mark_command(&self) {
+        self.command.store(true, Ordering::Release);
+    }
+    pub(crate) fn command(&self) -> bool {
+        self.command.load(Ordering::Acquire)
+    }
+
+    /// Gives the request its place in the batch orders. The read loop calls it once, before the request's thread starts.
+    pub(crate) fn attach_start(&self, start: Arc<crate::tool_start_order::ToolStart>) {
+        let _ = self.start.set(start);
+    }
+
+    /// The request's place in the batch orders while the request is live: a call of a completed or cancelled request carries no request
+    /// id, or fails before it writes, so it takes no part in them.
+    pub(crate) fn tool_start(&self) -> Option<&crate::tool_start_order::ToolStart> {
+        if self.state.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        self.start.get().map(|start| &**start)
+    }
+}
+
+/// A thread-safe connection to the host over a Unix socket.
+pub struct Connection {
+    /// The child agent sessions this connection created and has not disposed (`child_session.rs`).
+    pub(crate) children: crate::child_session::ChildSessions,
+    pub(crate) registered_tools: Mutex<HashMap<String, Arc<crate::extension::ToolDefinition>>>,
+    pub(crate) tool_registration_lock: Mutex<()>,
+    /// Commands, shortcuts and renderers registered after loading.
+    pub(crate) late_declarations: crate::extension::LateDeclarations,
+    /// The host's footer data and the branch-change subscribers.
+    pub(crate) footer: crate::footer_data::FooterState,
+    /// Tool renderer resolvers registered after loading.
+    pub(crate) late_tool_renderers: crate::tool_render::LateToolRendererResolvers,
+    pub(crate) autocomplete: crate::autocomplete::AutocompleteRegistry,
+    /// The TuiAltScreens this connection created, which the host's `tui.alt.cb` requests name.
+    pub(crate) tui_alt: crate::tui_alt_screen::TuiAltRegistry,
+    pub(crate) provider_objects: std::sync::OnceLock<Arc<crate::provider::ProviderObjects>>,
+    pub(crate) provider_callbacks: std::sync::OnceLock<Arc<crate::provider::ProviderCallbacks>>,
+    /// Settings, MCP servers and callable tools the host replicates for synchronous getters.
+    pub(crate) api_state: Mutex<crate::extension_api::ApiState>,
+    /// The replicated signal of the run in progress, with the host's run number. None while no run is active (`Context::signal`).
+    pub(crate) run_signal: Mutex<Option<(u64, crate::provider::ProviderSignal)>>,
+    /// The Host's invalidate message; the first one wins (runner.ts:725-727).
+    pub(crate) stale_message: Mutex<Option<String>>,
+    /// Virtual models by provider and id, load-time and post-load registrations alike.
+    pub(crate) virtual_models: crate::extension_api::VirtualModels,
+    /// Dispatchers of in-flight nested calls, by execute id. Each update travels with the channel its answer returns on.
+    pub(crate) execute_updates: Mutex<HashMap<String, mpsc::Sender<ExecuteUpdate>>>,
+    pub(crate) execute_seq: std::sync::atomic::AtomicU64,
+    /// The BashOperations objects a user_bash reply named by handle (see `Context::bash_operations`).
+    pub(crate) bash_operations: crate::user_bash::BashOperationsTable,
+    /// The withSession callbacks of this connection's replacement calls in flight.
+    pub(crate) with_sessions: crate::replaced_session::WithSessionRegistry,
+    /// The frontend flag, the image refs sent, and the live widget, header and footer views (D107).
+    pub(crate) views: crate::kit::ViewLedger,
+    /// D614: the replicated client abilities.
+    pub(crate) view_state: crate::ui_view::ViewState,
+    /// The setup callbacks of this connection's newSession calls in flight.
+    pub(crate) setups: crate::setup_session::SetupRegistry,
+    /// The functions passed in options of session graph objects (DefaultResourceLoader's overrides), by the name the host runs them under.
+    pub(crate) graph_callbacks: crate::graph::GraphCallbacks,
+    reader: Mutex<UnixStream>,
+    writer: Mutex<UnixStream>,
+    // control ends the socket for every clone without waiting on a reader or writer lock.
+    control: UnixStream,
+    call_id: std::sync::atomic::AtomicU64,
+    pending_calls: Mutex<HashMap<String, PendingCallSender>>,
+    request_parents: Mutex<HashMap<String, Arc<RequestParent>>>,
+    closed: AtomicBool,
+    /// Set for a connection a factory opened before `run` (host_helpers.rs): no reader thread serves it yet, so a call made on it reads the frames itself, and only the host calls the host answers before the extension registers are sent. `run` clears it when it takes the connection.
+    loading: AtomicBool,
+    /// Set when a loading connection read the host's shutdown frame while a call waited: `run` then registers and ends.
+    shutdown_read: AtomicBool,
+    // One thread at a time reads a frame for a loading connection's calls; it does not hold the lock while a frame is served.
+    pump: Mutex<()>,
+    /// What serves the requests and notifies a loading connection receives while a call waits (event_bus.rs `serve_loading`); cleared when `run` takes the connection.
+    loading_server: Mutex<Option<LoadingServer>>,
+    /// The notifies a loading connection read while a call waited that its loading server does not serve, in arrival order: state the host sent the extension that will run on the connection. `run` takes them (`take_early_notifies`).
+    early_notifies: Mutex<Vec<Envelope<Box<serde_json::value::RawValue>>>>,
+    pub(crate) closed_signal: crate::provider::ProviderSignal,
+}
+
+/// Serves a frame the host sends a loading connection that is not the answer to a call: a listener dispatch, a release.
+pub(crate) type LoadingServer =
+    Arc<dyn Fn(&Envelope<Box<serde_json::value::RawValue>>) + Send + Sync>;
+
+/// The host calls the host answers while a factory runs, before the extension registers: the shared event bus and the pure helpers that read no session state (Go's loadingBusCall).
+fn loading_host_call(method: &str) -> bool {
+    method.starts_with("events.")
+        || matches!(
+            method,
+            "frontmatter.parse"
+                | "date.parse"
+                | "diff.string"
+                | "diff.patch"
+                | "clipboard.copy"
+                | "image.convertToPng"
+                | "image.resize"
+                | "highlight.code"
+                | "type.engine"
+                | "theme.load"
+                | "builtinTool.definition"
+        )
+}
+
+struct PendingCallSender {
+    parent_request_id: Option<String>,
+    sender: mpsc::Sender<CallResultMsg<Box<serde_json::value::RawValue>>>,
+    /// The response slot of the tool handler that waits for this dialog's answer. The reader settles it when it reads the answer.
+    slot: Option<Arc<crate::tool_start_order::SettleSlot>>,
+}
+
+impl Connection {
+    /// Records the Host's `invalidate` notification: a captured context raises the message from its locally answered members afterwards.
+    pub(crate) fn apply_invalidate(&self, args: &serde_json::Value) {
+        if let Some(message) = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.is_empty())
+        {
+            self.stale_message
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| message.to_string());
+        }
+    }
+
+    /// Installs the host's `run_signal` frame: one signal for the whole run, cancelled when the run aborts.
+    pub(crate) fn apply_run_signal(&self, args: &serde_json::Value) {
+        let active = args
+            .get("active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let run = args.get("run").and_then(|v| v.as_u64()).unwrap_or(0);
+        let aborted = args
+            .get("aborted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let signal = {
+            let mut held = self.run_signal.lock().unwrap();
+            if !active {
+                *held = None;
+                return;
+            }
+            match held.as_ref() {
+                Some((id, signal)) if *id == run => signal.clone(),
+                _ => {
+                    let signal = crate::provider::ProviderSignal::new();
+                    *held = Some((run, signal.clone()));
+                    signal
+                }
+            }
+        };
+        if aborted {
+            signal.cancel();
+        }
+    }
+}
+
+pub(crate) struct PendingCall {
+    method: String,
+    receiver: mpsc::Receiver<CallResultMsg<Box<serde_json::value::RawValue>>>,
+}
+
+impl Connection {
+    pub fn new(stream: UnixStream) -> Self {
+        let writer = stream
+            .try_clone()
+            .expect("clone UnixStream for extension protocol writer");
+        let control = stream
+            .try_clone()
+            .expect("clone UnixStream for extension protocol control");
+        Self {
+            reader: Mutex::new(stream),
+            writer: Mutex::new(writer),
+            control,
+            call_id: std::sync::atomic::AtomicU64::new(0),
+            pending_calls: Mutex::new(HashMap::new()),
+            request_parents: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            loading: AtomicBool::new(false),
+            shutdown_read: AtomicBool::new(false),
+            pump: Mutex::new(()),
+            loading_server: Mutex::new(None),
+            early_notifies: Mutex::new(Vec::new()),
+            closed_signal: crate::provider::ProviderSignal::new(),
+            provider_objects: std::sync::OnceLock::new(),
+            provider_callbacks: std::sync::OnceLock::new(),
+            api_state: Mutex::new(Default::default()),
+            run_signal: Mutex::new(None),
+            stale_message: Mutex::new(None),
+            virtual_models: Mutex::new(HashMap::new()),
+            execute_updates: Mutex::new(HashMap::new()),
+            execute_seq: std::sync::atomic::AtomicU64::new(0),
+            bash_operations: Default::default(),
+            with_sessions: Default::default(),
+            views: Default::default(),
+            view_state: Default::default(),
+            setups: Default::default(),
+            graph_callbacks: Default::default(),
+            children: Default::default(),
+            registered_tools: Mutex::new(HashMap::new()),
+            tool_registration_lock: Mutex::new(()),
+            late_declarations: Default::default(),
+            footer: Default::default(),
+            late_tool_renderers: Default::default(),
+            autocomplete: crate::autocomplete::AutocompleteRegistry::default(),
+            tui_alt: crate::tui_alt_screen::TuiAltRegistry::default(),
+        }
+    }
+
+    pub(crate) fn arm_parent(&self, id: &str) -> Arc<RequestParent> {
+        let parent = Arc::new(RequestParent {
+            id: id.to_owned(),
+            state: AtomicU8::new(0),
+            finished: AtomicBool::new(false),
+            command: AtomicBool::new(false),
+            start: std::sync::OnceLock::new(),
+        });
+        self.request_parents
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), parent.clone());
+        parent
+    }
+
+    /// Marks the connection as one a factory opened, or, with false, as one the extension serves.
+    pub(crate) fn set_loading(&self, loading: bool) {
+        self.loading.store(loading, Ordering::Release);
+        if !loading {
+            *self.loading_server.lock().unwrap() = None;
+        }
+    }
+
+    /// Sets what serves the host's dispatches on a loading connection while a call waits.
+    pub(crate) fn set_loading_server(&self, server: LoadingServer) {
+        *self.loading_server.lock().unwrap() = Some(server);
+    }
+
+    /// The notifies the calls made while this connection loaded read and did not serve, in arrival order.
+    pub(crate) fn take_early_notifies(&self) -> Vec<Envelope<Box<serde_json::value::RawValue>>> {
+        std::mem::take(&mut *self.early_notifies.lock().unwrap())
+    }
+
+    /// Whether a call made while this connection loaded read the host's shutdown frame.
+    pub(crate) fn shutdown_read(&self) -> bool {
+        self.shutdown_read.load(Ordering::Acquire)
+    }
+
+    /// Whether the connection is a factory's, not yet taken by `run`.
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading.load(Ordering::Acquire)
+    }
+
+    /// Reads frames, completing the calls they answer and serving the host's dispatches, until `pending`'s reply arrives. A frame is served outside the pump lock, so a listener that makes a bus call of its own (its nested emit) pumps in turn, on the same thread, and the reply of the call it interrupted is waiting for it afterwards.
+    fn pump_until(
+        &self,
+        pending: &PendingCall,
+    ) -> io::Result<CallResultMsg<Box<serde_json::value::RawValue>>> {
+        loop {
+            let env = {
+                let _reading = self.pump.lock().unwrap();
+                match pending.receiver.try_recv() {
+                    Ok(reply) => return Ok(reply),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!("host call {} cancelled", pending.method),
+                        ));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                self.read_envelope()?
+            };
+            if self.complete_call(&env) {
+                continue;
+            }
+            if env.msg_type == "ping" {
+                if let Some(ping) = env.ping {
+                    self.write_envelope(&Envelope {
+                        msg_type: "pong".to_string(),
+                        pong: Some(PongMsg { nonce: ping.nonce }),
+                        ..Default::default()
+                    })?;
+                }
+                continue;
+            }
+            if env.msg_type == "shutdown" {
+                self.shutdown_read.store(true, Ordering::Release);
+                continue;
+            }
+            // A notify other than a listener's release is for the extension that will run on this connection (a state the host pushed before the register): it is kept for `run`, never dropped.
+            if env.msg_type == "notify"
+                && env
+                    .notify
+                    .as_ref()
+                    .is_some_and(|notify| notify.method != "events.release")
+            {
+                self.early_notifies.lock().unwrap().push(env);
+                continue;
+            }
+            let server = self.loading_server.lock().unwrap().clone();
+            match server {
+                Some(server) => server(&env),
+                None if env.msg_type == "request" => {
+                    if let Some(id) = env.id.as_deref() {
+                        let _ = self.respond(
+                            id,
+                            None,
+                            Some(ErrorInfo {
+                                code: None,
+                                message: "the extension has not registered with the host yet"
+                                    .to_string(),
+                                shell_exit: None,
+                            }),
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Ends the socket when the serve loop returns, as Go's RunWithConn closes its connection. A Context the extension keeps past its generation still holds this Connection, and the host's Retire waits for the close while the process lives on for later factory generations.
+    pub(crate) fn close_transport(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _ = self.control.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Read one frame from the socket (4-byte length prefix + JSON).
+    pub fn read_envelope(&self) -> io::Result<Envelope<Box<serde_json::value::RawValue>>> {
+        let mut stream = self.reader.lock().unwrap();
+        let mut hdr = [0u8; 4];
+        stream.read_exact(&mut hdr)?;
+        let size = u32::from_be_bytes(hdr);
+        if size > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame too large: {} bytes", size),
+            ));
+        }
+        let mut buf = vec![0u8; size as usize];
+        stream.read_exact(&mut buf)?;
+        decode_frame(&buf)
+    }
+
+    /// Write one frame to the socket.
+    pub fn write_envelope(&self, env: &Envelope) -> io::Result<()> {
+        Self::write_envelope_to(&mut self.writer.lock().unwrap(), env)
+    }
+
+    fn write_envelope_to(stream: &mut UnixStream, env: &impl Serialize) -> io::Result<()> {
+        Self::write_frame_to(stream, env)
+    }
+
+    fn write_frame_to(stream: &mut impl Write, env: &impl Serialize) -> io::Result<()> {
+        Self::write_encoded_frame(stream, &Self::encode_frame(env)?)
+    }
+
+    /// The frame of an envelope: a 4-byte length and the JSON body in one buffer, so it goes out in one write (a header and a body sent apart cost the
+    /// host two reads and, on a stream socket, two segments).
+    fn encode_frame(env: &impl Serialize) -> io::Result<Vec<u8>> {
+        let data =
+            serde_json::to_vec(env).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if data.len() > MAX_FRAME_SIZE as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame too large: {} bytes exceeds {}",
+                    data.len(),
+                    MAX_FRAME_SIZE
+                ),
+            ));
+        }
+        let mut frame = Vec::with_capacity(4 + data.len());
+        frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&data);
+        Ok(frame)
+    }
+
+    fn write_encoded_frame(stream: &mut impl Write, frame: &[u8]) -> io::Result<()> {
+        stream.write_all(frame)?;
+        stream.flush()
+    }
+
+    /// Send a response to a host request.
+    pub fn respond(
+        &self,
+        id: &str,
+        result: Option<Value>,
+        error: Option<ErrorInfo>,
+    ) -> io::Result<()> {
+        self.respond_serialized(id, result, error)
+    }
+
+    pub(crate) fn respond_serialized<T: Serialize>(
+        &self,
+        id: &str,
+        result: Option<T>,
+        error: Option<ErrorInfo>,
+    ) -> io::Result<()> {
+        #[derive(Serialize)]
+        struct Response<T> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            result: Option<T>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<ErrorInfo>,
+        }
+        #[derive(Serialize)]
+        struct Reply<'a, T> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            id: &'a str,
+            response: Response<T>,
+        }
+        // The response is encoded before the writer lock is taken: a result of hundreds of MiB takes seconds to encode, and the same lock carries the
+        // heartbeat's pong, which the host answers by closing a connection that stays silent.
+        let had_result = result.is_some();
+        let response = match Self::encode_frame(&Reply {
+            kind: "response",
+            id,
+            response: Response { result, error },
+        }) {
+            // The host waits for this request's response. A result that cannot be framed (past MAX_FRAME_SIZE, or not serializable) is answered with that failure, as the Node and Python SDKs answer it, rather than leaving the call to hang until it is aborted.
+            Err(err) if had_result && err.kind() == io::ErrorKind::InvalidData => {
+                Self::encode_frame(&Reply {
+                    kind: "response",
+                    id,
+                    response: Response::<()> {
+                        result: None,
+                        error: Some(ErrorInfo {
+                            code: None,
+                            message: err.to_string(),
+                            shell_exit: None,
+                        }),
+                    },
+                })
+            }
+            outcome => outcome,
+        };
+        let mut writer = self.writer.lock().unwrap();
+        if let Some(parent) = self.request_parents.lock().unwrap().remove(id) {
+            parent.finished.store(true, Ordering::Release);
+            let _ = parent
+                .state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        }
+        // Pi's host calls belong to no request: a call the handler left running when it returned continues until it ends. A cancelled request's calls were cancelled by its cancel frame. A completed request's pending calls are no longer scoped to it, so a later cancel frame for it does not reach them.
+        for pending in self.pending_calls.lock().unwrap().values_mut() {
+            if pending.parent_request_id.as_deref() == Some(id) {
+                pending.parent_request_id = None;
+            }
+        }
+        Self::write_envelope_to(
+            &mut writer,
+            &Envelope::<Value> {
+                msg_type: "request_state".to_string(),
+                request_state: Some(RequestStateMsg {
+                    request_id: id.to_string(),
+                    state: "completed".to_string(),
+                    reason: None,
+                }),
+                ..Default::default()
+            },
+        )?;
+        Self::write_encoded_frame(&mut *writer, &response?)
+    }
+
+    pub fn request_state(&self, id: &str, state: &str, reason: Option<&str>) -> io::Result<()> {
+        self.request_state_for(None, id, state, reason)
+    }
+
+    pub(crate) fn request_state_for(
+        &self,
+        scope: Option<&RequestParent>,
+        id: &str,
+        state: &str,
+        reason: Option<&str>,
+    ) -> io::Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        if scope.is_some_and(|parent| {
+            parent.finished.load(Ordering::Acquire) || (parent.cancelled() && state != "progress")
+        }) || self.is_closed()
+        {
+            return Ok(());
+        }
+        Self::write_envelope_to(
+            &mut writer,
+            &Envelope::<Value> {
+                msg_type: "request_state".to_string(),
+                request_state: Some(RequestStateMsg {
+                    request_id: id.to_string(),
+                    state: state.to_string(),
+                    reason: reason.map(str::to_string),
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Make a blocking call to the host and wait for call_result.
+    /// The main extension loop owns socket reads and routes call_result
+    /// envelopes through complete_call, so request handlers can call host APIs
+    /// without racing the reader.
+    pub fn call(&self, method: &str, args: Option<Value>) -> io::Result<CallResultMsg> {
+        self.call_for(None, method, args)
+    }
+
+    pub fn call_for(
+        &self,
+        parent_request_id: Option<&str>,
+        method: &str,
+        args: Option<Value>,
+    ) -> io::Result<CallResultMsg> {
+        let pending = self.begin_call_for(parent_request_id, method, args)?;
+        self.wait_call(pending)
+    }
+
+    pub(crate) fn call_for_scope(
+        &self,
+        scope: Option<&RequestParent>,
+        parent: Option<&str>,
+        method: &str,
+        args: Option<Value>,
+    ) -> io::Result<CallResultMsg> {
+        let pending = self.begin_call_with_scope(scope, parent, method, args)?;
+        self.wait_call(pending)
+    }
+
+    pub(crate) fn call_typed<A: Serialize, R: serde::de::DeserializeOwned + Send>(
+        &self,
+        scope: Option<&RequestParent>,
+        parent: Option<&str>,
+        method: &str,
+        args: Option<A>,
+    ) -> io::Result<CallResultMsg<R>> {
+        let pending = self.begin_call_with_scope(scope, parent, method, args)?;
+        self.wait_call_typed(pending)
+    }
+
+    /// Send a host call and return after its frame has been written. Streaming
+    /// APIs use this to order notify frames after the host-side consumer call.
+    pub(crate) fn begin_call_for(
+        &self,
+        parent_request_id: Option<&str>,
+        method: &str,
+        args: Option<Value>,
+    ) -> io::Result<PendingCall> {
+        self.begin_call_with_scope(None, parent_request_id, method, args)
+    }
+
+    pub(crate) fn begin_call_with_scope<A: Serialize>(
+        &self,
+        scope: Option<&RequestParent>,
+        parent_request_id: Option<&str>,
+        method: &str,
+        args: Option<A>,
+    ) -> io::Result<PendingCall> {
+        // A tool handler's host call, of any kind, is an await of Pi's handler: it orders the handler among the calls of its batch
+        // (`ToolStartOrder`). The wait for the dialog place comes before any lock below, so a waiting handler holds nothing the earlier
+        // ones need. Only a dialog call carries the response slot.
+        let start = scope.and_then(RequestParent::tool_start);
+        if let Some(start) = start {
+            start.before_call();
+        }
+        let slot = start
+            .filter(|_| crate::tool_start_order::is_dialog_method(method))
+            .and_then(crate::tool_start_order::ToolStart::response_slot);
+        let pending = self.write_call(scope, parent_request_id, method, args, slot);
+        if let Some(start) = start {
+            start.after_call();
+        }
+        pending
+    }
+
+    /// Writes a call frame and registers its answer. A `slot` is settled by the reader when it reads the answer.
+    fn write_call<A: Serialize>(
+        &self,
+        scope: Option<&RequestParent>,
+        parent_request_id: Option<&str>,
+        method: &str,
+        args: Option<A>,
+        slot: Option<Arc<crate::tool_start_order::SettleSlot>>,
+    ) -> io::Result<PendingCall> {
+        // The host answers only a few calls before the extension registers, and a call it does not answer would wait for ever.
+        if self.is_loading() && !loading_host_call(method) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("{method}: the extension has not registered with the host yet"),
+            ));
+        }
+        let mut writer = self.writer.lock().unwrap();
+        let mut pending_calls = self.pending_calls.lock().unwrap();
+        if self.is_closed() || scope.is_some_and(RequestParent::cancelled) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "host call owner is cancelled or closed",
+            ));
+        }
+        // pig additive (D189): a call made through a request's scope after its handler returned is deferred work, which Pi runs once its loop turns; the host holds it for that turn.
+        let timer = scope.is_some_and(RequestParent::completed);
+        let parent_request_id = match scope {
+            Some(parent) if parent.completed() => None,
+            Some(parent) => Some(parent.id.as_str()),
+            None => parent_request_id,
+        };
+        let command_context = scope.is_some_and(RequestParent::command);
+        let id = format!(
+            "c{}",
+            self.call_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let (tx, rx) = mpsc::channel();
+        pending_calls.insert(
+            id.clone(),
+            PendingCallSender {
+                parent_request_id: parent_request_id.map(str::to_string),
+                sender: tx,
+                slot,
+            },
+        );
+        drop(pending_calls);
+        #[derive(Serialize)]
+        struct Call<'a, A> {
+            method: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            args: Option<A>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            parent_request_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            command_context: bool,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            timer: bool,
+        }
+        #[derive(Serialize)]
+        struct Request<'a, A> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            id: &'a str,
+            call: Call<'a, A>,
+        }
+        if let Err(err) = Self::write_envelope_to(
+            &mut writer,
+            &Request {
+                kind: "call",
+                id: &id,
+                call: Call {
+                    method,
+                    args,
+                    parent_request_id,
+                    command_context,
+                    timer,
+                },
+            },
+        ) {
+            self.pending_calls.lock().unwrap().remove(&id);
+            return Err(err);
+        }
+        Ok(PendingCall {
+            method: method.to_string(),
+            receiver: rx,
+        })
+    }
+
+    pub(crate) fn wait_call(&self, pending: PendingCall) -> io::Result<CallResultMsg> {
+        self.wait_call_typed(pending)
+    }
+
+    pub(crate) fn wait_call_typed<R: serde::de::DeserializeOwned + Send>(
+        &self,
+        pending: PendingCall,
+    ) -> io::Result<CallResultMsg<R>> {
+        let reply = if self.is_loading() {
+            self.pump_until(&pending)?
+        } else {
+            pending.receiver.recv().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("host call {} cancelled", pending.method),
+                )
+            })?
+        };
+        let result = reply
+            .result
+            .map(|raw| from_json_str(raw.get()))
+            .transpose()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(CallResultMsg {
+            result,
+            error: reply.error,
+        })
+    }
+
+    pub(crate) fn notify(&self, method: &str, args: Option<Value>) -> io::Result<()> {
+        self.write_envelope(&Envelope {
+            msg_type: "notify".to_string(),
+            notify: Some(NotifyMsg {
+                custom_input: None,
+                args_error: None,
+                method: method.to_string(),
+                args,
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Send a notify whose arguments serialize themselves, so [`JsString`] fields keep lone UTF-16 units that a `serde_json::Value` cannot hold.
+    pub(crate) fn notify_typed<A: Serialize>(
+        &self,
+        method: &str,
+        args: Option<A>,
+    ) -> io::Result<()> {
+        #[derive(Serialize)]
+        struct TypedNotify<'a, A> {
+            method: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            args: Option<A>,
+        }
+        #[derive(Serialize)]
+        struct TypedEnvelope<'a, A> {
+            #[serde(rename = "type")]
+            msg_type: &'static str,
+            notify: TypedNotify<'a, A>,
+        }
+        Self::write_envelope_to(
+            &mut self.writer.lock().unwrap(),
+            &TypedEnvelope {
+                msg_type: "notify",
+                notify: TypedNotify { method, args },
+            },
+        )
+    }
+
+    /// Complete a pending host call. Returns true when the envelope was routed.
+    pub fn complete_call<R: Serialize>(&self, env: &Envelope<R>) -> bool {
+        if env.msg_type != "call_result" {
+            return false;
+        }
+        let Some(id) = env.id.as_ref() else {
+            return false;
+        };
+        let Some(pending) = self.pending_calls.lock().unwrap().remove(id) else {
+            return false;
+        };
+        // Pi resumes the handlers whose dialogs were answered in the order the answers arrived. This reader reads them in that order, which the
+        // threads that wait do not keep, so the answer settles its handler's response slot before the handler can see it.
+        if let Some(slot) = &pending.slot {
+            slot.settle();
+        }
+        let reply = env.call_result.as_ref();
+        let result = reply
+            .and_then(|r| r.result.as_ref())
+            .map(serde_json::value::to_raw_value)
+            .transpose();
+        if let Ok(result) = result {
+            let _ = pending.sender.send(CallResultMsg {
+                result,
+                error: reply.and_then(|r| r.error.clone()),
+            });
+        }
+        true
+    }
+
+    pub(crate) fn cancel_pending_calls_for(&self, parent_request_id: &str) {
+        if let Some(parent) = self.request_parents.lock().unwrap().get(parent_request_id) {
+            let _ = parent
+                .state
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+        }
+        self.pending_calls
+            .lock()
+            .unwrap()
+            .retain(|_, pending| pending.parent_request_id.as_deref() != Some(parent_request_id));
+    }
+
+    pub(crate) fn cancel_pending_calls(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.request_parents.lock().unwrap().clear();
+        self.pending_calls.lock().unwrap().clear();
+        self.closed_signal.cancel();
+    }
+
+    /// Push a widget update (fire-and-forget).
+    pub fn push_widget(&self, key: &str, lines: Vec<String>) -> io::Result<()> {
+        self.write_widget_push(WidgetPushMsg {
+            key: key.to_string(),
+            lines: Some(lines),
+            view: None,
+        })
+    }
+
+    /// Push a widget's authoritative kit view (fire-and-forget, D107).
+    pub(crate) fn push_widget_view(&self, key: &str, view: Value) -> io::Result<()> {
+        self.write_widget_push(WidgetPushMsg {
+            key: key.to_string(),
+            lines: None,
+            view: Some(view),
+        })
+    }
+
+    fn write_widget_push(&self, push: WidgetPushMsg) -> io::Result<()> {
+        self.write_envelope(&Envelope {
+            msg_type: "widget_push".to_string(),
+            widget_push: Some(push),
+            ..Default::default()
+        })
+    }
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+/// The deepest JSON nesting `from_json_str` accepts. serde_json refuses past 128 levels, and a refused frame would end the connection. The host's own JSON
+/// marshal refuses a value nested past 10000 levels, so no frame the host sends nests deeper than that (its envelope adds a few levels); the bound has headroom
+/// over it, and a value beyond is answered with Pi's RangeError (a request) or dropped (a notification). A bound stays so a hostile frame cannot overflow the
+/// stack of the recursive decoder.
+// pig divergence (D268): Pi fails a call at a V8-stack-dependent depth (about 4400 levels); the SDK reads every frame the host can send.
+const MAX_NESTING_DEPTH: usize = 10_016;
+
+/// Stack of the thread that decodes a value nested past serde_json's limit: a debug build uses about 2 KiB of it per level, so `MAX_NESTING_DEPTH` levels take about 20 MiB of it.
+const DEEP_DECODE_STACK: usize = 64 * 1024 * 1024;
+
+/// Runs a recursive decode on a thread with `DEEP_DECODE_STACK` bytes of stack, so the caller's own stack does not bound the depth.
+pub(crate) fn on_deep_stack<R: Send>(decode: impl FnOnce() -> R + Send) -> io::Result<R> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .stack_size(DEEP_DECODE_STACK)
+            .spawn_scoped(scope, decode)?;
+        worker
+            .join()
+            .map_err(|_| io::Error::other("deep JSON decode panicked"))
+    })
+}
+
+/// Decodes one frame body. serde_json refuses an unpaired surrogate, which every other runtime accepts, and refusing a frame ends the
+/// connection (the host sees EOF and the extension is gone). A JavaScript string may carry one (Pi keeps it as the UTF-16 unit) and the
+/// host sends it as a `\ud800` escape. The typed UTF-16 fields (`JsString`) take it losslessly; a `Value` or `String` position cannot
+/// hold it, so a refused frame is decoded again with each unpaired surrogate written as U+FFFD (divergence D648: a Rust extension holds
+/// U+FFFD where Pi's handler holds the unit, and writes U+FFFD back when it echoes the text). A frame that decodes the first time is
+/// untouched, so the lossless fields keep their units.
+fn decode_frame(buf: &[u8]) -> io::Result<Envelope<Box<serde_json::value::RawValue>>> {
+    match serde_json::from_slice(buf) {
+        // pig divergence (D648): a lone UTF-16 surrogate becomes U+FFFD here, where Pi's JavaScript string keeps the unit; the lossless Rust value type removes it.
+        Err(err) if err.is_data() || err.is_syntax() => {
+            match replace_unpaired_surrogate_escapes(buf) {
+                Some(repaired) => serde_json::from_slice(&repaired),
+                None => Err(err),
+            }
+        }
+        result => result,
+    }
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// `serde_json::from_str` for a value cut out of a frame (the arguments of a request or notification, the result of a host call). serde_json
+/// refuses nesting past 128 levels, and a refused frame ends the connection, while Pi's JavaScript parser, Go and Python take far more: the
+/// refusal is lifted up to `MAX_NESTING_DEPTH`. A number outside the `f64` range, which the deep decode can meet as well as the first one,
+/// is then rewritten as `null`.
+pub(crate) fn from_json_str<T: serde::de::DeserializeOwned + Send>(
+    text: &str,
+) -> serde_json::Result<T> {
+    decode_json_str(text, &mut false)
+}
+
+/// [`from_json_str`], that also sets `deep` when the value nests past serde_json's limit and was decoded on the deep stack: a value like that is dropped, ordered and written
+/// recursively once per level, so the request that carries it runs on a stack made for it (see `request_stack_size`), and a normal request keeps the default one.
+pub(crate) fn decode_json_str<T: serde::de::DeserializeOwned + Send>(
+    text: &str,
+    deep: &mut bool,
+) -> serde_json::Result<T> {
+    let decoded = match serde_json::from_str(text) {
+        Err(err)
+            if err.to_string().starts_with("recursion limit exceeded")
+                && nesting_depth(text.as_bytes()) <= MAX_NESTING_DEPTH =>
+        {
+            *deep = true;
+            on_deep_stack(|| {
+                let mut de = serde_json::Deserializer::from_str(text);
+                de.disable_recursion_limit();
+                let value = T::deserialize(&mut de)?;
+                de.end()?;
+                Ok(value)
+            })
+            .unwrap_or_else(|err| Err(<serde_json::Error as serde::de::Error>::custom(err)))
+        }
+        result => result,
+    };
+    match decoded {
+        Err(err) if err.to_string().starts_with("number out of range") => {
+            match replace_out_of_range_numbers(text) {
+                Some(repaired) => decode_json_str(&repaired, deep),
+                None => Err(err),
+            }
+        }
+        // A value cut out of a frame (a request's arguments, a host call's result) may spell an unpaired surrogate as an escape, which
+        // `decode_frame` let through inside the raw value. Rust text cannot hold the unit, so a refused value is decoded again with each
+        // one written as U+FFFD, as `decode_frame` does for the frame; one that decodes the first time keeps its typed UTF-16 fields.
+        // pig divergence (D648): a lone UTF-16 surrogate becomes U+FFFD here, where Pi's JavaScript string keeps the unit.
+        Err(err) if err.is_data() || err.is_syntax() => {
+            match replace_unpaired_surrogate_escapes(text.as_bytes())
+                .and_then(|repaired| String::from_utf8(repaired).ok())
+            {
+                Some(repaired) => decode_json_str(&repaired, deep),
+                None => Err(err),
+            }
+        }
+        result => result,
+    }
+}
+
+/// `text` with each number outside the `f64` range written as `null`, or `None` when there is none. `JSON.parse` reads `1e400` as Infinity,
+/// which `JSON.stringify`, and so every frame Pi writes, spells `null`; serde_json refuses the number, and a refused frame ends the connection.
+/// A `Value` cannot hold an infinity, so the number becomes the `null` it is written as.
+fn replace_out_of_range_numbers(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let (mut out, mut copied, mut index, mut in_string, mut escaped) =
+        (String::new(), 0, 0, false, false);
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            index += 1;
+        } else if byte == b'"' {
+            in_string = true;
+            index += 1;
+        } else if byte == b'-' || byte.is_ascii_digit() {
+            let start = index;
+            while index < bytes.len()
+                && matches!(bytes[index], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+            {
+                index += 1;
+            }
+            if text[start..index]
+                .parse::<f64>()
+                .is_ok_and(f64::is_infinite)
+            {
+                out.push_str(&text[copied..start]);
+                out.push_str("null");
+                copied = index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&text[copied..]);
+    Some(out)
+}
+
+/// The deepest array/object nesting in a JSON body, read without parsing it: string contents (and their escapes) are skipped.
+fn nesting_depth(buf: &[u8]) -> usize {
+    let (mut depth, mut deepest, mut in_string, mut escaped) = (0usize, 0usize, false, false);
+    for &byte in buf {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+fn hex_unit(escape: &[u8]) -> Option<u16> {
+    if escape.len() < 6 || escape[0] != b'\\' || escape[1] != b'u' {
+        return None;
+    }
+    let digits = std::str::from_utf8(&escape[2..6]).ok()?;
+    u16::from_str_radix(digits, 16).ok()
+}
+
+/// `serde_json::from_str::<Value>` for text that may spell an unpaired surrogate as an escape (Pi writes a session entry with `JSON.stringify`, which does): a `Value`
+/// string cannot hold one, so each is read as U+FFFD, as `decode_frame` does, instead of refusing the text.
+pub(crate) fn value_from_str_lossy(text: &str) -> serde_json::Result<serde_json::Value> {
+    match serde_json::from_str(text) {
+        Err(err) if err.is_data() || err.is_syntax() => {
+            match replace_unpaired_surrogate_escapes(text.as_bytes()) {
+                Some(repaired) => serde_json::from_slice(&repaired),
+                None => Err(err),
+            }
+        }
+        result => result,
+    }
+}
+
+/// Rewrites each `\uD800`-`\uDFFF` escape that is not half of a surrogate pair as `\ufffd`. Returns None when the body has none.
+fn replace_unpaired_surrogate_escapes(buf: &[u8]) -> Option<Vec<u8>> {
+    rewrite_unpaired_surrogate_escapes(buf, |_| b"\\ufffd".to_vec())
+}
+
+/// Rewrites each `\uD800`-`\uDFFF` escape that is not half of a surrogate pair as `replacement(unit)`. Returns None when the body has none.
+pub(crate) fn rewrite_unpaired_surrogate_escapes(
+    buf: &[u8],
+    mut replacement: impl FnMut(u16) -> Vec<u8>,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] != b'\\' || i + 1 >= buf.len() {
+            out.push(buf[i]);
+            i += 1;
+            continue;
+        }
+        let Some(unit) = hex_unit(&buf[i..]) else {
+            out.extend_from_slice(&buf[i..i + 2]);
+            i += 2;
+            continue;
+        };
+        let paired = (0xd800..0xdc00).contains(&unit)
+            && hex_unit(&buf[i + 6..]).is_some_and(|low| (0xdc00..0xe000).contains(&low));
+        if paired {
+            out.extend_from_slice(&buf[i..i + 12]);
+            i += 12;
+        } else if (0xd800..0xe000).contains(&unit) {
+            out.extend_from_slice(&replacement(unit));
+            changed = true;
+            i += 6;
+        } else {
+            out.extend_from_slice(&buf[i..i + 6]);
+            i += 6;
+        }
+    }
+    changed.then_some(out)
+}

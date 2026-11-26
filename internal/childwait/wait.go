@@ -1,0 +1,381 @@
+// Waiting for a child's output pipes after it exits.
+//
+// Ports packages/coding-agent/src/utils/child-process.ts waitForChildProcess.
+package childwait
+
+import (
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Grace mirrors upstream EXIT_STDIO_GRACE_MS.
+const Grace = 100 * time.Millisecond
+
+// Hooks order the reader, the child's exit and the grace in tests without
+// sleeps. Start takes them by pointer, nil outside tests, so they add nothing to
+// a production Pipes.
+type Hooks struct {
+	// BeforeRead runs in each reader before its first read.
+	BeforeRead func()
+	// AfterData runs in a reader once onData has taken a chunk, with the chunk
+	// onData was lent. A test learns from it that the reader has consumed what
+	// a writer wrote.
+	AfterData func(index int, chunk []byte)
+	// GraceTimer replaces the wall-clock timer that measures the grace, so a
+	// test decides when the grace elapses instead of racing a writer against
+	// host load.
+	GraceTimer func() IdleTimer
+	// GraceExpired runs each time the idle grace elapses, before Wait asks
+	// whether the pipes can still produce output.
+	GraceExpired func()
+	// BeforeDeliver runs in a reader once it has taken bytes from a pipe,
+	// before it hands them to onData: the bytes are out of the pipe and in
+	// no one's hands yet.
+	BeforeDeliver func()
+	// AfterPeek runs in a reader that waits for its turn, once it has asked
+	// whether the pipe of the earlier reader at index earlier holds bytes and
+	// before it asks whether that reader has taken bytes it has not
+	// delivered. That reader can take the pipe's bytes between the two
+	// questions; a test plays that reader here.
+	AfterPeek func(earlier int)
+	// Released runs in Wait once the grace released the pipes and Wait closed
+	// them, before it waits for the readers to stop.
+	Released func()
+}
+
+// IdleTimer is the clock of the grace that Wait measures. Every field is
+// required.
+type IdleTimer struct {
+	// Expired delivers once Grace has elapsed with no chunk.
+	Expired <-chan time.Time
+	// Rearm restarts the grace in full. Wait calls it for each chunk that
+	// arrives after the child exited, and when the grace elapsed while a pipe
+	// held output that no reader had taken.
+	Rearm func()
+	// Stop releases the timer when Wait no longer uses it.
+	Stop func()
+}
+
+// Pipes reads a child's output pipes. Create it with Start before the child
+// runs and call Wait once the child has exited.
+type Pipes struct {
+	files    []*os.File
+	onData   func(index int, chunk []byte)
+	hooks    *Hooks
+	activity chan struct{}
+	done     chan struct{}
+	// released is closed once Wait has closed the pipes, so a reader that waits for an earlier reader's delivery sees its own pipe gone.
+	released    chan struct{}
+	releaseOnce sync.Once
+	// wake[i] holds a token when a reader before i delivered or stopped since the reader of files[i] last looked, so it asks again whether an earlier pipe still
+	// holds output. One token is enough, and a token left over costs one question.
+	wake []chan struct{}
+
+	mu sync.Mutex
+
+	// stopped[i] is set once the reader of files[i] has returned: nothing more
+	// is taken from that pipe, so it holds no output a reader will deliver.
+	stopped []atomic.Bool
+
+	// inflight[i] is set from the moment the reader of files[i] has taken bytes until it has delivered them, so a reader of a later pipe can tell
+	// that earlier output is still on its way.
+	inflight []atomic.Bool
+}
+
+// Start reads each file until it fails or ends, calling onData with the index
+// of the file and the bytes read. Calls to onData never overlap. Every chunk a
+// reader has taken from a pipe is delivered, also when Wait released the pipes
+// meanwhile: Wait returns after the readers stopped, so no call outlives it.
+// The chunk is lent for the call:
+// each pipe reads into one buffer of its own, so onData copies what it keeps.
+func Start(files []*os.File, onData func(index int, chunk []byte), hooks *Hooks) *Pipes {
+	p := newPipes(files, onData, hooks)
+	var readers sync.WaitGroup
+	for index, file := range files {
+		readers.Go(func() {
+			p.read(index, file)
+			p.stopped[index].Store(true)
+			p.handOff(index)
+		})
+	}
+	go func() {
+		readers.Wait()
+		close(p.done)
+	}()
+	return p
+}
+
+func newPipes(files []*os.File, onData func(index int, chunk []byte), hooks *Hooks) *Pipes {
+	p := &Pipes{
+		files:    files,
+		onData:   onData,
+		hooks:    hooks,
+		activity: make(chan struct{}, 1),
+		done:     make(chan struct{}),
+		released: make(chan struct{}),
+		stopped:  make([]atomic.Bool, len(files)),
+		inflight: make([]atomic.Bool, len(files)),
+		wake:     make([]chan struct{}, len(files)),
+	}
+	// The first pipe has no earlier pipe to wait for.
+	for index := 1; index < len(files); index++ {
+		p.wake[index] = make(chan struct{}, 1)
+	}
+	return p
+}
+
+// handOff tells the readers of the pipes after index that the reader of files[index] delivered what it took or stopped, so each asks again whether it must
+// still wait. It never blocks.
+func (p *Pipes) handOff(index int) {
+	for later := index + 1; later < len(p.wake); later++ {
+		select {
+		case p.wake[later] <- struct{}{}:
+		default:
+		}
+	}
+}
+
+//perf:hot
+func (p *Pipes) read(index int, file *os.File) {
+	if p.hooks != nil && p.hooks.BeforeRead != nil {
+		p.hooks.BeforeRead()
+	}
+	// Node reads up to 64 KiB per chunk. One buffer serves every read: a
+	// line-buffered command delivers a few hundred bytes per read, and a
+	// buffer per read cost a zeroed 64 KiB allocation each time.
+	buf := make([]byte, 64*1024)
+	for {
+		claimed, ok := p.awaitTurn(index, file)
+		if !ok {
+			return
+		}
+		n, err := file.Read(buf)
+		if n > 0 {
+			if p.hooks != nil && p.hooks.BeforeDeliver != nil {
+				p.hooks.BeforeDeliver()
+			}
+			p.mu.Lock()
+			if p.onData != nil {
+				p.onData(index, buf[:n])
+			}
+			if p.hooks != nil && p.hooks.AfterData != nil {
+				p.hooks.AfterData(index, buf[:n])
+			}
+			p.mu.Unlock()
+			select {
+			case p.activity <- struct{}{}:
+			default:
+			}
+		}
+		if claimed {
+			p.inflight[index].Store(false)
+			p.handOff(index)
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// awaitTurn waits until the pipe is readable and no earlier pipe (stdout before stderr) holds output that is readable or already taken, then claims the
+// turn so that later pipes wait for this reader's delivery. Node's loop polls the pipes together and handles the readable ones in registration order, so
+// a child that writes stdout and then stderr is seen in that order, which a byte cap that spans both streams makes observable; reader goroutines that
+// each block in their own read would hand it to whichever the scheduler ran first. A pipe that holds nothing is not waited for. claimed is false where
+// poll(2) cannot answer; ok is false once the pipe is closed.
+//
+// A reader that must wait for an earlier pipe sleeps until an earlier reader delivers what it took or stops (handOff), or until Wait releases the pipes:
+// the earlier pipe holds output only until its own reader hands it on, so no clock is needed to notice that it no longer does. A hand-off after the
+// reader's question leaves a token that ends its sleep at once, so none is missed.
+func (p *Pipes) awaitTurn(index int, file *os.File) (claimed, ok bool) {
+	for {
+		readable, closed := pollReadable(file, 10)
+		if closed {
+			return false, false
+		}
+		if !readable {
+			if !pollSupported {
+				return false, true
+			}
+			continue
+		}
+		if !pollSupported {
+			return false, true
+		}
+		if !p.blockedByEarlier(index) {
+			p.inflight[index].Store(true)
+			return true, true
+		}
+		//portlint:allow golifetime the loop ends through p.released, which Wait closes, and when the pipe closes or polling is unsupported
+		select {
+		case <-p.wake[index]:
+		case <-p.released:
+		}
+	}
+}
+
+// blockedByEarlier reports whether a pipe before index holds output that has not been delivered.
+func (p *Pipes) blockedByEarlier(index int) bool {
+	for earlier := range index {
+		if p.holdsOutput(earlier) {
+			return true
+		}
+	}
+	return false
+}
+
+// holdsOutput reports whether the pipe of the earlier reader holds output that has not been delivered: bytes still in the pipe, or bytes its reader has taken
+// and not yet handed to onData.
+//
+// The pipe is asked first and the reader second, and the order is the point. A reader sets inflight before it takes bytes from its pipe and clears it
+// after it delivered them, so a pipe that has just been emptied by its reader has inflight set until the delivery is done. Asked the other way round, a
+// reader that claims its turn and empties the pipe between the two questions is seen by neither: its flag was clear when asked and the pipe is empty
+// when peeked, and the later reader delivers first.
+func (p *Pipes) holdsOutput(earlier int) bool {
+	if p.stopped[earlier].Load() {
+		return false
+	}
+	pending := pollPending(p.files[earlier])
+	if p.hooks != nil && p.hooks.AfterPeek != nil {
+		p.hooks.AfterPeek(earlier)
+	}
+	return pending || p.inflight[earlier].Load()
+}
+
+// graceVerdict is what Wait learns when the grace elapses.
+type graceVerdict int
+
+const (
+	// pipesQuiet: a process may still hold a write end, and the readers have taken everything the pipes hold. The grace measured the writers' silence,
+	// which is what upstream's idle timer measures: release the pipes.
+	pipesQuiet graceVerdict = iota
+	// pipesBehind: a pipe holds output that no reader has taken yet. The grace measured the readers' latency, not the writers' silence: keep waiting.
+	pipesBehind
+	// pipesEnded: no process holds a write end, so EOF follows the output the pipes hold: read to EOF.
+	pipesEnded
+)
+
+// Wait mirrors the post-exit half of upstream waitForChildProcess: once the
+// child has exited, keep reading until every pipe ends, or until no data has
+// arrived on any pipe for Grace (re-armed on every chunk). A descendant that
+// inherited a pipe therefore neither blocks the call nor truncates output it
+// is still writing. Wait then closes the pipes, discards what a held pipe
+// still holds unread when the grace released the wait (a reader that has
+// taken a chunk delivers it), and returns after every reader has stopped. It
+// reports whether every pipe ended.
+//
+// The grace exists only for a descendant that still holds a pipe, and it
+// measures that holder's silence, not a reader's latency. A reader that a busy
+// machine has not scheduled for a grace has taken nothing yet from a command
+// that exited long before, and the grace must not release the pipe on it: what
+// the exited command wrote is output, as it is for upstream, which keeps
+// reading while a pipe delivers (Pi's regression test for
+// earendil-works/pi#5303 drives the grace with virtual time because host load
+// reorders a real subprocess's writes and the grace timer). So when the grace
+// expires:
+//
+//   - mayHoldOutput reports whether a process can still hold a pipe that the
+//     kernel cannot tell Wait about (a Windows job that is empty holds none).
+//     If none can, every write end is closed, EOF follows once the readers have
+//     drained what the child's tree already wrote, and Wait reads to EOF.
+//   - On Unix the kernel answers for each pipe (pollPipe). A pipe with no write
+//     end left ends the same way. A pipe that holds bytes no reader has taken
+//     is a reader that fell behind: the grace is armed again, and the readers
+//     deliver what the exited command had already written.
+//   - Only a pipe that a process still holds and that holds no unread byte is
+//     the quiet holder the grace is for: Wait releases it.
+func (p *Pipes) Wait(mayHoldOutput func() bool) bool {
+	// Upstream re-arms the timer only for data that arrives after exit.
+	select {
+	case <-p.activity:
+	default:
+	}
+	closed := waitIdle(p.done, p.activity, func() graceVerdict { return p.verdict(mayHoldOutput) }, p.hooks)
+	for _, file := range p.files {
+		_ = file.Close()
+	}
+	p.releaseOnce.Do(func() { close(p.released) })
+	if p.hooks != nil && p.hooks.Released != nil {
+		p.hooks.Released()
+	}
+	<-p.done
+	return closed
+}
+
+// verdict is what the grace that just elapsed measured: see Wait.
+func (p *Pipes) verdict(mayHoldOutput func() bool) graceVerdict {
+	if !mayHoldOutput() {
+		return pipesEnded
+	}
+	ended, behind := true, false
+	for index, file := range p.files {
+		if p.stopped[index].Load() {
+			continue
+		}
+		hungUp, unread, known := pollPipe(file)
+		switch {
+		case !known:
+			// The kernel cannot say: upstream's idle timer decides.
+			return pipesQuiet
+		case hungUp:
+			// Every write end is closed; EOF follows what the pipe still holds.
+		case unread:
+			ended, behind = false, true
+		default:
+			ended = false
+		}
+	}
+	switch {
+	case ended:
+		return pipesEnded
+	case behind:
+		return pipesBehind
+	}
+	return pipesQuiet
+}
+
+func waitIdle(done, activity <-chan struct{}, verdict func() graceVerdict, hooks *Hooks) bool {
+	var (
+		wall    *time.Timer
+		fake    IdleTimer
+		expired <-chan time.Time
+	)
+	if hooks != nil && hooks.GraceTimer != nil {
+		fake = hooks.GraceTimer()
+		expired = fake.Expired
+		defer fake.Stop()
+	} else {
+		wall = time.NewTimer(Grace)
+		expired = wall.C
+		defer wall.Stop()
+	}
+	rearm := func() {
+		if wall != nil {
+			wall.Reset(Grace)
+		} else {
+			fake.Rearm()
+		}
+	}
+	for {
+		select {
+		case <-done:
+			return true
+		case <-activity:
+			rearm()
+		case <-expired:
+			if hooks != nil && hooks.GraceExpired != nil {
+				hooks.GraceExpired()
+			}
+			switch verdict() {
+			case pipesEnded:
+				<-done
+				return true
+			case pipesBehind:
+				rearm()
+			default:
+				return false
+			}
+		}
+	}
+}

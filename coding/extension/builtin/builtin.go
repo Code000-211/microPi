@@ -1,0 +1,68 @@
+// Package builtin is the registry of upstream's built-in extensions that PiG implements natively: the
+// `builtin:<name>` extension paths of codemode and tool-search (docs/specs/builtin-codemode-tool-search.md).
+//
+// Ports packages/coding-agent/src/extensions/index.ts (builtInExtensions).
+package builtin
+
+import (
+	"fmt"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+)
+
+// PathPrefix starts the path of a built-in extension, as in `builtin:codemode`.
+//
+// Ports packages/coding-agent/src/core/source-info.ts (BUILTIN_PATH_PREFIX).
+const PathPrefix = "builtin:"
+
+// Extension is one built-in extension.
+type Extension struct {
+	// Name is the part of the path after PathPrefix.
+	Name string
+	// Replaceable leaves the extension out when another extension registers a tool, command or flag it registers.
+	Replaceable bool
+	// Factory builds the extension: the Go counterpart of the factory that is the module's default export.
+	Factory extension.ExtensionFactory
+}
+
+// Path is the extension path, `builtin:<name>`.
+func (e Extension) Path() string { return PathPrefix + e.Name }
+
+// Options configures the built-in extensions that need the session's settings or a cache location.
+type Options struct {
+	// Codemode configures the codemode extension (unused when built with the `pig_strip_codemode` tag).
+	Codemode CodemodeOptions
+	// Mcp configures the MCP extension (unused when built with the `pig_strip_mcp` tag).
+	Mcp McpOptions
+}
+
+// All lists the built-in extensions in upstream's order, then PiG's own `pig-login`. A stripped built-in has no row.
+// pig additive (D92): each row comes from a registration shim a Piglet Binary compiles out with pig_strip_<name>.
+func All(options Options) []Extension {
+	registerCompiledInReferences()
+	entries := append(codemodeEntries(options), toolSearchEntries()...)
+	entries = append(entries, mcpEntries(options)...)
+	// pig divergence (D2): the sprite login is PiG's own built-in; upstream's index.ts lists no such entry.
+	return append(entries, pigLoginEntries()...)
+}
+
+// registerCompiledInReferences makes the built-ins that are linked the ones an extension names by reference (createCodemodeExtension, createToolSearchExtension), as
+// the session graph looks them up (internal/compiledin). It runs where the host assembles its built-ins, not when this package is linked: linking a package adds no
+// compiled-in code to a session (coding/extension/factoryload TestNoPackageLevelFactoryRegistry).
+func registerCompiledInReferences() {
+	registerCodemodeReference()
+	registerToolSearchReference()
+}
+
+// Resolve returns the built-in extension a `builtin:<name>` path names. An unknown name fails with upstream's
+// message.
+//
+// Ports packages/coding-agent/src/core/resource-loader.ts (loadExtensionPaths).
+func Resolve(path string, options Options) (Extension, error) {
+	for _, entry := range All(options) {
+		if entry.Path() == path {
+			return entry, nil
+		}
+	}
+	return Extension{}, fmt.Errorf("Unknown built-in extension: %s", path)
+}

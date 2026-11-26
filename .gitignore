@@ -82,3 +82,30 @@ npm/install.sh
 
 # gh runtime state
 .local/
+
+# --- Go / PiG ---
+bin/
+/build/
+tmp/
+*.exe
+*.test
+*.out
+*.prof
+*.pprof
+*.trace
+/pig
+/upi
+/gopi
+/gen-models
+.gopi/
+/durable/core/dist/
+coding/extension/host/runtimecell/cache/
+extensions/sdk*/.pig-sdk-version
+/test/parity/interface-closure/autobind/autobind
+/durable/core/contracttest/cmd/*/benchhost
+/durable/core/contracttest/cmd/*/replayhost
+/durable/core/contracttest/cmd/*/countgate
+/durable/core/contracttest/cmd/*/scprovider
+/result
+/result-*
+

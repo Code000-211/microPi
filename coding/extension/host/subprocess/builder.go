@@ -1,0 +1,1259 @@
+package subprocess
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"hash"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/configroot"
+	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/linkerexec"
+
+	"github.com/BurntSushi/toml"
+	"golang.org/x/mod/modfile"
+
+	"github.com/MichaelKinsy/PiG/coding/extension/host/runtimecell"
+	extsource "github.com/MichaelKinsy/PiG/coding/extension/source"
+	"github.com/MichaelKinsy/PiG/internal/buildprogress"
+	"github.com/MichaelKinsy/PiG/internal/execfile"
+	"github.com/MichaelKinsy/PiG/internal/pigsdklock"
+	"github.com/MichaelKinsy/PiG/internal/toolchain"
+)
+
+// BuildResult holds the outcome of an auto-build.
+type BuildResult struct {
+	BinaryPath string // path to the built (or cached) binary
+	Cached     bool   // true if cache hit: no rebuild needed
+	Hash       string // source content hash used for the cache key
+	Language   string // detected build type (go | rust | node)
+}
+
+// Builder handles automatic compilation and caching of source-based extensions.
+// It detects the build system (Go or Rust) from the source directory and uses
+// content-hash caching so unchanged sources produce instant startup.
+//
+// Cache layout: ~/.pig/cache/ext/<name>-<hash>[.exe]
+type Builder struct {
+	cacheDir   string
+	configRoot string
+
+	// verifyStagedSDK, when set, reports whether a staged SDK directory matches
+	// the SDK compiled into this binary. The staged copy lives outside core, so
+	// the owner injects the comparison rather than core reaching for it. A
+	// mismatch means every extension compiles against an SDK the host does not
+	// speak, which surfaces as a fixed bug reappearing.
+	verifyStagedSDK func(stagedDir, buildType string) error
+}
+
+// SetStagedSDKVerifier installs the staged-SDK freshness check. Without one the
+// builder only requires the directory to exist.
+func (b *Builder) SetStagedSDKVerifier(fn func(stagedDir, buildType string) error) {
+	b.verifyStagedSDK = fn
+}
+
+var stagedSDKVerifierFactory atomic.Pointer[func(configRoot string) func(stagedDir, buildType string) error]
+
+// SetDefaultStagedSDKVerifier registers the factory of the staged-SDK freshness check that hosts started by library entry points
+// (coding.DiscoverAndLoadExtensions) install. Linking coding/extension/pigsdk, which embeds and stages the SDKs, registers it, so
+// a program that imports the coding library without the SDKs does not link the SDK sources the check compares against.
+func SetDefaultStagedSDKVerifier(factory func(configRoot string) func(stagedDir, buildType string) error) {
+	stagedSDKVerifierFactory.Store(&factory)
+}
+
+// DefaultStagedSDKVerifier is the registered check for the configuration root, or nil when no program registered one.
+func DefaultStagedSDKVerifier(configRoot string) func(stagedDir, buildType string) error {
+	if factory := stagedSDKVerifierFactory.Load(); factory != nil {
+		return (*factory)(configRoot)
+	}
+	return nil
+}
+
+// NewBuilder creates a builder with the given cache directory.
+// Typically <config-root>/cache/ext/.
+func NewBuilder(cacheDir string) *Builder {
+	return NewBuilderWithConfigRoot(cacheDir, configroot.Dir())
+}
+
+// NewBuilderWithConfigRoot creates a builder pinned to the same writable
+// config root as the running Pig process. Product assembly should prefer this
+// form so an overridden HOME/XDG root cannot diverge from extension builds.
+func NewBuilderWithConfigRoot(cacheDir, configRoot string) *Builder {
+	if abs, err := filepath.Abs(cacheDir); err == nil {
+		cacheDir = abs
+	}
+	if strings.TrimSpace(configRoot) == "" {
+		configRoot = configroot.Dir()
+	}
+	if abs, err := filepath.Abs(configRoot); err == nil {
+		configRoot = abs
+	}
+	return &Builder{cacheDir: cacheDir, configRoot: configRoot}
+}
+
+// Build compiles the extension source at srcDir if needed. Returns the path
+// to the binary (cached or freshly built).
+//
+// Detection:
+//   - go.mod present → Go extension (go build)
+//   - Cargo.toml present → Rust extension (cargo build --release)
+//   - package.json / *.ts / *.js → Node/TypeScript extension (launcher script)
+//
+// The binary is cached at <cacheDir>/<name>-<hash>. If the hash matches an
+// existing cached binary, no build occurs (instant startup).
+func (b *Builder) Build(name, srcDir string) (*BuildResult, error) {
+	return b.BuildContext(context.Background(), name, srcDir)
+}
+
+// BuildContext builds an extension and cancels compiler subprocesses when ctx ends. Independent sources may build concurrently; PublishArtifact deduplicates each content identity and publishes it atomically. Build retains the background-context entry point.
+func (b *Builder) BuildContext(ctx context.Context, name, srcDir string) (*BuildResult, error) {
+	// pig additive (D20): the host bounds independent cell preparations; the content-addressed publisher owns same-artifact exclusion.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Resolve srcDir to absolute.
+	abs, err := filepath.Abs(srcDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve source dir: %w", err)
+	}
+	srcDir = abs
+
+	// Detect build system.
+	buildType, err := detectBuildType(srcDir)
+	if err != nil {
+		return nil, err
+	}
+	if buildType == "node" {
+		// pig additive (D92): a Piglet that strips node-extensions reports it before any cache work.
+		if err := nodeRuntimeUnavailable(); err != nil {
+			return nil, err
+		}
+	}
+	// reuseOnly returns a published entry, or nil without building or waiting.
+	build := func(reuseOnly bool) (*BuildResult, error) {
+		stagedSDK, err := b.resolveStagedSDK(srcDir, buildType)
+		if err != nil {
+			return nil, err
+		}
+
+		// Compute content hash of source files, and the stamp that lets the build prove they did not change.
+		hash, stamp, err := hashSourceDirStamped(srcDir, buildType)
+		if err != nil {
+			return nil, fmt.Errorf("hash source: %w", err)
+		}
+		if stagedSDK != "" {
+			hash, err = hashWithStagedSDK(hash, stagedSDK, buildType)
+			if err != nil {
+				return nil, fmt.Errorf("hash staged %s SDK: %w", buildType, err)
+			}
+		}
+
+		// A Piglet Binary may embed a prebuilt binary for this source-mode extension.
+		// Consulting the resolver here (before any compile) lets a toolchain-less
+		// Piglet Binary serve it without cargo/go. Nil resolver (stock pig) falls through.
+		if bin, ok := runtimecell.ResolvePrebuilt(runtimecell.PrebuiltRequest{
+			Language: buildType, Key: name, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
+			Extensions: []runtimecell.PrebuiltExtension{{Name: name, Hash: hash}},
+		}); ok {
+			return &BuildResult{BinaryPath: bin, Cached: true, Hash: hash, Language: buildType}, nil
+		}
+
+		// Content-addressed cache entry: <name>-<fullhash>/bin. Sharing the runtime
+		// cell publish primitive gives source-mode extensions the same cross-process
+		// dedup as packed cells: parallel Pig instances building the same extension
+		// take a per-digest lock, so exactly one compiles and the rest reuse the
+		// published binary instead of racing on a shared cache path.
+		finalDir := filepath.Join(b.cacheDir, fileNameComponent(name)+"-"+hash)
+		// A Node launcher keeps a sibling <bin>.runtime/ tree next to the launcher;
+		// every other build type publishes a single self-contained binary.
+		if reuseOnly {
+			entry, ok := runtimecell.ReusePublishedArtifact(finalDir, runtimecell.EntryIdentity{InputDigest: hash, Artifact: extensionArtifactName(runtime.GOOS, buildType), Language: buildType})
+			if !ok || !fileExists(filepath.Join(finalDir, sdkFingerprintFile)) {
+				return nil, nil
+			}
+			return &BuildResult{BinaryPath: entry.ArtifactPath, Cached: true, Hash: hash, Language: buildType}, nil
+		}
+		artifactName := extensionArtifactName(runtime.GOOS, buildType)
+		var keepAlso []string
+		if buildType == "node" {
+			keepAlso = []string{artifactName + ".runtime"}
+		}
+		entry, err := runtimecell.PublishArtifact(ctx, finalDir, artifactName, hash, buildType, func(scratch string) (string, error) {
+			// Preflight the compiler toolchain before announcing a build, so a
+			// toolchain-less host gets actionable guidance instead of an opaque exec
+			// error deep in go build / cargo build. Piglet Binaries and prebuilt
+			// packages ship compiled binaries served by the resolver above or reused
+			// from a warm cache, so neither reaches this build closure.
+			if err := ensureBuildToolchain(ctx, buildType); err != nil {
+				return "", err
+			}
+			out := filepath.Join(scratch, artifactName)
+			switch buildType {
+			case "go":
+				if err := buildGo(ctx, filepath.Dir(b.cacheDir), srcDir, out, stagedSDK); err != nil {
+					return "", err
+				}
+			case "rust":
+				if err := buildRust(ctx, filepath.Dir(b.cacheDir), srcDir, out, stagedSDK); err != nil {
+					return "", err
+				}
+			case "node":
+				if err := buildNode(ctx, b.cacheDir, srcDir, out); err != nil {
+					return "", fmt.Errorf("node launcher: %w", err)
+				}
+			}
+			// The compiler read the sources after the hash, past the wait for a peer's build and through its own compile. A
+			// source edited since is compiled into an artifact its digest does not describe, which the cache would serve for
+			// the original source once the edit is reverted. A Node launcher bakes no source.
+			if buildType != "node" {
+				if err := sourceUnchanged(srcDir, buildType, stamp); err != nil {
+					return "", err
+				}
+			}
+			return out, nil
+		}, keepAlso...)
+		if err != nil {
+			return nil, err
+		}
+		// Record the SDK this build compiled against. A later SDK change makes the
+		// build unreachable (the cache key folds the SDK in), and the fingerprint is
+		// what lets a prune prove that rather than guess from age.
+		//
+		// The SDK reaches a build two ways: injected from the staged copy, or via
+		// the extension's own local replace. Both must be fingerprinted. An
+		// extension whose replace already resolves never takes the staged path, so
+		// keying only on stagedSDK would leave every such build unfingerprinted and
+		// indistinguishable from one of unknown provenance.
+		if fp, err := b.buildSDKFingerprint(srcDir, stagedSDK, buildType); err == nil && fp != "" {
+			recordSDKFingerprint(filepath.Dir(entry.ArtifactPath), fp)
+		}
+
+		return &BuildResult{BinaryPath: entry.ArtifactPath, Cached: entry.Reused, Hash: hash, Language: buildType}, nil
+	}
+	if b.needsStagedSDK(srcDir, buildType) {
+		// A warm entry is found without the staged-SDK lease: its content hash
+		// covers the staged SDK, so a hash read during another process's restage
+		// names no published entry and falls through to the leased path.
+		if result, err := build(true); err == nil && result != nil {
+			return result, nil
+		}
+		return pigsdklock.WithBuild(ctx, b.configRoot, func() (*BuildResult, error) { return build(false) })
+	}
+	return build(false)
+}
+
+// needsStagedSDK reports whether a build of srcDir compiles against the SDK
+// staged under b's config root rather than the extension's own local SDK.
+func (b *Builder) needsStagedSDK(srcDir, buildType string) bool {
+	// A config root that stages no SDK for buildType has no retired stagings to
+	// recognize; the empty directory leaves every resolving local SDK in force.
+	stagedDir, _ := pigsdklock.StagedSDKDir(b.configRoot, buildType)
+	switch buildType {
+	case "go":
+		return goNeedsStagedSDK(srcDir, stagedDir)
+	case "rust":
+		return rustNeedsStagedSDK(srcDir, stagedDir)
+	default:
+		return false
+	}
+}
+
+// detectBuildType determines the build system from a source path.
+// src may be a directory (Go/Rust/Node package) or a direct .ts/.js file.
+func detectBuildType(src string) (string, error) {
+	if info, err := os.Stat(src); err == nil && !info.IsDir() {
+		if isNodeSourcePath(src) {
+			return "node", nil
+		}
+		return "", fmt.Errorf("cannot detect build type in %s: unsupported source file", src)
+	}
+	if _, err := os.Stat(filepath.Join(src, "go.mod")); err == nil {
+		return "go", nil
+	}
+	if _, err := os.Stat(filepath.Join(src, "Cargo.toml")); err == nil {
+		return "rust", nil
+	}
+	if hasNodeSource(src) {
+		return "node", nil
+	}
+	if lisp.hasSource != nil && lisp.hasSource(src) {
+		return "lisp", nil
+	}
+	return "", fmt.Errorf("cannot detect build type in %s: need go.mod, Cargo.toml, package.json, a .ts/.js entrypoint, or an ASDF .asd/.lisp factory", src)
+}
+
+// sourceUnchanged reports an error when the source files of srcDir no longer hash to the stamp read before the build. Nothing is
+// cached for a build that raced an edit; the next start hashes the edited source and builds it.
+func sourceUnchanged(srcDir, buildType, stamp string) error {
+	_, now, err := hashSourceDirStamped(srcDir, buildType)
+	if err != nil {
+		return fmt.Errorf("hash %s after its build: %w", srcDir, err)
+	}
+	if now != stamp {
+		return fmt.Errorf("the source of %s changed while it was being built, so nothing was cached; start again to build the current source", srcDir)
+	}
+	return nil
+}
+
+// hashSourceDir computes a SHA-256 hash of all relevant source files.
+func hashSourceDir(src, buildType string) (string, error) {
+	digest, _, err := hashSourceDirStamped(src, buildType)
+	return digest, err
+}
+
+// hashSourceDirStamped is hashSourceDir that also returns the stamp of the same inputs: their hash without the lock files a compiler
+// writes into the source directory (cargo creates or rewrites Cargo.lock there). A stamp read before a build and one read after it
+// are equal unless a source file changed in between, which the digests cannot say for a crate that has no Cargo.lock yet.
+func hashSourceDirStamped(src, buildType string) (digest, stamp string, err error) {
+	lexicalRoot, err := filepath.Abs(src)
+	if err != nil {
+		return "", "", err
+	}
+	physicalRoot, err := filepath.EvalSymlinks(lexicalRoot)
+	if err != nil {
+		return "", "", err
+	}
+	src = physicalRoot
+	h := sha256.New()
+	s := sha256.New()
+	mix := func(b []byte) { h.Write(b); s.Write(b) }
+	mix([]byte(buildType))
+	if buildType == "node" {
+		// Node launchers embed the absolute entrypoint path. Include the
+		// lexical source path so a moved checkout cannot reuse a stale
+		// wrapper that points at the previous location. Source bytes and
+		// relative dependencies are read from the resolved physical root.
+		mix([]byte(lexicalRoot))
+		mix([]byte(nodeRuntimeVersion))
+		mix([]byte(nodeLauncherFormat))
+		// The embedded runtime's digest: changes to runtime.mjs, cli.mjs,
+		// the loader, or any shim invalidate cached launchers without
+		// requiring a manual nodeRuntimeVersion bump.
+		mix(nodeRuntimeDigest())
+	}
+
+	var exts []string
+	switch buildType {
+	case "go":
+		exts = []string{".go", ".mod", ".sum"}
+	case "rust":
+		exts = []string{".rs", ".toml", ".lock"}
+	case "node":
+		exts = []string{".ts", ".js", ".mjs", ".cjs", ".json"}
+	case "lisp":
+		exts = []string{".lisp", ".asd"}
+	}
+
+	info, err := os.Stat(src)
+	if err != nil {
+		return "", "", err
+	}
+	if !info.IsDir() {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return "", "", err
+		}
+		mix([]byte(filepath.Base(src)))
+		mix(data)
+		digest = hex.EncodeToString(h.Sum(nil))
+		return digest, digest, nil
+	}
+
+	if err := hashDirSourcesStamped(h, s, src, exts); err != nil {
+		return "", "", err
+	}
+
+	// Go extensions resolve the pig SDK (and any other local dependency)
+	// through `replace` directives that point outside the extension directory.
+	// `go build` embeds that replaced source, so a change there produces a
+	// different binary. Hash the replaced directories too: without this,
+	// editing the SDK leaves the extension's own files untouched, the cache
+	// key is unchanged, and pig keeps serving a binary built against the old
+	// SDK: which silently breaks the host↔extension wire contract
+	// (MaxFrameSize, register fields) the instant the host advances. The
+	// replaced path is mixed in as well so relocating the SDK also
+	// invalidates the cache.
+	if buildType == "go" {
+		dirs, err := goLocalReplaceDirs(src)
+		if err != nil {
+			return "", "", err
+		}
+		for _, dir := range dirs {
+			mix([]byte("\x00replace\x00"))
+			mix([]byte(dir))
+			if err := hashDirSourcesStamped(h, s, dir, exts); err != nil {
+				return "", "", err
+			}
+		}
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), hex.EncodeToString(s.Sum(nil)), nil
+}
+
+// hashDirSources walks root and mixes every source file whose name ends in one
+// of exts into h, keyed by its path relative to root, in deterministic
+// filepath.WalkDir order. Hidden, vendor, build-output (named target or dist,
+// or marked with CACHEDIR.TAG), and dependency directories are skipped to
+// match what the compiler actually reads, and a directory that vanishes while
+// the walk runs held no source.
+func hashDirSources(h hash.Hash, root string, exts []string) error {
+	return hashDirSourcesStamped(h, nil, root, exts)
+}
+
+// hashDirSourcesStamped is hashDirSources that mixes the same files into stamp too, except the lock files a compiler writes into the
+// source directory. A nil stamp is skipped.
+func hashDirSourcesStamped(h, stamp hash.Hash, root string, exts []string) error {
+	// relBytes carries each relative path to the hashes. Writing []byte(rel) to a hash.Hash allocates a copy per call, two per source
+	// file; the walk of an extension that replaces the pig SDK visits every SDK source file, so the copies were about a sixth of its allocations.
+	var relBytes []byte
+	return walkDirSources(root, exts, func(path, rel string) error {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		relBytes = append(relBytes[:0], rel...)
+		h.Write(relBytes)
+		h.Write(data)
+		if stamp != nil && !strings.HasSuffix(path, ".lock") {
+			stamp.Write(relBytes)
+			stamp.Write(data)
+		}
+		return nil
+	})
+}
+
+// walkDirSources calls visit with the path, and the path relative to root, of
+// each source file hashDirSources mixes, in its order.
+func walkDirSources(root string, exts []string, visit func(path, rel string) error) error {
+	physicalRoot, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	physicalRoot, err = filepath.EvalSymlinks(physicalRoot)
+	if err != nil {
+		return err
+	}
+	// WalkDirShared, like filepath.WalkDir, does not traverse a symlink used as its root. Resolve only the
+	// admitted root; nested symlink entries remain excluded by the walk.
+	root = physicalRoot
+	vanish := runtimecell.NewVanishTracker()
+	if err := runtimecell.WalkDirShared(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A directory deleted after its parent listed it held no source of this build, as in runtimecell's hashGoModuleDir
+			// (on Windows one still being deleted fails to open instead of reporting not-exist; see VanishTracker). A directory
+			// or source file that is there and cannot be read is not that: the hash fails closed.
+			if path != root && d.IsDir() && vanish.Vanished(path, err) {
+				return filepath.SkipDir
+			}
+			return err
+		}
+		if d.IsDir() {
+			base := d.Name()
+			if path != root && (strings.HasPrefix(base, ".") || base == "target" || base == "vendor" || base == "node_modules" || base == "dist") {
+				return filepath.SkipDir
+			}
+			// A tree marked CACHEDIR.TAG (a Cargo target directory, whatever its name) is build output. Not opening
+			// any directory below it keeps the hash from failing on the temp directories the build removes mid-walk.
+			if path != root {
+				tagged, err := runtimecell.IsCacheDirectory(path)
+				if err != nil {
+					if vanish.Vanished(path, err) {
+						return filepath.SkipDir
+					}
+					return err
+				}
+				if tagged {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		// Skip transient per-build artifacts. buildGo writes a uniquely-named
+		// temp go.mod/go.sum (.pig-build-*) into the extension source dir for the
+		// staged-SDK build. Hashing it let concurrent builds in separate
+		// processes observe each other's transient temp modfiles and mint a
+		// divergent cache key per instance for identical source -- cache
+		// thrashing and redundant rebuilds when many pig instances share an
+		// extension. The temp modfile is not real source; the staged SDK it
+		// points at is already hashed separately via hashWithStagedSDK.
+		if strings.HasPrefix(d.Name(), ".pig-build-") {
+			return nil
+		}
+		for _, ext := range exts {
+			if strings.HasSuffix(path, ext) {
+				rel, _ := filepath.Rel(root, path)
+				return visit(path, rel)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return vanish.Verify()
+}
+
+// goLocalReplaceDirs returns physical existing directories that srcDir's go.mod
+// replaces with a local filesystem path. These hold dependency source, most
+// importantly the Pig extension SDK, that the build embeds. An explicit local
+// replacement participates even when its lexical path is inside srcDir because
+// the general source walk deliberately skips nested symlinks and hidden trees.
+func goLocalReplaceDirs(srcDir string) ([]string, error) {
+	physicalSource, err := filepath.EvalSymlinks(srcDir)
+	if err != nil {
+		return nil, err
+	}
+	srcDir = physicalSource
+	modPath := filepath.Join(srcDir, "go.mod")
+	data, err := os.ReadFile(modPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	// A malformed go.mod is left to `go build` to report; the go.mod bytes are
+	// already hashed directly by hashDirSources, so skipping replace resolution
+	// here forgoes only the extra invalidation, never something already
+	// captured.
+	f, err := modfile.Parse(modPath, data, nil)
+	if err != nil {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var dirs []string
+	for _, r := range f.Replace {
+		// Module-to-module replacements (=> other/module v1.2.3) carry a
+		// version and are fetched from the module cache, not local source.
+		if r.New.Version != "" {
+			continue
+		}
+		target := r.New.Path
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(srcDir, target)
+		}
+		target = filepath.Clean(target)
+		physicalTarget, err := filepath.EvalSymlinks(target)
+		if err != nil {
+			continue // unresolved replace; the build will surface it
+		}
+		info, err := os.Stat(physicalTarget)
+		if err != nil || !info.IsDir() {
+			continue // unresolved replace; the build will surface it
+		}
+		target = physicalTarget
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		dirs = append(dirs, target)
+	}
+	slices.Sort(dirs)
+	return dirs, nil
+}
+
+// isWithin reports whether target is base or a path nested under it.
+func isWithin(base, target string) bool {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+const (
+	goSDKModule  = "github.com/MichaelKinsy/PiG/extensions/sdk"
+	rustSDKCrate = "pig-sdk"
+)
+
+// buildSDKFingerprint identifies the SDK a build compiled against, whether it
+// came from the staged copy or from the extension's own resolving replace.
+// Fingerprinting content rather than location means a replace pointing at the
+// staged SDK (directly or through a symlink) produces the same value, so such a
+// build is correctly recognised as current.
+func (b *Builder) buildSDKFingerprint(srcDir, stagedSDK, buildType string) (string, error) {
+	if stagedSDK != "" {
+		return StagedSDKFingerprint(stagedSDK, buildType)
+	}
+	if buildType != "go" {
+		return "", nil
+	}
+	dirs, err := goLocalReplaceDirs(srcDir)
+	if err != nil || len(dirs) == 0 {
+		return "", err
+	}
+	for _, dir := range dirs {
+		if fp, err := StagedSDKFingerprint(dir, buildType); err == nil {
+			return fp, nil
+		}
+	}
+	return "", nil
+}
+
+func (b *Builder) resolveStagedSDK(srcDir, buildType string) (string, error) {
+	var label string
+	switch buildType {
+	case "go":
+		label = "Go"
+	case "rust":
+		label = "Rust"
+	default:
+		return "", nil
+	}
+	if !b.needsStagedSDK(srcDir, buildType) {
+		return "", nil
+	}
+	// pig additive (D92): this binary staged no SDK for a language the active Piglet strips.
+	if err := runtimecell.StrippedSDKError(buildType); err != nil {
+		return "", err
+	}
+	stagedDir, err := pigsdklock.StagedSDKDir(b.configRoot, buildType)
+	if err != nil {
+		return "", err
+	}
+	if info, err := os.Stat(stagedDir); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("staged %s SDK is missing at %s; run `pig reload` with the active config root", label, stagedDir)
+	}
+	if b.verifyStagedSDK != nil {
+		if err := b.verifyStagedSDK(stagedDir, buildType); err != nil {
+			return "", err
+		}
+	}
+	return stagedDir, nil
+}
+
+// goNeedsStagedSDK reports whether srcDir's module must build against
+// stagedDir, the Go SDK staged now, instead of its own SDK replace.
+func goNeedsStagedSDK(srcDir, stagedDir string) bool {
+	path := filepath.Join(srcDir, "go.mod")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	file, err := modfile.Parse(path, data, nil)
+	if err != nil {
+		return false
+	}
+	required := false
+	for _, requirement := range file.Require {
+		// pig additive (D19): legacy imports use a build-local alias of the current SDK, not an obsolete authored replacement.
+		if requirement.Mod.Path == extsource.LegacyGoSDKModulePath {
+			return true
+		}
+		if requirement.Mod.Path == goSDKModule {
+			required = true
+		}
+	}
+	if !required {
+		return false
+	}
+	for _, replacement := range file.Replace {
+		if replacement.Old.Path == goSDKModule {
+			// A filesystem replace is authoritative only if its target resolves.
+			// In the source tree the scaffold's relative replace points at the
+			// real SDK module; once installed to ~/.pig/extensions that path is
+			// dead, so the staged SDK must override it (buildGo does this via a
+			// temp -modfile, leaving the installed go.mod untouched). A
+			// module-version replace is a registry redirect and stands.
+			if replacement.New.Version != "" {
+				return false
+			}
+			resolved := replacement.New.Path
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(srcDir, resolved)
+			}
+			if _, err := os.Stat(resolved); err != nil {
+				return true
+			}
+			// A replace into the config root's SDK staging area that misses
+			// stagedDir names an SDK an earlier host build staged and never
+			// deleted (a link made to it before an update keeps resolving), so
+			// it is overridden like a dead path.
+			return runtimecell.RetiredStagedSDK(resolved, stagedDir)
+		}
+	}
+	return true
+}
+
+// rustNeedsStagedSDK reports whether srcDir's crate must build against
+// stagedDir, the Rust SDK staged now, instead of its own SDK path dependency.
+func rustNeedsStagedSDK(srcDir, stagedDir string) bool {
+	var manifest struct {
+		Dependencies map[string]any `toml:"dependencies"`
+	}
+	if _, err := toml.DecodeFile(filepath.Join(srcDir, "Cargo.toml"), &manifest); err != nil {
+		return false
+	}
+	dependency, ok := manifest.Dependencies[rustSDKCrate]
+	if !ok {
+		return false
+	}
+	if config, ok := dependency.(map[string]any); ok {
+		if path, _ := config["path"].(string); path != "" {
+			// A path dependency is authoritative only if it resolves. In the
+			// source tree the scaffold's relative path points at the real SDK
+			// crate, so no staging is needed. Once the extension is installed to
+			// ~/.pig/extensions that relative path is dead, so the staged SDK
+			// must redirect it (buildRust isolates the crate to do so without
+			// mutating the shared manifest).
+			resolved := path
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(srcDir, resolved)
+			}
+			// A path into the staging area that misses stagedDir is a retired
+			// staging, overridden like a dead path (see goNeedsStagedSDK).
+			if _, err := os.Stat(filepath.Join(resolved, "Cargo.toml")); err == nil && !runtimecell.RetiredStagedSDK(resolved, stagedDir) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// hashWithStagedSDK folds the staged SDK's source digest into baseHash, the
+// extension's own source hash.
+func hashWithStagedSDK(baseHash, sdkDir, buildType string) (string, error) {
+	digest, err := sdkSourceDigest(sdkDir, buildType)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	_, _ = io.WriteString(h, baseHash)
+	_, _ = io.WriteString(h, "\x00staged-sdk\x00"+buildType+"\x00")
+	_, _ = io.WriteString(h, digest)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// sdkSourceExts names the files that define an SDK of buildType.
+func sdkSourceExts(buildType string) []string {
+	switch buildType {
+	case "rust":
+		return []string{".rs", ".toml", ".lock"}
+	case "python":
+		return []string{".py", ".toml", ".lock"}
+	case "lisp":
+		return []string{".lisp", ".asd"}
+	case "node":
+		return []string{".js", ".mjs", ".cjs", ".ts", ".json"}
+	}
+	return []string{".go", ".mod", ".sum"}
+}
+
+type sdkDigestKey struct{ dir, buildType string }
+
+// sdkFileStamp is what a stat says of one SDK source file.
+type sdkFileStamp struct {
+	rel     string
+	size    int64
+	modTime time.Time
+}
+
+type sdkDigest struct {
+	files []sdkFileStamp // in walk order
+	hex   string
+}
+
+// sdkDigests holds sdkSourceDigest per physical SDK directory and build type
+// for the life of the process, with the stamp of every source file it read.
+var sdkDigests sync.Map // sdkDigestKey -> sdkDigest
+
+// sdkSourceDigest is the hex SHA-256 of the SDK sources in sdkDir that
+// hashDirSources mixes for buildType. Every Go or Rust extension build of a
+// process folds the same staged SDK (about 150 files, 1 MB) into its cache
+// key: the first one reads and hashes it, and the others stat its source
+// files, so a restage, or an edit in place, is hashed again.
+func sdkSourceDigest(sdkDir, buildType string) (string, error) {
+	physical, err := filepath.Abs(sdkDir)
+	if err != nil {
+		return "", err
+	}
+	if physical, err = filepath.EvalSymlinks(physical); err != nil {
+		return "", err
+	}
+	exts := sdkSourceExts(buildType)
+	key := sdkDigestKey{physical, buildType}
+	if cached, ok := sdkDigests.Load(key); ok {
+		if d := cached.(sdkDigest); sdkStampsMatch(physical, exts, d.files) {
+			return d.hex, nil
+		}
+	}
+	h := sha256.New()
+	var files []sdkFileStamp
+	err = walkDirSources(physical, exts, func(path, rel string) error {
+		// The stamp is taken before the read: a change after it leaves a stamp the next call does not match.
+		info, err := os.Stat(path) //perf:ok once per staged SDK file per extension build, which runs a Go/Rust toolchain build
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		files = append(files, sdkFileStamp{rel: rel, size: info.Size(), modTime: info.ModTime()})
+		h.Write([]byte(rel))
+		h.Write(data)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	digest := hex.EncodeToString(h.Sum(nil))
+	sdkDigests.Store(key, sdkDigest{files: files, hex: digest})
+	return digest, nil
+}
+
+// sdkStampsMatch reports whether the source files under root are the stamped
+// files, in order, each with its size and modification time unchanged.
+func sdkStampsMatch(root string, exts []string, files []sdkFileStamp) bool {
+	matched := 0
+	stale := false
+	err := walkDirSources(root, exts, func(path, rel string) error {
+		info, err := os.Stat(path) //perf:ok one stat per staged SDK file per extension build replaces reading and hashing the file
+		if err != nil || matched == len(files) {
+			stale = true
+			return fs.SkipAll
+		}
+		if f := files[matched]; f.rel != rel || f.size != info.Size() || !f.modTime.Equal(info.ModTime()) {
+			stale = true
+			return fs.SkipAll
+		}
+		matched++
+		return nil
+	})
+	return err == nil && !stale && matched == len(files)
+}
+
+// ensureBuildToolchain fails early with actionable guidance when the toolchain a
+// source extension needs is not installed. pig compiles extensions (upstream pi
+// does not), so on a bare host the build otherwise dies with an opaque
+// "exec: \"go\": executable file not found in $PATH". The remedy is to install
+// the toolchain or run the extension from a Piglet Binary or prebuilt package, which
+// ship a compiled binary and need no toolchain. Unknown build types are a no-op.
+func ensureBuildToolchain(ctx context.Context, buildType string) error {
+	if buildType == "node" {
+		// pig additive (D19): a process that requests another TypeScript runtime checks Node only when a launch falls back to it.
+		if !typeScriptBuildNeedsNode() {
+			return nodeRuntimeUnavailable()
+		}
+		_, err := ensureNodeRuntime(ctx)
+		return err
+	}
+	return missingCompiler(buildType)
+}
+
+// missingCompiler is ensureBuildToolchain's check of a compiled build type: the readiness error, with its remedy, when the compiler
+// is not on PATH.
+func missingCompiler(buildType string) error {
+	tool := map[string]string{"go": "go", "rust": "cargo"}[buildType]
+	if tool == "" {
+		return nil
+	}
+	if _, err := exec.LookPath(tool); err != nil {
+		return fmt.Errorf("cannot build %s extension: the %q toolchain is not installed; install it, or run this extension from a Piglet Binary or prebuilt package (which need no toolchain)", buildType, tool)
+	}
+	return nil
+}
+
+// buildGo compiles a Go module to the given output path.
+// VCS stamping is disabled so an extension build depends only on its source and toolchain, not on the availability or health of repository metadata around the source.
+// Uses a temp file + rename to avoid partial binaries on failure.
+func buildGo(ctx context.Context, cacheRoot, srcDir, outPath, stagedSDK string) error {
+	tmpPath := outPath + ".tmp"
+	args := []string{"build", "-buildvcs=false", "-trimpath", "-ldflags", "-s -w", "-o", tmpPath}
+	cleanup := func() {}
+	if stagedSDK != "" {
+		modPath, remove, err := stagedGoModFile(srcDir, stagedSDK)
+		if err != nil {
+			return err
+		}
+		cleanup = remove
+		args = append(args, "-modfile="+modPath)
+	}
+	defer cleanup()
+	args = append(args, ".")
+	goToolchain, err := toolchain.ResolveGo()
+	if err != nil {
+		return err
+	}
+	if known, ok := runtimecell.KnownGoToolchainFailure(goToolchain); ok {
+		return known
+	}
+	buildprogress.Phase(ctx, "Compiling Go member", srcDir+" (module resolution, compile, link)")
+	cmd := linkerexec.CommandContext(ctx, goToolchain.Command, buildprogress.ToolArgs(ctx, "go", args)...)
+	cmd.Dir = srcDir
+	cmd.Env = toolchain.WorkDirEnv(srcDir, append(goToolchain.Environ(goBuildEnvironment(srcDir, os.Environ())), runtimecell.GoBuildCgoEnv(runtime.GOOS, runtime.GOARCH), "GOWORK=off"))
+	out, err := buildprogress.CombinedOutput(ctx, cmd)
+	if err != nil {
+		_ = os.Remove(tmpPath) // Clean up partial.
+		if ctx.Err() != nil {
+			return fmt.Errorf("go build: %w", err)
+		}
+		failure, _ := runtimecell.GoBuildFailure(cacheRoot, srcDir, srcDir, goToolchain, err, out, nil)
+		return failure
+	}
+	if err := rejectNonExecutableArtifact(tmpPath, srcDir); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	// Atomic rename: no partial binary visible at outPath.
+	return os.Rename(tmpPath, outPath)
+}
+
+func goBuildEnvironment(source string, environment []string) []string {
+	for _, value := range environment {
+		if workTree, ok := strings.CutPrefix(value, "GIT_WORK_TREE="); ok && isWithin(workTree, source) {
+			return append([]string(nil), environment...)
+		}
+	}
+	return withoutGitEnvironmentOverrides(environment)
+}
+
+func withoutGitEnvironmentOverrides(environment []string) []string {
+	return slices.DeleteFunc(append([]string(nil), environment...), func(value string) bool {
+		return strings.HasPrefix(value, "GIT_DIR=") || strings.HasPrefix(value, "GIT_WORK_TREE=")
+	})
+}
+
+// archiveMagic opens a Unix ar archive, which is what the Go toolchain writes
+// when asked to build a package that declares something other than `main`.
+const archiveMagic = "!<arch>\n"
+
+// isArchive reports whether a build artifact is a static library rather than a
+// program.
+func isArchive(data []byte) bool {
+	return strings.HasPrefix(string(data), archiveMagic)
+}
+
+// rejectNonExecutableArtifact turns a silently useless build into a build error.
+//
+// `go build -o out .` exits 0 for a package that is not `main`, writing a
+// library archive to the output path. Nothing downstream inspects the artifact,
+// so the extension is cached as built and the problem first appears when the
+// host executes it, reported as a launch failure that names neither the package
+// nor the fix.
+func rejectNonExecutableArtifact(path, srcDir string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("read build output: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	header := make([]byte, len(archiveMagic))
+	if _, err := io.ReadFull(f, header); err != nil {
+		return fmt.Errorf("read build output: %w", err)
+	}
+	if !isArchive(header) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s compiled to a library archive, not a program: its package is not `main`.\n"+
+			"An extension built this way cannot be executed. Either give the package "+
+			"`package main` with a `func main()`, or expose "+
+			"`func Extension() *sdk.Extension` so PiG builds it through the factory path",
+		srcDir)
+}
+
+// buildRust compiles a Rust crate and copies the binary to outPath.
+// Uses a temp file + rename to avoid partial binaries on failure.
+func buildRust(ctx context.Context, cacheRoot, srcDir, outPath, stagedSDK string) error {
+	buildDir := srcDir
+	args := []string{}
+	if stagedSDK != "" {
+		// Redirect the pig-sdk path dependency (the SDK scaffold's canonical
+		// form) to the staged SDK. Cargo has no `--modfile` equivalent to Go's
+		// staged go.mod, and [patch.crates-io] cannot redirect a path dependency
+		// (cargo reads the stale/relative dead path before patch resolution),
+		// which is why an installed crate whose Cargo.toml points at a moved
+		// checkout fails to build. When the crate declares an inline pig-sdk path
+		// dep, build an isolated copy with a rewritten manifest in this build's
+		// private scratch dir (the parent of outPath). This never mutates the
+		// shared installed crate, so concurrent Pig builds and manifest readers
+		// stay safe. A registry-form `pig-sdk = "x.y"` dep needs no copy and is
+		// handled by the crates-io patch below.
+		if hasInlinePigSDKPath(srcDir) {
+			buildDir = filepath.Join(filepath.Dir(outPath), "rust-crate")
+			if err := copyCrateWithStagedSDK(srcDir, buildDir, stagedSDK); err != nil {
+				return err
+			}
+		}
+		args = append(args, "--config", "patch.crates-io."+rustSDKCrate+".path="+strconv.Quote(filepath.ToSlash(stagedSDK)))
+	}
+	args = append(args, "build", "--release", "--quiet")
+	buildprogress.Phase(ctx, "Compiling Rust member", srcDir+" (dependency resolution, compile, link)")
+	cmd := linkerexec.CommandContext(ctx, "cargo", buildprogress.ToolArgs(ctx, "rust", args)...)
+	cmd.Dir = buildDir
+	cmd.Env = withoutGitEnvironmentOverrides(os.Environ())
+	cargoStarted := time.Now()
+	out, err := buildprogress.CombinedOutput(ctx, cmd)
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("cargo build: %w", err)
+		}
+		failure, _ := runtimecell.RustBuildFailure(cacheRoot, srcDir, buildDir, err, out, runtimecell.BuildRun{Elapsed: time.Since(cargoStarted)})
+		return failure
+	}
+
+	var manifest struct {
+		Package struct {
+			Name string `toml:"name"`
+		} `toml:"package"`
+	}
+	if _, err := toml.DecodeFile(filepath.Join(srcDir, "Cargo.toml"), &manifest); err != nil {
+		return fmt.Errorf("read Rust standalone package name: %w", err)
+	}
+	if manifest.Package.Name == "" {
+		return fmt.Errorf("Rust standalone %s has no Cargo package name", srcDir)
+	}
+	binarySuffix := strings.TrimPrefix(extensionArtifactName(runtime.GOOS, "rust"), "bin")
+	builtBin := filepath.Join(cargoBuildTargetDirectory(buildDir), "release", manifest.Package.Name+binarySuffix)
+	if _, err := os.Stat(builtBin); err != nil {
+		return fmt.Errorf("built binary not found at %s", builtBin)
+	}
+
+	// Copy to temp, then rename (atomic).
+	tmpPath := outPath + ".tmp"
+	if err := copyBuiltBinary(builtBin, tmpPath); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, outPath)
+}
+
+// copyBuiltBinary copies the binary cargo built to dst, the program the host executes once the build is published. execfile writes the copy: a concurrent fork must not leave a child that holds its write descriptor, which makes the exec fail with ETXTBSY.
+func copyBuiltBinary(src, dst string) error {
+	input, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = input.Close() }() // Read-only: close cannot lose data.
+	return execfile.Write(dst, os.O_CREATE|os.O_TRUNC, 0o755, input)
+}
+
+func cargoBuildTargetDirectory(workingDirectory string) string {
+	target := strings.TrimSpace(os.Getenv("CARGO_TARGET_DIR"))
+	if target == "" {
+		return filepath.Join(workingDirectory, "target")
+	}
+	if filepath.IsAbs(target) {
+		return target
+	}
+	return filepath.Join(workingDirectory, target)
+}
+
+// pigSDKInlinePathRe matches an inline `pig-sdk = { ... path = "..." }`
+// dependency, capturing everything up to (and including) the opening quote of
+// the path value so it can be replaced. Registry-form deps (`pig-sdk = "x.y"`)
+// and section-form `[dependencies.pig-sdk]` tables do not match; the SDK
+// scaffolds emit the inline path form.
+var pigSDKInlinePathRe = lazyregexp.New(`(pig-sdk\s*=\s*\{[^}]*?path\s*=\s*)"[^"]*"`)
+
+// rewritePigSDKPath redirects an inline pig-sdk path dependency to newPath,
+// returning the rewritten manifest and whether a replacement occurred.
+func rewritePigSDKPath(manifest, newPath string) (string, bool) {
+	loc := pigSDKInlinePathRe.FindStringSubmatchIndex(manifest)
+	if loc == nil {
+		return manifest, false
+	}
+	// loc[3] ends capture group 1 (through `path = `); loc[1] ends the whole
+	// match (just after the old quoted value).
+	quoted := strconv.Quote(filepath.ToSlash(newPath))
+	return manifest[:loc[3]] + quoted + manifest[loc[1]:], true
+}
+
+// hasInlinePigSDKPath reports whether srcDir/Cargo.toml declares an inline
+// pig-sdk path dependency that must be redirected to the staged SDK.
+func hasInlinePigSDKPath(srcDir string) bool {
+	data, err := os.ReadFile(filepath.Join(srcDir, "Cargo.toml"))
+	if err != nil {
+		return false
+	}
+	return pigSDKInlinePathRe.Match(data)
+}
+
+// copyCrateWithStagedSDK copies the Rust crate at srcDir into dstDir (skipping
+// build artifacts and VCS metadata) and rewrites the copied Cargo.toml's inline
+// pig-sdk path dependency to stagedSDK. Building the copy leaves the shared
+// installed crate untouched, keeping concurrent Pig builds and manifest readers
+// safe.
+func copyCrateWithStagedSDK(srcDir, dstDir, stagedSDK string) error {
+	walk := func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return os.MkdirAll(dstDir, 0o755)
+		}
+		if d.IsDir() {
+			if base := filepath.Base(rel); base == "target" || base == ".git" {
+				return fs.SkipDir
+			}
+			return os.MkdirAll(filepath.Join(dstDir, rel), 0o755)
+		}
+		if !d.Type().IsRegular() {
+			return nil // skip symlinks and other non-regular files
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dstDir, rel), data, info.Mode().Perm())
+	}
+	if err := filepath.WalkDir(srcDir, walk); err != nil {
+		return fmt.Errorf("copy rust crate: %w", err)
+	}
+	manifestPath := filepath.Join(dstDir, "Cargo.toml")
+	orig, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return err
+	}
+	rewritten, changed := rewritePigSDKPath(string(orig), stagedSDK)
+	if !changed {
+		return nil
+	}
+	return os.WriteFile(manifestPath, []byte(rewritten), 0o644)
+}
+
+func stagedGoModFile(srcDir, stagedSDK string) (string, func(), error) {
+	path := filepath.Join(srcDir, "go.mod")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", func() {}, err
+	}
+	file, err := modfile.Parse(path, data, nil)
+	if err != nil {
+		return "", func() {}, fmt.Errorf("parse go.mod for staged SDK: %w", err)
+	}
+	if err := file.AddReplace(goSDKModule, "", filepath.ToSlash(stagedSDK), ""); err != nil {
+		return "", func() {}, fmt.Errorf("add staged SDK replacement: %w", err)
+	}
+	aliasDir := ""
+	for _, requirement := range file.Require {
+		if requirement.Mod.Path != extsource.LegacyGoSDKModulePath {
+			continue
+		}
+		aliasDir, err = os.MkdirTemp("", "pig-legacy-sdk-*")
+		if err != nil {
+			return "", func() {}, err
+		}
+		if err = runtimecell.StageLegacyGoSDK(stagedSDK, aliasDir); err == nil {
+			err = file.AddReplace(extsource.LegacyGoSDKModulePath, "", filepath.ToSlash(aliasDir), "")
+		}
+		if err != nil {
+			_ = os.RemoveAll(aliasDir)
+			return "", func() {}, err
+		}
+		break
+	}
+	keepAlias := false
+	defer func() {
+		if aliasDir != "" && !keepAlias {
+			_ = os.RemoveAll(aliasDir)
+		}
+	}()
+	encoded, err := file.Format()
+	if err != nil {
+		return "", func() {}, fmt.Errorf("format build-local go.mod: %w", err)
+	}
+	temp, err := os.CreateTemp(srcDir, ".pig-build-*.mod")
+	if err != nil {
+		return "", func() {}, err
+	}
+	tempPath := temp.Name()
+	sumPath := strings.TrimSuffix(tempPath, ".mod") + ".sum"
+	cleanup := func() {
+		_ = os.Remove(tempPath)
+		_ = os.Remove(sumPath)
+		if aliasDir != "" {
+			_ = os.RemoveAll(aliasDir)
+		}
+	}
+	if _, err := temp.Write(encoded); err != nil {
+		_ = temp.Close()
+		cleanup()
+		return "", func() {}, err
+	}
+	if err := temp.Close(); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	// Go resolves the module checksum file next to the -modfile (same base name,
+	// .sum). Seed it with the extension's existing go.sum so third-party
+	// dependencies verify offline; without this, a -modfile build reports
+	// "missing go.sum entry" for every module the extension imports. Extensions
+	// with only the local SDK replace and stdlib have no go.sum and need none.
+	if sum, err := os.ReadFile(filepath.Join(srcDir, "go.sum")); err == nil {
+		if err := os.WriteFile(sumPath, sum, 0o644); err != nil {
+			cleanup()
+			return "", func() {}, err
+		}
+	}
+	keepAlias = true
+	return tempPath, cleanup, nil
+}
+
+// CurrentCacheEntry returns the valid source-build cache entry selected by the
+// same source and staged-SDK hash as BuildContext, without building it.
+func (b *Builder) CurrentCacheEntry(name, srcDir string) (string, bool, error) {
+	absolute, err := filepath.Abs(srcDir)
+	if err != nil {
+		return "", false, err
+	}
+	buildType, err := detectBuildType(absolute)
+	if err != nil {
+		return "", false, err
+	}
+	stagedSDK, err := b.resolveStagedSDK(absolute, buildType)
+	if err != nil {
+		return "", false, err
+	}
+	hash, err := hashSourceDir(absolute, buildType)
+	if err != nil {
+		return "", false, err
+	}
+	if stagedSDK != "" {
+		hash, err = hashWithStagedSDK(hash, stagedSDK, buildType)
+		if err != nil {
+			return "", false, err
+		}
+	}
+	entry := filepath.Join(b.cacheDir, fileNameComponent(name)+"-"+hash)
+	_, valid := runtimecell.ValidEntry(entry, runtimecell.EntryIdentity{InputDigest: hash, Artifact: extensionArtifactName(runtime.GOOS, buildType), Language: buildType})
+	return entry, valid, nil
+}
+
+// hasLispSource reports whether dir holds an ASDF system definition or a Lisp source file.
+func hasLispSource(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(entry.Name())) {
+		case ".lisp", ".asd":
+			return true
+		}
+	}
+	return false
+}

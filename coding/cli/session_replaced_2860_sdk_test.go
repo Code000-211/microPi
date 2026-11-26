@@ -1,0 +1,163 @@
+package cli
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/testbudget"
+	"github.com/MichaelKinsy/PiG/internal/toolchain"
+)
+
+// replaced2860Fixtures returns the -e argument of each SDK realization of testdata/session-replaced-2860: the Node, Python and Lisp modules, and the Go and Rust executables built from their testdata sources.
+func replaced2860Fixtures(t *testing.T) map[string]string {
+	t.Helper()
+	for _, tool := range []string{"node", "python3", "cargo"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Fatalf("%s is required for the SDK realizations of #2860: %v", tool, err)
+		}
+	}
+	if _, err := exec.LookPath(toolchain.SBCLExecutable(runtime.GOOS, exec.LookPath)); err != nil {
+		t.Fatalf("sbcl is required for the Lisp SDK realization of #2860: %v", err)
+	}
+	lisp, err := filepath.Abs(filepath.Join("testdata", "session-replaced-2860.lisp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := filepath.Abs(filepath.Join("testdata", "session-replaced-2860.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	python, err := filepath.Abs(filepath.Join("testdata", "session-replaced-2860.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return map[string]string{
+		"node":   node,
+		"python": python,
+		"go":     buildGoSDKFixture(t, "session-replaced-2860-go"),
+		"rust":   buildRustSDKFixture(t, "session-replaced-2860-rs"),
+		"lisp":   lisp,
+	}
+}
+
+// runReplaced2860 runs pig in print mode with the fixture and messages, and returns the fixture's log with each process id replaced by its first-seen ordinal.
+func runReplaced2860(t *testing.T, bin, fixture string, messages ...string) []string {
+	t.Helper()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "2860.log")
+	// The prompt template "echo" ("/echo Alice" expands to "reply with exactly: expanded Alice") that the expand-it command sends to the replacement Session.
+	prompts := filepath.Join(dir, "prompts")
+	if err := os.MkdirAll(prompts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prompts, "echo.md"), []byte("reply with exactly: expanded $1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--no-extensions", "--no-skills", "--no-prompt-templates", "--prompt-template", prompts, "--session-dir", filepath.Join(dir, "sessions"), "--model", "test-faux/faux-1", "-e", fixture, "-p"}
+	// A blocked extension keeps pig running, so each run has a bound.
+	ctx := testbudget.Context(t)
+	cmd := exec.CommandContext(ctx, bin, append(args, messages...)...)
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(), "PIG_HOME="+filepath.Join(dir, "home"), "PIG_CODING_AGENT_DIR="+filepath.Join(dir, "agent"), "PIG_TEST_FAUX=1",
+		"PIG_TEST_2860_LOG="+log, "PIG_TEST_2860_MARKS="+filepath.Join(dir, "marks.json"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("pig -p %q: %v\n%s", messages, err, out)
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinals := map[string]int{}
+	var lines []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
+		// Python's text-mode files end lines with CRLF on Windows; TrimSpace above strips only the last line's CR, which would give the final record's process id a different key.
+		line = strings.TrimRight(line, "\r")
+		name, pid, found := strings.Cut(line, ":")
+		if found && (name == "start" || name == "shutdown" || name == "with") {
+			if _, seen := ordinals[pid]; !seen {
+				ordinals[pid] = len(ordinals) + 1
+			}
+			line = name + ":" + strconv.Itoa(ordinals[pid])
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// Pi's 2860-replaced-session-context.test.ts:147, 211 and 243 run a withSession callback from an extension command after newSession, fork and switchSession. Each SDK realization runs the same bodies through print mode: the callback receives a context of the replacement Session after it is rebound (start:2 precedes with:1), the command's captured context and API throw or fail, the replacement context's sendUserMessage returns after the replacement Session's turn, its session and state reads see the replacement Session, and a callback's error rejects the call with that error. Each Session's extensions run in their own process (D70), so process ordinals name the instances. The faux model answers "reply with exactly: <text>" with <text>, in place of the test's scripted replies.
+func TestReplacedSession2860AcrossSDKs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts the pig binary and extension processes in five languages")
+	}
+	bin := buildPigBinaryForSignalTest(t)
+	fixtures := replaced2860Fixtures(t)
+	cases := []struct {
+		name     string
+		messages []string
+		want     []string
+	}{
+		{
+			name:     "new",
+			messages: []string{"/repro"},
+			want: []string{"start:1", "shutdown:1", "start:2", "with:1", "replacement:true", "staleCtx:true", "stalePi:true", "idle:true", "yield:ok", "model:faux-1",
+				"conversation:user:reply with exactly: hello reply|assistant:hello reply", "shutdown:2"},
+		},
+		{
+			// types.ts:411, agent-session-runtime.ts:254-257: setup seeds the replacement Session through its SessionManager, in the extension process,
+			// before the replacement's extensions start (agent-session-runtime-events.test.ts:131-137 binds them after newSession) and before
+			// withSession reads the replacement back; the entry ids setup received are distinct and non-empty.
+			name:     "setup seeds the replacement",
+			messages: []string{"/seed-it"},
+			want:     []string{"start:1", "shutdown:1", "setup:true", "start:2", "seedName:seeded-session", "seedEntry:seed-msg=from setup", "shutdown:2"},
+		},
+		{
+			name:     "callback error",
+			messages: []string{"/throw-it"},
+			want:     []string{"start:1", "shutdown:1", "start:2", "caught:callback failed", "shutdown:2"},
+		},
+		{
+			// types.ts:463-473, agent-session.ts:2530-2557: the replacement context's sendUserMessage hands expandPromptTemplates to the replacement Session. true runs the template "/echo Alice" as typed input would (the model sees "reply with exactly: expanded Alice"); false and no option send the text as it is, which the faux model answers "done" because it does not start with the reply prefix.
+			name:     "sendUserMessage expands prompt templates",
+			messages: []string{"/expand-it"},
+			want: []string{"start:1", "shutdown:1", "start:2",
+				"conversation:user:reply with exactly: expanded Alice|assistant:expanded Alice|user:/echo reply with exactly: Bob|assistant:done|user:/echo reply with exactly: Carol|assistant:done", "shutdown:2"},
+		},
+		{
+			// A replacement context the callback kept and used after the call returned must not block the extension process.
+			name:     "kept context",
+			messages: []string{"/keep-it"},
+			want:     []string{"start:1", "shutdown:1", "start:2", "kept:returned", "shutdown:2"},
+		},
+		{
+			name:     "fork",
+			messages: []string{"reply with exactly: seed reply", "/fork-it"},
+			want: []string{"start:1", "shutdown:1", "start:2",
+				"conversation:user:reply with exactly: seed reply|assistant:seed reply|user:reply with exactly: fork reply|assistant:fork reply", "shutdown:2"},
+		},
+		{
+			name:     "switch",
+			messages: []string{"reply with exactly: root reply", "/mark original", "/new", "reply with exactly: target reply", "/mark target", "/switch original", "/switch-it"},
+			want: []string{"start:1", "shutdown:1", "start:2", "shutdown:2", "start:3", "shutdown:3", "start:4", "switched:true",
+				"conversation:user:reply with exactly: target reply|assistant:target reply|user:reply with exactly: switch reply|assistant:switch reply", "shutdown:4"},
+		},
+	}
+	for _, sdk := range []string{"node", "go", "python", "rust", "lisp"} {
+		t.Run(sdk, func(t *testing.T) {
+			t.Parallel()
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					if got := runReplaced2860(t, bin, fixtures[sdk], tc.messages...); !slices.Equal(got, tc.want) {
+						t.Fatalf("records:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(tc.want, "\n"))
+					}
+				})
+			}
+		})
+	}
+}

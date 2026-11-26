@@ -1,0 +1,1918 @@
+package codingagent
+
+// Ports packages/coding-agent/src/modes/interactive/interactive-mode.ts (bindCurrentSessionExtensions and the extension action wiring).
+
+import (
+	"cmp"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"math"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/sessionentry"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
+	"github.com/MichaelKinsy/PiG/tui"
+	"github.com/MichaelKinsy/PiG/tui/widthx"
+)
+
+func (m *InteractiveMode) deliverUserMessage(content any, deliverAs extension.DeliverAs) error {
+	return m.deliverUserMessageAfter(content, deliverAs, nil)
+}
+
+// deliverUserMessageAfter is deliverUserMessage for a send whose caller asked to make the refusal's report when the sending code's run ends (subprocess.SendUserMessageOptions.AfterRun).
+func (m *InteractiveMode) deliverUserMessageAfter(content any, deliverAs extension.DeliverAs, after func(report func())) error {
+	parsed, err := subprocessUserContent(content)
+	if err != nil {
+		return fmt.Errorf("sendUserMessage: %w", err)
+	}
+	var text string
+	var images []ai.ImageContent
+	switch value := parsed.(type) {
+	case ai.UserText:
+		text = string(value)
+	case ai.UserContentBlocks:
+		var parts []string
+		for _, block := range value {
+			switch block := block.(type) {
+			case ai.TextContent:
+				parts = append(parts, block.Text)
+			case ai.ImageContent:
+				images = append(images, block)
+			}
+		}
+		text = strings.Join(parts, "\n")
+	}
+	if m.agent == nil {
+		return fmt.Errorf("agent not available")
+	}
+	switch deliverAs {
+	case "", extension.DeliverAsFollowUp, extension.DeliverAsSteer:
+		// validated; dispatched on the main loop below
+	default:
+		return fmt.Errorf("unsupported deliverAs %q", deliverAs)
+	}
+
+	// Host callbacks may run off the main loop. Marshal onto the UI task queue,
+	// where TUI/session mutation is safe.
+	//
+	// turnActive, not isIdle, decides whether a turn exists to receive the
+	// message. The run goroutine clears turnActive before it queues the cleanup
+	// that restores isIdle, so a task landing in that window reads isIdle false
+	// with no goroutine left to drain a steering queue, and the message is lost.
+	// Upstream prompt() throws when a run is active and no streaming behavior was given (agent-session.ts:2240-2244); the bound action reports
+	// the refusal as the extension error `send_user_message` and the call returns (:3565-3572), as the Session's binding does in print, JSON and RPC.
+	if deliverAs == "" && m.runStreaming() {
+		m.reportRuntimeErrorAfter(after, "send_user_message", errors.New("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."))
+		return nil
+	}
+	return m.postToMain(m.runCtx, func() {
+		if m.agent == nil {
+			return
+		}
+		// Upstream sendUserMessage is prompt() with source "extension" and
+		// no command dispatch or template expansion. A run that started
+		// after the check above receives an unspecified delivery as a
+		// follow-up.
+		m.promptUserInput(m.runCtx, text, images, deliverAs != extension.DeliverAsSteer, extension.InputSourceExtension, false)
+	})
+}
+
+// extensionAbort is an extension's ctx.abort() in interactive mode, for subprocess and in-process extensions alike. It is Pi's restoreQueuedMessagesToEditor({ abort: true }): the queued steering and follow-up messages go back to the editor, then `void this.session.abort()` cancels the retry delay, compaction, branch summary and run. Both happened when it returns, as in Pi, where they run before abort()'s first await: ctx.hasPendingMessages() is false and the run's signal is aborted. Nothing waits for the end of the run, so a handler the run awaits can call it. The owner loop runs it as one of its tasks (inline for a caller on the loop), and a mode that stops first drops it.
+// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts:2399-2401, :4925-4941
+func (m *InteractiveMode) extensionAbort() {
+	_ = m.runOnMainAndWait(m.runCtx, func() error {
+		m.restoreQueuedMessagesToEditor(false)
+		if m.opts.SessionHandle != nil {
+			m.opts.SessionHandle.AbortRetry()
+			m.opts.SessionHandle.AbortCompaction()
+			m.opts.SessionHandle.AbortBranchSummary()
+		}
+		m.abortRun(m.runCtx)
+		return nil
+	})
+}
+
+// activeBuiltinToolNames returns the names of built-in tools that are
+// currently active (i.e., that refreshAgentTools will actually create and
+// add to the agent). If ActiveBuiltinTools is nil, all built-in tools are
+// active. Otherwise, only those in the set are active.
+//
+// This is used by GetAllTools/GetActiveTools host callbacks so that piglet
+// scoping sees built-in tools alongside extension tools. Without this, the
+// piglet extension's applyScoping would build an AllowedTools set from only
+// extension tools, causing refreshAgentTools to filter out all built-in tools
+// (bash, read, write, edit, grep, find, ls) after a /reload or rescope.
+func (m *InteractiveMode) activeBuiltinToolNames(extTools ...extension.RegisteredTool) []string {
+	all := tools.BuiltinToolNames()
+	overridden := make(map[string]bool, len(extTools))
+	for _, tool := range extTools {
+		overridden[tool.Definition.Name] = true
+	}
+	active := make([]string, 0, len(all))
+	for _, name := range all {
+		if !overridden[name] && tools.BuiltinToolActive(name, m.opts.ActiveBuiltinTools, m.opts.AllowedTools) {
+			active = append(active, name)
+		}
+	}
+	return active
+}
+
+// activeToolNames returns the tools the agent sends with its next request, in
+// that order. Mirrors upstream AgentSession.getActiveToolNames
+// (agent.state.tools): a tool an extension deactivated with setActiveTools is
+// not reported, so a getActiveTools/setActiveTools round trip keeps it off.
+func (m *InteractiveMode) activeToolNames() []string {
+	if m.agent == nil {
+		return m.activeBuiltinToolNames()
+	}
+	active := m.agent.Tools()
+	names := make([]string, len(active))
+	for i, tool := range active {
+		names[i] = tool.Name()
+	}
+	return names
+}
+
+// sessionModel is the Session's model, read live as Pi's extension context reads agent.state.model (runner.ts createContext `get model()`, agent-session.ts _bindExtensionCore). The Session applies a change before it emits model_select and thinking_level_select; the mode's own copy follows only after the Session returns.
+func (m *InteractiveMode) sessionModel() *ai.Model {
+	if m.opts.SessionHandle != nil {
+		if session := m.opts.SessionHandle.Agent(); session != nil {
+			if model := session.Model(); model != nil {
+				return model
+			}
+		}
+	}
+	if m.agent != nil {
+		if model := m.agent.Model(); model != nil {
+			return model
+		}
+	}
+	return m.opts.Model
+}
+
+// extensionContextUsage reads the same Session projection as the stock footer. A zero window means no usage; a nil estimate with a usable window means unknown usage after compaction.
+func (m *InteractiveMode) extensionContextUsage() *extension.ContextUsage {
+	if m.opts.ContextUsage == nil {
+		return nil
+	}
+	tokens, window := m.opts.ContextUsage()
+	if window <= 0 {
+		return nil
+	}
+	usage := &extension.ContextUsage{Tokens: tokens, ContextWindow: window}
+	if tokens != nil {
+		percent := float64(*tokens) / float64(window) * 100
+		usage.Percent = &percent
+	}
+	return usage
+}
+
+// wireInprocContextActions binds the same session state as wireSubprocessHostCallbacks to direct extension context calls.
+func (m *InteractiveMode) wireInprocContextActions() {
+	m.bindEditorSnapshot()
+	if m.newRunner == nil {
+		return
+	}
+	m.newRunner.AddErrorListener(m.queueExtensionError)
+	var ui extension.UIContext
+	if m.tuiInst != nil && m.layout != nil {
+		ui = &ExtUIContext{m: m}
+	}
+	m.newRunner.SetUIContext(ui, extension.ModeTUI)
+	// Subprocess dialogs reach the TUI through the bridge, so the bridge
+	// reports their ui_prompt_start/ui_prompt_end through the current runner.
+	if m.opts.SubprocessUIBridge != nil {
+		m.opts.SubprocessUIBridge.SetUIPromptScope(m.newRunner)
+	}
+
+	actions := extension.ContextActions{
+		GetScopedModels: m.extensionScopedModels,
+		GetAllTools: func() []extension.ToolInfo {
+			// upstream: agent-session.ts:3353 (getAllTools): the Session's registry, with each tool's source, exposure and namespace.
+			if session, ok := m.opts.SessionHandle.(interface{ GetAllTools() []extension.ToolInfo }); ok {
+				return session.GetAllTools()
+			}
+			extTools := m.newRunner.Tools()
+			builtinNames := m.activeBuiltinToolNames(extTools...)
+			result := make([]extension.ToolInfo, 0, len(extTools)+len(builtinNames))
+			for _, t := range extTools {
+				source := "builtin"
+				if t.Source != "" {
+					source = t.Source
+				}
+				result = append(result, extension.ToolInfo{
+					Name:        t.Definition.Name,
+					Description: t.Definition.Description,
+					SourceInfo:  t.SourceInfo,
+					Source:      source,
+				})
+			}
+			// Append built-in tools so piglet scoping sees them. Built-in
+			// tools live in the agent (not the runner), so without this they
+			// would be invisible to GetAllTools → ScopeTools → SetActiveTools,
+			// causing them to be filtered out after a rescope.
+			for _, name := range builtinNames {
+				result = append(result, extension.ToolInfo{
+					Name:        name,
+					Description: tools.BuiltinToolDescription(name),
+					SourceInfo:  CreateSyntheticSourceInfo(BuiltinPathPrefix+name, SyntheticSourceInfoOptions{Source: "builtin"}),
+					Source:      "builtin",
+				})
+			}
+			return result
+		},
+		GetActiveTools: m.activeToolNames,
+		SetActiveTools: m.setActiveToolsByName,
+		RefreshTools:   func() error { return m.refreshSessionTools(false) },
+		GetFlagValue: func(name string) any {
+			if m.opts.UnknownFlags != nil {
+				if value, ok := m.opts.UnknownFlags[name]; ok {
+					return value
+				}
+			}
+			return nil
+		},
+		// upstream: runner.ts:906-909 `get model()` returns getModel(), which is the Session's own Model object (agent-session.ts:3437 `getModel: () => this.model`).
+		GetModel:           m.sessionModel,
+		IsIdle:             m.extensionIsIdle,
+		GetSignal:          m.extensionSignal,
+		IsProjectTrusted:   func() bool { return m.projectTrusted() },
+		HasPendingMessages: m.extensionHasPendingMessages,
+		Abort:              m.extensionAbort,
+		Shutdown:           m.requestExtensionShutdown,
+		GetContextUsage:    m.extensionContextUsage,
+		GetSystemPrompt: func() string {
+			return m.currentSystemPrompt()
+		},
+		GetSystemPromptOptions: m.currentSystemPromptOptions,
+	}
+
+	m.newRunner.BindCore(
+		extension.ExtensionActions{
+			// upstream: agent-session.ts:3361-3384 (_bindExtensionCore getCommands).
+			GetCommands: func() []extension.SlashCommandInfo { return m.currentSlashCatalog().Commands() },
+			// upstream: agent-session.ts:3339 binds getSettings to the session's settings manager in every mode.
+			GetSettings: func() extension.Settings {
+				if m.opts.SettingsManager == nil {
+					return extension.Settings{}
+				}
+				return m.opts.SettingsManager.ExtensionSettings()
+			},
+			SendUserMessage: func(content any, opts *extension.SendUserMessageOptions) error {
+				var deliverAs extension.DeliverAs
+				if opts != nil {
+					deliverAs = opts.DeliverAs
+				}
+				return m.deliverUserMessage(content, deliverAs)
+			},
+			// upstream: agent-session.ts:3416-3426 (_bindExtensionCore sendMessage). The routing is the one the wire sendMessage action runs.
+			SendMessage: func(msg extension.CustomMessageRef, opts *extension.SendMessageOptions) error {
+				var options extension.SendMessageOptions
+				if opts != nil {
+					options = *opts
+				}
+				m.reportRuntimeError("send_message", m.sendExtensionMessage(msg, options))
+				return nil
+			},
+			// upstream: agent-session.ts:3416-3465 (_bindExtensionCore) binds these in every mode; the mode's bind replaces the Session's.
+			AppendEntry:      m.appendExtensionEntry,
+			SetSessionName:   m.setExtensionSessionName,
+			GetSessionName:   m.extensionSessionName,
+			SetModel:         m.setExtensionModel,
+			GetThinkingLevel: m.extensionThinkingLevel,
+			SetThinkingLevel: m.setExtensionThinkingLevel,
+		},
+		actions,
+		nil,
+	)
+	m.bindExtensionCommandActions()
+}
+
+// setActiveToolsByName activates the named registered tools in the requested
+// order and ignores unknown names. As upstream selects from the whole tool
+// registry, a built-in outside the startup active set can be activated; the
+// --tools allowlist and --exclude-tools still bound the registry.
+// Mirrors upstream AgentSession.setActiveToolsByName.
+func (m *InteractiveMode) setActiveToolsByName(names []string) {
+	m.selectActiveToolsByName(names)
+	m.rebuildToolSystemPrompt()
+	m.refreshForcedPrompt()
+}
+
+func (m *InteractiveMode) selectActiveToolsByName(names []string) {
+	// The Session owns the tool registry and the loadout (exposure, namespaces, declarations): it admits the names, and
+	// this mode keeps the allow-list its own rebuilds apply.
+	if session, ok := m.opts.SessionHandle.(interface {
+		SetActiveToolsByName([]string)
+		ActiveToolNames() []string
+	}); ok {
+		session.SetActiveToolsByName(names)
+		active := session.ActiveToolNames()
+		m.opts.AllowedTools = make(map[string]struct{}, len(active))
+		for _, name := range active {
+			m.opts.AllowedTools[name] = struct{}{}
+		}
+		return
+	}
+	m.opts.AllowedTools = make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if m.opts.ToolRegistryAllowed != nil && !extension.NewToolFilter(m.opts.ToolRegistryAllowed, nil).Allows(name) {
+			continue
+		}
+		m.opts.AllowedTools[name] = struct{}{}
+	}
+	tools, errs := m.buildAgentTools()
+	for _, err := range errs {
+		fmt.Fprintf(os.Stderr, "tool refresh: %v\n", err)
+	}
+	if m.agent == nil {
+		return
+	}
+	available := make(map[string]agent.AgentTool)
+	for _, tool := range tools {
+		available[tool.Name()] = tool
+	}
+	var selected []agent.AgentTool
+	for _, name := range names {
+		if tool := available[name]; tool != nil {
+			selected = append(selected, tool)
+		}
+	}
+	m.agent.SetTools(selected)
+}
+
+// bindExtensionCommandActions binds the interactive command-context actions
+// over the Session's own, for in-process and subprocess extensions.
+func (m *InteractiveMode) bindExtensionCommandActions() {
+	actions := m.extensionReplacementActions()
+	actions.NavigateTree = m.extensionNavigateTree
+	actions.NavigateTreeContext = m.extensionNavigateTreeContext
+	if m.newRunner != nil {
+		m.newRunner.BindCommandActions(actions)
+	}
+	if m.opts.SubprocessUIBridge != nil {
+		bridge := m.opts.SubprocessUIBridge
+		bridge.SetHostAction("navigateTree", actions.NavigateTreeContext)
+		if actions.NewSessionContext != nil {
+			bridge.SetHostAction("newSession", actions.NewSessionContext)
+			bridge.SetHostAction("fork", actions.ForkContext)
+			bridge.SetHostAction("switchSession", actions.SwitchSessionContext)
+		}
+	}
+}
+
+// extensionNavigateTree is ctx.navigateTree in interactive mode: navigate the
+// Session, then redraw the chat, fill an empty editor with the editor text
+// and report it (interactive-mode.ts commandContextActions.navigateTree).
+func (m *InteractiveMode) extensionNavigateTree(targetID string, opts *extension.NavigateTreeOptions) (extension.CancelledResult, error) {
+	return m.extensionNavigateTreeContext(context.Background(), targetID, opts)
+}
+
+func (m *InteractiveMode) extensionNavigateTreeContext(ctx context.Context, targetID string, opts *extension.NavigateTreeOptions) (extension.CancelledResult, error) {
+	if m.opts.SessionHandle == nil {
+		return extension.CancelledResult{Cancelled: true}, nil
+	}
+	// interactive-mode.ts:2001-2007 forwards all four navigateTree options to the session.
+	var options NavigateTreeOptions
+	if opts != nil {
+		options = NavigateTreeOptions{Summarize: opts.Summarize, CustomInstructions: opts.CustomInstructions, ReplaceInstructions: opts.ReplaceInstructions, Label: opts.Label}
+	}
+	result, err := m.opts.SessionHandle.NavigateTreeHandle(ctx, targetID, options)
+	if err != nil {
+		return extension.CancelledResult{}, err
+	}
+	if result.Cancelled {
+		return extension.CancelledResult{Cancelled: true}, nil
+	}
+	m.runOnMain(m.runCtx, func() {
+		m.repaintInitialMessages()
+		if result.EditorText != "" && widthx.JSTrim(m.editor.Text()) == "" {
+			m.editor.SetText(result.EditorText)
+		}
+		m.showStatus("Navigated to selected point")
+		m.tuiInst.Render()
+	})
+	return extension.CancelledResult{}, nil
+}
+
+// publishSlashCommandCatalog republishes the prompt templates, skills and
+// resource provenance pi.getCommands() lists. Call it on the owner loop after
+// changing any of them: extension host calls read the published copy, never
+// the live fields.
+func (m *InteractiveMode) publishSlashCommandCatalog() {
+	catalog := &SlashCommandCatalog{
+		PromptTemplates: append([]PromptTemplate(nil), m.promptTemplates...),
+		Skills:          append([]*SkillDef(nil), m.opts.Skills...),
+		CWD:             m.opts.CWD,
+		AgentDir:        m.opts.AgentDir,
+		SourceInfo:      cloneResourceSourceInfoMap(m.resourceSourceInfo),
+	}
+	m.slashCatalog.Store(catalog)
+}
+
+// currentSlashCatalog is the published prompt-template and skill catalog with the live extension runner, the catalog pi.getCommands() lists in every extension host.
+func (m *InteractiveMode) currentSlashCatalog() SlashCommandCatalog {
+	catalog := SlashCommandCatalog{}
+	if published := m.slashCatalog.Load(); published != nil {
+		catalog = *published
+	}
+	if m.newRunner != nil {
+		catalog.Runner = m.newRunner
+	}
+	return catalog
+}
+
+// syncWidgets puts widgets on the selected side of the editor in insertion order. Only the above-editor slot has a leading blank row.
+func (m *InteractiveMode) syncWidgets(widgets map[string]*subprocess.PushProxy) {
+	m.widgetMu.Lock()
+	defer m.widgetMu.Unlock()
+	m.bridgeWidgets = widgets
+	m.renderWidgetsLocked()
+}
+
+// renderWidgetsLocked lays out the widgets of each side in the order they were set, the extension processes' and the host-process ones
+// interleaved (interactive-mode.ts renderWidgets over one Map per side): above the editor a blank row, then the widgets; below it the widgets.
+// widgetMu is held.
+func (m *InteractiveMode) renderWidgetsLocked() {
+	widgets := m.bridgeWidgets
+	type widgetEntry struct {
+		component tui.Component
+		below     bool
+		order     uint64
+		seq       uint64
+	}
+	entries := make([]widgetEntry, 0, len(widgets)+len(m.inprocessWidgets))
+	for _, proxy := range widgets {
+		placement, order := proxy.WidgetLayout()
+		entries = append(entries, widgetEntry{component: proxy, below: placement == string(extension.WidgetPlacementBelowEditor), order: order})
+	}
+	// A proxy seen for the first time, or with a new bridge order (replaced or moved), was set now: it takes the next sequences in bridge order.
+	sortx.Func(entries, func(a, b widgetEntry) int { return cmp.Compare(a.order, b.order) })
+	seqs := make(map[*subprocess.PushProxy]bridgeWidgetSeq, len(entries))
+	for i := range entries {
+		proxy := entries[i].component.(*subprocess.PushProxy)
+		known, ok := m.bridgeWidgetSeqs[proxy]
+		if !ok || known.order != entries[i].order {
+			m.widgetSeq++
+			known = bridgeWidgetSeq{order: entries[i].order, seq: m.widgetSeq}
+		}
+		seqs[proxy] = known
+		entries[i].seq = known.seq
+	}
+	m.bridgeWidgetSeqs = seqs
+	// Widget keys are one namespace: an extension process that set a key after a host-process extension did replaces its widget.
+	for key, proxy := range widgets {
+		for i, widget := range m.inprocessWidgets {
+			if widget.key == key && widget.seq < seqs[proxy].seq {
+				disposeWidget(widget.component)
+				m.inprocessWidgets = append(m.inprocessWidgets[:i], m.inprocessWidgets[i+1:]...)
+				break
+			}
+		}
+	}
+	if m.widgetContainer == nil {
+		return
+	}
+	for _, widget := range m.inprocessWidgets {
+		entries = append(entries, widgetEntry{component: widget.component, below: widget.placement == extension.WidgetPlacementBelowEditor, seq: widget.seq})
+	}
+	sortx.Func(entries, func(a, b widgetEntry) int { return cmp.Compare(a.seq, b.seq) })
+	above := []tui.Component{tui.NewSpacer(1)}
+	var below []tui.Component
+	for _, entry := range entries {
+		if entry.below {
+			below = append(below, entry.component)
+		} else {
+			above = append(above, entry.component)
+		}
+	}
+	// pig additive (D614): the mounts the terminal view client draws follow the widgets of their side, and the panels are
+	// the rows nearest the editor.
+	for _, region := range [...]viewRegion{viewAboveEditor, viewPanel, viewBelowEditor} {
+		if region == viewPanel && m.viewTabRow != nil {
+			above = append(above, m.viewTabRow)
+		}
+		for _, mount := range m.viewMounts {
+			switch {
+			case mount.slot.region != region:
+			case region == viewBelowEditor:
+				below = append(below, mount)
+			default:
+				above = append(above, mount)
+			}
+		}
+	}
+	// pig additive (D614): the row that stands for the dialogs is the row directly above the editor.
+	if m.viewWaitRow != nil {
+		above = append(above, m.viewWaitRow)
+	}
+	// pig divergence (D228): the one-time copy tip sits under the editor, after the below-editor widgets.
+	if m.queueCopyTip != nil {
+		below = append(below, m.queueCopyTip)
+	}
+	m.widgetContainer.SetChildren(above...)
+	if m.widgetContainerBelow != nil {
+		m.widgetContainerBelow.SetChildren(below...)
+	}
+	if m.tuiInst != nil {
+		m.tuiInst.RequestRender()
+	}
+}
+
+// sessionToolActions is the session's nested-call actions. Only a session that runs tools has them; the handle is read at call time because a replacement swaps it.
+func (m *InteractiveMode) sessionToolActions() (extension.ToolActions, bool) {
+	session, ok := m.opts.SessionHandle.(interface{ ToolActions() extension.ToolActions })
+	if !ok {
+		return extension.ToolActions{}, false
+	}
+	return session.ToolActions(), true
+}
+
+func (m *InteractiveMode) wireSubprocessHostCallbacks() func() {
+	b := m.opts.SubprocessUIBridge
+	detachModelRegistry := WireModelOperations(b, ModelOperationBindings{
+		CurrentModel: m.sessionModel, ModelLookup: m.opts.ModelLookup, ModelCatalog: m.opts.ModelCatalog, Classify: m.opts.ModelClassify, GenerateImages: m.opts.ModelGenerateImages,
+		Registry: m.opts.ModelRegistry, ModelBuilder: m.opts.ModelBuilder, SessionHandle: m.opts.SessionHandle,
+	})
+
+	b.SetHostAction("getFlag", func(extName, name string) any {
+		if m.opts.UnknownFlags != nil {
+			if value, ok := m.opts.UnknownFlags[name]; ok {
+				return value
+			}
+		}
+		return nil
+	})
+
+	b.SetHostAction("getActiveTools", m.activeToolNames)
+	b.SetHostAction("getAllTools", func() []subprocess.ToolInfo {
+		var runner ExtensionToolLister
+		if m.newRunner != nil {
+			runner = m.newRunner
+		}
+		var scope *extension.ToolScope
+		if session, ok := m.opts.SessionHandle.(interface{ ToolScope() *extension.ToolScope }); ok {
+			scope = session.ToolScope()
+		}
+		return ExtensionToolInfosScoped(runner, m.opts.ToolRegistryAllowed, m.opts.ExcludedTools, scope)
+	})
+	// upstream: agent-session.ts:3339, 3382-3383 bind getSettings, executeTool and getCallableTools to the session in every mode.
+	b.SetHostAction("getSettings", func() extension.Settings {
+		if m.opts.SettingsManager == nil {
+			return nil
+		}
+		return m.opts.SettingsManager.ExtensionSettings()
+	})
+	// The state push carries the settings in Pi's member order, encoded once per settings change (ExtensionSettingsJSON); null as json.Marshal of
+	// getSettings' nil without a settings manager.
+	b.SetHostAction("getSettingsJSON", func() json.RawMessage {
+		if m.opts.SettingsManager == nil {
+			return json.RawMessage("null")
+		}
+		return m.opts.SettingsManager.ExtensionSettingsJSON()
+	})
+	b.SetHostAction("getCallableTools", func() []extension.AgentTool {
+		if actions, ok := m.sessionToolActions(); ok {
+			return actions.GetCallableTools()
+		}
+		return nil
+	})
+	b.SetHostAction("executeTool", func(ctx context.Context, callerID, name string, args json.RawMessage, options extension.ExecuteToolOptions) (extension.AgentToolCallOutcome, error) {
+		if actions, ok := m.sessionToolActions(); ok {
+			return actions.ExecuteTool(ctx, callerID, name, args, options)
+		}
+		return subprocess.UnavailableNestedCall(callerID, name), nil
+	})
+	b.SetHostAction("getCommands", func() []subprocess.CommandInfo { return m.currentSlashCatalog().SubprocessCommands() })
+	// A state push encodes the catalog only when the published catalog, the runner or the runner's commands changed.
+	var commandsVersion CommandCatalogVersion
+	b.SetHostAction("getCommandsVersion", func() uint64 {
+		return commandsVersion.Version(m.slashCatalog.Load(), m.currentSlashCatalog().Runner)
+	})
+	b.SetHostAction("setActiveTools", m.setActiveToolsByName)
+	b.SetHostAction("refreshTools", func() error { return m.refreshSessionTools(true) })
+	b.SetHostAction("getThinkingLevel", func() string { return string(m.extensionThinkingLevel()) })
+	b.SetHostAction("setThinkingLevel", func(level string) { m.setExtensionThinkingLevel(ai.ModelThinkingLevel(level)) })
+	b.SetHostAction("isIdle", m.extensionIsIdle)
+	b.SetHostAction("getSignal", m.extensionSignal)
+	b.SetHostAction("isProjectTrusted", func() bool { return m.projectTrusted() })
+	if m.statusLine != nil {
+		b.SetHostAction("getGitBranch", func() string { return m.statusLine.GitBranch() })
+		b.SetHostAction("getExtensionStatuses", func() map[string]string { return m.statusLine.GetExtensionStatuses() })
+		b.SetHostAction("getAvailableProviderCount", func() int { return m.statusLine.ProviderCount() })
+	}
+	b.SetHostAction("abort", m.extensionAbort)
+	b.SetHostAction("getScopedModels", m.extensionScopedModels)
+	b.SetHostAction("hasPendingMessages", m.extensionHasPendingMessages)
+	b.SetHostAction("shutdown", m.requestExtensionShutdown)
+	b.SetHostAction("waitForIdle", func(ctx context.Context) error {
+		extension.CallInitiated(ctx)
+		return m.waitForIdle(m.runCtx)
+	})
+	b.SetHostAction("reload", m.reloadFromExtension)
+	b.SetHostAction("compact", func(ctx context.Context, opts *extension.CompactOptions) {
+		extension.CallInitiated(ctx)
+		// upstream: agent-session.ts:3369-3379. The Session starts and owns the compaction and reports through the extension's callbacks; without callbacks the outcome is dropped.
+		if m.opts.SessionHandle != nil {
+			m.opts.SessionHandle.ExtensionCompact(opts)
+			return
+		}
+		if opts != nil && opts.OnError != nil {
+			opts.OnError(errors.New("compaction is not available"))
+		}
+	})
+	b.SetHostAction(subprocess.CallSetModel, func(ctx context.Context, object *ai.Model) (bool, error) {
+		m.invalidatePostLoginSelection()
+		extension.CallInitiated(ctx)
+		newModel, err := m.bindExtensionModelObject(object)
+		if err != nil {
+			return false, err
+		}
+		return m.switchExtensionModel(ctx, newModel)
+	})
+	b.SetHostAction(subprocess.CallResolveModel, func(ctx context.Context, spec string) (*ai.Model, error) {
+		extension.CallInitiated(ctx)
+		if m.opts.ModelBuilder == nil {
+			return nil, fmt.Errorf("model switching not configured")
+		}
+		return m.opts.ModelBuilder(spec)
+	})
+	b.SetHostAction("getSessionName", m.extensionSessionName)
+	b.SetHostAction("getSessionID", func() string {
+		if m.currentSession() != nil {
+			return m.currentSession().ID()
+		}
+		return ""
+	})
+	b.SetHostAction("getSessionFile", func() string {
+		if m.currentSession() != nil {
+			return m.currentSession().Path()
+		}
+		return ""
+	})
+	b.SetHostAction("getLeafID", func() string {
+		if m.currentSession() == nil {
+			return ""
+		}
+		if leaf := m.currentSession().GetLeafID(); leaf != nil {
+			return sessionentry.WireID(*leaf)
+		}
+		return ""
+	})
+
+	b.SetHostAction("getContextUsage", m.extensionContextUsage)
+
+	// System prompt.
+	b.SetHostAction("getSystemPrompt", func() string {
+		return m.currentSystemPrompt()
+	})
+	b.SetHostAction("getSystemPromptOptions", func() extension.BuildSystemPromptOptions {
+		return *m.currentSystemPromptOptions()
+	})
+	// Interactive mode has no version of its base options, which an in-process extension may edit in place, so it reports no key and the bridge encodes the options for every state push.
+	b.SetHostAction("getSystemPromptOptionsKey", func() any { return nil })
+
+	// getEntriesPage backs bounded per-extension state pushes. Session entries
+	// are append-only, so a cursor beyond the current length means the session
+	// changed and the runtime is resent from zero.
+	b.SetHostAction("getEntriesPage", func(cursor, maxBytes int) ([]json.RawMessage, int, bool, string) {
+		if m.currentSession() == nil {
+			return nil, 0, false, ""
+		}
+		page, next, total := m.currentSession().RawEntriesPage(cursor, maxBytes)
+		leafID := ""
+		if leaf := m.currentSession().GetLeafID(); leaf != nil {
+			leafID = *leaf
+		}
+		return page, next, next < total, leafID
+	})
+	b.SetHostAction("getMessageEntries", func(cursor int) ([]sessionentry.MessageSeq, int) {
+		if m.currentSession() == nil {
+			return nil, 0
+		}
+		return m.currentSession().MessageEntriesAfter(cursor)
+	})
+	b.SetHostAction("sessionRead", func(method string, args json.RawMessage) (any, error) {
+		return ExtensionSessionRead(ExtensionSessionView{Session: m.currentSession(), CWD: m.opts.CWD, SessionDir: ExtensionSessionDir(m.opts.SessionDir)}, method, args)
+	})
+	b.SetHostAction("exec", func(ctx context.Context, command string, args []string, opts *extension.ExecOptions) (extension.ExecResult, error) {
+		return extension.ExecCommand(ctx, m.opts.CWD, command, args, opts)
+	})
+	// agent-session.ts:3419 binds setLabel into the runner's runtime; the host action reaches that one handler with the label as the extension gave it: a string (an empty one included), null, or none.
+	b.SetHostAction("setLabel", func(entryID string, label *string, null bool) error {
+		if m.currentSession() == nil || m.newRunner == nil || m.newRunner.Runtime().SetLabel == nil {
+			return fmt.Errorf("session not available")
+		}
+		return m.newRunner.Runtime().ApplyLabel(entryID, label, null)
+	})
+	b.SetHostAction("setSessionName", m.setExtensionSessionName)
+	b.SetHostAction("sendMessage", func(msg extension.CustomMessageRef, opts subprocess.SendMessageOptions) error {
+		m.reportRuntimeErrorAfter(opts.AfterRun, "send_message", m.sendExtensionMessage(msg, extension.SendMessageOptions{TriggerTurn: opts.TriggerTurn, DeliverAs: extension.DeliverAs(opts.DeliverAs)}))
+		return nil
+	})
+	b.SetHostAction("sendUserMessage", func(content any, opts subprocess.SendUserMessageOptions) error {
+		deliver := func() { _ = m.deliverUserMessageAfter(content, extension.DeliverAs(opts.DeliverAs), opts.AfterRun) }
+		if m.deferSettledAction(deliver) {
+			return nil
+		}
+		return m.deliverUserMessageAfter(content, extension.DeliverAs(opts.DeliverAs), opts.AfterRun)
+	})
+	BindAppendEntryAction(b, func() (*Session, error) {
+		if m.currentSession() == nil {
+			return nil, fmt.Errorf("session not available")
+		}
+		return m.currentSession(), nil
+	}, func(entry CustomEntry, direct *subprocess.DirectEntryAppend) error {
+		if direct != nil && !direct.Event {
+			// ctx.sessionManager.appendCustomEntry writes the log only;
+			// upstream emits entry_appended for pi.appendEntry alone.
+			return nil
+		}
+		// Live path (upstream interactive-mode.ts "entry_appended"): render the
+		// custom entry immediately. The host action runs off the UI loop, so the
+		// chat mutation + render marshal back through runOnMain, matching
+		// sendMessage's live-display path.
+		m.runOnMain(m.runCtx, func() {
+			m.addCustomEntryToChat(entry)
+			m.tuiInst.Render()
+		})
+		return nil
+	})
+	stopSessionState := m.watchReplicatedState(b)
+	return func() {
+		stopSessionState()
+		detachModelRegistry()
+	}
+}
+
+// hostStateNotifier is what the extension host's UI bridge offers the owner of state its runtimes replicate: a report that the state changed with no extension call to announce it.
+type hostStateNotifier interface{ HostStateChanged() }
+
+// hostStateScopeNotifier is a bridge that also takes the bracket around a change of the Session's identity state (UIBridge.HostStateChanging, HostStateSettled).
+type hostStateScopeNotifier interface {
+	HostStateChanging()
+	HostStateSettled()
+}
+
+// replicatedStateScopeSession is a Session that brackets the changes of its identity state (ObserveReplicatedStateScope).
+type replicatedStateScopeSession interface {
+	ObserveReplicatedStateScope(begin, end func()) func()
+}
+
+// replicatedStateSession is a Session that reports the changes of the state an extension runtime replicates (model, thinking level, session name, settings).
+type replicatedStateSession interface {
+	ObserveReplicatedState(observe func()) func()
+}
+
+// watchReplicatedState reports each change of the state the extension runtimes replicate to bridge, and returns the function that stops. Pi's `ctx.model`, `pi.getSettings()` and `pi.getSessionName()` read the live Session (runner.ts:906, loader.ts:411-414), `ctx.ui.theme` is the global theme (interactive-mode.ts:2665), and a footer reads the live git branch and provider count (footer-data-provider.ts); a user's model switch or settings edit, the /name command, a theme selection, a branch checkout or a login changes them with no extension call and no event to an extension without a handler, so the runtimes learn of it when it happens, not at their next request. The report returns at once, so it never waits for an extension on the owner loop.
+func (m *InteractiveMode) watchReplicatedState(bridge SubprocessUIBridge) func() {
+	notifier, ok := bridge.(hostStateNotifier)
+	if !ok {
+		return func() {}
+	}
+	var stops []func()
+	m.toolMu.Lock()
+	m.toolsExpandedChanged = notifier.HostStateChanged
+	m.toolMu.Unlock()
+	stops = append(stops, func() {
+		m.toolMu.Lock()
+		m.toolsExpandedChanged = nil
+		m.toolMu.Unlock()
+	})
+	if session, ok := m.opts.SessionHandle.(replicatedStateSession); ok {
+		stops = append(stops, session.ObserveReplicatedState(notifier.HostStateChanged))
+	}
+	if session, ok := m.opts.SessionHandle.(replicatedStateScopeSession); ok {
+		if scope, ok := bridge.(hostStateScopeNotifier); ok {
+			stops = append(stops, session.ObserveReplicatedStateScope(scope.HostStateChanging, scope.HostStateSettled))
+		}
+	}
+	if m.statusLine != nil {
+		stops = append(stops, m.statusLine.ObserveChange(notifier.HostStateChanged))
+	}
+	stops = append(stops, tui.ObserveActiveTheme(notifier.HostStateChanged))
+	return func() {
+		for _, stop := range stops {
+			stop()
+		}
+	}
+}
+
+func hasAssistantUsageAfter(entries []SessionEntry, index int) bool {
+	for i := len(entries) - 1; i > index; i-- {
+		msg, ok := asMessage(entries[i])
+		if !ok || msg.Message.Assistant == nil {
+			continue
+		}
+		assistant := msg.Message.Assistant
+		if assistant.StopReason == "aborted" || assistant.StopReason == "error" {
+			return false
+		}
+		usage := assistant.Usage
+		if usage == nil {
+			return false
+		}
+		return usage.TotalTokens > 0 || usage.Input+usage.Output+usage.CacheRead+usage.CacheWrite > 0
+	}
+	return false
+}
+
+func subprocessModelSpec(model map[string]any) string {
+	providerID := ""
+	switch p := model["provider"].(type) {
+	case string:
+		providerID = p
+	case map[string]any:
+		providerID, _ = p["id"].(string)
+	}
+	modelID, _ := model["modelId"].(string)
+	if modelID == "" {
+		if id, _ := model["id"].(string); id != "" {
+			if before, after, ok := strings.Cut(id, "/"); ok {
+				if providerID == "" {
+					providerID = before
+				}
+				modelID = after
+			} else {
+				modelID = id
+			}
+		}
+	}
+	if providerID == "" {
+		return modelID
+	}
+	return providerID + "/" + modelID
+}
+
+func subprocessRequiredString(object map[string]any, key, path string) (string, error) {
+	value, exists := object[key]
+	if !exists {
+		return "", fmt.Errorf("%s.%s is required", path, key)
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s.%s must be a string", path, key)
+	}
+	return text, nil
+}
+
+func subprocessOptionalString(object map[string]any, key, path string) (string, error) {
+	value, exists := object[key]
+	if !exists {
+		return "", nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s.%s must be a string", path, key)
+	}
+	return text, nil
+}
+
+func subprocessOptionalInt64(object map[string]any, key, path string) (int64, error) {
+	value, exists := object[key]
+	if !exists {
+		return 0, nil
+	}
+	switch number := value.(type) {
+	case float64:
+		if number < -(1<<63) || number >= 1<<63 || number != math.Trunc(number) {
+			return 0, fmt.Errorf("%s.%s must be an integer", path, key)
+		}
+		//portlint:allow numbers the range and integrality checks above make the conversion exact
+		return int64(number), nil
+	case int:
+		return int64(number), nil
+	case int64:
+		return number, nil
+	default:
+		return 0, fmt.Errorf("%s.%s must be an integer", path, key)
+	}
+}
+
+func subprocessDecodeJSON(value any, target any, path string) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if err := json.Unmarshal(encoded, target); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
+func subprocessRequestMessages(raw any) ([]ai.Message, error) {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("model request messages must be an array")
+	}
+	messages := make([]ai.Message, 0, len(items))
+	for index, item := range items {
+		message, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("model request messages[%d] must be an object", index)
+		}
+		role, err := subprocessRequiredString(message, "role", fmt.Sprintf("model request messages[%d]", index))
+		if err != nil {
+			return nil, err
+		}
+		path := fmt.Sprintf("model request messages[%d]", index)
+		switch role {
+		case "system":
+			var content ai.SystemContent
+			switch rawContent := message["content"].(type) {
+			case string:
+				content = ai.SystemText(rawContent)
+			case []any:
+				blocks := make(ai.SystemTextBlocks, 0, len(rawContent))
+				for blockIndex, rawBlock := range rawContent {
+					block, ok := rawBlock.(map[string]any)
+					if !ok || block["type"] != "text" {
+						return nil, fmt.Errorf("%s.content[%d] must be a text block", path, blockIndex)
+					}
+					text, err := subprocessRequiredString(block, "text", fmt.Sprintf("%s.content[%d]", path, blockIndex))
+					if err != nil {
+						return nil, err
+					}
+					textSignature, err := subprocessOptionalString(block, "textSignature", fmt.Sprintf("%s.content[%d]", path, blockIndex))
+					if err != nil {
+						return nil, err
+					}
+					blocks = append(blocks, ai.TextContent{Text: text, TextSignature: textSignature})
+				}
+				content = blocks
+			default:
+				return nil, fmt.Errorf("%s.content must be a string or text-block array", path)
+			}
+			var sections ai.OrderedSections
+			if rawSections, exists := message["sections"]; exists {
+				switch rawSections := rawSections.(type) {
+				case ai.OrderedSections:
+					sections = rawSections
+				default:
+					if err := subprocessDecodeJSON(rawSections, &sections, path+".sections"); err != nil {
+						return nil, err
+					}
+				}
+			}
+			var toolsAdded []ai.ToolSchema
+			if rawTools, exists := message["toolsAdded"]; exists {
+				if err := subprocessDecodeJSON(rawTools, &toolsAdded, path+".toolsAdded"); err != nil {
+					return nil, err
+				}
+			}
+			var toolsRemoved []ai.ToolReference
+			if rawTools, exists := message["toolsRemoved"]; exists {
+				if err := subprocessDecodeJSON(rawTools, &toolsRemoved, path+".toolsRemoved"); err != nil {
+					return nil, err
+				}
+			}
+			timestamp, err := subprocessOptionalInt64(message, "timestamp", path)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, ai.SystemMessage{Content: content, Sections: sections, ToolsAdded: toolsAdded, ToolsRemoved: toolsRemoved, Timestamp: timestamp})
+		case "user":
+			content, err := subprocessUserContent(message["content"])
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+			timestamp, err := subprocessOptionalInt64(message, "timestamp", path)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, ai.UserMessage{Content: content, Timestamp: timestamp})
+		case "assistant":
+			content, err := subprocessAssistantContent(message["content"])
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+			var fields struct {
+				API                   ai.API                          `json:"api"`
+				Provider              string                          `json:"provider"`
+				Model                 string                          `json:"model"`
+				ResponseModel         string                          `json:"responseModel"`
+				ResponseID            string                          `json:"responseId"`
+				ProviderThinkingLevel string                          `json:"providerThinkingLevel"`
+				Diagnostics           []ai.AssistantMessageDiagnostic `json:"diagnostics"`
+				Usage                 ai.Usage                        `json:"usage"`
+				StopReason            ai.StopReason                   `json:"stopReason"`
+				Deferred              *ai.DeferredHandle              `json:"deferred"`
+				ErrorMessage          string                          `json:"errorMessage"`
+				RawStopReason         string                          `json:"rawStopReason"`
+				EndTurn               *bool                           `json:"endTurn"`
+				DurationMs            *int64                          `json:"durationMs"`
+				Timestamp             int64                           `json:"timestamp"`
+			}
+			if err := subprocessDecodeJSON(message, &fields, path); err != nil {
+				return nil, err
+			}
+			messages = append(messages, ai.AssistantMessage{Content: content, API: fields.API, Provider: fields.Provider, Model: fields.Model, ResponseModel: fields.ResponseModel, ResponseID: fields.ResponseID, ProviderThinkingLevel: fields.ProviderThinkingLevel, Diagnostics: fields.Diagnostics, Usage: fields.Usage, StopReason: fields.StopReason, Deferred: fields.Deferred, ErrorMessage: fields.ErrorMessage, RawStopReason: fields.RawStopReason, EndTurn: fields.EndTurn, DurationMs: fields.DurationMs, Timestamp: fields.Timestamp})
+		case "toolResult", "tool":
+			content, err := subprocessToolResultContent(message["content"])
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+			var fields struct {
+				ToolCallID string    `json:"toolCallId"`
+				ToolName   string    `json:"toolName"`
+				Details    any       `json:"details"`
+				Usage      *ai.Usage `json:"usage"`
+				IsError    bool      `json:"isError"`
+				DurationMs *int64    `json:"durationMs"`
+				Timestamp  int64     `json:"timestamp"`
+			}
+			if err := subprocessDecodeJSON(message, &fields, path); err != nil {
+				return nil, err
+			}
+			if fields.ToolCallID == "" {
+				return nil, fmt.Errorf("%s.toolCallId is required", path)
+			}
+			_, hasDetails := message["details"]
+			messages = append(messages, ai.ToolResultMessage{ToolCallID: fields.ToolCallID, ToolName: fields.ToolName, Content: content, Details: fields.Details, DetailsNull: hasDetails && fields.Details == nil, Usage: fields.Usage, IsError: fields.IsError, DurationMs: fields.DurationMs, Timestamp: fields.Timestamp})
+		default:
+			return nil, fmt.Errorf("%s has unsupported role %q", path, role)
+		}
+	}
+	return messages, nil
+}
+
+func subprocessUserContent(raw any) (ai.UserContent, error) {
+	switch typed := raw.(type) {
+	case ai.UserText:
+		return typed, nil
+	case ai.UserContentBlocks:
+		return slices.Clone(typed), nil
+	case []ai.UserContentBlock:
+		return ai.UserContentBlocks(slices.Clone(typed)), nil
+	}
+	if text, ok := raw.(string); ok {
+		return ai.UserText(text), nil
+	}
+	blocks, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("user content must be a string or array")
+	}
+	content := make(ai.UserContentBlocks, 0, len(blocks))
+	for index, rawBlock := range blocks {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("user content[%d] must be an object", index)
+		}
+		blockType, err := subprocessRequiredString(block, "type", fmt.Sprintf("user content[%d]", index))
+		if err != nil {
+			return nil, err
+		}
+		switch blockType {
+		case "text":
+			text, err := subprocessRequiredString(block, "text", fmt.Sprintf("user content[%d]", index))
+			if err != nil {
+				return nil, err
+			}
+			signature, err := subprocessOptionalString(block, "textSignature", fmt.Sprintf("user content[%d]", index))
+			if err != nil {
+				return nil, err
+			}
+			content = append(content, ai.TextContent{Text: text, TextSignature: signature})
+		case "image":
+			data, err := subprocessRequiredString(block, "data", fmt.Sprintf("user content[%d]", index))
+			if err != nil {
+				return nil, err
+			}
+			mimeType, err := subprocessOptionalString(block, "mimeType", fmt.Sprintf("user content[%d]", index))
+			if err != nil {
+				return nil, err
+			}
+			if mimeType == "" {
+				mimeType, err = subprocessRequiredString(block, "media_type", fmt.Sprintf("user content[%d]", index))
+				if err != nil {
+					return nil, err
+				}
+			}
+			content = append(content, ai.ImageContent{Data: data, MimeType: mimeType})
+		default:
+			return nil, fmt.Errorf("unsupported user content type %q", blockType)
+		}
+	}
+	return content, nil
+}
+
+func subprocessAssistantContent(raw any) ([]ai.AssistantContentBlock, error) {
+	blocks, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("assistant content must be an array")
+	}
+	content := make([]ai.AssistantContentBlock, 0, len(blocks))
+	for index, rawBlock := range blocks {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("assistant content[%d] must be an object", index)
+		}
+		path := fmt.Sprintf("assistant content[%d]", index)
+		blockType, err := subprocessRequiredString(block, "type", path)
+		if err != nil {
+			return nil, err
+		}
+		switch blockType {
+		case "text":
+			text, err := subprocessRequiredString(block, "text", path)
+			if err != nil {
+				return nil, err
+			}
+			signature, err := subprocessOptionalString(block, "textSignature", path)
+			if err != nil {
+				return nil, err
+			}
+			content = append(content, ai.TextContent{Text: text, TextSignature: signature})
+		case "thinking":
+			thinking, err := subprocessRequiredString(block, "thinking", path)
+			if err != nil {
+				return nil, err
+			}
+			signature, err := subprocessOptionalString(block, "thinkingSignature", path)
+			if err != nil {
+				return nil, err
+			}
+			redacted := false
+			if raw, exists := block["redacted"]; exists {
+				var ok bool
+				redacted, ok = raw.(bool)
+				if !ok {
+					return nil, fmt.Errorf("%s.redacted must be a boolean", path)
+				}
+			}
+			content = append(content, ai.ThinkingContent{Thinking: thinking, ThinkingSignature: signature, Redacted: redacted})
+		case "toolCall":
+			id, err := subprocessRequiredString(block, "id", path)
+			if err != nil || id == "" {
+				if err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("%s.id is required", path)
+			}
+			name, err := subprocessRequiredString(block, "name", path)
+			if err != nil {
+				return nil, err
+			}
+			arguments, ok := block["arguments"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("%s.arguments must be an object", path)
+			}
+			thoughtSignature, err := subprocessOptionalString(block, "thoughtSignature", path)
+			if err != nil {
+				return nil, err
+			}
+			namespace, err := subprocessOptionalString(block, "namespace", path)
+			if err != nil {
+				return nil, err
+			}
+			content = append(content, ai.ToolCall{ID: id, Name: name, Arguments: ai.JsonObject(arguments), ThoughtSignature: thoughtSignature, Namespace: namespace})
+		default:
+			return nil, fmt.Errorf("unsupported assistant content type %q", blockType)
+		}
+	}
+	return content, nil
+}
+
+func subprocessToolResultContent(raw any) ([]ai.ToolResultMessageContent, error) {
+	if text, ok := raw.(string); ok {
+		return []ai.ToolResultMessageContent{ai.TextContent{Text: text}}, nil
+	}
+	userContent, err := subprocessUserContent(raw)
+	if err != nil {
+		return nil, err
+	}
+	blocks := userContent.(ai.UserContentBlocks)
+	content := make([]ai.ToolResultMessageContent, len(blocks))
+	for i, block := range blocks {
+		content[i] = block.(ai.ToolResultMessageContent)
+	}
+	return content, nil
+}
+
+func subprocessOptionalFloat64(object map[string]any, key, path string) (float64, bool, error) {
+	value, exists := object[key]
+	if !exists {
+		return 0, false, nil
+	}
+	switch number := value.(type) {
+	case float64:
+		return number, true, nil
+	case int:
+		return float64(number), true, nil
+	default:
+		return 0, true, fmt.Errorf("%s.%s must be a number", path, key)
+	}
+}
+
+func subprocessStringMap(raw any, path string) (map[string]string, error) {
+	object, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an object", path)
+	}
+	values := make(map[string]string, len(object))
+	for key, rawValue := range object {
+		value, ok := rawValue.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s.%s must be a string", path, key)
+		}
+		values[key] = value
+	}
+	return values, nil
+}
+
+// subprocessRequestMetadata reads requestMetadata, a string map. An *orderedjson.Object (the subprocess bridge's decoding) also gives
+// the keys' insertion order.
+func subprocessRequestMetadata(raw any, path string) (map[string]string, []string, error) {
+	object, ok := raw.(*orderedjson.Object)
+	if !ok {
+		values, err := subprocessStringMap(raw, path)
+		return values, nil, err
+	}
+	keys := object.Keys()
+	values := make(map[string]string, len(keys))
+	for _, key := range keys {
+		rawValue, _ := object.Get(key)
+		var value string
+		if len(rawValue) == 0 || rawValue[0] != '"' || json.Unmarshal(rawValue, &value) != nil {
+			return nil, nil, fmt.Errorf("%s.%s must be a string", path, key)
+		}
+		values[key] = value
+	}
+	return values, keys, nil
+}
+
+// subprocessSamplingParams reads samplingParams, an object. An *orderedjson.Object (the subprocess bridge's decoding of an object whose
+// members are not in sorted order) also gives the member order, which the provider keeps on the wire.
+func subprocessSamplingParams(raw any) (map[string]any, []string, error) {
+	ordered, ok := raw.(*orderedjson.Object)
+	if !ok {
+		object, ok := raw.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("model request.samplingParams must be an object")
+		}
+		return object, nil, nil
+	}
+	keys := ordered.Keys()
+	object := make(map[string]any, len(keys))
+	for _, key := range keys {
+		value, _ := ordered.Get(key)
+		object[key] = orderedjson.Value(value)
+	}
+	return object, keys, nil
+}
+
+func subprocessProviderHeaders(raw any, path string) (ai.ProviderHeaders, error) {
+	object, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an object", path)
+	}
+	values := make(ai.ProviderHeaders, len(object))
+	for key, rawValue := range object {
+		if rawValue == nil {
+			values[key] = nil
+			continue
+		}
+		value, ok := rawValue.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s.%s must be a string or null", path, key)
+		}
+		values[key] = new(value)
+	}
+	return values, nil
+}
+
+func subprocessStreamOptions(request map[string]any, defaults ai.StreamOptions) (ai.StreamOptions, error) {
+	options := defaults
+	for _, field := range []struct {
+		name   string
+		target **int
+	}{
+		{"timeoutMs", &options.TimeoutMs}, {"websocketConnectTimeoutMs", &options.WebSocketConnectTimeoutMs}, {"maxRetries", &options.MaxRetries}, {"maxRetryDelayMs", &options.MaxRetryDelayMs},
+	} {
+		if _, exists := request[field.name]; !exists {
+			continue
+		}
+		value, err := subprocessOptionalInt64(request, field.name, "model request")
+		if err != nil {
+			return ai.StreamOptions{}, err
+		}
+		if value < 0 {
+			return ai.StreamOptions{}, fmt.Errorf("model request.%s must be non-negative", field.name)
+		}
+		*field.target = new(int(value))
+	}
+	if value, exists := request["maxTokens"]; exists {
+		number, err := subprocessOptionalInt64(request, "maxTokens", "model request")
+		if err != nil {
+			return ai.StreamOptions{}, err
+		}
+		if number < 0 {
+			return ai.StreamOptions{}, fmt.Errorf("model request.maxTokens must be non-negative")
+		}
+		options.MaxTokens = int(number)
+		_ = value
+	}
+	if value, exists, err := subprocessOptionalFloat64(request, "temperature", "model request"); err != nil {
+		return ai.StreamOptions{}, err
+	} else if exists {
+		options.Temperature = value
+		options.TemperatureSet = true
+	}
+	if raw, exists := request["samplingParams"]; exists {
+		object, order, err := subprocessSamplingParams(raw)
+		if err != nil {
+			return ai.StreamOptions{}, err
+		}
+		options.SamplingParams, options.SamplingParamsOrder = object, order
+	}
+	if raw, exists := request["thinkingBudgets"]; exists {
+		object, ok := raw.(map[string]any)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.thinkingBudgets must be an object")
+		}
+		// A present level is configured whatever its value, zero included (simple-options.ts:82).
+		levels := map[string]*int{}
+		for _, key := range []string{"minimal", "low", "medium", "high"} {
+			if _, exists := object[key]; !exists {
+				continue
+			}
+			value, err := subprocessOptionalInt64(object, key, "model request.thinkingBudgets")
+			if err != nil {
+				return ai.StreamOptions{}, err
+			}
+			levels[key] = new(int(value))
+		}
+		budgets := ai.NewThinkingBudgets(levels["minimal"], levels["low"], levels["medium"], levels["high"])
+		if budgets == nil {
+			budgets = &ai.ThinkingBudgets{}
+		}
+		options.ThinkingBudgets = budgets
+	}
+	if value, exists := request["thinking"]; exists {
+		object, ok := value.(map[string]any)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.thinking must be an object")
+		}
+		data, err := json.Marshal(object)
+		if err != nil {
+			return ai.StreamOptions{}, err
+		}
+		var thinking ai.GoogleThinkingOptions
+		if err := json.Unmarshal(data, &thinking); err != nil {
+			return ai.StreamOptions{}, fmt.Errorf("model request.thinking: %w", err)
+		}
+		options.GoogleThinking = &thinking
+	}
+	for name, target := range map[string]**bool{"thinkingEnabled": &options.ThinkingEnabled, "interleavedThinking": &options.InterleavedThinking} {
+		if value, exists := request[name]; exists {
+			boolean, ok := value.(bool)
+			if !ok {
+				return ai.StreamOptions{}, fmt.Errorf("model request.%s must be a boolean", name)
+			}
+			*target = new(boolean)
+		}
+	}
+	if _, exists := request["thinkingBudgetTokens"]; exists {
+		value, err := subprocessOptionalInt64(request, "thinkingBudgetTokens", "model request")
+		if err != nil {
+			return ai.StreamOptions{}, err
+		}
+		options.ThinkingBudgetTokens = new(int(value))
+	}
+	if value, exists := request["effort"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.effort must be a string")
+		}
+		options.Effort = ai.AnthropicEffort(text)
+	}
+	if value, exists := request["thinkingDisplay"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.thinkingDisplay must be a string")
+		}
+		options.ThinkingDisplay = ai.AnthropicThinkingDisplay(text)
+	}
+	if value, exists := request["requestMetadata"]; exists {
+		metadata, order, err := subprocessRequestMetadata(value, "model request.requestMetadata")
+		if err != nil {
+			return ai.StreamOptions{}, err
+		}
+		options.RequestMetadata, options.RequestMetadataOrder = metadata, order
+	}
+	if value, exists := request["reasoningEffort"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.reasoningEffort must be a string")
+		}
+		options.ReasoningEffort = text
+	}
+	if value, exists := request["reasoning"]; exists {
+		// Upstream SimpleStreamOptions.reasoning: the thinking level of a
+		// streamSimple/completeSimple request.
+		text, ok := value.(string)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.reasoning must be a string")
+		}
+		options.Thinking = ai.ModelThinkingLevel(text).ReasoningOption()
+	}
+	if value, exists := request["apiKey"]; exists {
+		// Upstream options.apiKey: the request's credential, ahead of the
+		// configured one.
+		text, ok := value.(string)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.apiKey must be a string")
+		}
+		options.APIKey = text
+	}
+	if value, exists := request["isReasoning"]; exists {
+		boolean, ok := value.(bool)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.isReasoning must be a boolean")
+		}
+		options.IsReasoning = boolean
+	}
+	if raw, exists := request["env"]; exists {
+		values, err := subprocessStringMap(raw, "model request.env")
+		if err != nil {
+			return ai.StreamOptions{}, err
+		}
+		options.Env = ai.ProviderEnv(values)
+	}
+	if raw, exists := request["headers"]; exists {
+		values, err := subprocessProviderHeaders(raw, "model request.headers")
+		if err != nil {
+			return ai.StreamOptions{}, err
+		}
+		options.Headers = values
+	}
+	if value, exists := request["sessionId"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.sessionId must be a string")
+		}
+		options.SessionID = text
+	}
+	if value, exists := request["transport"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.transport must be a string")
+		}
+		options.Transport = ai.Transport(text)
+	}
+	if value, exists := request["cacheRetention"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.cacheRetention must be a string")
+		}
+		options.CacheRetention = ai.CacheRetention(text)
+	}
+	options.ToolChoice = request["toolChoice"]
+	if metadata, exists := request["metadata"]; exists {
+		object, ok := metadata.(map[string]any)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.metadata must be an object")
+		}
+		options.Metadata = object
+	}
+	// upstream: packages/ai/src/utils/identity.ts:ClientIdentity. A Node extension's own request (a Session from createAgentSession, whose core/sdk.ts passes getClientIdentity, or a direct pi-ai call) names how it identifies itself; null or absent leaves the provider's defaults.
+	if value := request["identity"]; value != nil {
+		object, ok := value.(map[string]any)
+		if !ok {
+			return ai.StreamOptions{}, fmt.Errorf("model request.identity must be an object")
+		}
+		identity, err := subprocessClientIdentity(object)
+		if err != nil {
+			return ai.StreamOptions{}, fmt.Errorf("model request.identity: %w", err)
+		}
+		options.Identity = identity
+	}
+	return options, nil
+}
+
+// subprocessClientIdentity reads pi-ai's ClientIdentity from the request's decoded JSON: userAgent ("short", "detailed" or { custom }),
+// version, and attribution (an object, or null for none). An absent or null field leaves the provider default.
+func subprocessClientIdentity(object map[string]any) (*ai.ClientIdentity, error) {
+	identity := &ai.ClientIdentity{}
+	if value := object["userAgent"]; value != nil {
+		var mode ai.UserAgentMode
+		switch typed := value.(type) {
+		case string:
+			switch typed {
+			case "short":
+				mode = ai.UserAgentShort
+			case "detailed":
+				mode = ai.UserAgentDetailed
+			default:
+				return nil, errors.New(`userAgent must be "short", "detailed" or { "custom": string }`)
+			}
+		case map[string]any:
+			custom, ok := typed["custom"].(string)
+			if !ok {
+				return nil, errors.New(`userAgent must be "short", "detailed" or { "custom": string }`)
+			}
+			mode = ai.UserAgentCustom(custom)
+		default:
+			return nil, errors.New(`userAgent must be "short", "detailed" or { "custom": string }`)
+		}
+		identity.UserAgent = &mode
+	}
+	if value := object["version"]; value != nil {
+		version, ok := value.(string)
+		if !ok {
+			return nil, errors.New("version must be a string")
+		}
+		identity.Version = &version
+	}
+	if value, exists := object["attribution"]; exists {
+		if value == nil {
+			identity.AttributionNull = true
+			return identity, nil
+		}
+		fields, ok := value.(map[string]any)
+		if !ok {
+			return nil, errors.New("attribution must be an object or null")
+		}
+		attribution := &ai.ClientAttribution{}
+		var nameOK, urlOK bool
+		attribution.Name, nameOK = fields["name"].(string)
+		attribution.URL, urlOK = fields["url"].(string)
+		if !nameOK || !urlOK {
+			return nil, errors.New("attribution.name and attribution.url must be strings")
+		}
+		if categories, exists := fields["categories"]; exists && categories != nil {
+			list, ok := categories.([]any)
+			if !ok {
+				return nil, errors.New("attribution.categories must be an array of strings")
+			}
+			for _, entry := range list {
+				category, ok := entry.(string)
+				if !ok {
+					return nil, errors.New("attribution.categories must be an array of strings")
+				}
+				attribution.Categories = append(attribution.Categories, category)
+			}
+		}
+		identity.Attribution = attribution
+	}
+	return identity, nil
+}
+
+type ModelOperationBridge interface {
+	SetHostAction(key string, fn any)
+	PublishModelCatalog()
+}
+
+type modelCatalogEncodingBridge interface {
+	SetModelCatalog(func() []json.RawMessage, func() (json.RawMessage, error))
+}
+
+type ModelOperationBindings struct {
+	CurrentModel  func() *ai.Model
+	ModelLookup   func(providerID, modelID string) *ai.Model
+	ModelCatalog  func(providerID ...string) []*ai.Model
+	Registry      *ModelRegistry
+	ModelBuilder  func(spec string) (*ai.Model, error)
+	SessionHandle InteractiveSessionHandle
+	// Classify is the Session runtime's classify; an extension's ctx.modelRegistry.classify reaches it. Nil answers an error result.
+	Classify func(context.Context, *ai.ClassifierModel, ai.ClassifierContext, ...ai.ModelsClassifierOptions) ai.ClassifierResult
+	// GenerateImages is the Session runtime's generateImages; an extension's ctx.modelRegistry.generateImages reaches it. Nil answers an error result.
+	GenerateImages func(context.Context, *ai.ImageModel, ai.ImagesContext, ...ai.ModelsImagesOptions) ai.AssistantImages
+}
+
+// WireModelOperations installs one Session-owned extension model surface and returns its catalog-listener detach function.
+func WireModelOperations(bridge ModelOperationBridge, bindings ModelOperationBindings) func() {
+	if bridge == nil {
+		return func() {}
+	}
+	// Each replica receives one snapshot of the finished binding, when this function returns.
+	if batching, ok := bridge.(interface{ BatchModelCatalogPublication() func() }); ok {
+		defer batching.BatchModelCatalogPublication()()
+	}
+	bridge.SetHostAction("getModelInfo", func() json.RawMessage {
+		if bindings.CurrentModel == nil {
+			return nil
+		}
+		object, _ := extension.ModelObject(bindings.CurrentModel())
+		return object
+	})
+	// A model is immutable once built, so its metadata changes only when the Session holds another one.
+	bridge.SetHostAction("getModelKey", func() any {
+		if bindings.CurrentModel == nil {
+			return nil
+		}
+		return bindings.CurrentModel()
+	})
+	bridge.SetHostAction("getModel", func(providerID, modelID string) json.RawMessage {
+		if bindings.ModelLookup == nil {
+			return nil
+		}
+		object, _ := extension.ModelObject(bindings.ModelLookup(providerID, modelID))
+		return object
+	})
+	catalogEncoding := &extensionCatalogEncoding{}
+	getModels := func() []json.RawMessage {
+		if bindings.ModelCatalog == nil {
+			return nil
+		}
+		models := bindings.ModelCatalog()
+		result := make([]json.RawMessage, 0, len(models))
+		for _, model := range models {
+			if object, _ := extension.ModelObject(model); object != nil {
+				result = append(result, object)
+			}
+		}
+		return result
+	}
+	if encoded, ok := bridge.(modelCatalogEncodingBridge); ok {
+		encoded.SetModelCatalog(getModels, func() (json.RawMessage, error) {
+			if bindings.ModelCatalog == nil {
+				return json.RawMessage("null"), nil
+			}
+			// The first publication has no registry provider state or registration ordering yet. Share only its model encoding; later publications still read current metadata and auth.
+			state := catalogEncoding.state(nil, bindings.ModelCatalog())
+			if models, ok := state["models"].(json.RawMessage); ok {
+				return models, nil
+			}
+			return json.Marshal(state["models"])
+		})
+	} else {
+		bridge.SetHostAction("getModels", getModels)
+	}
+	bridge.SetHostAction("getModelAuth", func(ctx context.Context, providerID, modelID string) map[string]any {
+		extension.CallInitiated(ctx)
+		if bindings.Registry == nil {
+			return map[string]any{"ok": false, "error": "model registry not available"}
+		}
+		if bindings.Registry.NativeProvider(providerID) != nil {
+			auth, err := bindings.Registry.NativeProviderAuth(ctx, providerID, ai.AuthResolutionOverrides{})
+			if err != nil {
+				return map[string]any{"ok": false, "error": err.Error()}
+			}
+			result := map[string]any{"ok": true}
+			if auth != nil {
+				maps.Copy(result, AuthResultJSON(auth)["auth"].(map[string]any))
+				if auth.Env != nil {
+					result["env"] = auth.Env
+				}
+			}
+			return result
+		}
+		var model *ai.Model
+		if bindings.ModelLookup != nil {
+			model = bindings.ModelLookup(providerID, modelID)
+		} else {
+			for _, candidate := range bindings.Registry.GetProviderModelData(providerID) {
+				if candidate.ID == modelID {
+					model = candidate
+					break
+				}
+			}
+		}
+		if model == nil {
+			return map[string]any{"ok": false, "error": "model not found"}
+		}
+		auth, err := bindings.Registry.ResolveCompatibilityModelAuth(ctx, model)
+		if err != nil {
+			return map[string]any{"ok": false, "error": err.Error()}
+		}
+		result := map[string]any{"ok": true}
+		maps.Copy(result, AuthResultJSON(auth)["auth"].(map[string]any))
+		if auth.Env != nil {
+			result["env"] = auth.Env
+		}
+		return result
+	})
+	bridge.SetHostAction("getModelRegistryState", func() map[string]any {
+		var catalog []*ai.Model
+		if bindings.ModelCatalog != nil {
+			catalog = bindings.ModelCatalog()
+		}
+		return catalogEncoding.state(bindings.Registry, catalog)
+	})
+	bridge.SetHostAction("getAvailableOfType", func(ctx context.Context, modelType, providerID string) ([]json.RawMessage, error) {
+		return extensionAvailableOfType(ctx, bindings.Registry, modelType, providerID)
+	})
+	bridge.SetHostAction("classify", func(ctx context.Context, model map[string]any, request json.RawMessage, options map[string]any) (json.RawMessage, error) {
+		return extensionClassify(ctx, bindings.Classify, model, request, options), nil
+	})
+	bridge.SetHostAction("generateImages", func(ctx context.Context, model map[string]any, request json.RawMessage, options map[string]any) (json.RawMessage, error) {
+		return extensionGenerateImages(ctx, bindings.GenerateImages, model, request, options), nil
+	})
+	bridge.SetHostAction("getProviderAuth", func(ctx context.Context, providerID string) (map[string]any, error) {
+		if bindings.Registry == nil {
+			return nil, nil
+		}
+		result, err := bindings.Registry.ExtensionProviderAuth(ctx, providerID)
+		if err != nil {
+			return nil, err
+		}
+		return AuthResultJSON(result), nil
+	})
+	bridge.SetHostAction("refreshModelRegistry", func(ctx context.Context, allowNetwork *bool, providers []string, force *bool) (map[string]any, error) {
+		errors := map[string]string{}
+		if bindings.Registry == nil {
+			return map[string]any{"aborted": false, "errors": errors}, nil
+		}
+		result := bindings.Registry.ExtensionRefresh(ctx, allowNetwork, providers, force)
+		for providerID, err := range result.Errors {
+			errors[providerID] = err.Error()
+		}
+		return map[string]any{"aborted": result.Aborted, "errors": errors}, nil
+	})
+	stream := func(ctx context.Context, model map[string]any, request map[string]any) (*ai.AssistantMessageEventStream, error) {
+		return streamModelForSubprocess(ctx, model, request, bindings)
+	}
+	bridge.SetHostAction("streamModel", stream)
+	bridge.SetHostAction("complete", func(ctx context.Context, model map[string]any, request map[string]any, _ map[string]any) (map[string]any, error) {
+		stream, err := stream(ctx, model, request)
+		if err != nil {
+			return nil, err
+		}
+		extension.CallInitiated(ctx)
+		encoded, err := json.Marshal(stream.Result())
+		if err != nil {
+			return nil, err
+		}
+		var result map[string]any
+		if err := json.Unmarshal(encoded, &result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	})
+	if bindings.Registry == nil {
+		return func() {}
+	}
+	// The typed models are recomposed on the same committed registry changes that republish the catalog. The subscription is an observer: the registry's single listener slot belongs to ModelRuntime.SetChangeListener callers.
+	// The registry notifies after every commit, whether or not it changed anything (a refresh commits twice: models.json reloaded, the catalogs
+	// refreshed): a bridge that can tell sends a replica nothing it already holds.
+	publishChange := bridge.PublishModelCatalog
+	if changes, ok := bridge.(interface{ PublishModelCatalogChange() }); ok {
+		publishChange = changes.PublishModelCatalogChange
+	}
+	detach := bindings.Registry.ObserveChanges(func() {
+		catalogEncoding.invalidateTyped()
+		publishChange()
+	})
+	bridge.PublishModelCatalog()
+	return detach
+}
+
+// EarlyModelStream is the model stream for the pi-ai functions (`completeSimple`, `streamSimple`) an extension calls while its module loads. Pi runs them in its
+// own process with no registration gate and no Session: the model is the caller's own object and the request goes through the global API providers.
+func EarlyModelStream() func(context.Context, map[string]any, map[string]any) (*ai.AssistantMessageEventStream, error) {
+	return func(ctx context.Context, model map[string]any, request map[string]any) (*ai.AssistantMessageEventStream, error) {
+		return streamModelForSubprocess(ctx, model, request, ModelOperationBindings{})
+	}
+}
+
+// WireEarlyModelStream installs [EarlyModelStream] on a bridge. The host has no Session yet, so the Session-owned surface of [WireModelOperations] replaces it
+// when it is installed.
+func WireEarlyModelStream(bridge ModelOperationBridge) {
+	if bridge == nil {
+		return
+	}
+	bridge.SetHostAction("streamModel", EarlyModelStream())
+}
+
+func streamModelForSubprocess(ctx context.Context, model map[string]any, request map[string]any, bindings ModelOperationBindings) (*ai.AssistantMessageEventStream, error) {
+	bridgeRequest := extension.ModelStreamRequestFromContext(ctx)
+	// A pi-ai API call carries its own model object; only a model named by provider and id needs the Session's builder and runtime.
+	if bindings.SessionHandle == nil && !bridgeRequest.API {
+		return nil, fmt.Errorf("session model runtime not available")
+	}
+	if bindings.ModelBuilder == nil && !bridgeRequest.API {
+		return nil, fmt.Errorf("model builder not available")
+	}
+	var llmModel *ai.Model
+	var err error
+	if bridgeRequest.API {
+		llmModel, err = subprocessAPIModel(model)
+	} else {
+		llmModel, err = bindings.ModelBuilder(subprocessModelSpec(model))
+	}
+	if err != nil {
+		return nil, err
+	}
+	ctx, aiRequest, options, err := decodeSubprocessStream(ctx, llmModel, request, bridgeRequest)
+	if err != nil {
+		return nil, err
+	}
+	if bindings.SessionHandle == nil {
+		// A pi-ai call made while the module loads has no Session yet.
+		if extension.ProviderStreamSimpleSelected(ctx) {
+			return ai.StreamSimpleContext(ctx, llmModel, aiRequest, options)
+		}
+		return ai.Stream(ctx, llmModel, aiRequest, options)
+	}
+	return bindings.SessionHandle.StreamModel(ctx, llmModel, aiRequest, options), nil
+}
+
+// decodeSubprocessStream turns an extension's model request (the wire map) into the provider call's context and options. It adds no transport: Pi's extension model calls pass the options the extension gave (model-runtime.ts streamSimple
+// :744-776 forwards `rest`, and the pi-ai compat stream functions an extension imports pass its options on), so a transport reaches the provider only when the request names one.
+func decodeSubprocessStream(ctx context.Context, llmModel *ai.Model, request map[string]any, bridgeRequest extension.ModelStreamRequest) (context.Context, ai.Context, ai.StreamOptions, error) {
+	// A null option is an absent one: upstream providers read undefined and
+	// null alike, and extensions pass getApiKeyAndHeaders' null headers and
+	// env straight through.
+	present := make(map[string]any, len(request))
+	for key, value := range request {
+		if value != nil {
+			present[key] = value
+		}
+	}
+	request = present
+	messages, err := subprocessRequestMessages(request["messages"])
+	if err != nil {
+		return ctx, ai.Context{}, ai.StreamOptions{}, err
+	}
+	systemPrompt, err := subprocessOptionalString(request, "systemPrompt", "model request")
+	if err != nil {
+		return ctx, ai.Context{}, ai.StreamOptions{}, err
+	}
+	var tools []ai.ToolSchema
+	if rawTools, exists := request["tools"]; exists {
+		if err := subprocessDecodeJSON(rawTools, &tools, "model request.tools"); err != nil {
+			return ctx, ai.Context{}, ai.StreamOptions{}, err
+		}
+	}
+	options, err := subprocessStreamOptions(request, ai.StreamOptions{IsReasoning: llmModel.Capabilities.MaxThinking != ""})
+	if err != nil {
+		return ctx, ai.Context{}, ai.StreamOptions{}, err
+	}
+	maxRetries, err := subprocessOptionalInt64(request, "maxRetries", "model request")
+	if err != nil {
+		return ctx, ai.Context{}, ai.StreamOptions{}, err
+	}
+	var maxRetryDelay *int
+	if _, exists := request["maxRetryDelayMs"]; exists {
+		value, err := subprocessOptionalInt64(request, "maxRetryDelayMs", "model request")
+		if err != nil {
+			return ctx, ai.Context{}, ai.StreamOptions{}, err
+		}
+		maxRetryDelay = new(int(value))
+	}
+	ctx = ai.WithProviderRequestRetry(ctx, int(maxRetries), maxRetryDelay)
+	options.Fetch = bridgeRequest.Fetch
+	options.OnPayload = bridgeRequest.OnPayload
+	options.OnResponse = bridgeRequest.OnResponse
+	options.TransformHeaders = bridgeRequest.TransformHeaders
+	return ctx, ai.Context{SystemPrompt: systemPrompt, Messages: messages, Tools: tools}, options, nil
+}
+
+func (m *InteractiveMode) streamForSubprocess(ctx context.Context, model map[string]any, request map[string]any) (*ai.AssistantMessageEventStream, error) {
+	return streamModelForSubprocess(ctx, model, request, ModelOperationBindings{
+		ModelBuilder: m.opts.ModelBuilder, SessionHandle: m.opts.SessionHandle,
+	})
+}
+
+// refreshSessionTools is ctx.refreshTools / pi.refreshTools: the Session admits and declares the tools extensions registered, then this mode rebuilds its tool prompt. An in-process caller may run on the main goroutine, so it does not wait for the rebuild; a subprocess call does.
+// upstream: agent-session.ts:3353
+func (m *InteractiveMode) refreshSessionTools(wait bool) error {
+	session, ok := m.opts.SessionHandle.(interface{ RefreshTools() error })
+	if !ok {
+		return errors.New("interactive Session cannot refresh tools")
+	}
+	if wait && m.runCtx != nil {
+		return m.runOnMainAndWait(m.runCtx, func() error {
+			if err := session.RefreshTools(); err != nil {
+				return err
+			}
+			m.rebuildToolSystemPrompt()
+			return nil
+		})
+	}
+	if err := session.RefreshTools(); err != nil {
+		return err
+	}
+	if m.runCtx == nil {
+		m.rebuildToolSystemPrompt()
+		return nil
+	}
+	return m.postToMain(m.runCtx, m.rebuildToolSystemPrompt)
+}
+
+// extensionHasPendingMessages answers the extension-facing hasPendingMessages(): whether user messages wait in the steering or follow-up queue.
+// upstream: agent-session.ts:2443-2445 counts only those; extension custom messages queued with sendMessage are not pending messages.
+func (m *InteractiveMode) extensionHasPendingMessages() bool {
+	if m.agent == nil {
+		return false
+	}
+	steering, followUps := m.agent.PendingMessages()
+	for _, message := range slices.Concat(steering, followUps) {
+		if message.User != nil {
+			return true
+		}
+	}
+	return false
+}

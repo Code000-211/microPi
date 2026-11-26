@@ -1,0 +1,44 @@
+# Upstream evidence: Pi 0.87.1 oauth-selector.ts:103-108 includes method.name in fuzzy search.
+# Pi 1.0.0 oauth-selector.ts:37 labels options without credentials " • not configured" (re-probed against Pi 1.0.0: "→ OpenAI • not configured", same 19 matches).
+# Pi 1.5.0+c23b9ec1 (the pin) matches 20 providers for 'open' in its 42-provider API-key catalog (probed 2026-11-08, both binaries); the counter reads (1/20).
+# The W3 B2 oracle captured 19 matches for 'open' in the 41-provider API-key catalog; the complete first page and counter remain compared.
+name = "17-login-method-search"
+description = "Provider search includes authentication method metadata"
+covers = ["packages/coding-agent/src/modes/interactive/components/oauth-selector.ts"]
+tags = ["hermetic", "tui"]
+driver = "interactive-tmux"
+[tmux]
+width = 120
+height = 35
+ready_pattern_pig = "(auto)"
+ready_pattern_pi = "(auto)"
+ready_timeout_seconds = 30
+capture_start = "Select provider to configure:"
+capture_end = "(1/20)"
+settle_seconds = 1
+cwd = "../selectors/testdata/login-empty-project"
+[[tmux.steps]]
+keys = ["/login", "Enter"]
+wait_contains = ["Select authentication method:"]
+[[tmux.steps]]
+keys = ["Down", "Enter"]
+wait_contains = ["Select provider to configure:"]
+[[tmux.steps]]
+keys = ["open"]
+wait_visible_contains = ["> open", "(1/20)"]
+[env]
+pig = ["PIG_CODING_AGENT_DIR=testdata/privacy-pi-compatible", "PI_CODING_AGENT_DIR=", "PIG_HOME=../selectors/testdata/pig-home-noauth", "HOME={{TEMP}}/home", "PATH={{FAKE_BIN}}:{{PATH}}"]
+pi = ["PI_CODING_AGENT_DIR=testdata/privacy-pi-compatible", "PIG_CODING_AGENT_DIR=", "PIG_HOME=", "HOME={{TEMP}}/home", "PATH={{FAKE_BIN}}:{{PATH}}"]
+pig_args = ["--no-extensions", "--session-dir", "{{TEMP}}/sessions"]
+pi_args = ["--no-extensions", "--session-dir", "{{TEMP}}/sessions"]
+[assert]
+both_reach_ready = true
+both_contain = ["> open", "OpenAI • not configured", "OpenRouter ✦ • not configured", "(1/20)"]
+escaped_output_equal = true
+runs = 3
+
+# normalize-rationale: The selected row shows the animated provider brand (provider-brand.ts, driven by each process's own clock since the selector opened), so the two binaries sample different phases of the glow. Only the 24-bit foreground colour of the animated provider name is masked; the name, the escapes that close it, the partner glyph, every other escape and all layout stay compared. Pig's colour per elapsed time is covered by Go tests of tui/provider_brand.go.
+[[assert.normalize_replace]]
+pattern = '\x1b\[38;2;\d+;\d+;\d+m(OpenRouter)'
+with = "<openrouter-glow>${1}"
+reason = "The glow phase is the selector age, which differs per process; the colour is the only masked part of the row."

@@ -1,0 +1,332 @@
+package app
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"net"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/chord/next/contracts"
+	"github.com/MichaelKinsy/PiG/chord/next/data"
+	chordhttp "github.com/MichaelKinsy/PiG/chord/nextnode/http"
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins"
+	"github.com/MichaelKinsy/PiG/chord/nextnode/plugins/model"
+)
+
+// Test support for StartServer and StartWorker (Pi's test/node/app/support.ts): an app started in a temporary data directory with a
+// temporary plugins root, the tests' API (testdata/api/v1.mjs), a worker kind whose entry is this test binary run again
+// (TestMain, fixtureEnv "worker"), and the plugins the tests write.
+
+const appFixtureEnv = "CHORD_APP_FIXTURE"
+
+var (
+	project = mustHostKind("project", contracts.Prop("id", contracts.Str()))
+	team    = mustHostKind("team", contracts.Prop("id", contracts.Str()))
+
+	testServer = delta.JsonObjectOf("kind", "server")
+	testOwner  = delta.JsonObjectOf("kind", "owner")
+)
+
+func TestMain(m *testing.M) {
+	switch os.Getenv(appFixtureEnv) {
+	case "worker":
+		StartWorker(workerOptions())
+		return
+	case "importer":
+		runSeamChild()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// apiModules are the tests' API as the server and the fixture worker have it.
+func apiModules() AppAPI {
+	path, err := filepath.Abs(filepath.Join("testdata", "api", "v1.mjs"))
+	if err != nil {
+		panic(err)
+	}
+	return AppAPI{Name: "@test/app", Versions: []string{"v1"}, Modules: plugins.HostPackages{"@test/app/v1": path}}
+}
+
+func testKinds() []AppKindEntry {
+	node := AppKind{Platform: model.PlatformNode}
+	return []AppKindEntry{{Name: "server", Kind: node}, {Name: "worker", Kind: node}, {Name: "teamworker", Kind: node}}
+}
+
+// workerOptions are the fixture worker's: StartWorker with the tests' API.
+func workerOptions() WorkerOptions {
+	return WorkerOptions{
+		API: apiModules(), Kinds: testKinds(), WorkerKinds: []*contracts.HostKind{project, team},
+		OnError: func(err any) { fmt.Fprintln(os.Stderr, err) },
+	}
+}
+
+// testWorker is the tests' worker kind: its entry is this test binary.
+func testWorker(t testing.TB, kind *contracts.HostKind, facet string) AppWorkerKind {
+	t.Helper()
+	worker, err := testWorkerKind(kind, facet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return worker
+}
+
+// testWorkerKind is testWorker for a process that has no test to fail (the importing child of the kill test).
+func testWorkerKind(kind *contracts.HostKind, facet string) (AppWorkerKind, error) {
+	entry, err := os.Executable()
+	if err != nil {
+		return AppWorkerKind{}, err
+	}
+	return AppWorkerKind{
+		Kind: kind, Entry: entry, Facet: facet,
+		Env: map[string]string{appFixtureEnv: "worker", "GORACE": "atexit_sleep_ms=0"},
+		Start: func(address contracts.Address, _ context.Context) (delta.JsonValue, error) {
+			return delta.JsonObjectOf(kind.Kind, address.Key), nil
+		},
+		Authorize: func(data.Principal, contracts.Address) bool { return true },
+		IdleMs:    func() time.Duration { return time.Minute },
+	}, nil
+}
+
+// appErrors collects what an app reports.
+type appErrors struct {
+	mu   sync.Mutex
+	list []AppError
+	// expected is set by a test that causes the app to report errors.
+	expected bool
+}
+
+// expect says the test makes the app report errors: its end does not require there to be none.
+func (e *appErrors) expect() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.expected = true
+}
+
+// all is what the app reported so far.
+func (e *appErrors) all() []AppError {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.list)
+}
+
+func (e *appErrors) add(err AppError) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.list = append(e.list, err)
+}
+
+// kinds are the kinds of what the app reported, in order.
+func (e *appErrors) kinds() []AppErrorKind {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var kinds []AppErrorKind
+	for _, err := range e.list {
+		kinds = append(kinds, err.Kind)
+	}
+	return kinds
+}
+
+// started is a started test app and what it reported.
+type started struct {
+	app     *App
+	errors  *appErrors
+	dataDir string
+	root    string
+	port    int
+}
+
+// testOptions are the options of a test app in base: a temporary data directory and plugins root unless options name them.
+func testOptions(t testing.TB, edit func(*AppOptions)) (AppOptions, *appErrors) {
+	t.Helper()
+	base := t.TempDir()
+	errs := &appErrors{}
+	options := AppOptions{
+		Name: "chord-test", DataDir: filepath.Join(base, "data"), Root: filepath.Join(base, "plugins"),
+		Listen: &chordhttp.ListenAddress{Host: "127.0.0.1", Port: 0},
+		API:    apiModules(), Kinds: testKinds(),
+		Principal: AppPrincipals{
+			Server: testServer, Owner: testOwner,
+			Worker: func(address contracts.Address) data.Principal {
+				return delta.JsonObjectOf("kind", "worker", "key", address.Key)
+			},
+		},
+		OnError: errs.add,
+	}
+	if edit != nil {
+		edit(&options)
+	}
+	if err := os.MkdirAll(options.Root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return options, errs
+}
+
+// closeAndWait closes app and joins its builds and scan (Wait): a build the test left stalled fails the test after a minute instead of
+// hanging it. A close that fails is not reported here (the test that made it fail did).
+func closeAndWait(t testing.TB, app *App) {
+	t.Helper()
+	_ = app.Close(background)
+	ctx, cancel := context.WithTimeout(background, time.Minute)
+	defer cancel()
+	if err := app.Wait(ctx); err != nil {
+		t.Errorf("the app's builds did not end: %v", err)
+	}
+}
+
+// startTestApp starts an app with testOptions, its bases built (BasesBuilt: most tests get the app as its first requests see it);
+// it is closed when the test ends unless a test closed it.
+func startTestApp(t testing.TB, plugins map[string]map[string]string, edit func(*AppOptions)) started {
+	t.Helper()
+	s := startUnbuilt(t, plugins, edit)
+	<-s.app.BasesBuilt()
+	return s
+}
+
+// startUnbuilt is startTestApp handing the app out before its bases are built (Pi's test option `unbuilt`).
+func startUnbuilt(t testing.TB, plugins map[string]map[string]string, edit func(*AppOptions)) started {
+	t.Helper()
+	options, errs := testOptions(t, edit)
+	for dir, files := range plugins {
+		writePlugin(t, options.Root, dir, "@test/"+dir, files)
+	}
+	app, err := StartServer(options, background)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Registered first, so it runs after the close and the join: no goroutine of the app, its HTTP component, its workers or its plugins outlives it.
+	t.Cleanup(func() {
+		noGoroutinesOf(t, "chord/nextnode/app.", "chord/nextnode/http.", "chord/nextnode/workers.", "chord/nextnode/plugins.")
+	})
+	t.Cleanup(func() { closeAndWait(t, app) })
+	// Runs before the close: a started app that ran its test reported nothing. An app the test closed itself is not asked: a close
+	// reports what it ends (a call in flight, a hold that could not resolve), as the reload rows with a link in flight have it.
+	t.Cleanup(func() {
+		if app.closing.Load() {
+			return
+		}
+		errs.mu.Lock()
+		expected := errs.expected
+		errs.mu.Unlock()
+		if got := errs.all(); len(got) != 0 && !expected {
+			t.Errorf("the app reported errors: %v", got)
+		}
+	})
+	var port int
+	_, _ = fmt.Sscanf(app.OwnerLink(), "http://127.0.0.1:%d/", &port)
+	resolvedDataDir, err := filepath.EvalSymlinks(options.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return started{app: app, errors: errs, dataDir: resolvedDataDir, root: options.Root, port: port}
+}
+
+// writePlugin writes the plugin dir of root: its package.json and files.
+func writePlugin(t testing.TB, root, dir, name string, files map[string]string) {
+	t.Helper()
+	all := map[string]string{"package.json": fmt.Sprintf(`{"name":%q,"private":true,"type":"module"}`, name)}
+	maps.Copy(all, files)
+	for file, text := range all {
+		path := filepath.Join(root, dir, file)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// echoServer is a plugin's server facet serving `Echo` (a local type) through the tests' API.
+const echoServer = `import { constant, defineFacet, local, str } from "@test/app/v1";
+const Echo = local("test.echo", { version: 1, params: {}, members: { text: str() } });
+export default defineFacet((host) => host.serve(Echo, () => ({ text: constant("echo") })));`
+
+var echo = mustLocal("test.echo", contracts.LocalDeclaration{Version: 1, Params: contracts.Params{}, Members: []contracts.LocalEntry{contracts.Mem("text", contracts.Str())}})
+
+// notesPlugin is the notes plugin of the worker tests (Pi's NOTES_PLUGIN, test/node/app/support.ts): on each project's worker a persisted
+// document, a table, its WorkerInfo start and its files, reached from the server through the remote `Notes`.
+var notesPlugin = map[string]string{
+	"worker.ts": `import { defineFacet, defineState, defineTable, Files, hostKind, int, local, method, obj, remote, str, unknown, WorkerInfo } from "@test/app/v1";
+const Project = hostKind("project", { id: str() });
+const Notes = remote("test.notes", { version: 1, params: { id: str() }, hostAddress: ({ id }) => Project({ id }), variants: { main: { state: { text: str(), start: unknown() }, methods: { write: method(str()), visit: method(str(), int()), attach: method(str(), str()), file: method(str(), str()) } } } });
+const Text = defineState("test.text", { schema: obj({ text: str() }), version: 1, initial: () => ({ text: "" }), persist: true, checkpointWhen: () => false });
+const Visits = defineTable("test.visits", { version: 1, columns: { page: str(), count: int() }, key: ["page"] });
+const Store = local("test.store", { version: 1, params: {}, members: { text: str(), write: method(str()), visit: method(str(), int()) } });
+export default defineFacet((host) => {
+	host.serve(Store, (_params, self) => {
+		const text = self.state(Text);
+		const visits = self.table(Visits);
+		return {
+			text: self.derive([text], ([value]) => value.text),
+			write: async (next, ctx) => { await text.change((draft) => { draft.text = next; }, ctx); return null; },
+			visit: async (page, ctx) => self.tx(async (tx) => { const count = ((await tx.get(visits, { page }))?.count ?? 0) + 1; tx.put(visits, { page, count }); return count; }, ctx),
+		};
+	});
+	host.serve(Notes, (_params, _principal, self) => {
+		const store = self.get(Store, {});
+		const info = self.get(WorkerInfo, {});
+		const files = self.get(Files, {});
+		const decoder = new TextDecoder();
+		return { variant: "main", members: {
+			text: self.derive([store.text], ([value]) => value),
+			start: self.derive([info.start], ([value]) => value),
+			write: (next, ctx) => store.write(next, ctx),
+			visit: (page, ctx) => store.visit(page, ctx),
+			attach: async (body, ctx) => (await files.put({ space: "notes", path: "note.txt", mime: "text/plain", source: "test", bytes: new TextEncoder().encode(body) }, ctx)).id,
+			file: async (id, ctx) => decoder.decode(await files.read({ id, offset: 0, length: 1024 }, ctx)),
+		} };
+	});
+});`,
+}
+
+// notes is the Go form of the notes plugin's remote contract (contracts are data).
+var notes = func() *contracts.Contract {
+	contract, err := contracts.Remote("test.notes", contracts.RemoteDeclaration{
+		Version: 1, Params: contracts.Params{contracts.Prop("id", contracts.Str())},
+		HostAddress: func(params *delta.JsonObject) (contracts.Address, error) {
+			return project.Address(delta.JsonObjectOf("id", params.Value("id"))), nil
+		},
+		Variants: []contracts.VariantEntry{contracts.Var("main", contracts.VariantDeclaration{
+			State: []contracts.Property{contracts.Prop("text", contracts.Str()), contracts.Prop("start", contracts.Unknown())},
+			Methods: []contracts.MethodEntry{
+				contracts.Meth("write", contracts.NewMethod(contracts.Str())), contracts.Meth("visit", contracts.NewMethod(contracts.Str(), contracts.Int())),
+				contracts.Meth("attach", contracts.NewMethod(contracts.Str(), contracts.Str())), contracts.Meth("file", contracts.NewMethod(contracts.Str(), contracts.Str())),
+			},
+		})},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return contract
+}()
+
+// optionsFor is the options of a test app on dataDir and root.
+func optionsFor(t testing.TB, dataDir, root string) AppOptions {
+	t.Helper()
+	options, _ := testOptions(t, func(o *AppOptions) { o.DataDir, o.Root = dataDir, root })
+	return options
+}
+
+// dirEntries are the entries of dir, sorted ([] when none).
+func dirEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	list := dirNames(t, dir)
+	if list == nil {
+		list = []string{}
+	}
+	return list
+}
+
+// socketDial is whether anything accepts on the loopback port.
+func socketDial(port int) (net.Conn, error) {
+	return net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
+}

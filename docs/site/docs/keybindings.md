@@ -1,0 +1,280 @@
+# Keybindings
+
+PiG reads keybindings from `~/.pig/agent/keybindings.json`. The file is optional. If it is absent, PiG uses the defaults in this page. The action names and defaults are those of Pi 1.6.0 ([Pi's keybindings reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/keybindings.md)).
+
+Each entry maps one action to one key or a list of keys. To change a binding, write the action name and the keys you want:
+
+```json
+{
+  "app.tools.expand": "alt+o",
+  "app.session.tree": ["ctrl+shift+t", "alt+shift+t"]
+}
+```
+
+A binding in the file replaces the default for that action. It does not add to it. Bindings you do not name keep their defaults. Set an action to `[]` to leave the action with no key.
+
+For validation and completion in your editor, add `"$schema": "https://pi.dev/schemas/keybindings.schema.json"` to the file. PiG ignores the `$schema` key when it loads the bindings. Pi 1.2.0 added this schema.
+
+Set `PIG_CODING_AGENT_DIR` to read the file from a different directory. After you edit the file, run `/reload` to apply the change to the running session.
+
+Use `/hotkeys` to list the keys that are active in the current session.
+
+A custom `tui.input.submit` binding submits messages and slash commands through the normal interactive handler. Enabling `PIG_DEBUG_KEYS` does not change that binding.
+
+If two actions claim the same key, PiG records the conflict and keeps both bindings. Both actions then answer that key, so give one of them a different key.
+
+## Worked example: move the tool-output key
+
+Tool output longer than a few lines folds, and a hint names the key that expands it. Take this request, whose command prints 30 lines. PiG shows the last five and a hint with the key (checked on PiG; `ctrl+o` is the default):
+
+```text
+ $ seq 1 30
+
+ ... (25 earlier lines, ctrl+o to expand)
+ 26
+ 27
+ 28
+ 29
+ 30
+```
+
+Put this in `~/.pig/agent/keybindings.json`, then type `/reload` (or start PiG again):
+
+```json
+{
+  "app.tools.expand": ["alt+o"]
+}
+```
+
+The hint now names the new key, and the old key stops working:
+
+```text
+ ... (25 earlier lines, alt+o to expand)
+```
+
+Pressing `alt+o` expands all 30 lines and prints `Tool output: expanded`. Pressing `ctrl+o` does nothing. `/hotkeys` lists the change as `Alt+O | Toggle tool output expansion`.
+
+Choose a key that no other action uses. The key `ctrl+e` is the editor's "End of line", so a binding of `app.tools.expand` to `ctrl+e` leaves both actions on the key (checked: `/hotkeys` listed `End/Ctrl+E` and `Ctrl+E | Toggle tool output expansion`). PiG keeps both bindings and answers with both, which is rarely what you want. Pick an unused key, and check `/hotkeys` after every change.
+
+## Defaults
+
+The keys below are the macOS defaults. Platform differences are listed after the tables.
+
+### Session control
+
+| Action | Default key | Effect |
+|---|---|---|
+| `app.clear` | `ctrl+c` | Clear editor |
+| `app.exit` | `ctrl+d` | Exit when editor is empty |
+| `app.interrupt` | `escape` | Cancel or abort |
+| `app.session.delete` | `ctrl+d` | Delete session |
+| `app.session.deleteNoninvasive` | `ctrl+backspace` | Delete session when query is empty |
+| `app.session.fork` | none | Fork current session |
+| `app.session.new` | none | Start a new session |
+| `app.session.rename` | `ctrl+r` | Rename session |
+| `app.session.resume` | none | Resume a session |
+| `app.session.toggleNamedFilter` | `ctrl+n` | Toggle named session filter |
+| `app.session.togglePath` | `ctrl+p` | Toggle session path display |
+| `app.session.toggleSort` | `ctrl+s` | Toggle session sort mode |
+| `app.session.tree` | none | Open session tree |
+| `app.suspend` | `ctrl+z` | Suspend to background |
+
+### Editing and messages
+
+| Action | Default key | Effect |
+|---|---|---|
+| `app.clipboard.pasteImage` | `ctrl+v` | Paste files on macOS, images, or text from clipboard |
+| `app.editor.external` | `ctrl+g` | Open external editor |
+| `app.message.copy` | `ctrl+x` | Copy the selected message in `/tree`. In fullscreen mode with `fullscreenCopyOnSelect` set to `false`, copy the active selection. Otherwise copy the last assistant message. On OAuth sign-in screens, copy the sign-in URL |
+| `app.message.dequeue` | `alt+up` | Restore queued messages |
+| `app.message.followUp` | `alt+enter` | Queue follow-up message |
+
+macOS Terminal.app sends Option+Up as plain Up in its default profile, so `app.message.dequeue` (`alt+up`) never arrives there. Pi treats that Up as history recall: the queued message appears in the editor as a copy, stays queued, and is still sent. PiG differs in two ways (D228):
+
+- In Terminal.app (`TERM_PROGRAM=Apple_Terminal`), when the editor is empty, a message is queued and `app.message.dequeue` is bound to `alt+up`, plain Up runs `app.message.dequeue`. The queued-message hint then names `Up`. In every other state Up keeps Pi's behavior.
+- Everywhere else, when Up recalls history while a message is queued, PiG shows one dim line under the editor, once per run: `That's a copy. The queued message still sends. <key> edits the queue.` Here `<key>` is the key bound to `app.message.dequeue`. In tmux, over ssh, or in a terminal PiG does not know, the line also says how to map Option+Up to `\033[1;3A` in Terminal Settings > Profiles > Keyboard. Do not enable "Use Option as Meta key" for this: it makes Option+Up send Esc and then Up, and Esc aborts the turn.
+
+Both differences apply to PiG's own editor only. An extension's custom editor keeps Pi's Up (D228).
+
+Clipboard image helper commands reject stdout larger than 50 MiB. PiG cancels and joins an oversized helper instead of retaining its output. Unsupported image formats such as BMP are converted to PNG; a failed conversion produces no image.
+
+### Models
+
+| Action | Default key | Effect |
+|---|---|---|
+| `app.model.cycleBackward` | `shift+ctrl+p` | Cycle to previous model |
+| `app.model.cycleForward` | `ctrl+p` | Cycle to next model |
+| `app.model.select` | `ctrl+l` | Open model selector |
+| `app.models.clearAll` | `ctrl+x` | Clear all models |
+| `app.models.enableAll` | `ctrl+a` | Enable all models |
+| `app.models.reorderDown` | `alt+down` | Move model down in order |
+| `app.models.reorderUp` | `alt+up` | Move model up in order |
+| `app.models.save` | `ctrl+s` | Save model selection |
+| `app.models.toggleProvider` | `ctrl+p` | Toggle all models for provider |
+| `app.thinking.save` | `ctrl+s` | Save the selected thinking level as the default, in the thinking level selector |
+
+### Display
+
+| Action | Default key | Effect |
+|---|---|---|
+| `app.thinking.cycle` | `shift+tab` | Cycle thinking level |
+| `app.thinking.toggle` | `ctrl+t` | Toggle thinking blocks |
+| `app.tools.expand` | `ctrl+o` | Toggle tool output |
+
+### Session tree
+
+| Action | Default key | Effect |
+|---|---|---|
+| `app.tree.editLabel` | `shift+l` | Edit tree label |
+| `app.tree.filter.all` | `ctrl+a` | Tree filter: show all entries |
+| `app.tree.filter.cycleBackward` | `shift+ctrl+o` | Tree filter: cycle backward |
+| `app.tree.filter.cycleForward` | `ctrl+o` | Tree filter: cycle forward |
+| `app.tree.filter.default` | `ctrl+d` | Tree filter: default view |
+| `app.tree.filter.labeledOnly` | `ctrl+l` | Tree filter: labeled entries only |
+| `app.tree.filter.noTools` | `ctrl+t` | Tree filter: hide tool results |
+| `app.tree.filter.userOnly` | `ctrl+u` | Tree filter: user messages only |
+| `app.tree.foldOrUp` | `alt+left, ctrl+left` | Fold tree branch or move up |
+| `app.tree.toggleLabelTimestamp` | `shift+t` | Toggle tree label timestamps |
+| `app.tree.unfoldOrDown` | `alt+right, ctrl+right` | Unfold tree branch or move down |
+
+Several actions share a key, such as `ctrl+s` for `app.session.toggleSort`, `app.models.save` and `app.thinking.save`. Each one applies only in its own selector, so they do not conflict.
+
+## Terminal UI actions
+
+Actions named `tui.*` control the editor, lists, and the fullscreen transcript. Rebind them in `keybindings.json` the same way as `app.*` actions.
+
+### Cursor movement
+
+| Action | Default key | Effect |
+|---|---|---|
+| `tui.editor.cursorUp` | `up` | Move cursor up, or browse older history at the top |
+| `tui.editor.cursorDown` | `down` | Move cursor down, or browse newer history at the bottom |
+| `tui.editor.historyPrevious` | none | Select the previous prompt history entry |
+| `tui.editor.historyNext` | none | Select the next prompt history entry |
+| `tui.editor.cursorLeft` | `left`, `ctrl+b` | Move cursor left |
+| `tui.editor.cursorRight` | `right`, `ctrl+f` | Move cursor right |
+| `tui.editor.cursorWordLeft` | `alt+left`, `ctrl+left`, `alt+b` | Move cursor one word left |
+| `tui.editor.cursorWordRight` | `alt+right`, `ctrl+right`, `alt+f` | Move cursor one word right |
+| `tui.editor.cursorLineStart` | `home`, `ctrl+a` | Move to line start |
+| `tui.editor.cursorLineEnd` | `end`, `ctrl+e` | Move to line end |
+| `tui.editor.jumpForward` | `ctrl+]` | Jump forward to a character |
+| `tui.editor.jumpBackward` | `ctrl+alt+]` | Jump backward to a character |
+| `tui.editor.pageUp` | `pageUp`, `ctrl+pageUp` | Scroll the editor up one page |
+| `tui.editor.pageDown` | `pageDown`, `ctrl+pageDown` | Scroll the editor down one page |
+
+The dedicated history actions browse prompt history wherever the cursor is, and they take precedence over application actions on the same key.
+
+### Text editing
+
+| Action | Default key | Effect |
+|---|---|---|
+| `tui.editor.deleteCharBackward` | `backspace` | Delete character backward |
+| `tui.editor.deleteCharForward` | `delete`, `ctrl+d` | Delete character forward |
+| `tui.editor.deleteWordBackward` | `ctrl+w`, `alt+backspace` | Delete word backward |
+| `tui.editor.deleteWordForward` | `alt+d`, `alt+delete` | Delete word forward |
+| `tui.editor.deleteToLineStart` | `ctrl+u` | Delete to line start |
+| `tui.editor.deleteToLineEnd` | `ctrl+k` | Delete to line end |
+| `tui.editor.yank` | `ctrl+y` | Paste the most recently deleted text |
+| `tui.editor.yankPop` | `alt+y` | Cycle through deleted text after a yank |
+| `tui.editor.undo` | `ctrl+-` | Undo the last edit |
+
+Undo groups consecutive word characters. A space starts a new group, and each newline or paste is a separate edit. Undo restores the cursor and any large-paste content with the text. Submission clears the undo stack.
+
+Consecutive word or line deletions accumulate in the kill ring. Typing or replacing the editor text ends that accumulation. Yank-pop replaces the last yank, including multiline text, and keeps the ring's rotated order.
+
+### Input and selection
+
+During initial theme detection and managed-tool setup, submitting keeps the text in the editor and shows `Startup is still in progress`. Submit again after startup completes.
+
+| Action | Default key | Effect |
+|---|---|---|
+| `tui.input.newLine` | `shift+enter`, `ctrl+j` | Insert a new line |
+| `tui.input.submit` | `enter` | Submit input |
+| `tui.input.tab` | `tab` | Tab or autocomplete |
+| `tui.input.copy` | `ctrl+c` | Copy selection |
+| `tui.select.up` | `up` | Move selection up |
+| `tui.select.down` | `down` | Move selection down |
+| `tui.select.pageUp` | `pageUp` | Move the selection up one page in a list |
+| `tui.select.pageDown` | `pageDown` | Move the selection down one page in a list |
+| `tui.select.confirm` | `enter` | Confirm selection |
+| `tui.select.cancel` | `escape`, `ctrl+c` | Cancel selection |
+
+PiG pages like Pi 1.6.0: PageUp and PageDown move the selection by one visible page in the select and settings lists, the open autocomplete list, and the model, session, tree, user-message, OAuth, scoped-models, llama.cpp and `/mcp` selectors, and the fullscreen transcript behind such a list does not scroll. The config selector also pages, but, as in Pi, it does not keep the fullscreen transcript from scrolling on those keys. The extension selector, the trust selector and the first-time setup dialog have no page keys and ignore them ([Pi #7629](https://github.com/earendil-works/pi/issues/7629)).
+
+### Fullscreen transcript
+
+These actions apply when `tuiMode` is `fullscreen`. They take precedence over editor actions that use the same key. While an overlay or a scrollable list such as autocomplete, `/settings`, or the model selector has focus, the scrolling and prompt-jump actions go to it instead of the transcript, so `tui.select.pageUp` and `tui.select.pageDown` move the list selection. Transcript search actions keep working.
+
+| Action | Default key | Effect |
+|---|---|---|
+| `tui.altScreen.pageUp` | `pageUp` | Scroll the transcript up one page |
+| `tui.altScreen.pageDown` | `pageDown` | Scroll the transcript down one page |
+| `tui.altScreen.halfPageUp` | none | Scroll the transcript up half a page |
+| `tui.altScreen.halfPageDown` | none | Scroll the transcript down half a page |
+| `tui.altScreen.lineUp` | none | Scroll the transcript up one line |
+| `tui.altScreen.lineDown` | none | Scroll the transcript down one line |
+| `tui.altScreen.previousPrompt` | `ctrl+shift+up`, `ctrl+up` | Jump to the previous prompt |
+| `tui.altScreen.nextPrompt` | `ctrl+shift+down`, `ctrl+down` | Jump to the next prompt |
+| `tui.altScreen.search` | `ctrl+shift+f` | Search the transcript |
+| `tui.altScreen.searchNext` | `enter`, `ctrl+g` | Select the next match while searching |
+| `tui.altScreen.searchPrevious` | `shift+enter`, `ctrl+shift+g` | Select the previous match while searching |
+| `tui.altScreen.searchClose` | `escape` | Close transcript search |
+| `tui.altScreen.top` | `ctrl+home` | Scroll to the start of the transcript |
+| `tui.altScreen.bottom` | `ctrl+end` | Scroll to the end of the transcript and follow new output |
+
+## Platform differences
+
+Some actions use a different key on each platform, because the terminal or the operating system reserves the macOS key. WSL uses the Windows keys, except that `ctrl+z` still suspends and `alt+z` undoes. PiG detects WSL from `WSL_DISTRO_NAME` or `WSL_INTEROP`.
+
+| Action | macOS | Linux | WSL | Windows |
+|---|---|---|---|---|
+| `app.clipboard.pasteImage` | `ctrl+v` | `ctrl+v` | `alt+v, ctrl+v` | `alt+v, ctrl+v` |
+| `app.suspend` | `ctrl+z` | `ctrl+z` | `ctrl+z` | none |
+| `app.message.dequeue` | `alt+up` | `alt+up` | `alt+q` | `alt+q` |
+| `app.message.followUp` | `alt+enter` | `alt+enter` | `ctrl+q` | `ctrl+q` |
+| `app.model.cycleBackward` | `shift+ctrl+p` | `shift+ctrl+p` | `alt+p` | `alt+p` |
+| `app.tree.foldOrUp` | `alt+left, ctrl+left` | `ctrl+left, alt+left` | `ctrl+left, alt+left` | `ctrl+left, alt+left` |
+| `app.tree.unfoldOrDown` | `alt+right, ctrl+right` | `ctrl+right, alt+right` | `ctrl+right, alt+right` | `ctrl+right, alt+right` |
+| `tui.editor.undo` | `ctrl+-` | `ctrl+-` | `alt+z` | `ctrl+z` |
+| `tui.altScreen.previousPrompt` | `ctrl+shift+up, ctrl+up` | `ctrl+shift+up, ctrl+up` | `ctrl+up` | `ctrl+up` |
+| `tui.altScreen.nextPrompt` | `ctrl+shift+down, ctrl+down` | `ctrl+shift+down, ctrl+down` | `ctrl+down` | `ctrl+down` |
+| `tui.altScreen.search` | `ctrl+shift+f` | `ctrl+shift+f` | `ctrl+f` | `ctrl+f` |
+
+On native Windows, `app.suspend` has no default because Windows terminals do not support Unix job control. If you assign it, PiG shows a status message instead of suspending.
+
+After `ctrl+z`, `bg` leaves the session stopped: PiG does not take the terminal back from the shell, and `fg` returns to it. Pi restarts its UI on `bg` and stops when its first terminal call fails (divergence D227).
+
+## Actions with no default key
+
+These actions exist but have no key until you assign one. Reach them with their slash command, or bind them in `keybindings.json`.
+
+| Action | Slash command |
+|---|---|
+| `app.session.fork` | `/fork` |
+| `app.session.new` | `/new` |
+| `app.session.resume` | `/resume` |
+| `app.session.tree` | `/tree` |
+
+## Key names
+
+Write a key as its name, or as modifiers joined to the name with `+`. The modifiers are `ctrl`, `alt`, `shift` and `super`, and you can combine them. Examples: `ctrl+o`, `shift+ctrl+p`, `alt+enter`, `escape`, `ctrl+backspace`, `super+k`.
+
+The key names are:
+
+- Letters: `a` to `z`.
+- Digits: `0` to `9`.
+- Special keys: `escape`, `esc`, `enter`, `return`, `tab`, `space`, `backspace`, `delete`, `insert`, `clear`, `home`, `end`, `pageUp`, `pageDown`, `up`, `down`, `left`, `right`.
+- Function keys: `f1` to `f12`.
+- Symbols: `` ` ``, `-`, `=`, `[`, `]`, `\`, `;`, `'`, `,`, `.`, `/`, `!`, `@`, `#`, `$`, `%`, `^`, `&`, `*`, `(`, `)`, `_`, `+`, `|`, `~`, `{`, `}`, `:`, `<`, `>`, `?`.
+
+A `super` binding needs a terminal that reports the modifier on its own, usually through the Kitty keyboard protocol.
+
+A shifted symbol such as `+` matches the character the key produces, so `ctrl++` responds under the Kitty keyboard protocol and modifyOtherKeys. Pi 1.1.0 did not match these bindings; Pi 1.6.0 does.
+
+Terminals do not all report the same keys. If a binding does not respond, the terminal usually consumed the key before PiG saw it. See [terminal setup](/docs/latest/terminal-setup).
+
+## Related
+
+- [Slash commands](/docs/latest/slash-commands) lists the slash commands.
+- [Settings](/docs/latest/settings) lists the files and settings PiG reads.
+- [Terminal setup](/docs/latest/terminal-setup) covers keys the terminal intercepts.

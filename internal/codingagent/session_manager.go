@@ -1,0 +1,462 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Mario Zechner
+// SPDX-License-Identifier: MIT
+
+package codingagent
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/nodepath"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
+	"github.com/MichaelKinsy/PiG/internal/sessionentry"
+)
+
+// ─── SessionManager ───────────────────────────────────────────────────────────
+
+// SessionManager owns the on-disk sessions directory for a given cwd
+// and tracks the active session. It carries the static half of Pi's
+// SessionManager (create, open, forkFrom, getDefaultSessionDir).
+// Ports packages/coding-agent/src/core/session-manager.ts
+type SessionManager struct {
+	cwd        string
+	sessionDir string
+	current    *Session
+	mu         sync.RWMutex
+}
+
+// NewSessionManager creates a SessionManager for the given working dir.
+func NewSessionManager(cwd string) *SessionManager {
+	return &SessionManager{
+		cwd:        managerCWD(cwd),
+		sessionDir: defaultSessionDir(cwd),
+	}
+}
+
+// managerCWD is the cwd a SessionManager records in every header it writes: Pi's constructor stores resolvePath(cwd) (tilde and file URL normalization, then
+// path.resolve), so on Windows "/work/project" is written as "D:\work\project".
+// upstream: packages/coding-agent/src/core/session-manager.ts:SessionManager.constructor
+func managerCWD(cwd string) string {
+	if resolved, err := ResolvePath(cwd, ""); err == nil {
+		return resolved
+	}
+	return absCleanDir(cwd)
+}
+
+// NewSessionManagerWithDir overrides the default session directory
+// (tests use this; production callers pass the result of
+// defaultSessionDir).
+func NewSessionManagerWithDir(cwd, dir string) *SessionManager {
+	return &SessionManager{cwd: managerCWD(cwd), sessionDir: dir}
+}
+
+// defaultSessionDir returns <agent-dir>/sessions/<encoded-cwd>/.
+// Mirrors upstream `getDefaultSessionDirPath`
+// (.upstream/current/packages/coding-agent/src/core/session-manager.ts).
+// This keeps the same relative path upstream Pi uses, modulo the config-root
+// rename from ~/.pi to ~/.pig.
+func defaultSessionDir(cwd string) string {
+	return GetDefaultSessionDirPath(cwd, AgentDir())
+}
+
+// MkdirSessionDir creates a session directory and its missing parents with mode 0700, as Pi does when existsSync finds the path absent (`if (!existsSync(dir)) mkdirSync(dir, { recursive: true })`, session-manager.ts:597-602,1018-1020): a path that exists, even a file, is left as it is. A failure is reported as Node's mkdirSync does (`ENOTDIR: not a directory, mkdir '<dir>'`), which Pi lets escape unwrapped from getDefaultSessionDir and from the SessionManager constructor. pig divergence (D132): Pi creates them with the umask
+// default (0755), so every other user of the machine can read the sessions (pi-mono #10770). An existing directory keeps its mode.
+func MkdirSessionDir(dir string) error {
+	if pathExists(dir) {
+		return nil
+	}
+	return nodeerrno.MkdirAll(dir, 0o700)
+}
+
+// GetDefaultSessionDirPath derives storage from the selected agent directory, without consulting another configuration root.
+//
+// upstream: session-manager.ts getDefaultSessionDirPath (both paths go through resolvePath first, so a trailing or doubled separator, a `..` segment, `~` and a relative cwd name the same directory as their resolved form)
+func GetDefaultSessionDirPath(cwd, agentDir string) string {
+	if resolved, err := resolvepath.Resolve(cwd, ""); err == nil {
+		cwd = resolved
+	}
+	if resolved, err := resolvepath.Resolve(agentDir, ""); err == nil {
+		agentDir = resolved
+	}
+	return filepath.Join(agentDir, "sessions", encodeCwdForSessionDir(cwd))
+}
+
+// encodeCwdForSessionDir produces upstream's `--<path>--` directory
+// name from a cwd path. Steps mirror `session-manager.ts:429`:
+//  1. Strip a leading `/` or `\` (one only).
+//  2. Replace any `/`, `\`, or `:` with `-`.
+//  3. Wrap in `--...--` bookends.
+//
+// Examples (Unix; pig is Unix-only):
+//
+//	/tmp/foo            -> --tmp-foo--
+//	/Users/example/work -> --Users-example-work--
+//	(empty)             -> ----
+func encodeCwdForSessionDir(cwd string) string {
+	s := cwd
+	if len(s) > 0 && (s[0] == '/' || s[0] == '\\') {
+		s = s[1:]
+	}
+	s = strings.NewReplacer("/", "-", `\`, "-", ":", "-").Replace(s)
+	return "--" + s + "--"
+}
+
+// Create validates a supplied session ID or generates an omitted one, then assigns the deferred session file path. parentSessionPath records a source session when supplied.
+func (sm *SessionManager) Create(id, parentSessionPath string) (*Session, error) {
+	var option *string
+	if id != "" {
+		option = &id
+	}
+	sess, err := newSessionWithOptions(sm.cwd, option, parentSessionPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := MkdirSessionDir(sm.sessionDir); err != nil {
+		return nil, err
+	}
+	// File name: <ts>_<id>.jsonl (matches upstream ordering convention
+	// so directory listings sort chronologically).
+	filename := fileTimestamp(sess.header.Timestamp) + "_" + sess.ID() + ".jsonl"
+	path := filepath.Join(sm.sessionDir, filename)
+	sess.path = path
+	sess.sessionDir = sm.sessionDir
+
+	// Do not write the file yet. Mirrors upstream SessionManager.newSession,
+	// which sets the path but defers the first disk write to _persist on the
+	// first user or assistant message. This keeps abandoned sessions (opened
+	// but never used) off disk instead of leaving empty .jsonl files.
+
+	sm.mu.Lock()
+	sm.current = sess
+	sm.mu.Unlock()
+	return sess, nil
+}
+
+// fileTimestamp turns an RFC3339Nano timestamp into a filesystem-safe
+// prefix: ":" and "." → "-". Mirrors upstream's filename convention.
+func fileTimestamp(ts string) string {
+	r := strings.NewReplacer(":", "-", ".", "-")
+	return r.Replace(ts)
+}
+
+// Load reads and migrates a session JSONL and makes it current. A missing path starts a fresh session at that exact path, with persistence deferred until the first user or assistant message.
+func (sm *SessionManager) Load(path string) (*Session, error) {
+	sess, err := loadSessionFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		resolved, resolveErr := ResolvePath(path, "")
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		id, idErr := generateSessionID()
+		if idErr != nil {
+			return nil, idErr
+		}
+		sess = NewSession(id, sm.cwd)
+		sess.path = resolved
+		err = nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sess.sessionDir = sm.sessionDir
+	sm.mu.Lock()
+	sm.current = sess
+	sm.mu.Unlock()
+	return sess, nil
+}
+
+// loadSessionFile parses and migrates a JSONL session. It rejects empty files and files without a session header.
+func loadSessionFile(path string) (*Session, error) {
+	resolvedPath, err := ResolvePath(path, "")
+	if err != nil {
+		return nil, fmt.Errorf("session: resolve %s: %w", path, err)
+	}
+	path = resolvedPath
+	session, empty, err := loadPersistedSession(path)
+	if err != nil {
+		return nil, err
+	}
+	if empty {
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("session: open %s: %w", path, err)
+		}
+		if info.Size() == 0 {
+			return nil, fmt.Errorf("session: empty file: %s", path)
+		}
+		// pig divergence (D2): the message names pig where Pi's names pi ("Product name in messages").
+		return nil, fmt.Errorf("Session file is not a valid pig session: %s", path)
+	}
+	return session, nil
+}
+
+// Current returns the active session.
+func (sm *SessionManager) Current() *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.current
+}
+
+// SessionDir returns the session directory.
+func (sm *SessionManager) SessionDir() string { return sm.sessionDir }
+
+// CWD returns the working directory.
+func (sm *SessionManager) CWD() string { return sm.cwd }
+
+// Clone extracts the chosen root-to-leaf path with resolved labels into a fresh Session. In-memory sessions stay in memory. A persisted clone is written immediately only when its path contains a user or assistant message; otherwise its first such message creates the file. The records of a persisted source are streamed from the source to the new file one at a time and the clone opens that file as a resume does, so the branch is never held decoded.
+func (sm *SessionManager) Clone(source *Session, leafID string) (*Session, error) {
+	if source == nil {
+		return nil, fmt.Errorf("sessionmanager: Clone: nil source")
+	}
+	plan, found := source.planBranchedSession(leafID)
+	if !found {
+		return nil, fmt.Errorf("Entry %s not found", leafID)
+	}
+	newID, err := generateSessionID()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	sourcePath := source.Path()
+	header := SessionHeader{
+		Type:          "session",
+		Version:       CurrentSessionVersion,
+		ID:            newID,
+		Timestamp:     now,
+		CWD:           sm.cwd,
+		ParentSession: sourcePath,
+	}
+	headerJSON, err := marshalSessionLine(header)
+	if err != nil {
+		return nil, err
+	}
+	var loaded *Session
+	if sourcePath != "" {
+		if err := MkdirSessionDir(sm.sessionDir); err != nil {
+			return nil, err
+		}
+	}
+	path := filepath.Join(sm.sessionDir, fileTimestamp(now)+"_"+newID+".jsonl")
+	if sourcePath != "" && plan.hasConversation {
+		err = writeSessionRecords(path, os.O_TRUNC, sessionWriteBuffer, func(emit func(...[]byte) error) error {
+			if err := emit(headerJSON); err != nil {
+				return err
+			}
+			return source.writeBranchedSession(plan, func(_ SessionEntry, _ *string, parts ...[]byte) error { return emit(parts...) })
+		})
+		if err != nil {
+			return nil, err
+		}
+		var empty bool
+		if loaded, empty, err = loadPersistedSession(path); err != nil {
+			return nil, err
+		}
+		if empty {
+			// pig divergence (D2): the message names pig where Pi's names pi ("Product name in messages").
+			return nil, fmt.Errorf("Session file is not a valid pig session: %s", path)
+		}
+	} else {
+		records := []FileEntry{header}
+		err = source.writeBranchedSession(plan, func(entry SessionEntry, parent *string, parts ...[]byte) error {
+			raw := slices.Concat(parts...)
+			record := rebasedMessage(entry, parent, raw)
+			if record == nil {
+				record = sessionentry.DecodeFileEntry(raw)
+			}
+			records = append(records, record)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if loaded, err = newSessionFromEntries(sm.cwd, newID, records); err != nil {
+			return nil, err
+		}
+		if sourcePath != "" {
+			loaded.path = path
+		}
+	}
+	if sourcePath != "" {
+		loaded.sessionDir = sm.sessionDir
+	}
+	sm.mu.Lock()
+	sm.current = loaded
+	sm.mu.Unlock()
+	return loaded, nil
+}
+
+// ForkFromFile copies every non-header entry from sourcePath into a new JSONL. An optional ID is validated and used verbatim; omission generates a UUIDv7. The header records the absolute source path as parentSession. Unlike Clone, this preserves the complete entry tree and writes the file immediately.
+func (sm *SessionManager) ForkFromFile(sourcePath string, idOption ...string) (*Session, error) {
+	abs, err := ResolvePath(sourcePath, "")
+	if err != nil {
+		return nil, fmt.Errorf("sessionmanager: fork: bad path: %w", err)
+	}
+	// Pi session-manager.ts forkFrom validates the source with loadEntriesFromFile, which reads a missing, empty, or headerless file as no entries.
+	records, err := LoadEntriesFromFile(abs)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("Cannot fork: source session file is empty or invalid: %s", abs)
+	}
+	if _, ok := records[0].(SessionHeader); !ok {
+		return nil, fmt.Errorf("Cannot fork: source session has no header: %s", abs)
+	}
+
+	var option *string
+	if len(idOption) > 0 {
+		option = &idOption[0]
+	}
+	created, err := newSessionWithOptions(sm.cwd, option, abs)
+	if err != nil {
+		return nil, err
+	}
+	if err := MkdirSessionDir(sm.sessionDir); err != nil {
+		return nil, err
+	}
+	header := created.GetHeader()
+	newPath := filepath.Join(sm.sessionDir, fileTimestamp(header.Timestamp)+"_"+header.ID+".jsonl")
+
+	// Pi writes the header with writeFileSync(newSessionFile, ..., { flag: "wx" }) (session-manager.ts forkFrom), so a file that already holds this timestamp and id is an EEXIST error and is left as it is.
+	f, err := os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	if err != nil {
+		return nil, sessionPersistenceError(err, "open", newPath)
+	}
+	defer func() { _ = f.Close() }()
+	// pig additive (D112): Pi writes the header and every entry with writeFileSync on one fd (session-manager.ts forkFrom, Pi 8ddc44ec8); the buffer batches those writes and is flushed before the file is read back, so the file holds the same bytes.
+	w := bufio.NewWriterSize(f, 64<<10)
+	headerJSON, _ := json.Marshal(header)
+	// A bufio.Writer keeps its first error, which Flush returns.
+	_, _ = w.Write(headerJSON)
+	_ = w.WriteByte('\n')
+	// forkFrom (session-manager.ts) writes every non-header entry with JSON.stringify of the parsed record, so the copy is
+	// normalized (escapes decoded, numbers reformatted, duplicate keys merged, integer keys first), not verbatim. Canonicalize of the record
+	// as read is that text: encoding it again first would only respell it (encoding/json escapes <, > and &).
+	for _, record := range records[1:] {
+		line, err := jsonstringify.Canonicalize(record.Raw())
+		if err != nil {
+			return nil, err
+		}
+		// A record whose type is "session" holds `"type":"session"` in its canonical text; only such a line needs the probe.
+		if bytes.Contains(line, []byte(`"type":"session"`)) {
+			if probe := (struct {
+				Type string `json:"type"`
+			}{}); json.Unmarshal(line, &probe) == nil && probe.Type == "session" {
+				continue
+			}
+		}
+		_, _ = w.Write(line)
+		_ = w.WriteByte('\n')
+	}
+	if err := w.Flush(); err != nil {
+		return nil, err
+	}
+
+	loaded, err := loadSessionFile(newPath)
+	if err != nil {
+		return nil, fmt.Errorf("sessionmanager: fork reload: %w", err)
+	}
+	sm.mu.Lock()
+	sm.current = loaded
+	sm.mu.Unlock()
+	return loaded, nil
+}
+
+// DeleteSession deletes a session file within the listed root, trying trash before unlink. A file that is already gone counts as success, as in the selector.
+func (sm *SessionManager) DeleteSession(path string) error {
+	result := sm.deleteListedSession(path)
+	if !result.ok {
+		return errors.New(result.error)
+	}
+	return nil
+}
+
+// deleteListedSession deletes a session file the selector listed with Pi's deleteSessionFile. Pi's selector deletes any confirmed path; PiG refuses a path outside the directory the All scope lists, comparing whole path elements (case-insensitively on Windows), so every listed session remains deletable.
+func (sm *SessionManager) deleteListedSession(path string) sessionDeleteResult {
+	refuse := func(message string) sessionDeleteResult {
+		return sessionDeleteResult{method: sessionDeleteUnlink, error: message}
+	}
+	absPath, err := nodepath.Resolve(path)
+	if err != nil {
+		return refuse("sessionmanager: delete: bad path: " + err.Error())
+	}
+	absRoot, err := nodepath.Resolve(sm.sessionListRoot())
+	if err != nil {
+		return refuse("sessionmanager: delete: bad dir: " + err.Error())
+	}
+	if !pathWithin(absPath, absRoot) {
+		return refuse("sessionmanager: refusing to delete file outside session dir")
+	}
+	return deleteSessionFile(path)
+}
+
+// RenameSession updates the session name by appending a session_info entry.
+// Mirrors upstream session-selector.ts rename functionality.
+func (sm *SessionManager) RenameSession(path, newName string) error {
+	session, err := loadSessionFile(path)
+	if err != nil {
+		return fmt.Errorf("sessionmanager: rename open: %w", err)
+	}
+	_, err = session.AppendSessionInfo(newName)
+	return err
+}
+
+// forEachJSONLLine calls fn with each line of r without its line ending. Lines
+// have no length limit, as upstream reads whole session files. The slice is
+// valid only during the call. A read error is wrapped; an fn error is
+// returned as is.
+func forEachJSONLLine(r io.Reader, fn func(line []byte) error) error {
+	return forEachJSONLLineContext(context.Background(), r, fn)
+}
+
+// pig additive (D112): Pi reads a session file through a 1 MiB buffer (session-manager.ts loadEntriesFromFile) or a line reader; a line longer than this pooled buffer is read into a separate slice, so every line is the same.
+var jsonlReaderPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 64*1024) }}
+
+func forEachJSONLLineContext(ctx context.Context, r io.Reader, fn func(line []byte) error) error {
+	reader := jsonlReaderPool.Get().(*bufio.Reader)
+	reader.Reset(r)
+	//perf:ok the pooled bufio.Reader keeps its fixed 64 KiB buffer; a long line grows the separate long slice, which is not pooled
+	defer func() { reader.Reset(nil); jsonlReaderPool.Put(reader) }()
+	var long []byte
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk, err := reader.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			long = append(long, chunk...)
+			continue
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("session: read: %w", err)
+		}
+		line := chunk
+		if len(long) > 0 {
+			long = append(long, chunk...)
+			line = long
+		}
+		if len(line) > 0 {
+			line = bytes.TrimSuffix(bytes.TrimSuffix(line, []byte{'\n'}), []byte{'\r'})
+			if fnErr := fn(line); fnErr != nil {
+				return fnErr
+			}
+		}
+		long = long[:0]
+		if err != nil {
+			return nil
+		}
+	}
+}

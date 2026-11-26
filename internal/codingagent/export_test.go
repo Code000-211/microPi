@@ -1,0 +1,457 @@
+package codingagent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	"github.com/MichaelKinsy/PiG/tui"
+	"github.com/MichaelKinsy/PiG/tui/widthx"
+)
+
+// TestHarness drives an InteractiveMode's owner loop without a terminal, for
+// tests in package codingagent_test that pair the mode with a real
+// coding.Session. The loop runs posted UI tasks and handles Session events
+// like inputLoop; every other access goes through Do, on that loop.
+type TestHarness struct {
+	m       *InteractiveMode
+	ctx     context.Context
+	onEvent func(h *TestHarness, ev agent.AgentEvent)
+}
+
+// ObserveTerminalTitles reports each title the mode writes on its renderer's terminal to notify, on the goroutine that writes it.
+func (h *TestHarness) ObserveTerminalTitles(t testing.TB, notify func(title string)) {
+	t.Helper()
+	h.Do(func() { recordTerminalCalls(t, h.m).onTitle = notify })
+}
+
+// NewTestHarness builds a mode around opts.SessionHandle and starts its owner
+// loop. onEvent, when non-nil, runs on the loop after the mode handles each
+// Session event.
+func NewTestHarness(t testing.TB, opts InteractiveModeOptions, onEvent func(h *TestHarness, ev agent.AgentEvent)) *TestHarness {
+	t.Helper()
+	return NewTestHarnessWithOutput(t, opts, onEvent, io.Discard)
+}
+
+// NewTestHarnessWithOutput is NewTestHarness with the renderer writing to out, so a test can assert the exact bytes the
+// terminal receives. out must tolerate concurrent writes from the render timer and the owner loop.
+func NewTestHarnessWithOutput(t testing.TB, opts InteractiveModeOptions, onEvent func(h *TestHarness, ev agent.AgentEvent), out io.Writer) *TestHarness {
+	t.Helper()
+	restoreStartupTheme(t)
+	m := NewInteractiveMode(nil, opts)
+	m.chatContainer = tui.NewContainer()
+	m.loadedResourcesContainer = tui.NewContainer()
+	m.editorContainer = tui.NewContainer()
+	m.statusContainer = tui.NewContainer()
+	m.pendingMessagesContainer = tui.NewContainer()
+	m.widgetContainer = tui.NewContainer(tui.NewSpacer(1))
+	m.widgetContainerBelow = tui.NewContainer()
+	m.rendererOut = out
+	m.tuiInst = tui.NewWithOutput(m.rendererOut, 100, 30)
+	m.statusLine = NewFooterComponent(opts.Model, "", nil)
+	m.editor = tui.NewEditor()
+	m.editorContainer.Add(m.editor)
+	m.layout = tui.NewContainer(m.loadedResourcesContainer, m.chatContainer, m.editorContainer)
+	m.tuiInst.SetFocus(m.editor)
+	m.newRunner = opts.ExtensionRunner
+	m.wireInprocContextActions()
+	m.keybindings = NewKeybindingsManagerFromBindings(harnessUserBindings, "")
+	m.slashRegistry = NewSlashRegistry()
+	if out != io.Discard {
+		// A test that reads the bytes needs the whole regular-mode layout mounted and painted once, as Run does.
+		m.layout = tui.NewContainer(m.loadedResourcesContainer, m.chatContainer, m.pendingMessagesContainer, m.statusContainer, m.editorContainer, m.statusLine)
+		m.tuiInst.Add(m.layout)
+		m.tuiInst.Render()
+	}
+	m.agent = opts.SessionHandle.Agent()
+	m.installRunPromptTurnRefresh()
+	m.eventCh = opts.SessionHandle.Events()
+	m.subscribeSessionListener()
+	t.Cleanup(m.unsubscribeSessionListener)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.runCtx = ctx
+	m.abortCtx, m.abortFn = context.WithCancel(ctx)
+	h := &TestHarness{m: m, ctx: ctx, onEvent: onEvent}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case fn := <-m.uiTaskCh:
+				fn()
+			case <-m.renderWakeCh:
+				// Nil until OwnFrames: the renderer's own timer runs the frames otherwise.
+				m.runScheduledRender()
+			case ev, ok := <-m.eventCh:
+				if !ok {
+					m.eventCh = nil
+					continue
+				}
+				m.handleAgentEvent(ev)
+				if h.onEvent != nil {
+					h.onEvent(h, ev)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	return h
+}
+
+// RebindToReplacement moves the mode onto a replacement Session as the runtime host's rebind callback does after /new or a resume: it applies the replacement build, then rebinds the mode to the Session.
+func (h *TestHarness) RebindToReplacement(ctx context.Context, session InteractiveSessionHandle, replacement InteractiveReplacement) error {
+	h.Do(func() {
+		h.m.opts.ReplacementResources = func(InteractiveSessionHandle) InteractiveReplacement { return replacement }
+	})
+	return h.m.rebindFromRuntime(ctx, session)
+}
+
+// ReplaceExtensionRunner swaps in a runner over exts as /reload does and returns the errors that reload reports.
+func (h *TestHarness) ReplaceExtensionRunner(exts []extension.Extension) []error {
+	var errs []error
+	h.Do(func() { errs = h.m.replaceExtensionRunner(exts) })
+	return errs
+}
+
+// Runner is the in-process runner the mode currently binds.
+func (h *TestHarness) Runner() *inproc.Runner {
+	var runner *inproc.Runner
+	h.Do(func() { runner = h.m.newRunner })
+	return runner
+}
+
+// Do runs fn on the owner loop and waits for it.
+func (h *TestHarness) Do(fn func()) {
+	finished := make(chan struct{})
+	h.m.runOnMain(h.ctx, func() {
+		fn()
+		close(finished)
+	})
+	<-finished
+}
+
+// Enter types text into the editor and presses Enter. Call it from an onEvent
+// callback, which already runs on the owner loop, or through Do.
+func (h *TestHarness) Enter(text string) {
+	h.m.editor.SetText(text)
+	_ = h.m.dispatchKey(h.ctx, "\r")
+}
+
+// SubmitInitialMessages runs the startup path for positional messages after
+// the first. Call it off the owner loop.
+func (h *TestHarness) SubmitInitialMessages(messages []string) {
+	h.m.submitInitialMessages(h.ctx, messages)
+}
+
+// Key dispatches one key sequence. Call it on the owner loop, like Enter.
+func (h *TestHarness) Key(data string) {
+	_ = h.m.dispatchKey(h.ctx, data)
+}
+
+// PendingDisplay returns the pending-messages rows as plain text.
+func (h *TestHarness) PendingDisplay() string {
+	var text string
+	h.Do(func() {
+		lines := h.m.pendingMessagesContainer.Render(100)
+		for i, line := range lines {
+			lines[i] = widthx.StripAnsi(line)
+		}
+		text = strings.Join(lines, "\n")
+	})
+	return text
+}
+
+// BelowEditor returns the rows under the editor as plain text.
+func (h *TestHarness) BelowEditor() string {
+	var text string
+	h.Do(func() {
+		lines := h.m.widgetContainerBelow.Render(100)
+		for i, line := range lines {
+			lines[i] = widthx.StripAnsi(line)
+		}
+		text = strings.Join(lines, "\n")
+	})
+	return text
+}
+
+// SetEditorText replaces the editor's text. Call it on the owner loop.
+func (h *TestHarness) SetEditorText(text string) { h.m.editor.SetText(text) }
+
+// EditorText returns the editor's text.
+func (h *TestHarness) EditorText() string {
+	var text string
+	h.Do(func() { text = h.m.editor.Text() })
+	return text
+}
+
+// Idle reports, on the owner loop, whether no run is active.
+func (h *TestHarness) Idle() bool {
+	var idle bool
+	h.Do(func() { idle = !h.m.turnActive.Load() && h.m.isIdle })
+	return idle
+}
+
+// WaitForSessionIdle drives the production captured-session waiter off the owner loop.
+func (h *TestHarness) WaitForSessionIdle(ctx context.Context) error { return h.m.waitForIdle(ctx) }
+
+// SetIdleWaitState installs the independent mode cleanup barrier and Session on the owner loop.
+func (h *TestHarness) SetIdleWaitState(session InteractiveSessionHandle, settled chan struct{}) {
+	h.m.queueMu.Lock()
+	h.m.opts.SessionHandle = session
+	h.m.turnSettled = settled
+	h.m.queueMu.Unlock()
+}
+
+// WaitIdle waits until no run is active and the UI shows idle.
+func (h *TestHarness) WaitIdle(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !h.Idle() {
+		if time.Now().After(deadline) {
+			t.Fatal("interactive run did not settle")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Notify and ChatOnOwner are used inside Do callbacks without posting recursively.
+func (h *TestHarness) Notify(message string) { h.m.showExtensionNotify(message, "info") }
+func (h *TestHarness) ChatOnOwner() string {
+	lines := h.m.chatContainer.Render(100)
+	for i := range lines {
+		lines[i] = widthx.StripAnsi(lines[i])
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Chat returns the transcript as plain text.
+func (h *TestHarness) Chat() string {
+	var chat string
+	h.Do(func() {
+		lines := h.m.chatContainer.Render(100)
+		for i, line := range lines {
+			lines[i] = widthx.StripAnsi(line)
+		}
+		chat = strings.Join(lines, "\n")
+	})
+	return chat
+}
+
+// QueuedMessages reports the agent's queued steering and follow-up counts.
+func (h *TestHarness) QueuedMessages() (steering, followUp int) {
+	h.Do(func() {
+		s, f := h.m.agent.PendingMessages()
+		steering, followUp = len(s), len(f)
+	})
+	return steering, followUp
+}
+
+// ToolCard builds the pending card of one tool call, bound to definition as the interactive mode binds a registered definition (ToolExecutionComponent constructed with a definition), and returns its Render.
+func ToolCard(t *testing.T, name, toolCallID string, args json.RawMessage, definition extension.ToolDefinition) func(width int) []string {
+	t.Helper()
+	return toolComponentRaw(t, name, toolCallID, args, &definition).card.Render
+}
+
+// RecordProgramStatus points the mode's program-status reporter at a terminal that records its reports, and returns a reader that copies the reports on the owner loop.
+func (h *TestHarness) RecordProgramStatus(sessionName string) func() []tui.ProgramStatus {
+	var terminal *programStatusTerminal
+	h.Do(func() { terminal = recordProgramStatus(h.m, sessionName) })
+	return func() []tui.ProgramStatus {
+		var reports []tui.ProgramStatus
+		h.Do(func() { reports = append(reports, terminal.reports...) })
+		return reports
+	}
+}
+
+// InitSnapshot is the state Init leaves behind, for the pty test that drives the real startup sequence.
+type InitSnapshot struct {
+	Initialized          bool
+	EditorPaddingX       int
+	AutocompleteMax      int
+	SteeringMode         string
+	FollowUpMode         string
+	AutoCompact          bool
+	StatusName           string
+	HasUI                bool
+	ExtensionSession     bool
+	TimingsBound         bool
+	StartupHeaderPending bool
+	HideThinking         bool
+	ChatChildren         int
+	WidgetChildren       int
+	Teardowns            int
+	KeybindingsSet       bool
+	SlashRegistrySet     bool
+	FocusIsEditor        bool
+	SlashCommands        []string
+	PromptTemplates      []string
+	ResourceSourceInfo   int
+	FooterCwd            string
+}
+
+// InitSnapshot reads the state of m after Init.
+func (m *InteractiveMode) InitSnapshot() InitSnapshot {
+	snapshot := InitSnapshot{
+		Initialized: m.isInitialized, EditorPaddingX: m.editor.PaddingX(), AutocompleteMax: m.editor.AutocompleteMaxVisible(),
+		AutoCompact: m.statusLine.autoCompactEnabled, StatusName: m.statusLine.name, TimingsBound: m.statusLine.timings != nil,
+		StartupHeaderPending: m.startupHeaderPending, HideThinking: m.hideThinking, ChatChildren: len(m.chatContainer.Children()),
+		WidgetChildren: len(m.widgetContainer.Children()), Teardowns: len(m.teardowns), KeybindingsSet: m.keybindings != nil, SlashRegistrySet: m.slashRegistry != nil,
+	}
+	snapshot.FocusIsEditor = m.tuiInst.GetFocusedComponent() == tui.Component(m.editor)
+	for _, command := range m.slashRegistry.All() {
+		snapshot.SlashCommands = append(snapshot.SlashCommands, command.Name)
+	}
+	for _, template := range m.promptTemplates {
+		snapshot.PromptTemplates = append(snapshot.PromptTemplates, template.Name)
+	}
+	snapshot.ResourceSourceInfo = len(m.resourceSourceInfo)
+	if m.statusLine.FooterDataProvider != nil {
+		snapshot.FooterCwd = m.statusLine.cwd
+	}
+	if m.agent != nil {
+		snapshot.SteeringMode, snapshot.FollowUpMode = string(m.agent.SteeringMode()), string(m.agent.FollowUpMode())
+	}
+	if m.extCtx != nil {
+		snapshot.HasUI, snapshot.ExtensionSession = m.extCtx.HasUI, m.extCtx.Session != nil
+	}
+	return snapshot
+}
+
+// ApplyScopedSelection runs the /scoped-models selector's scope update over the given available models, as the catalog refresh does when the user changed nothing (interactive-mode.ts showModelsSelector updateSessionModels).
+func (h *TestHarness) ApplyScopedSelection(models []tui.ModelItem, enabled []string) {
+	h.Do(func() {
+		selection, _ := newScopedModelsSelection(models, nil, nil)
+		selection.apply(h.m, enabled)
+	})
+}
+
+// HostDequeueInputs are the legacy terminal inputs for the host platform's default app.message.dequeue key: Alt+Up (CSI 1;3A, or ESC p as a terminal in
+// application mode sends it) except with Windows keybindings (native Windows and WSL), where it is Alt+Q, as upstream keybindings.ts.
+func HostDequeueInputs() []string {
+	if key := keybindingDefinitionsFor(tui.HostKeybindingPlatform())["app.message.dequeue"].DefaultKeys[0]; key != "alt+up" {
+		return []string{"\x1bq"}
+	}
+	return []string{"\x1b[1;3A", "\x1bp"}
+}
+
+// HostFollowUpInput is the legacy terminal input for the host platform's default app.message.followUp key (Alt+Enter, Ctrl+Q with Windows keybindings).
+func HostFollowUpInput() string { return hostFollowUpInput() }
+
+// harnessUserBindings are the user bindings the next TestHarness starts with.
+var harnessUserBindings map[string][]KeyID
+
+// RestoreStartupTheme is restoreStartupTheme for the tests of package codingagent_test.
+func RestoreStartupTheme(t testing.TB) {
+	t.Helper()
+	restoreStartupTheme(t)
+}
+
+// BindDequeueToAltUp makes the harnesses of the test bind app.message.dequeue to Alt+Up, its default except with Windows keybindings. The Terminal.app
+// divergence D228 acts only while the action is bound to the key Option+Up stands for.
+func BindDequeueToAltUp(t *testing.T) {
+	t.Helper()
+	harnessUserBindings = map[string][]KeyID{"app.message.dequeue": {"alt+up"}}
+	t.Cleanup(func() { harnessUserBindings = nil })
+}
+
+// HoldStartupInput makes one terminal chunk ready on the channel the owner loop reads, before a startup step that may or may not serve input. The terminal
+// reader's router keeps the channel it was built with, so nothing else arrives on this one.
+func (m *InteractiveMode) HoldStartupInput(data string) {
+	m.inputReadCh = make(chan inputChunk, 1)
+	m.inputReadCh <- inputChunk{data: []byte(data)}
+}
+
+// HeldStartupInputUnread reports whether the chunk HoldStartupInput made ready still waits for the owner loop.
+func (m *InteractiveMode) HeldStartupInputUnread() bool { return len(m.inputReadCh) == 1 }
+
+// EditorAutocompleteOffers reports whether the editor has an autocomplete provider and the values that provider offers for line (a slash-command prefix), asked on the caller's goroutine.
+func (m *InteractiveMode) EditorAutocompleteOffers(line string) (installed bool, values []string) {
+	provider := m.editor.AutocompleteProvider()
+	if provider == nil {
+		return false, nil
+	}
+	suggestions := provider.GetSuggestions(context.Background(), []string{line}, 0, len(line), tui.AutocompleteSuggestionOptions{})
+	if suggestions != nil {
+		for _, item := range suggestions.Items {
+			values = append(values, item.Value)
+		}
+	}
+	return true, values
+}
+
+// ChainAutocompleteOffers reports the values the provider chain the editors share (Pi's this.autocompleteProvider) offers for line, a slash-command prefix: the
+// chain is taken on the owner loop and asked on the caller's goroutine, as the editor's worker asks it. ctx bounds the wait.
+func (m *InteractiveMode) ChainAutocompleteOffers(ctx context.Context, line string) []string {
+	var provider *extension.AutocompleteProvider
+	_ = m.runOnMainAndWait(ctx, func() error {
+		provider = m.currentAutocompleteProvider()
+		return nil
+	})
+	if provider == nil || provider.GetSuggestions == nil {
+		return nil
+	}
+	suggestions, err := provider.GetSuggestions(ctx, []string{line}, 0, len(line), false)
+	if err != nil || suggestions == nil {
+		return nil
+	}
+	var values []string
+	for _, item := range suggestions.Items {
+		values = append(values, item.Value)
+	}
+	return values
+}
+
+// EditorAutocompleteState reports, on the owner loop, whether the editor holds an autocomplete provider, whether the provider chain the editors share is built,
+// and whether the bind's first setup has run.
+func (m *InteractiveMode) EditorAutocompleteState(ctx context.Context) string {
+	var state string
+	_ = m.runOnMainAndWait(ctx, func() error {
+		state = fmt.Sprintf("editor provider set=%t, chain built=%t, first setup run=%t", m.editor.AutocompleteProvider() != nil, m.autocompleteProvider != nil, m.autocompleteSetUp)
+		return nil
+	})
+	return state
+}
+
+// EditorPopupAfterTyping delivers text to the owner loop as one terminal read, through dispatchTerminalRead as the loop does (it flushes the editor's request
+// after the read), waits for the completion work the read started (none when the editor has no provider), and returns the editor's rendered lines, the
+// autocomplete popup among them. ctx bounds the waits.
+func (m *InteractiveMode) EditorPopupAfterTyping(ctx context.Context, text string) string {
+	var done <-chan struct{}
+	_ = m.runOnMainAndWait(ctx, func() error {
+		keys := splitKeys(text)
+		rest := make(chan inputChunk, len(keys))
+		for i, key := range keys[1:] {
+			rest <- inputChunk{data: []byte(key), more: i < len(keys)-2}
+		}
+		err := m.dispatchTerminalRead(ctx, inputChunk{data: []byte(keys[0]), more: len(keys) > 1}, &rest, make(chan error))
+		done = m.autocompletePending
+		return err
+	})
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
+	var lines []string
+	_ = m.runOnMainAndWait(ctx, func() error {
+		lines = m.editor.Render(100)
+		return nil
+	})
+	for i := range lines {
+		lines[i] = widthx.StripAnsi(lines[i])
+	}
+	return strings.Join(lines, "\n")
+}

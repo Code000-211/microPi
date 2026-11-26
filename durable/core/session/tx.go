@@ -1,0 +1,845 @@
+package session
+
+import (
+	"errors"
+
+	"github.com/MichaelKinsy/PiG/durable/core/session/hopcost"
+
+	"github.com/MichaelKinsy/PiG/durable/core/internal/delta"
+	"github.com/MichaelKinsy/PiG/durable/core/jv"
+)
+
+const internalScanPage = 256
+
+// TaskDef is the part of a task definition the Session layer needs to create a
+// task: its kind, its version and its first checkpoint. Phases, abort and
+// migration belong to the scheduler.
+type TaskDef struct {
+	Name    string
+	Version int
+	// Initial returns the first checkpoint for a new task's input.
+	Initial func(input any) any
+}
+
+// TaskOptions are the creation options of a task (types.ts TaskOptions).
+type TaskOptions struct {
+	// OwnerTask is the owning task of a child task; zero for a conversation-owned task.
+	OwnerTask ID
+	// ConversationID defaults to the owner task's conversation or the transaction's bound conversation.
+	ConversationID ID
+	Background     bool
+	// AbandonOnRestart marks a task its creator awaits only in memory: a later Harness abort-marks it with reason restart.
+	AbandonOnRestart bool
+	// Trace is the carrier the task's phase spans start under (types.ts TaskOptions.trace); nil inherits the creating
+	// transaction's carrier (TxScope.Trace), and NoTrace stores none (`trace: "root"`).
+	Trace   any
+	NoTrace bool
+	// Links are the immutable creation-time links of the task's first invocation (types.ts TaskOptions.links).
+	Links []any
+	// Submissions are the input submissions of a run (transaction.ts TaskCreationOptions.submissionIds): the first one's
+	// carrier is the task's trace, and the carriers of the others are its links.
+	Submissions []ID
+	// Owned says the input and the initial checkpoint belong to the transaction (a host's operation parsed them for it and nothing
+	// else holds them), so the record keeps them instead of copies: a 20,000-task commit would hold two more objects per task.
+	Owned bool
+}
+
+// Ownership is how a created conversation is attributed.
+type Ownership struct {
+	// Task is the owning task; zero means ownerless.
+	Task ID
+}
+
+// TxScope binds a transaction to a conversation and a task: the default
+// conversation of Tx.CreateTask and the task attributed to appended entries.
+type TxScope struct {
+	ConversationID ID
+	TaskID         ID
+	// Span is the host's handle of the span of the commit's Context (Context.telemetry): the commit's entry and settlement
+	// events go to it. Zero is the NOOP span, which takes none (src/session/session.ts #publish).
+	Span uint32
+	// Trace is the carrier of that span (propagation.inject(span)): the trace of a task the commit creates without one.
+	Trace any
+	// Host marks a transaction whose callback runs in the host (ABI section 8): it cannot run again, so a Finish that returns a *NeedPublication
+	// keeps the transaction's state and may be called again once the key is published.
+	Host bool
+	// Deferred marks the commit deferrable (durable CommitPersistence): see held.go. WithinMs is its window in milliseconds,
+	// or negative for the Session's default (PersistWithin).
+	Deferred bool
+	WithinMs float64
+}
+
+type txTask struct {
+	committed    *jv.Object
+	hasCommitted bool
+	write        *jv.Object
+	writeIsNew   bool
+	pubConv      ID
+}
+
+type submissionChange struct {
+	id     ID
+	place  bool
+	entry  ID
+	settle *jv.Object
+}
+
+type docTargetKind uint8
+
+const (
+	targetLoaded docTargetKind = iota + 1
+	targetCreated
+	targetForkCopy
+	targetRetireOnly
+)
+
+type docTarget struct {
+	kind    docTargetKind
+	loaded  *loadedDoc
+	record  *jv.Object // created, fork copy, retire-only
+	version int
+	tracker *delta.Tracker
+	source  DocCopySource
+}
+
+type docEntry struct {
+	addressID      string
+	address        Address
+	def            *DocDef
+	draft          *delta.Obj
+	target         *docTarget
+	change         *delta.Change
+	prepared       *delta.Prepared
+	retireOnCommit bool
+	// mintAfter is the ticks from the call of tx.doc to the mint of the ID of a document it creates (hopcost.TxDocMint).
+	mintAfter int
+	// external holds operations a host's tracker produced for this draft (SetDocOps); hasExternal marks them set.
+	external    []delta.Op
+	hasExternal bool
+}
+
+type planChange struct {
+	tracker  *delta.Tracker
+	prepared *delta.Prepared
+	version  int
+	loaded   *loadedDoc
+	def      *DocDef
+}
+
+type docPlan struct {
+	addressID string
+	record    *jv.Object
+	committed bool
+	retire    bool
+	content   *Write
+	change    *planChange
+	convID    ID
+	// held is set (hasHeld) when this commit also stores held changes of the incarnation (held.go takeHeld), whose content is stored.
+	held    heldPlan
+	hasHeld bool
+	stored  Write
+}
+
+// Tx stages one atomic commit. Every method must run inside the callback that
+// received it; after the callback ends the transaction is sealed.
+type Tx struct {
+	s     *Session
+	scope TxScope
+
+	sealed        bool
+	hasTableWrite bool
+
+	writes []Write
+	// taken is the holds whose changes this commit stores with its own (held.go takeHeld).
+	taken []*loadedDoc
+	// settledWrites are the writes settleSuccess assembled, once settledOK: a Finish that waited for a publication does not settle again.
+	settledWrites []Write
+	settledOK     bool
+	// The maps below are made by their first write: most transactions of a step write none of them, and a nil map reads as empty.
+	createdConvs      map[ID]bool
+	forkSourceConvs   map[ID]bool
+	forkSourceDocs    map[ID]bool
+	tasks             map[ID]*txTask
+	taskOrder         []ID
+	submissions       map[ID]*jv.Object
+	submissionOrder   []ID
+	submissionChanges []submissionChange
+	// settleReads is the ticks of the settle's awaits that the change callback did not already make (hopcost.Settle): the committed record of
+	// each replaced task and of each staged submission change, the document pages of a task going terminal that the Session did not create, and the
+	// `#currentTask` of each task whose document the commit publishes (transaction.ts #assemble).
+	settleReads int
+	// settleCached counts the replaced tasks whose committed read the callback had already made (assemble awaits the settled promise).
+	settleCached int
+	// settleOwners is the ticks of validateOwners (hopcost.Settle): its `#currentTask` of each owner of a created task or conversation.
+	settleOwners int
+	// convHit is whether the last requireConversation found its conversation in the Session's cache.
+	convHit hopcost.Cache
+
+	plans        []*docPlan
+	documents    []*docEntry
+	latestByAddr map[string]*docEntry
+	mintStart    ID
+	// ticks is Pi's await ticks of the change callback so far (hopcost: each Transaction method await, then the
+	// Scheduler wrapper's).
+	ticks int
+}
+
+// DeferWithin marks the commit deferrable (durable CommitPersistence) with a window of ms milliseconds, negative for the Session's
+// default: a transaction of a task invocation takes its scope from the task (Runtime.BeginHost).
+func (tx *Tx) DeferWithin(ms float64) { tx.scope.Deferred, tx.scope.WithinMs = true, ms }
+
+// charge adds the ticks of one Transaction method await.
+func (tx *Tx) charge(n int) {
+	tx.s.touchAt = tx.ticks
+	tx.ticks += n
+}
+
+// Ticks is Pi's await ticks the callback has spent so far (hopcost): where, in the job's duration, the code that runs now would run.
+func (tx *Tx) Ticks() int { return tx.ticks }
+
+// Await charges the ticks of a callback's own `await` of Pi code that is not a Transaction method (hopcost: an async function
+// without awaits of its own settles at once and its caller resumes one tick later).
+func (tx *Tx) Await(n int) { tx.charge(n) }
+
+func (tx *Tx) readTicks(r hopcost.Read) { tx.charge(hopcost.TxRead(tx.s.hop, r)) }
+
+func newTx(s *Session, scope TxScope) *Tx {
+	return &Tx{
+		s: s, scope: scope,
+		mintStart: s.nextID,
+	}
+}
+
+func (tx *Tx) assertOpen() error {
+	if tx.sealed {
+		return ErrSealed
+	}
+	// A Transaction method starts after the awaits of the methods before it: a key it touches is waited for from there.
+	tx.s.touchAt = tx.ticks
+	return nil
+}
+
+// mint takes the next ID. Pi's Storage mints it `after` ticks into the Transaction method that began at tick `from` of the callback, so
+// the Storage's own counter has it from then on (Session.storageNextID). A host transaction's methods run as the host calls them, not as
+// the callback of Pi's job does: Pi's callback starts as the job does (a task's runtime.commit, `#gated`, after its decision region) and
+// the host's first call reaches the core hopcost.HostFirstOp ticks after the grant, which on an idle line is a tick before Pi's job starts
+// (Loop.HostStart). The method's own offset from its start is `after`, in either.
+func (tx *Tx) mint(from, after int) ID {
+	id := tx.s.nextID
+	tx.s.nextID++
+	if tx.scope.Host {
+		tx.s.mintsAt(hopcost.HostCallbackStart(tx.scope.TaskID != 0)+tx.s.hostStart()+after, hopcost.HostFirstOp)
+	} else {
+		tx.s.mintsAt(from+after, 0)
+	}
+	return id
+}
+
+// read gates a table read: it fails once the transaction has written a table.
+func (tx *Tx) read(method string) error {
+	if err := tx.assertOpen(); err != nil {
+		return err
+	}
+	if tx.hasTableWrite {
+		return ReadAfterWriteOf("Tx." + method + "()")
+	}
+	return nil
+}
+
+// HasTableWrite reports whether a table write was staged, after which table reads (and a submission's admission) fail with ReadAfterWrite.
+func (tx *Tx) HasTableWrite() bool { return tx.hasTableWrite }
+
+func (tx *Tx) write() error {
+	if err := tx.assertOpen(); err != nil {
+		return err
+	}
+	tx.hasTableWrite = true
+	return nil
+}
+
+// Conversation returns a committed conversation record, or nil.
+func (tx *Tx) Conversation(id ID) (*jv.Object, error) {
+	if err := tx.read("conversation"); err != nil {
+		return nil, err
+	}
+	hit := tx.s.hasConversation(id)
+	tx.charge(hopcost.TxConversation(tx.s.hop, hit))
+	rec, err := tx.s.store.Conversation(id)
+	if rec != nil && hit == hopcost.CacheMiss {
+		tx.s.keepConversation(id)
+	}
+	return rec, err
+}
+
+// Entry returns a committed entry, or nil.
+func (tx *Tx) Entry(id ID) (*jv.Object, error) {
+	if err := tx.read("entry"); err != nil {
+		return nil, err
+	}
+	tx.charge(hopcost.TxEntry(tx.s.hop))
+	e, _, err := tx.s.store.Entry(id)
+	return e, err
+}
+
+// Task returns the committed task record, or nil.
+func (tx *Tx) Task(id ID) (*jv.Object, error) {
+	if err := tx.read("task"); err != nil {
+		return nil, err
+	}
+	t := tx.tasks[id]
+	cached := t != nil && t.hasCommitted
+	tx.charge(hopcost.TxTask(tx.s.hop, cached, tx.s.hasTask(id)))
+	return tx.committedTask(id)
+}
+
+// ScanConversations scans committed conversations.
+func (tx *Tx) ScanConversations(q ConversationQuery, limit int, after ID) (Page, error) {
+	if err := tx.read("scanConversations"); err != nil {
+		return Page{}, err
+	}
+	tx.readTicks(hopcost.ReadRow)
+	return tx.s.store.ScanConversations(q, limit, after)
+}
+
+// ScanEntries scans committed entries visible from a conversation.
+func (tx *Tx) ScanEntries(q EntryQuery, limit int, after ID) (Page, error) {
+	if err := tx.read("scanEntries"); err != nil {
+		return Page{}, err
+	}
+	tx.readTicks(hopcost.ReadScanEntries)
+	return tx.s.store.ScanEntries(q, limit, after)
+}
+
+// LatestHeadMarker returns the newest head-marker entry of a conversation, or nil.
+func (tx *Tx) LatestHeadMarker(conversationID ID) (*jv.Object, error) {
+	return tx.LatestHeadMarkerAt(conversationID, 0)
+}
+
+// LatestHeadMarkerAt returns the newest head-marker entry of a conversation at or before atOrBefore (0: any), or nil.
+func (tx *Tx) LatestHeadMarkerAt(conversationID, atOrBefore ID) (*jv.Object, error) {
+	if err := tx.read("latestHeadMarker"); err != nil {
+		return nil, err
+	}
+	marker, ticks, err := tx.s.LatestHeadMarker(conversationID, atOrBefore)
+	if err != nil {
+		return nil, err
+	}
+	tx.charge(ticks)
+	return marker, nil
+}
+
+// LatestEntryID returns the newest entry ID visible from a conversation, 0 for none, known from the Session's commits when it
+// can be (transaction.ts latestEntryId).
+func (tx *Tx) LatestEntryID(conversationID ID) (ID, error) {
+	if err := tx.read("latestEntryId"); err != nil {
+		return 0, err
+	}
+	id, ticks, err := tx.s.LatestEntryID(conversationID)
+	if err != nil {
+		return 0, err
+	}
+	tx.charge(ticks)
+	return id, nil
+}
+
+// ScanTasks scans committed tasks.
+func (tx *Tx) ScanTasks(q TaskQuery, limit int, after ID) (Page, error) {
+	if err := tx.read("scanTasks"); err != nil {
+		return Page{}, err
+	}
+	tx.readTicks(hopcost.ReadRow)
+	return tx.s.store.ScanTasks(q, limit, after)
+}
+
+// Submission returns a committed submission, or nil.
+func (tx *Tx) Submission(id ID) (*jv.Object, error) {
+	if err := tx.read("submission"); err != nil {
+		return nil, err
+	}
+	tx.charge(hopcost.TxSubmission(tx.s.hop, tx.s.hasSubmission(id)))
+	return tx.s.store.Submission(id)
+}
+
+// SubmissionByRequest returns the submission with the request ID, or nil.
+func (tx *Tx) SubmissionByRequest(conversationID ID, requestID string) (*jv.Object, error) {
+	if err := tx.read("submissionByRequest"); err != nil {
+		return nil, err
+	}
+	tx.readTicks(hopcost.ReadRow)
+	return tx.s.store.SubmissionByRequest(conversationID, requestID)
+}
+
+// taskTicksState is whether the task is staged in this transaction, whether its committed read is cached, and whether the Session's cache
+// answers that read (hopcost.CurrentTask).
+func (tx *Tx) taskTicksState(id ID) (staged, cached bool, hit hopcost.Cache) {
+	if t := tx.tasks[id]; t != nil {
+		staged, cached = t.write != nil, t.hasCommitted
+	}
+	if !staged && !cached {
+		hit = tx.s.hasTask(id)
+	}
+	return staged, cached, hit
+}
+
+func (tx *Tx) taskEntry(id ID) *txTask {
+	t := tx.tasks[id]
+	if t == nil {
+		t = &txTask{}
+		if tx.tasks == nil {
+			tx.tasks = map[ID]*txTask{}
+		}
+		tx.tasks[id] = t
+		tx.taskOrder = append(tx.taskOrder, id)
+	}
+	return t
+}
+
+//go:noinline
+func (tx *Tx) committedTask(id ID) (*jv.Object, error) {
+	t := tx.taskEntry(id)
+	if !t.hasCommitted {
+		hit := tx.s.hasTask(id)
+		rec, err := tx.s.store.Task(id)
+		if err != nil {
+			return nil, err
+		}
+		if rec != nil && hit == hopcost.CacheMiss {
+			tx.s.keepTask(rec)
+		}
+		t.committed, t.hasCommitted = rec, true
+	}
+	return t.committed, nil
+}
+
+func (tx *Tx) currentTask(id ID) (*jv.Object, error) {
+	if t := tx.tasks[id]; t != nil && t.write != nil {
+		return t.write, nil
+	}
+	return tx.committedTask(id)
+}
+
+// ConversationCreated reports whether this transaction created the conversation (transaction.ts #createdConversationIds).
+func (tx *Tx) ConversationCreated(id ID) bool { return tx.createdConvs[id] }
+
+func (tx *Tx) requireConversation(id ID) error {
+	if tx.createdConvs[id] {
+		return nil
+	}
+	hit := tx.s.hasConversation(id)
+	tx.convHit = hit
+	rec, err := tx.s.store.Conversation(id)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return errorf("Conversation %d does not exist", id)
+	}
+	if hit == hopcost.CacheMiss {
+		tx.s.keepConversation(id)
+	}
+	return nil
+}
+
+// CreateConversation stages a new conversation.
+func (tx *Tx) CreateConversation(own Ownership) (*jv.Object, error) {
+	if err := tx.write(); err != nil {
+		return nil, err
+	}
+	return tx.stageConversation(nil, own, 0)
+}
+
+// CreateRootConversation stages the root conversation under its reserved ID.
+func (tx *Tx) CreateRootConversation() (*jv.Object, error) {
+	if err := tx.write(); err != nil {
+		return nil, err
+	}
+	return tx.stageConversation(nil, Ownership{}, RootConversationID)
+}
+
+// ForkConversation stages a conversation that inherits the parent's history
+// through the entry at.
+func (tx *Tx) ForkConversation(parent, at ID, own Ownership) (*jv.Object, error) {
+	if err := tx.write(); err != nil {
+		return nil, err
+	}
+	return tx.stageConversation(&forkParent{parent, at}, own, 0)
+}
+
+type forkParent struct{ conversationID, at ID }
+
+func (tx *Tx) stageConversation(parent *forkParent, own Ownership, reserved ID) (*jv.Object, error) {
+	ownerStaged, ownerCached, ownerHit := tx.taskTicksState(own.Task)
+	before := tx.ticks
+	defer func() {
+		// The conversationCreated hook's own awaits were charged as they ran; Pi's Session default is Promise.resolve() (1).
+		hook := tx.ticks - before
+		if tx.s.ConversationCreated == nil {
+			hook = 1
+		} else {
+			hook++ // the async hook's return
+		}
+		tx.ticks = before + hopcost.TxCreateConversation(tx.s.hop, own.Task != 0, ownerStaged, ownerCached, ownerHit, hook)
+	}()
+	id := reserved
+	if id == 0 {
+		id = tx.mint(tx.ticks, hopcost.TxCreateConversationMint(tx.s.hop))
+	}
+	var owner *jv.Object
+	if own.Task != 0 {
+		task, err := tx.currentTask(own.Task)
+		if err != nil {
+			return nil, err
+		}
+		if task == nil {
+			return nil, errorf("Conversation owner task %d does not exist", own.Task)
+		}
+		owner = obj("conversationId", idv(mustInt(task, "conversationId")), "taskId", idv(own.Task))
+	}
+	record := obj("id", idv(id))
+	if parent != nil {
+		record.Set("parent", obj("conversationId", idv(parent.conversationID), "at", idv(parent.at)))
+	}
+	if owner != nil {
+		record.Set("owner", owner)
+	}
+	var copies []forkCopy
+	if parent != nil {
+		var err error
+		copies, err = tx.prepareForkDocumentCopies(parent.conversationID, parent.at, id)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, c := range copies {
+		if tx.forkSourceDocs == nil {
+			tx.forkSourceDocs = map[ID]bool{}
+		}
+		tx.forkSourceDocs[c.source.ID] = true
+		e := &docEntry{
+			addressID: addressID(recordAddress(c.record)), address: recordAddress(c.record),
+			target: &docTarget{kind: targetForkCopy, record: c.record, source: c.source},
+		}
+		tx.documents = append(tx.documents, e)
+		if tx.latestByAddr == nil {
+			tx.latestByAddr = map[string]*docEntry{}
+		}
+		tx.latestByAddr[e.addressID] = e
+	}
+	if parent != nil {
+		if tx.forkSourceConvs == nil {
+			tx.forkSourceConvs = map[ID]bool{}
+		}
+		tx.forkSourceConvs[parent.conversationID] = true
+	}
+	if tx.createdConvs == nil {
+		tx.createdConvs = map[ID]bool{}
+	}
+	tx.createdConvs[id] = true
+	tx.writes = append(tx.writes, Write{Kind: WriteConversation, Record: record})
+	if tx.s.ConversationCreated != nil {
+		if err := tx.s.ConversationCreated(tx, record); err != nil {
+			return nil, err
+		}
+	}
+	return record, nil
+}
+
+// AppendEntry stages a new entry. The draft's head may be the string "self".
+func (tx *Tx) AppendEntry(conversationID ID, draft *jv.Object) (*jv.Object, error) {
+	if err := tx.write(); err != nil {
+		return nil, err
+	}
+	from, mintAfter := tx.ticks, hopcost.TxAppendEntryMint(tx.s.hop, tx.createdConvs[conversationID], tx.s.hasConversation(conversationID))
+	tx.charge(hopcost.TxAppendEntry(tx.s.hop, tx.createdConvs[conversationID], tx.s.hasConversation(conversationID)))
+	if err := tx.requireConversation(conversationID); err != nil {
+		return nil, err
+	}
+	id := tx.mint(from, mintAfter)
+	rest := without(draft, "head")
+	record := rest.Shallow()
+	record.Set("id", idv(id))
+	record.Set("conversationId", idv(conversationID))
+	if h, ok := draft.Get("head"); ok {
+		if s, isStr := h.(string); isStr && s == "self" {
+			record.Set("head", idv(id))
+		} else if h != nil {
+			record.Set("head", h)
+		}
+	}
+	if tx.scope.TaskID != 0 {
+		record.Set("byTaskId", idv(tx.scope.TaskID))
+	}
+	tx.writes = append(tx.writes, Write{Kind: WriteEntry, Record: record})
+	return record, nil
+}
+
+// CreateTask stages a pending task and returns its ID.
+func (tx *Tx) CreateTask(def *TaskDef, input any, opts TaskOptions) (ID, error) {
+	if err := tx.write(); err != nil {
+		return 0, err
+	}
+	if len(opts.Submissions) != 0 {
+		var err error
+		if opts.Trace, opts.NoTrace, opts.Links, err = tx.traceOfRun(opts.Submissions); err != nil {
+			return 0, err
+		}
+	}
+	ownerStaged, ownerCached, ownerHit := tx.taskTicksState(opts.OwnerTask)
+	defer func() {
+		conv := opts.ConversationID
+		if conv == 0 {
+			conv = tx.scope.ConversationID
+		}
+		if t := tx.tasks[opts.OwnerTask]; opts.OwnerTask != 0 && t != nil {
+			if rec := t.write; rec != nil {
+				conv = mustInt(rec, "conversationId")
+			} else if t.committed != nil {
+				conv = mustInt(t.committed, "conversationId")
+			}
+		}
+		tx.charge(hopcost.TxCreateTask(tx.s.hop, opts.OwnerTask != 0, ownerStaged, ownerCached, ownerHit, tx.createdConvs[conv], tx.convHit))
+	}()
+	var owner *jv.Object
+	if opts.OwnerTask != 0 {
+		var err error
+		if owner, err = tx.currentTask(opts.OwnerTask); err != nil {
+			return 0, err
+		}
+		if owner == nil {
+			return 0, errorf("Task owner %d does not exist", opts.OwnerTask)
+		}
+		if opts.Background {
+			return 0, errors.New("A child task cannot be background")
+		}
+		if opts.ConversationID != 0 && opts.ConversationID != mustInt(owner, "conversationId") {
+			return 0, errorf("A child task lives in its owner's conversation %d", mustInt(owner, "conversationId"))
+		}
+	}
+	conv := opts.ConversationID
+	if conv == 0 {
+		conv = tx.scope.ConversationID
+	}
+	if owner != nil {
+		conv = mustInt(owner, "conversationId")
+	}
+	if conv == 0 {
+		return 0, errors.New("Tx.createTask() requires options.conversationId")
+	}
+	if err := tx.requireConversation(conv); err != nil {
+		return 0, err
+	}
+	checkpoint := def.Initial(input)
+	id := tx.mint(tx.ticks, hopcost.TxCreateTaskMint(tx.s.hop, opts.OwnerTask != 0, ownerStaged, ownerCached, ownerHit, tx.createdConvs[conv], tx.convHit))
+	if opts.Owned {
+		checkpoint = shared(&tx.s.lastCheckpoint, checkpoint)
+	} else {
+		input, checkpoint = jv.Clone(input), jv.Clone(checkpoint)
+	}
+	rec := obj("id", idv(id), "conversationId", idv(conv), "kind", def.Name, "version", float64(def.Version), "input", input)
+	// transaction.ts createTask: `trace: "root"` stores none; an omitted one is the creating Context's carrier.
+	trace := opts.Trace
+	if trace == nil && !opts.NoTrace {
+		trace = tx.scope.Trace
+	}
+	if trace != nil {
+		rec.Set("trace", jv.Clone(trace))
+	}
+	if opts.Links != nil {
+		rec.Set("links", jv.Clone(opts.Links))
+	}
+	if owner != nil {
+		rec.Set("owner", idv(mustInt(owner, "id")))
+	}
+	rec.Set("background", opts.Background)
+	rec.Set("abortRequested", false)
+	if opts.AbandonOnRestart {
+		rec.Set("abandonOnRestart", true)
+	}
+	rec.Set("state", obj("status", StatusPending, "checkpoint", checkpoint))
+	t := tx.taskEntry(id)
+	t.write, t.writeIsNew = rec, true
+	return id, nil
+}
+
+// traceOfRun resolves a run's carriers from its input submissions (transaction.ts createTask, `submissionIds`): the first
+// submission's carrier is the task's trace (none: the task starts at the root), and the others' carriers are its links. A
+// submission the transaction did not stage is read from Storage.
+func (tx *Tx) traceOfRun(submissions []ID) (trace any, noTrace bool, links []any, err error) {
+	for i, id := range submissions {
+		rec := tx.submissions[id]
+		if rec == nil {
+			tx.charge(hopcost.TxSubmission(tx.s.hop, tx.s.hasSubmission(id)))
+			if rec, err = tx.s.store.Submission(id); err != nil {
+				return nil, false, nil, err
+			}
+		}
+		var carrier any
+		if rec != nil {
+			carrier, _ = rec.Get("trace")
+		}
+		switch {
+		case i == 0 && carrier == nil:
+			noTrace = true
+		case i == 0:
+			trace = carrier
+		case carrier != nil:
+			links = append(links, carrier)
+		}
+	}
+	return trace, noTrace, links, nil
+}
+
+// CreateSubmission stages a submission; its record is {...create, id}.
+func (tx *Tx) CreateSubmission(create *jv.Object) (*jv.Object, error) {
+	if err := tx.write(); err != nil {
+		return nil, err
+	}
+	from, mintAfter := tx.ticks, hopcost.TxCreateSubmissionMint(tx.s.hop, tx.createdConvs[mustInt(create, "conversationId")], tx.s.hasConversation(mustInt(create, "conversationId")))
+	tx.charge(hopcost.TxCreateSubmission(tx.s.hop, tx.createdConvs[mustInt(create, "conversationId")], tx.s.hasConversation(mustInt(create, "conversationId"))))
+	if err := tx.requireConversation(mustInt(create, "conversationId")); err != nil {
+		return nil, err
+	}
+	id := tx.mint(from, mintAfter)
+	rec := jv.Clone(create).(*jv.Object)
+	rec.Set("id", idv(id))
+	tx.setSubmission(id, rec)
+	return rec, nil
+}
+
+func (tx *Tx) setSubmission(id ID, rec *jv.Object) {
+	if _, ok := tx.submissions[id]; !ok {
+		tx.submissionOrder = append(tx.submissionOrder, id)
+	}
+	if tx.submissions == nil {
+		tx.submissions = map[ID]*jv.Object{}
+	}
+	tx.submissions[id] = rec
+}
+
+// SettleSubmission stages a settlement: status "done" with answer, or
+// "unanswered" with reason and optional detail.
+func (tx *Tx) SettleSubmission(id ID, settlement *jv.Object) error {
+	if err := tx.assertOpen(); err != nil {
+		return err
+	}
+	tx.hasTableWrite = true
+	tx.submissionChanges = append(tx.submissionChanges, submissionChange{id: id, settle: jv.Clone(settlement).(*jv.Object)})
+	return nil
+}
+
+// PlaceSubmission stages the placement of a queued submission at an entry.
+func (tx *Tx) PlaceSubmission(id, entry ID) error {
+	if err := tx.assertOpen(); err != nil {
+		return err
+	}
+	tx.hasTableWrite = true
+	tx.submissionChanges = append(tx.submissionChanges, submissionChange{id: id, place: true, entry: entry})
+	return nil
+}
+
+// SetTask stages a replacement of a task record, stamping start and end times. The staged record is a deep copy, as Pi's
+// copyJson makes it, so the caller's value stays its own.
+func (tx *Tx) SetTask(value *jv.Object) error {
+	_, err := tx.setTask(value, true, false)
+	return err
+}
+
+// stageTask is SetTask for a record the scheduler built for this write (with, withState, withAbortMark): its top level is
+// new, and its nested values are those of committed records and host values, which nothing changes in place. It stages the
+// record itself, stamped. The copy SetTask makes would be the second record of each task a transaction writes: a finalize
+// that ends a 20,000-deep chain in one transaction held both, about 1 KB per task on the TinyGo core.
+func (tx *Tx) stageTask(value *jv.Object) error {
+	_, err := tx.setTask(value, false, false)
+	return err
+}
+
+// stageFresh is stageTask for a record whose top level nothing else holds (the copy with, withState or withAbortMark returned, not
+// a live record): stamping its times sets them on it instead of on a copy of it.
+func (tx *Tx) stageFresh(value *jv.Object) error {
+	_, err := tx.setTask(value, false, true)
+	return err
+}
+
+// setTask stages value, a deep copy of it when clone is set, and returns the staged record.
+func (tx *Tx) setTask(value *jv.Object, clone, fresh bool) (*jv.Object, error) {
+	if err := tx.assertOpen(); err != nil {
+		return nil, err
+	}
+	tx.hasTableWrite = true
+	id := mustInt(value, "id")
+	t := tx.taskEntry(id)
+	candidate := t.write
+	if candidate != nil && taskStatus(candidate) == StatusTerminal {
+		return nil, errorf("Task %d already has a terminal candidate", id)
+	}
+	if candidate != nil && mustInt(candidate, "conversationId") != mustInt(value, "conversationId") {
+		return nil, errorf("Task %d cannot change conversations", id)
+	}
+	staged := tx.stampTimes(value, candidate, fresh)
+	if clone {
+		staged = jv.Clone(staged).(*jv.Object)
+	}
+	// A staged create stays a create.
+	t.write = staged
+	return staged, nil
+}
+
+func (tx *Tx) stampTimes(value, candidate *jv.Object, fresh bool) *jv.Object {
+	status := taskStatus(value)
+	pick := func(key string, stamps bool) (any, bool) {
+		if candidate != nil {
+			if v, ok := candidate.Get(key); ok {
+				return v, true
+			}
+		}
+		if v, ok := value.Get(key); ok {
+			return v, true
+		}
+		if stamps {
+			return tx.s.now(), true
+		}
+		return nil, false
+	}
+	started, hasStarted := pick("startedAt", status == StatusRunning)
+	ended, hasEnded := pick("endedAt", status == StatusTerminal)
+	curStarted, curHas1 := value.Get("startedAt")
+	curEnded, curHas2 := value.Get("endedAt")
+	if hasStarted == curHas1 && hasEnded == curHas2 && (!hasStarted || curStarted == started) && (!hasEnded || curEnded == ended) {
+		return value
+	}
+	// A record the scheduler built for this write is stamped in place: a copy would be the second record of each task the
+	// transaction writes.
+	out := value
+	if !fresh {
+		out = spread(value)
+	}
+	if hasStarted {
+		out.Set("startedAt", started)
+	}
+	if hasEnded {
+		out.Set("endedAt", ended)
+	}
+	return out
+}
+
+// StagedTasks returns the staged task records in staging order.
+func (tx *Tx) StagedTasks() []*jv.Object {
+	var out []*jv.Object
+	for _, id := range tx.taskOrder {
+		if w := tx.tasks[id].write; w != nil {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// StagedConversations returns the staged conversation records.
+func (tx *Tx) StagedConversations() []*jv.Object {
+	var out []*jv.Object
+	for _, w := range tx.writes {
+		if w.Kind == WriteConversation {
+			out = append(out, w.Record)
+		}
+	}
+	return out
+}

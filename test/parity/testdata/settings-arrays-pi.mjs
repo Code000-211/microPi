@@ -1,0 +1,15 @@
+import { PI_PACKAGE_VERSION } from "./pi-version.mjs";
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const root = resolve('extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent');
+assert.equal(JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version, PI_PACKAGE_VERSION);
+const { SettingsManager } = await import(pathToFileURL(join(root, 'dist/core/settings-manager.js')));
+const empty = { packages: [], extensions: [], skills: [], prompts: [], themes: [], enabledModels: [], defaultTools: [], npmCommand: [] };
+const settings = SettingsManager.inMemory(empty);
+settings.setTheme('dark'); await settings.flush(); await settings.reload();
+const global = settings.getGlobalSettings();
+console.log('SETTINGS_ARRAYS ' + JSON.stringify(Object.fromEntries(Object.keys(global).sort().map(key => [key, global[key]]))));
+const absent = SettingsManager.inMemory();
+console.log('SETTINGS_ARRAY_DEFAULTS ' + JSON.stringify([absent.getPackages(), absent.getExtensionPaths(), absent.getSkillPaths(), absent.getPromptTemplatePaths(), absent.getThemePaths(), absent.getDefaultTools(), absent.drainErrors()]));

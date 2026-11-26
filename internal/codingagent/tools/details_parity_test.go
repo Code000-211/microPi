@@ -1,0 +1,132 @@
+package tools
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+)
+
+var lineSizeNotice = regexp.MustCompile(`\(line is [^)]*\)`)
+
+// The paired oracle executes Pi 0.87.1's published create*Tool functions with the same fixtures and arguments.
+func TestBuiltinToolDetailsParityProbe(t *testing.T) {
+	cwd := t.TempDir()
+	for name, text := range map[string]string{"a.txt": "hello\nsecond\n", "b.txt": "hello\n", "large.txt": strings.Repeat("line\n", 2001)} {
+		if err := os.WriteFile(filepath.Join(cwd, name), []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		tool agent.AgentTool
+		args string
+	}{
+		{"read", &ReadTool{CWD: cwd}, `{"path":"a.txt"}`},
+		{"read limited", &ReadTool{CWD: cwd}, `{"path":"a.txt","limit":1}`},
+		{"read truncated", &ReadTool{CWD: cwd}, `{"path":"large.txt"}`},
+		{"write", &WriteTool{CWD: cwd}, `{"path":"written.txt","content":"ok"}`},
+		{"edit", &EditTool{CWD: cwd}, `{"path":"a.txt","edits":[{"oldText":"second","newText":"changed"}]}`},
+		{"ls", &LsTool{CWD: cwd}, `{}`},
+		{"ls fractional", &LsTool{CWD: cwd}, `{"limit":1.5}`},
+		{"ls limited", &LsTool{CWD: cwd}, `{"limit":1}`},
+		{"find", &FindTool{CWD: cwd}, `{"pattern":"a.txt"}`},
+		{"find limited", &FindTool{CWD: cwd}, `{"pattern":"a.txt","limit":1}`},
+		{"grep", &GrepTool{CWD: cwd}, `{"pattern":"hello","path":"a.txt"}`},
+		{"grep fractional", &GrepTool{CWD: cwd}, `{"pattern":".","path":"a.txt","limit":1.5}`},
+		{"grep limited", &GrepTool{CWD: cwd}, `{"pattern":"hello","path":"a.txt","limit":1}`},
+		{"bash", &BashTool{CWD: cwd}, `{"command":"printf hello"}`},
+		{"bash truncated", &BashTool{CWD: cwd}, `{"command":"printf '%060000d' 0"}`},
+		// Pi 935f0ac0ccfc (#12092): a short line, then one line far past the limit, then a newline.
+		{"bash over-long last line", &BashTool{CWD: cwd}, `{"command":"printf 'first line\\n'; head -c 219000 /dev/zero | tr '\\0' y; printf 'END\\n'"}`},
+	} {
+		var update map[string]any
+		r, err := tc.tool.Execute(t.Context(), "call", json.RawMessage(tc.args), func(partial agent.AgentToolResult) {
+			if text := partial.Text(); text != "" {
+				update = map[string]any{"content": []any{map[string]any{"type": "text", "text": text}}}
+				if partial.Details != nil {
+					update["details"] = partial.Details
+				}
+			}
+		})
+		if err != nil || r.IsError {
+			t.Fatalf("%s: %+v %v", tc.name, r, err)
+		}
+		if d, ok := r.Details.(*BashDetails); ok && d.FullOutputPath != "" {
+			if _, err := os.Stat(d.FullOutputPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(d.FullOutputPath); err != nil {
+				t.Fatal(err)
+			}
+			r.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: strings.ReplaceAll(r.Text(), d.FullOutputPath, "OUTPUT_FILE")}}
+			d.FullOutputPath = "OUTPUT_FILE"
+		}
+		if tc.name == "bash over-long last line" {
+			// D153: the output ends with a newline, so Pi's notice names 0B where PiG names the long line's size; every other byte stays compared.
+			r.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: lineSizeNotice.ReplaceAllString(r.Text(), "(line is SIZE)")}}
+		}
+		result := map[string]any{"content": r.Content}
+		if r.Details != nil {
+			result["details"] = r.Details
+		}
+		if r.StructuredContent != nil {
+			var structured any
+			if err := json.Unmarshal(r.StructuredContent, &structured); err != nil {
+				t.Fatal(err)
+			}
+			if fields, ok := structured.(map[string]any); ok {
+				// bash.ts:392 measures the wall clock; the probe keeps only its type on both sides.
+				if _, ok := fields["wall_time_seconds"].(float64); !ok {
+					t.Fatalf("wall_time_seconds = %#v", fields["wall_time_seconds"])
+				}
+				fields["wall_time_seconds"] = "NUMBER"
+			}
+			result["structuredContent"] = structured
+		}
+		printToolWire(t, tc.name, result)
+		if tc.name == "bash" {
+			if update == nil {
+				t.Fatal("bash emitted no output update")
+			}
+			printToolWire(t, "bash output update", update)
+		}
+	}
+	wide := filepath.Join(cwd, "wide")
+	if err := os.Mkdir(wide, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 300 {
+		if err := os.WriteFile(filepath.Join(wide, fmt.Sprintf("%03d-%s.txt", i, strings.Repeat("a", 190))), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := (&LsTool{CWD: cwd}).Execute(t.Context(), "call", json.RawMessage(`{"path":"wide","limit":1000}`), nil)
+	if err != nil || r.IsError {
+		t.Fatalf("wide ls: %+v %v", r, err)
+	}
+	printToolWire(t, "ls byte truncated", map[string]any{"content": r.Content, "details": r.Details})
+}
+
+func printToolWire(t *testing.T, name string, result any) {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"case": name, "result": result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("TOOL_WIRE %s\n", data)
+}

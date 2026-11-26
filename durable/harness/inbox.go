@@ -1,0 +1,328 @@
+// Ports packages/durable/src/harness/inbox.ts.
+
+package harness
+
+import (
+	"fmt"
+	"slices"
+
+	"github.com/MichaelKinsy/PiG/chord/delta"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/durable"
+)
+
+// InboxMode is the mode of a queued submission: user input for a run (steer or followUp) or a passive entry write.
+type InboxMode string
+
+const (
+	InboxSteer    InboxMode = "steer"
+	InboxFollowUp InboxMode = "followUp"
+	InboxWrite    InboxMode = "write"
+)
+
+// InboxItem is a queued submission: user input for a run, with Content and, when it is not placed as pi.user, Entry, an
+// InputEntry stored as plain JSON; or a passive entry write, with Entry, an EntryDraft stored as plain JSON (inbox.ts:8-16).
+type InboxItem struct {
+	Id   durable.SubmissionId `json:"id"`
+	Mode InboxMode            `json:"mode"`
+	// Content is the JSON representation of the user input; nil for writes.
+	Content durable.JsonValue `json:"content,omitempty"`
+	// Entry is the JSON representation of the entry draft of a write, or of the InputEntry of an input placed as an
+	// application entry; nil for an input placed as pi.user.
+	Entry durable.JsonObject `json:"entry,omitempty"`
+	// OnAbort is "keep" for an input submitted with onAbort keep, which a conversation abort leaves queued; absent
+	// otherwise, and for writes. Any other stored value withdraws like an absent one.
+	OnAbort durable.OnAbort `json:"onAbort,omitempty"`
+}
+
+// InboxState is the built-in queue of one conversation's submissions waiting for a boundary, in ID order.
+type InboxState struct {
+	Items []InboxItem `json:"items"`
+}
+
+// InboxDoc is the built-in pi.inbox document; a complete base is stored exactly while it is empty (inbox.ts:16-24).
+var InboxDoc = durable.DefineDoc(durable.DocDefinition[InboxState]{
+	Kind:    "pi.inbox",
+	Version: 1,
+	CheckpointWhenRaw: func(value durable.JsonObject, _ []durable.Op, _ durable.CheckpointInfo) bool {
+		items, _ := value.Get("items")
+		list, _ := items.([]any)
+		return len(list) == 0
+	},
+
+	Initial:           func() InboxState { return InboxState{Items: []InboxItem{}} },
+	DocumentSemantics: durable.NewLatestConversationSemantics(durable.ForkInitial).DocumentSemantics,
+})
+
+// appendInput appends the entry an input is placed as: the entry's kind and data, or pi.user, with the user message of
+// content (inbox.ts appendInput).
+func appendInput(tx durable.Tx, conversationId durable.ConversationId, content durable.UserInput, entry *durable.InputEntry, now float64) (durable.EntryRecord, error) {
+	message := ai.UserMessage{Content: content, Timestamp: int64(now)}
+	if entry == nil {
+		typed, err := durable.TxAppendEntry(tx, durable.UserEntry, conversationId, durable.TypedEntryDraft[durable.Never]{Model: []ai.Message{message}})
+		if err != nil {
+			return durable.EntryRecord{}, err
+		}
+		return typed.EntryRecord, nil
+	}
+	return tx.AppendEntry(conversationId, durable.EntryDraft{Kind: entry.Kind, Data: entry.Data, Model: []ai.Message{message}})
+}
+
+// pickInputEntry is the kind and data of an input's entry as strict JSON (inbox.ts pickInputEntry).
+func pickInputEntry(entry durable.InputEntry) (durable.JsonObject, error) {
+	return durable.ToJsonObject(durable.InputEntry{Kind: entry.Kind, Data: entry.Data})
+}
+
+// QueueModes are the settings a boundary reads, on the Session line.
+type QueueModes struct {
+	SteeringMode durable.QueueMode
+	FollowUpMode durable.QueueMode
+}
+
+// QueueModesOf returns the queue modes of resolved settings.
+func QueueModesOf(settings durable.Settings) QueueModes {
+	return QueueModes{SteeringMode: settings.SteeringMode, FollowUpMode: settings.FollowUpMode}
+}
+
+// Boundary is what a boundary reads before the commit's first table write, and the newest head it has seen so far.
+type Boundary struct {
+	ConversationId durable.ConversationId
+	// Inbox is the pi.inbox draft of the boundary's commit.
+	Inbox        *delta.Object
+	SteeringMode durable.QueueMode
+	FollowUpMode durable.QueueMode
+	// Head is the start of the active range, the newest head marker's head; advanced by heads written in this
+	// commit. Nil when no head marker exists.
+	Head *durable.EntryId
+}
+
+// BoundaryResult holds the selected user items, in ID order, the first entry the boundary placed, a write's or a user
+// item's (a run it starts begins there, LiveRun.First), and whether a head "self" write (a reset) was placed.
+type BoundaryResult struct {
+	Users []durable.SubmissionId
+	First *durable.EntryId
+	Reset bool
+}
+
+// BoundaryAt is where a boundary runs: after a tool round, or at the end of a run.
+type BoundaryAt string
+
+const (
+	BoundaryPostTools BoundaryAt = "postTools"
+	BoundaryFinal     BoundaryAt = "final"
+)
+
+// PrepareBoundary reads what a boundary needs. Table reads must precede the commit's first table write, so callers
+// prepare the boundary at the start of their commit (inbox.ts:44-55).
+func PrepareBoundary(tx durable.Tx, conversationId durable.ConversationId, modes QueueModes) (*Boundary, error) {
+	marker, err := tx.LatestHeadMarker(conversationId)
+	if err != nil {
+		return nil, err
+	}
+	inbox, err := docDraft(tx, InboxDoc, conversationId)
+	if err != nil {
+		return nil, err
+	}
+	boundary := &Boundary{ConversationId: conversationId, Inbox: inbox, SteeringMode: modes.SteeringMode, FollowUpMode: modes.FollowUpMode}
+	if marker != nil && marker.Head != nil {
+		head := *marker.Head
+		boundary.Head = &head
+	}
+	return boundary, nil
+}
+
+// ApplyBoundary places the queued items a boundary selects (spec §6, inbox.ts:65-108): every write, the first or all
+// steers, and at final the first or all follow-ups. A selected reset turns a postTools boundary into final. Writes are
+// placed first and user items after them, each in ID order, so user items queued before a reset run in the new
+// context. A write whose head targets an entry before the active range, including a range started earlier in this
+// commit, is stale. Selected and stale items are removed positionally.
+func ApplyBoundary(tx durable.Tx, boundary *Boundary, at BoundaryAt, now float64) (BoundaryResult, error) {
+	conversationId := boundary.ConversationId
+	state, err := decodeDraft[InboxState](boundary.Inbox)
+	if err != nil {
+		return BoundaryResult{}, err
+	}
+	items := state.Items
+	reset := HasQueuedReset(items)
+	final := at == BoundaryFinal || reset
+	pick := func(mode InboxMode, queueMode durable.QueueMode) []int {
+		var indexes []int
+		for index, item := range items {
+			if item.Mode == mode {
+				indexes = append(indexes, index)
+			}
+		}
+		if queueMode != durable.QueueAll && len(indexes) > 1 {
+			indexes = indexes[:1]
+		}
+		return indexes
+	}
+	var writes []int
+	for index, item := range items {
+		if item.Mode == InboxWrite {
+			writes = append(writes, index)
+		}
+	}
+	users := pick(InboxSteer, boundary.SteeringMode)
+	if final {
+		users = append(users, pick(InboxFollowUp, boundary.FollowUpMode)...)
+	}
+	slices.Sort(users)
+
+	// AppendEntry copies the drafts' values; the items are removed only afterwards.
+	var first *durable.EntryId
+	for _, index := range writes {
+		item := items[index]
+		var draft durable.EntryDraft
+		if err := decodeJSON(item.Entry, &draft); err != nil {
+			return BoundaryResult{}, err
+		}
+		if IsStale(boundary, draft) {
+			if err := tx.SettleSubmission(item.Id, durable.SubmissionSettlement{Status: durable.SubmissionUnanswered, Reason: "stale"}); err != nil {
+				return BoundaryResult{}, err
+			}
+			continue
+		}
+		entry, err := tx.AppendEntry(conversationId, draft)
+		if err != nil {
+			return BoundaryResult{}, err
+		}
+		if draft.HeadSelf {
+			id := entry.Id
+			boundary.Head = &id
+		} else if draft.Head != nil {
+			id := *draft.Head
+			boundary.Head = &id
+		}
+		if err := tx.PlaceSubmission(item.Id, entry.Id); err != nil {
+			return BoundaryResult{}, err
+		}
+		if first == nil {
+			id := entry.Id
+			first = &id
+		}
+	}
+	placed := []durable.SubmissionId{}
+	for _, index := range users {
+		item := items[index]
+		content, err := durable.DecodeUserContent(item.Content)
+		if err != nil {
+			return BoundaryResult{}, err
+		}
+		var inputEntry *durable.InputEntry
+		if item.Entry != nil {
+			inputEntry = new(durable.InputEntry)
+			if err := decodeJSON(item.Entry, inputEntry); err != nil {
+				return BoundaryResult{}, err
+			}
+		}
+		entry, err := appendInput(tx, conversationId, content, inputEntry, now)
+		if err != nil {
+			return BoundaryResult{}, err
+		}
+		if err := tx.PlaceSubmission(item.Id, entry.Id); err != nil {
+			return BoundaryResult{}, err
+		}
+		placed = append(placed, item.Id)
+		if first == nil {
+			id := entry.Id
+			first = &id
+		}
+	}
+	removed := append(slices.Clone(writes), users...)
+	slices.SortFunc(removed, func(a, b int) int { return b - a })
+	array := boundary.Inbox.Array("items")
+	for _, index := range removed {
+		if _, err := array.Splice(index, 1); err != nil {
+			return BoundaryResult{}, err
+		}
+	}
+	return BoundaryResult{Users: placed, First: first, Reset: reset}, nil
+}
+
+// IsDisplayOnly reports whether a write is display-only: it has no model, head or edits (a present one counts, even if
+// empty), so it changes nothing the model sees and needs no boundary (inbox.ts isDisplayOnly).
+func IsDisplayOnly(entry durable.EntryDraft) bool {
+	return entry.Model == nil && entry.Head == nil && !entry.HeadSelf && entry.Edits == nil
+}
+
+// HasQueuedReset reports whether a reset (a head "self" write) is queued; entries appended before it leave the active range
+// when it lands (inbox.ts hasQueuedReset).
+func HasQueuedReset(items []InboxItem) bool {
+	return slices.ContainsFunc(items, func(item InboxItem) bool {
+		return item.Mode == InboxWrite && item.Entry.Value("head") == "self"
+	})
+}
+
+// IsStale reports whether a head write targets an entry before the active range, so placing it would bring back cut
+// history (inbox.ts:111-113).
+func IsStale(boundary *Boundary, entry durable.EntryDraft) bool {
+	return !entry.HeadSelf && entry.Head != nil && boundary.Head != nil && *entry.Head < *boundary.Head
+}
+
+// RemoveInboxItem removes a withdrawn submission's item; the caller settles the submission.
+func RemoveInboxItem(tx durable.Tx, conversationId durable.ConversationId, id durable.SubmissionId) error {
+	items, err := inboxItems(tx, conversationId)
+	if err != nil {
+		return err
+	}
+	for index := range items.Len() {
+		if items.Object(index).Get("id") == float64(id) {
+			_, err := items.Splice(index, 1)
+			return err
+		}
+	}
+	return nil
+}
+
+// WithdrawAbortedInputs withdraws the queued inputs of a conversation as Conversation.Abort and abort cascades do: each
+// settles unanswered with reason aborted and leaves the inbox, except those submitted with onAbort keep (an item that
+// stores any other value withdraws); queued writes stay for later placement (inbox.ts withdrawAbortedInputs).
+func WithdrawAbortedInputs(tx durable.Tx, conversationId durable.ConversationId) error {
+	return withdrawInputs(tx, conversationId, "aborted", func(item *delta.Object) bool {
+		return item.Get("onAbort") != string(durable.OnAbortKeep)
+	})
+}
+
+// WithdrawQueuedInputsFor withdraws every queued input of a conversation, as a failed run does under afterFailedRun
+// withdraw: each settles unanswered with reason and leaves the inbox, kept ones too; queued writes stay for later
+// placement (inbox.ts withdrawQueuedInputs).
+func WithdrawQueuedInputsFor(tx durable.Tx, conversationId durable.ConversationId, reason string) error {
+	return withdrawInputs(tx, conversationId, reason, func(*delta.Object) bool { return true })
+}
+
+// withdrawInputs settles and removes the queued inputs withdraws selects, keeping the order of the items that stay.
+func withdrawInputs(tx durable.Tx, conversationId durable.ConversationId, reason string, withdraws func(item *delta.Object) bool) error {
+	items, err := inboxItems(tx, conversationId)
+	if err != nil {
+		return err
+	}
+	for index := items.Len() - 1; index >= 0; index-- {
+		item := items.Object(index)
+		if item.Get("mode") == string(InboxWrite) || !withdraws(item) {
+			continue
+		}
+		id, _ := item.Get("id").(float64)
+		if err := tx.SettleSubmission(durable.SubmissionId(id), durable.SubmissionSettlement{Status: durable.SubmissionUnanswered, Reason: reason}); err != nil {
+			return err
+		}
+		if _, err := items.Splice(index, 1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// inboxItems returns the items draft of a conversation's pi.inbox.
+func inboxItems(tx durable.Tx, conversationId durable.ConversationId) (*delta.Array, error) {
+	inbox, err := docDraft(tx, InboxDoc, conversationId)
+	if err != nil {
+		return nil, err
+	}
+	items := inbox.Array("items")
+	if items == nil {
+		return nil, fmt.Errorf("pi.inbox of conversation %d has no items", conversationId)
+	}
+	return items, nil
+}

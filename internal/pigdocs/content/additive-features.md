@@ -1,0 +1,35 @@
+# Additive features
+
+These PiG-only features have no Pi equivalent. This page lists the ones that matter when you extend or modify PiG: extensions and SDKs, Piglets and Binaries, and diagnostic commands. 26 more additive records cover performance, crash handling, security, and platform details; they do not change how you author. Search this page with `grep -n -i <word>`. [Divergences](divergences.md) lists the places where PiG behaves differently from Pi.
+
+| ID | Title | Summary |
+|---|---|---|
+| D18 | Piglet management and build dispatch | PiG manages, validates, runs, and builds Piglets with generic commands, and Pi has no Piglets. |
+| D19 | Multi-language subprocess SDK bridges | PiG ships extension SDKs for Go, Rust, Python, and Lisp that use the same wire protocol and the same features. |
+| D22 | Stock documentation materialization | PiG carries its own manual, and the pig docs command writes it to the config directory so no source checkout is needed. |
+| D23 | Per-tool source metadata and piglet-scoped active-tool Context API | Extensions can list all tools with their source, read and change the active tools, and read flag values. |
+| D28 | Extension validation report surface (pig install --validate-only --json) | The pig install --validate-only command loads and starts an extension without installing it and prints a machine-readable report. |
+| D31 | Fused in-process extension runtime for Piglet Binaries | A Piglet Binary can run a Go extension inside the host process instead of in a separate process. |
+| D40 | Extension-contributed authentication targets | The pig login --list command shows every sign-in method, including the methods that extensions add. |
+| D41 | Additive typed status and Piglet inventory | The pig package list, pig status, and pig piglet list commands can print Packages, Resources, and Piglets as JSON. |
+| D52 | Extension terminal-geometry context (ctx.width / ctx.height) | Extensions can read the terminal width and height and learn when either one changes. |
+| D60 | Typed native login extension API | An extension can replace the header with a native login screen by calling ui.setLogin. |
+| D91 | Piglet frontend members draw the interactive mode | A Piglet Binary can include a Go frontend member that draws the interactive screen. |
+| D92 | Piglet strip lists disable built-ins and compile them out of a Piglet Binary | A Piglet can strip built-in tools, commands, extensions, APIs, and features, and a Piglet Binary compiles out what the Piglet strips. |
+| D107 | Extension component kit | An extension can describe its screen as a tree of standard UI components that the host renders. |
+| D109 | Extension SDK upgrade | When a Go extension fails to build because the SDK changed, PiG says that it was written for an older SDK and shows each changed API. |
+| D170 | Piglet tree, lineage and provenance diagnostics | The pig piglet tree and pig piglet lineage commands show how installed Piglets extend each other and where each one comes from. |
+| D194 | Piglet resolution installs npm and Git Packages with lifecycle scripts disabled unless the command opts in | Resolving a Piglet installs npm and Git Packages with lifecycle scripts turned off unless the command allows them. |
+| D201 | The SDK resource loader takes the runtime its extensions register against | The SDK resource loader accepts a runtime, so the extensions it loads register against the runtime that you supply. |
+| D202 | A Piglet Binary accepts overlay Piglets unless it is built closed (build.closed) | A Piglet Binary accepts a Piglet that you choose at launch as an overlay, as stock PiG does, unless you build it with build.closed. |
+| D209 | A session exports its active Piglet to its tool processes (PIG_ACTIVE_PIGLET_SOURCE) | A running session sets PIG_ACTIVE_PIGLET_SOURCE for its tools, so pig status, pig diagnose, and pig piglet show can name the active Piglet. |
+| D211 | A Piglet can withhold a project's context files until the project is trusted (contextFiles: trusted-only) | A Piglet with contextFiles: trusted-only loads no AGENTS.md or CLAUDE.md of a project that is not trusted, and says which files it skipped. |
+| D214 | An extension can own thinking runs, so a run that draws no rows leaves no blank rows (ownThinkingRuns) | An extension that calls ownThinkingRuns() leaves no blank rows around a thinking run that is hidden or rewritten to empty text, and can turn that on and off while it runs. |
+| D216 | A configured local Package that does not exist is reported at startup and by pig install --validate-only | A local Package in packages[] whose directory is gone shows as a session warning and fails pig install --validate-only, with its resolved path and the pig remove that drops it. |
+| D223 | The plugins' Node subprocess: a store, a spare process, exit details, and the link waits it needs | A program that evaluates chord plugins can give them a SQLite store, keep a spare Node process warm, read why the process ended, and wait for a host to handle a link's deliveries. |
+| D273 | A Go handler can read the key order of an event's objects (Context.ObjectKeys) | A Go extension reads the keys of an object of the event it is handling in the order Object.keys gives them in Pi; Node, Rust, Python and Lisp objects already keep that order. |
+| D276 | A message or entry renderer of an SDK keeps per-message state and takes the mouse events of its view (MessageViewEvent, EntryViewEvent, MessageRenderOptions.State) | A Go, Rust, Python or Lisp extension keeps state per displayed message or entry in its renderer and gets clicks on its view's mouse regions, so a click-expanded card works in every SDK as in Pi. |
+| D614 | One data-only UI protocol for plugins: mounts, intents and client abilities over D107 views | An extension in any language can mount a view in a slot the attached client draws and answer the user's intents, without the client running any plugin code. |
+| D653 | A fused Piglet member's CLI hook owns the command line, a print run's output and exit status, and the default retry config | A Piglet Binary with a fused Go member can run code before PiG parses its arguments, to serve the invocation or rewrite it, to own a print run's output and exit status, and to set the retry defaults. |
+| D654 | A fused member decides which failed model requests PiG retries, how long it waits, and whether PiG prints its retry lines (clihook.RetryPolicy.Decide, Silent, HTTPIdleTimeoutMs) | A fused Piglet member decides per failed model request whether PiG retries and after how long, can silence PiG's retry lines, and can set the default HTTP idle time-out. |
+| D655 | A Go program can read a branch's entries by reference and read only the bodies it needs (BranchRefs, ReadEntries) | A program that embeds PiG can list a branch's entries without reading them and then read, with an error and a context, only the entries it picks, so a page of a long session costs the page. |

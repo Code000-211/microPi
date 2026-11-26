@@ -1,0 +1,560 @@
+package ai
+
+// Ports packages/coding-agent/src/core/auth-storage.ts
+// Credentials use Pi's JSON shape and proper-lockfile directory lock, including across Pi and PiG processes.
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"slices"
+	"strconv"
+
+	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
+	"github.com/MichaelKinsy/PiG/internal/configvalue"
+	"github.com/MichaelKinsy/PiG/internal/jsonparse"
+	"github.com/MichaelKinsy/PiG/internal/jsonstringify"
+	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/nodepath"
+	"github.com/MichaelKinsy/PiG/internal/ownerfile"
+	"github.com/MichaelKinsy/PiG/internal/pilock"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
+	"github.com/MichaelKinsy/PiG/internal/text"
+)
+
+// AuthSource reports where auth would be sourced from.
+// Mirrors upstream AuthStatus.source union.
+type AuthSource string
+
+const (
+	AuthSourceStored            AuthSource = "stored"
+	AuthSourceRuntime           AuthSource = "runtime"
+	AuthSourceEnvironment       AuthSource = "environment"
+	AuthSourceFallback          AuthSource = "fallback"
+	AuthSourceModelsJSONKey     AuthSource = "models_json_key"
+	AuthSourceModelsJSONCommand AuthSource = "models_json_command"
+)
+
+// AuthStatus reports whether auth is configured and where pig would source
+// it from, without exposing secret values.
+type AuthStatus struct {
+	Configured bool
+	Source     AuthSource
+	Label      string
+}
+
+// CredentialType is the discriminator stored as `"type"` in auth.json.
+//
+// Values match upstream pi `dist/core/auth-storage.d.ts`:
+//   - "api_key" for raw API keys (field: "key")
+//   - "oauth"   for OAuth refresh/access tokens
+//
+// Files written by pig must round-trip through upstream pi and vice versa.
+// Earlier PiG builds wrote "type":"api" / "apiKey", which broke parity. The
+// Load() path migrates the old shape forward in place on first read.
+type CredentialType string
+
+const (
+	CredentialAPIKey CredentialType = "api_key"
+	CredentialOAuth  CredentialType = "oauth"
+
+	// legacyCredentialAPIKey is the pre-parity-fix discriminator. Detected
+	// during Load() and rewritten to CredentialAPIKey on next write.
+	legacyCredentialAPIKey CredentialType = "api"
+)
+
+// Credential is the on-disk shape for one provider's credentials.
+// We use a flat struct that covers both the api-key and oauth variants -
+// fields not relevant to the type are simply zero-valued.
+//
+// JSON field names match upstream's typed surface so files are
+// interchangeable with `pi`'s auth.json.
+type Credential struct {
+	Extra map[string]json.RawMessage `json:"-"`
+	Type  CredentialType             `json:"type"`
+
+	// API-key variant. Field is "key" (matches upstream); we keep an
+	// alias "apiKey" on read for backwards compatibility with auth.json
+	// files written by older pig builds.
+	Key string `json:"key,omitempty"`
+
+	// Env holds provider-scoped environment overrides for an API-key
+	// credential. Values take precedence over the process environment when
+	// resolving this credential's own `$VAR` references and when the provider
+	// reads configuration env. Mirrors upstream auth-storage.ts
+	// ApiKeyCredential.env.
+	Env map[string]string `json:"env,omitempty"`
+
+	// OAuth variant (used by github-copilot, anthropic, etc.)
+	Refresh string `json:"refresh,omitempty"`
+	Access  string `json:"access,omitempty"`
+	// Expires is the truncated integer projection of expires in milliseconds since the epoch. ExpiresMillis returns Pi's exact value, including a fraction or an absent property.
+	// Expiry decisions must use ExpiresMillis. SetExpiresMillis stores a fraction; assigning Expires replaces any retained exact value.
+	Expires          int64  `json:"expires,omitempty"`
+	ProjectID        string `json:"projectId,omitempty"`
+	AccountID        string `json:"accountId,omitempty"`
+	EnterpriseDomain string `json:"enterpriseUrl,omitempty"`
+	// Scope is the granted OAuth scope some flows (Radius) return and persist.
+	Scope string `json:"scope,omitempty"`
+	// AvailableModelIDs retains the account's optional picker filter, including an explicit empty list or malformed external value.
+	AvailableModelIDs json.RawMessage `json:"availableModelIds,omitempty"`
+	// GatewayConfig is the Radius gateway catalog that pre-ModelsStore Radius
+	// builds cached on the credential. It is read once to import that catalog.
+	GatewayConfig json.RawMessage `json:"gatewayConfig,omitempty"`
+
+	expiry credentialExpiry
+	order  credentialKeyOrder
+	// opaque is a stored entry no typed credential can hold (a wrong-typed field, a value that is not an object). Pi keeps it as written and lists it; so does the store.
+	opaque json.RawMessage
+}
+
+// rawCredential mirrors Credential but also accepts the legacy `apiKey`
+// JSON field. Used only during Load() to migrate old files in place.
+type rawCredential struct {
+	Extra             map[string]json.RawMessage `json:"-"`
+	Type              CredentialType             `json:"type"`
+	Key               string                     `json:"key,omitempty"`
+	LegacyAPIKey      string                     `json:"apiKey,omitempty"`
+	Env               map[string]string          `json:"env,omitempty"`
+	Refresh           string                     `json:"refresh,omitempty"`
+	Access            string                     `json:"access,omitempty"`
+	Expires           int64                      `json:"expires,omitempty"`
+	ProjectID         string                     `json:"projectId,omitempty"`
+	AccountID         string                     `json:"accountId,omitempty"`
+	EnterpriseDomain  string                     `json:"enterpriseUrl,omitempty"`
+	Scope             string                     `json:"scope,omitempty"`
+	GatewayConfig     json.RawMessage            `json:"gatewayConfig,omitempty"`
+	AvailableModelIDs json.RawMessage            `json:"availableModelIds,omitempty"`
+
+	expiry credentialExpiry
+	order  credentialKeyOrder
+}
+
+func (r rawCredential) normalize() Credential {
+	c := Credential{
+		Extra:             cloneCredentialExtra(r.Extra),
+		Type:              r.Type,
+		Key:               r.Key,
+		Env:               r.Env,
+		Refresh:           r.Refresh,
+		Access:            r.Access,
+		Expires:           r.Expires,
+		ProjectID:         r.ProjectID,
+		AccountID:         r.AccountID,
+		EnterpriseDomain:  r.EnterpriseDomain,
+		Scope:             r.Scope,
+		GatewayConfig:     r.GatewayConfig,
+		AvailableModelIDs: r.AvailableModelIDs,
+		expiry:            r.expiry,
+	}
+	if c.Type == legacyCredentialAPIKey {
+		c.Type = CredentialAPIKey
+	}
+	if c.Key == "" && r.LegacyAPIKey != "" {
+		c.Key = r.LegacyAPIKey
+	}
+	c.order = r.order.renamed("apiKey", "key").retainedFor(c.marshalFields)
+	return c
+}
+
+// decodeStoredCredential reads one entry of auth.json. An entry the typed credential cannot hold exactly (a wrong-typed field, a value that is not an object, a member the typed form would add or drop) keeps its source: Pi holds any JSON value per provider and rewrites the entry only when it changes, so an unrelated write leaves it as it was.
+func decodeStoredCredential(entry json.RawMessage) Credential {
+	var r rawCredential
+	if err := json.Unmarshal(entry, &r); err != nil {
+		var object struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(entry, &object)
+		return Credential{Type: CredentialType(object.Type), opaque: bytes.Clone(entry)}
+	}
+	credential := r.normalize()
+	if r.LegacyAPIKey != "" || r.Type == legacyCredentialAPIKey {
+		// An entry an older PiG wrote is migrated by the next write, as the migration documents.
+		return credential
+	}
+	written, err := credential.marshalTyped()
+	canonical, canonicalErr := jsonstringify.Canonicalize(entry)
+	if err != nil || canonicalErr != nil || !bytes.Equal(written, canonical) {
+		credential.opaque = bytes.Clone(entry)
+	}
+	return credential
+}
+
+// sourceUnchanged reports whether a credential that kept its source still equals what that source decodes to; a caller that changed it gets the typed form written.
+func (c Credential) sourceUnchanged() bool {
+	var r rawCredential
+	var baseline Credential
+	if err := json.Unmarshal(c.opaque, &r); err != nil {
+		baseline = Credential{Type: c.Type}
+	} else {
+		baseline = r.normalize()
+	}
+	// The typed form is what a change would write: equal bytes mean no field changed.
+	current, currentErr := c.marshalTyped()
+	original, originalErr := baseline.marshalTyped()
+	return currentErr == nil && originalErr == nil && bytes.Equal(current, original)
+}
+
+// AuthStorage is the persistent credential store at <agentDir>/auth.json.
+type AuthStorage struct {
+	path string
+	mu   authMutex // cancellable process-local guard around mutations
+	read *authReadState
+}
+
+// NewAuthStorage opens the credential store and materializes a missing auth.json as {} with mode 0600. The parent directory uses mode 0700. Existing bytes and permissions remain unchanged; a failed initial load preserves the last valid snapshot. Instances of the first auth path share that snapshot. A directory that cannot be made is not an error here: AuthStorage.create's constructor ends in reload(), which keeps the last snapshot for every error of the lock that makes the directory (auth-storage.ts:68,99,379-392), so the store opens empty and the first write, which makes the directory again, returns Node's mkdir error.
+func NewAuthStorage(path string) (*AuthStorage, error) {
+	if path == "" {
+		return nil, errors.New("auth: empty path")
+	}
+	// AuthStorage.create (auth-storage.ts:348) opens normalizePath(authPath): `~` and `~/x` expand to the home directory and a file:// URL becomes its path.
+	path, err := resolvepath.Normalize(path)
+	if err != nil {
+		return nil, err
+	}
+	store := &AuthStorage{path: path, read: authReadStateForPath(path)}
+	store.reloadInitialSnapshot()
+	return store, nil
+}
+
+// Path returns the auth.json file path.
+func (a *AuthStorage) Path() string { return a.path }
+
+// Load reads all credentials, creating an empty file if it no longer exists.
+func (a *AuthStorage) Load() (map[string]Credential, error) {
+	return a.load(context.Background())
+}
+
+func (a *AuthStorage) load(ctx context.Context) (map[string]Credential, error) {
+	creds, err := a.readLatest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return cloneAuthCredentials(creds.values), nil
+}
+
+func cloneAuthCredentials(creds map[string]Credential) map[string]Credential {
+	out := make(map[string]Credential, len(creds))
+	for provider, cred := range creds {
+		out[provider] = cloneCredential(cred)
+	}
+	return out
+}
+
+// credential returns one provider's stored credential from the latest snapshot.
+func (a *AuthStorage) credential(provider string) (Credential, bool, error) {
+	return a.credentialIn(context.Background(), provider)
+}
+
+// credentialIn is credential with its read made in ctx's operation. It does not end with ctx.
+func (a *AuthStorage) credentialIn(ctx context.Context, provider string) (Credential, bool, error) {
+	// A context with Done() == nil can never end, so the wrapper changes nothing for it: only one that can end needs it (an allocation, and a second on every Value lookup). A custom context with Done() == nil and a non-nil Err or a Deadline is not one the product makes.
+	if ctx.Done() != nil {
+		ctx = context.WithoutCancel(ctx)
+	}
+	creds, err := a.readLatest(ctx)
+	if err != nil {
+		return Credential{}, false, err
+	}
+	cred, ok := creds.values[provider]
+	return cloneCredential(cred), ok, nil
+}
+
+// readAuthFile reads auth.json. Tests replace it to count file reads.
+var readAuthFile = os.ReadFile
+
+func (a *AuthStorage) loadLocked() (*authStorageData, error) {
+	data, err := readAuthFile(a.path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return newAuthStorageData(nil), nil
+	}
+	if err != nil {
+		return nil, nodeerrno.FromPathError(err)
+	}
+	if len(data) == 0 {
+		return newAuthStorageData(nil), nil
+	}
+	// Preserve UTF-16 provider-key identity before building the map; JSON.parse keeps lone surrogates distinct from U+FFFD.
+	data = text.StripBomBytes(data)
+	// JSON.parse's SyntaxError is what the caller reports, with V8's message.
+	if err := jsonparse.Validate(data); err != nil {
+		return nil, err
+	}
+	// JSON.parse returns any JSON value; auth-storage.ts keeps it as it is.
+	switch root := bytes.TrimSpace(data)[0]; {
+	case root == 'n':
+		return &authStorageData{values: map[string]Credential{}, root: authRootNull}, nil
+	case root == '[':
+		var items []json.RawMessage
+		if err := json.Unmarshal(data, &items); err != nil {
+			return nil, fmt.Errorf("auth: parse: %w", err)
+		}
+		array := &authStorageData{values: make(map[string]Credential, len(items)), root: authRootArray, arrayLen: len(items)}
+		for i, item := range items {
+			key := strconv.Itoa(i)
+			array.values[key] = decodeStoredCredential(item)
+			array.order = append(array.order, key)
+		}
+		return array, nil
+	case root != '{':
+		canonical, err := jsonstringify.Canonicalize(data)
+		if err != nil {
+			return nil, err
+		}
+		return &authStorageData{values: map[string]Credential{}, root: authRootScalar, scalar: canonical}, nil
+	}
+	raw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("auth: parse: %w", err)
+	}
+	// Legacy shapes are normalized in memory only: upstream never writes on
+	// read, and the next write stores the current shape.
+	// An entry that does not decode into a credential stays as written: Pi holds any JSON value per provider and the other providers keep working.
+	creds := make(map[string]Credential, len(raw))
+	for k, entry := range raw {
+		creds[k] = decodeStoredCredential(entry)
+	}
+	order, err := authStorageObjectKeys(data)
+	if err != nil {
+		return nil, fmt.Errorf("auth: parse: %w", err)
+	}
+	return &authStorageData{values: creds, order: order}, nil
+}
+
+// Get returns the credential for a provider, if present.
+//
+// For API-key credentials the Key field is passed through
+// configvalue.Resolve so that auth.json values like "$OPENAI_API_KEY"
+// (explicit env reference) or "!op read op://Personal/openai/key" (shell
+// command) become the runtime value. Bare names are literals (v0.78.1).
+// Mirrors upstream auth-storage.ts which calls resolveConfigValue on the
+// API key on the read path. The on-disk value is left untouched.
+func (a *AuthStorage) Get(provider string) (Credential, bool, error) {
+	c, ok, err := a.credential(provider)
+	if err != nil {
+		return Credential{}, false, err
+	}
+	if ok && c.Type == CredentialAPIKey && c.Key != "" {
+		c.Key = configvalue.Resolve(c.Key, c.Env)
+	}
+	return c, ok, nil
+}
+
+// GetProviderEnv returns a copy of the provider-scoped environment overrides
+// for an API-key credential, or nil when none are set. Mirrors upstream
+// auth-storage.ts getProviderEnv.
+func (a *AuthStorage) GetProviderEnv(provider string) (map[string]string, error) {
+	c, ok, err := a.credential(provider)
+	if err != nil {
+		return nil, err
+	}
+	if !ok || c.Type != CredentialAPIKey || len(c.Env) == 0 {
+		return nil, nil
+	}
+	return c.Env, nil
+}
+
+// GetRaw returns the credential without applying configvalue.Resolve to
+// the Key field. Use this when you need the on-disk value (e.g. for
+// rewriting auth.json or for OAuth flows where Refresh/Access tokens
+// must round-trip verbatim).
+func (a *AuthStorage) GetRaw(provider string) (Credential, bool, error) {
+	return a.credential(provider)
+}
+
+// GetAuthStatus reports whether auth is configured for provider without
+// exposing credential values or refreshing OAuth tokens.
+func (a *AuthStorage) GetAuthStatus(provider string) AuthStatus {
+	cred, ok, err := a.GetRaw(provider)
+	if err == nil && ok {
+		_ = cred
+		return AuthStatus{Configured: true, Source: AuthSourceStored}
+	}
+	if key := firstAuthEnvKey(provider); key != "" {
+		return AuthStatus{Configured: false, Source: AuthSourceEnvironment, Label: key}
+	}
+	return AuthStatus{Configured: false}
+}
+
+// Set writes (or replaces) the credential for a provider.
+// Acquires an exclusive file lock during the read-modify-write cycle so
+// concurrent pi instances refreshing the same OAuth token don't clobber
+// each other.
+func (a *AuthStorage) Set(provider string, cred Credential) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.withFileLock(context.Background(), false, func(lock *pilock.Lock) error {
+		creds, err := a.loadLocked()
+		if err != nil {
+			return err
+		}
+		creds.set(provider, cred)
+		return a.writeLocked(creds, lock)
+	})
+}
+
+// Update mutates the credential for a provider under the lock. The mutator
+// receives the current credential (zero value if absent) and the boolean
+// indicates whether it existed. Returning an error aborts the write.
+func (a *AuthStorage) Update(provider string, mutate func(cur Credential, exists bool) (Credential, error)) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.withFileLock(context.Background(), false, func(lock *pilock.Lock) error {
+		creds, err := a.loadLocked()
+		if err != nil {
+			return err
+		}
+		cur, ok := creds.values[provider]
+		next, err := mutate(cur, ok)
+		if err != nil {
+			return err
+		}
+		creds.set(provider, next)
+		return a.writeLocked(creds, lock)
+	})
+}
+
+// Delete removes the credential for a provider (no-op if absent). Cancellation aborts process-local or file-lock acquisition and prevents a pending write without releasing another operation's ownership.
+func (a *AuthStorage) Delete(ctx context.Context, provider string) error {
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
+	if err := a.mu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer a.mu.Unlock()
+	return a.withFileLock(ctx, true, func(lock *pilock.Lock) error {
+		creds, err := a.loadLocked()
+		if err != nil {
+			return err
+		}
+		if creds.root == authRootNull {
+			return errAuthNullEntries
+		}
+		creds.delete(provider)
+		return a.writeLocked(creds, lock)
+	})
+}
+
+// stringifyAuthStorage is JSON.stringify(data, null, 2) (auth-storage.ts:358,467,479): two-space indentation, no HTML escaping, and JS number and key order.
+func stringifyAuthStorage(creds *authStorageData) ([]byte, error) {
+	compact, err := creds.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	canonical, err := jsonstringify.Canonicalize(compact)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	if err := json.Indent(&out, canonical, "", "  "); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func (a *AuthStorage) writeLocked(creds *authStorageData, lock *pilock.Lock) error {
+	a.read.mu.Lock()
+	a.read.revision = fileRevision{}
+	a.read.mu.Unlock()
+	data, err := stringifyAuthStorage(creds)
+	if err != nil {
+		return fmt.Errorf("auth: marshal: %w", err)
+	}
+	if err := lock.Check(); err != nil {
+		return err
+	}
+	// Pi applies the mode only at creation and rewrites in place: the replacement keeps the mode, a symlink and, on Windows, the DACL, and never leaves a truncated file behind.
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+	if err := writeAuthFile(a.path, data, 0o600); err != nil {
+		return nodeerrno.FromPathError(err)
+	}
+	// After the write Pi checks only for a compromise, not the caller's abort (auth-storage.ts:189).
+	if err := lock.Compromised(); err != nil {
+		return err
+	}
+	a.read.mu.Lock()
+	a.read.creds = &authStorageData{values: cloneAuthCredentials(creds.values), order: slices.Clone(creds.order)}
+	a.read.mu.Unlock()
+	return nil
+}
+
+// ensureFileExists is FileAuthStorageBackend's ensureParentDir and ensureFileExists (auth-storage.ts:55-68): it creates the directory and then the store as "{}" when existsSync finds neither, and returns Node's fs errors.
+func (a *AuthStorage) ensureFileExists() error {
+	if dir := nodepath.Dirname(a.path); !pathExists(dir) {
+		if err := nodeerrno.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	if pathExists(a.path) {
+		return nil
+	}
+	// Exclusive creation preserves existing bytes, modes, ACLs and symlinks, including when another process creates the file concurrently. A symlink whose target is missing gets its target created, as Pi's writeFileSync does, because the lock follows the link to the real file.
+	file, err := createNewFollowingLinks(a.path, ownerfile.CreateNew)
+	if errors.Is(err, fs.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return nodeerrno.FromPathError(err)
+	}
+	_, writeErr := file.WriteString("{}")
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		return nodeerrno.FromPathError(err)
+	}
+	return nil
+}
+
+// pathExists is Node's fs.existsSync: whether the path, followed through links, can be read at all.
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// File operations share acquisition, write and release boundaries; one coalesced reload owns one lease.
+var (
+	acquireAuthFileLock = pilock.Acquire
+	releaseAuthFileLock = (*pilock.Lock).Release
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+	writeAuthFile = atomicfile.WriteFile
+)
+
+// withFileLock serializes reads and writes with Pi's synchronous or cancellable auth lock contract. A failure to release the lock is ignored on the cancellable path, as withLockAsync ignores unlock errors (auth-storage.ts:191-198); on the synchronous path it replaces the result, as withLock's finally block rethrows it (auth-storage.ts:109-113).
+func (a *AuthStorage) withFileLock(ctx context.Context, asynchronous bool, fn func(*pilock.Lock) error) (err error) {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	// Pi's FileAuthStorageBackend ensures the file before acquiring either lock.
+	if err := a.ensureFileExists(); err != nil {
+		return err
+	}
+	var lock *pilock.Lock
+	if asynchronous {
+		lock, err = acquireAuthFileLock(ctx, a.path)
+	} else {
+		lock, err = pilock.AcquireAuthSync(a.path)
+	}
+	if err != nil {
+		// FileAuthStorageBackend rethrows proper-lockfile's error unchanged (auth-storage.ts:82,141).
+		return err
+	}
+	defer func() {
+		if releaseErr := releaseAuthFileLock(lock); releaseErr != nil && !asynchronous {
+			err = releaseErr
+		}
+	}()
+	if err := lock.Check(); err != nil {
+		return err
+	}
+	return fn(lock)
+}
+
+func firstAuthEnvKey(provider string) string {
+	if keys := FindEnvKeys(provider, nil); len(keys) > 0 {
+		return keys[0]
+	}
+	return ""
+}

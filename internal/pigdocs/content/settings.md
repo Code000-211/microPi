@@ -1,0 +1,214 @@
+# Settings
+
+> **Differs from Pi, or easy to get wrong**
+> - Settings live in `~/.pig/agent/settings.json` and `<project>/.pig/settings.json`, never `~/.pi` or `.pi/` (D2).
+> - The project file loads only in a trusted project. With `-p` there is no prompt and PiG ignores it: pass `--approve` ([project trust](trust.md)).
+> - `pig status` shows the project trust decision and marks resources that an untrusted project's run ignores.
+
+PiG reads settings from `~/.pig/agent/settings.json`. The file is optional. Every
+key is optional, and a key you leave out keeps its default.
+
+Set `PIG_HOME` to move the whole configuration root. Set `PIG_CODING_AGENT_DIR`
+to move only this directory.
+
+```json
+{
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4",
+  "theme": "dark",
+  "compaction": { "enabled": true }
+}
+```
+
+Use `/settings` to change a setting from inside a session. PiG writes the file
+for you and applies the change without a restart. When the file cannot be
+written, PiG prints `Failed to save settings: <error>`, so you know the change
+will not survive a restart; Pi 1.6.0 reports the failed write only in the
+settings warnings of a later start (D633).
+
+## Where PiG reads settings
+
+PiG merges two files. A key set in the project file overrides the same key in the
+global file. `defaultProjectTrust` is the exception: PiG reads it from the global
+file only.
+
+| Scope | Path |
+|---|---|
+| global | `~/.pig/agent/settings.json` |
+| project | `<project>/.pig/settings.json` |
+
+PiG reads the project file only after you trust the project. An untrusted project
+contributes nothing, so cloning a repository cannot change your shell, your model
+or your packages before you agree to it. See [project trust](trust.md).
+
+An empty default column means PiG has no value for the key until you set one, or
+the value depends on what it detects.
+
+## Models and providers
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `defaultProvider` | string |  | Provider for the saved default model. Set it with `defaultModel`. |
+| `defaultModel` | string |  | Model ID within `defaultProvider`, without a provider prefix. A qualified ID such as `github-copilot/gpt-6-sol` is not supported here. |
+| `defaultThinkingLevel` | string | `medium` | Thinking level applied to a new session: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `modelThinkingLevels` | object |  | Thinking level for a new session per model, keyed by `provider/modelId`. It overrides `defaultThinkingLevel`. |
+| `enabledModels` | string[] | `all` | Models offered in the model selector. |
+| `thinkingBudgets` | object |  | Token budget per thinking level: `minimal`, `low`, `medium`, `high`. |
+| `transport` | string | `auto` | Transport for providers that support more than one: `auto`, `sse`, `websocket`, or `websocket-cached`. |
+| `retry` | object | see meaning | Retry policy: `enabled` (default `true`), `maxRetries` (default `3`), `baseDelayMs` (default `2000`), `maxAgentDelayMs` (the cap on each retry delay, default `60000`), and a per-`provider` override. An explicit `0` is kept. |
+| `httpProxy` | string | unset | Global HTTP/HTTPS proxy URL. Sets only absent `HTTP_PROXY` and `HTTPS_PROXY` environment variables. Provider requests use CONNECT tunnels; `NO_PROXY` controls bypasses. |
+| `websocketConnectTimeoutMs` | number | provider default | WebSocket opening-handshake timeout in milliseconds. `0` or `"disabled"` turns it off. Explicit request options override the setting. |
+| `httpIdleTimeoutMs` | number | `300000` | Idle timeout for provider requests, in milliseconds. `0` or `"disabled"` turns it off. |
+| `cacheWarming` | string | `idle` | `off`, `streaming`, or `idle`. Keeps the provider's prompt cache warm with periodic requests. Global setting only: PiG ignores it in a project file. See [cache warming](#cache-warming). |
+
+### Cache warming
+
+Cache warming is on by default, as in Pi. Each refresh is a real provider
+request that you pay for. PiG replays the last request with a one-token output
+limit shortly before the prompt cache expires, so the next request reads the
+cache instead of writing it again at full price.
+
+- `off`: PiG never sends refreshes.
+- `streaming`: only while the agent is running.
+- `idle`: while the agent runs, and between runs for up to 30 minutes after
+  the last request. This is the default.
+
+A refresh is sent only when the model declares a prompt cache lifetime and PiG
+expects it to save at least $0.05 in avoided cache-miss cost. Warming stops when
+the conversation or model changes, after one hour (30 minutes when idle), and
+when the session ends. Refresh usage counts toward the session's token and cost
+totals, but it never enters the model's context. `/session` shows the mode, the
+next decision, and its estimated cost.
+
+To turn cache warming off, choose `off` for **Cache warming** in `/settings`, or
+set it in `~/.pig/agent/settings.json`:
+
+```json
+{
+  "cacheWarming": "off"
+}
+```
+
+## Session behavior
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `compaction` | object | see meaning | Automatic compaction: `enabled` (default `true`), `reserveTokens` (default `16384`), `keepRecentTokens` (default `20000`), and `modelOverrides` (per-model `reserveTokens` and `keepRecentTokens` keyed by exact `provider/modelId`). See [compaction](compaction.md). |
+| `branchSummary` | object | see meaning | Summary written when you leave a branch: `reserveTokens` (default `16384`) and `skipPrompt` (default `false`, skip the prompt and write no summary). |
+| `steeringMode` | string | `one-at-a-time` | How queued steering messages are dispatched. |
+| `followUpMode` | string | `one-at-a-time` | How queued follow-up messages are dispatched. |
+| `sessionDir` | string |  | Directory that holds session files. |
+| `sessionShareDestination` | string | `auto` | Pi's `/share` destination: `auto`, `gist`, or `radius`. PiG accepts and keeps the value so a settings file shared with Pi stays valid, but PiG's `/share` always uploads to `https://pi-in-go.dev`, and `/settings` has no item for it (D64). |
+| `defaultProjectTrust` | string | `ask` | Trust decision applied to a project that has none: `ask`, `always`, or `never`. PiG reads this key from the global file only. |
+
+## Interface
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `theme` | string |  | Active theme name. |
+| `tuiMode` | string | `regular` | `regular` or `fullscreen`. |
+| `fullscreenScrollbar` | string | `auto` | Scrollbar in fullscreen mode: `auto`, `always`, or `hidden`. No effect in regular mode. |
+| `fullscreenExitOutput` | string | `transcript` | `transcript` prints the final transcript when fullscreen exits. `resume-hint` restores the previous screen and prints only the resume hint. |
+| `fullscreenCopyOnSelect` | boolean | `true` | Copy selected fullscreen text automatically. When disabled, `ctrl+x` copies the active selection. No effect in regular mode. |
+| `fullscreenWheelScrollLines` | `"auto"` \| number | `"auto"` | Lines per mouse-wheel event in fullscreen mode, from 1 to 100. `"auto"` moves one line per event in local macOS terminals, which already accelerate wheel and trackpad input; elsewhere, and over SSH, it speeds up fast wheel spins to at most 6 lines per event. A fractional value is rounded down, and any other value falls back to `"auto"`. No effect in regular mode. |
+| `extensionsAutoUpgrade` | boolean | `false` | PiG-only (D109). Run `pig extension upgrade` rules at startup and after `pig update` for Go extensions written for an older SDK, with a backup and one line per extension. Global settings only; a project file cannot turn it on. Pi's `extensions` setting is an array and unrelated. |
+| `extensionsTypescriptRuntime` | string | `node` | PiG-only (D19). Runtime that runs TypeScript and JavaScript extensions: `node` or the name of a runtime an extension or Piglet installed. When it cannot run, extensions run on Node; `pig extensions runtime status` shows why. `PIG_TS_RUNTIME` overrides it. Global settings only. |
+| `maskSecretInput` | boolean | `true` | PiG-only login-input privacy (divergence D80). Show dots, a character count and the last four characters; fewer than five characters show no suffix. False restores Pi's plain-text typing and submitted history. Change **Mask secret input** in `/settings`. Pi harmlessly ignores this key in shared settings. |
+| `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in the transcript. |
+| `doubleEscapeAction` | string | `tree` | Action bound to pressing escape twice. |
+| `treeFilterMode` | string | `default` | Filter `/tree` opens with. |
+| `editorPaddingX` | number | `0` | Horizontal padding inside the editor. |
+| `outputPad` | number | `1` | Horizontal transcript padding for messages, tool output, `!` command output, and summary blocks: `0` or `1`. |
+| `autocompleteMaxVisible` | number | `5` | Rows shown in the autocomplete list. |
+| `showHardwareCursor` | boolean | `false` | Show the terminal's own cursor. |
+| `markdown` | object |  | Markdown rendering: `codeBlockIndent`, `mermaid`. |
+| `quietStartup` | boolean | `false` | Suppress the startup banner. |
+| `collapseChangelog` | boolean | `false` | Show a condensed changelog. Also condenses extension Package changelogs to one line per Package. |
+| `lastChangelogVersion` | string |  | Last changelog version shown. PiG writes this. |
+| `extensionChangelogVersions` | object |  | Last seen changelog version per extension package, keyed by package source and scope. PiG writes this. |
+
+## Images and terminal
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `terminal` | object | see meaning | Terminal image, width, shrink-repaint, and progress settings described below. |
+| `images` | object | see meaning | Image resize and transcript-blocking settings described below. |
+| `terminal.showImages` | boolean | `true` | Render images when the terminal accepts them. |
+| `terminal.imageWidthCells` | number | `60` | Width of a rendered image, in terminal cells. |
+| `terminal.clearOnShrink` | boolean | `false` | Repaint the screen when content shrinks. |
+| `terminal.showTerminalProgress` | boolean | `false` | Show OSC 9;4 progress in the terminal tab. |
+| `images.autoResize` | boolean | `true` | Resize an image to fit the width. |
+| `images.blockImages` | boolean | `false` | Hide images in the transcript. Pi also removes images from model requests. PiG does not yet: it still sends them to the provider. |
+
+## Resources
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `packages` | object[] |  | Packages to load. See [packages](packages.md). |
+| `extensions` | string[] |  | Extension paths to load. See [extensions](extensions.md). |
+| `skills` | string[] |  | Skill paths to load. See [skills](skills.md). |
+| `prompts` | string[] |  | Prompt paths to load. |
+| `themes` | string[] |  | Theme paths to load. |
+| `enableSkillCommands` | boolean | `true` | Offer skills as slash commands. |
+
+## Terminal capability overrides
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `terminal.hyperlinks` | `boolean \| "auto"` | `"auto"` | Override OSC 8 hyperlink detection. |
+| `terminal.images` | `"kitty" \| "iterm2" \| "auto" \| false` | `"auto"` | Override inline-image protocol detection. `false` turns images off. |
+| `terminal.trueColor` | `boolean \| "auto"` | `"auto"` | Override true-color detection. |
+
+A setting wins over the matching `PI_HYPERLINKS`, `PI_IMAGE_PROTOCOL` or
+`PI_TRUE_COLOR` variable, and the variable wins over detection. `"auto"` and any
+other value leave detection in charge. Without true color, PiG draws the theme
+in the 256-color palette, as Pi does. See [terminal setup](terminal-setup.md).
+
+## Shell and tools
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `shellPath` | string |  | Shell used by the bash tool. |
+| `shellCommandPrefix` | string |  | Prefix applied to every shell command. |
+| `externalEditor` | string |  | Editor opened by `app.editor.external`. |
+| `npmCommand` | string[] | `["npm"]` | Command and arguments used to run npm for package lookup and installation. |
+| `selfUpdateCommand` | string[] | none | Command and arguments `pig update` runs to update PiG itself, with `{packageName}`, `{version}` and `{installSpec}` placeholders. `PI_SELF_UPDATE_COMMAND` takes precedence. **Can only be set in agent-directory settings.** |
+
+## Tools
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `defaultTools` | string[] | `read`, `bash`, `edit`, `write` | Tools active at startup. Plain names replace the defaults; `+name` adds a tool and `-name` removes one. An empty array turns off every built-in tool but keeps extension and SDK tools. |
+| `codemode` | object | see meaning | How the `codemode` tool presents tools while it is active. `mode` is `on` (default) or `only`. `inlineBudget` is the estimated number of tokens (characters divided by 4) its description may spend on tool declarations, default `3000`. |
+
+A list of only `+name` and `-name` entries changes the inherited selection instead of replacing it, so a project can adjust the tools a user chose. For example, this enables `codemode` next to the default tools:
+
+```json
+{
+  "defaultTools": ["+codemode"]
+}
+```
+
+`/reload` enables tools newly added to `defaultTools`. It does not turn off tools removed from it or turn on unchanged tools you turned off. `--tools`, `--no-tools` and `--no-builtin-tools` override `defaultTools`, also on reload.
+
+The built-in tools are `read`, `bash`, `powershell`, `edit`, `write`, `grep`,
+`find`, and `ls`. The CLI tool options override this setting for one run. See
+[Tools](commands.md#tools).
+
+## Notices
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `warnings` | object | see meaning | Warning toggles: `anthropicExtraUsage` (default `true`) warns when Anthropic subscription auth may use paid extra usage. |
+| `showCacheMissNotices` | boolean |  | Report a prompt cache miss and each successful cache-warming refresh. |
+| `enableInstallTelemetry` | boolean | `true` | Gate for the anonymous install/update ping and the pig-branded OpenRouter, NVIDIA, and Cloudflare attribution headers. When on, PiG sends one HTTPS GET carrying only your PiG version (`?version=<version>`) and PiG's `User-Agent` header to `https://pi-in-go.dev/api/report-install`, after a fresh install and after an update that has new changelog entries, and at no other time. The site stores one data point (the version and arrival time) per call and never logs your IP address or User-Agent. Set to `false`, or set `PI_TELEMETRY=0`, to opt out; `PI_OFFLINE=1` also stops it. Override with `PI_TELEMETRY`. |
+| `enableAnalytics` | boolean | `false` | Opt in to analytics data sharing. PiG stores the choice; nothing sends data. |
+| `trackingId` | string |  | Analytics tracking identifier. PiG writes this on the first opt-in and keeps it when you toggle `enableAnalytics`. Bug reports omit it. |
+| `deviceId` | string |  | Stable random ID of this installation. PiG writes it to the global settings file the first time a sign-in needs it and ignores a `deviceId` in a project file. Bug reports omit it. |
+
+## Related
+
+- [Config](config.md) lists every file PiG reads.
+- [Environment variables](environment-variables.md) lists runtime overrides.
+- [Keybindings](keybindings.md) covers `keybindings.json`.
+- [Models](models.md) covers model selection.

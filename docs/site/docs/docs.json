@@ -1,0 +1,510 @@
+{
+  "provenance": {
+    "applied-use-cases.md": "pig-authored",
+    "benchmarking.md": "pig-authored",
+    "bug-ledger.md": "pig-authored",
+    "cli-integration.md": "adapted-pi",
+    "cli-examples.md": "pig-authored",
+    "cli.md": "adapted-pi",
+    "codemode.md": "adapted-pi",
+    "compaction.md": "adapted-pi",
+    "coming-from-pi.md": "pig-authored",
+    "concepts.md": "pig-authored",
+    "configuration.md": "adapted-pi",
+    "containerization.md": "pig-authored",
+    "custom-provider.md": "adapted-pi",
+    "derivative-harnesses.md": "pig-authored",
+    "development.md": "pig-authored",
+    "environment-variables.md": "adapted-pi",
+    "evals.md": "pig-authored",
+    "event-bus.md": "pig-authored",
+    "extensions.md": "adapted-pi",
+    "first-extension.md": "pig-authored",
+    "first-run.md": "pig-authored",
+    "glossary.md": "pig-authored",
+    "go-hot-reload.md": "pig-authored",
+    "how-pig-works.md": "adapted-pi",
+    "index.md": "pig-authored",
+    "install-troubleshooting.md": "pig-authored",
+    "json.md": "adapted-pi",
+    "keybindings.md": "adapted-pi",
+    "knowledge-graph.md": "pig-authored",
+    "llama-cpp.md": "adapted-pi",
+    "mcp.md": "adapted-pi",
+    "message-types.md": "adapted-pi",
+    "models-configuration.md": "adapted-pi",
+    "models.md": "adapted-pi",
+    "nvidia-rtx-llama-cpp.md": "adapted-pi",
+    "packages.md": "adapted-pi",
+    "piglet-binaries.md": "pig-authored",
+    "piglet-lifecycle.md": "pig-authored",
+    "piglets.md": "pig-authored",
+    "port-your-extension.md": "pig-authored",
+    "publishing.md": "pig-authored",
+    "prompt-templates.md": "adapted-pi",
+    "providers.md": "adapted-pi",
+    "quickstart.md": "pig-authored",
+    "rpc-commands.md": "adapted-pi",
+    "rpc-extension-ui.md": "adapted-pi",
+    "rpc.md": "adapted-pi",
+    "sdk.md": "pig-authored",
+    "security.md": "pig-authored",
+    "session-format.md": "adapted-pi",
+    "sessions.md": "adapted-pi",
+    "settings-examples.md": "pig-authored",
+    "settings.md": "adapted-pi",
+    "shell-aliases.md": "adapted-pi",
+    "skills.md": "adapted-pi",
+    "slash-commands.md": "adapted-pi",
+    "terminal-setup.md": "adapted-pi",
+    "termux.md": "adapted-pi",
+    "themes.md": "adapted-pi",
+    "tmux.md": "adapted-pi",
+    "tui.md": "adapted-pi",
+    "typescript-runtimes.md": "pig-authored",
+    "trust.md": "pig-authored",
+    "ui-views.md": "pig-authored",
+    "usage.md": "adapted-pi",
+    "usecase-clean-spreadsheet.md": "pig-authored",
+    "usecase-draft-document.md": "pig-authored",
+    "usecase-organise-files.md": "pig-authored",
+    "usecase-summarise-pdfs.md": "pig-authored",
+    "usecase-weekly-report.md": "pig-authored",
+    "virtual-models.md": "adapted-pi",
+    "what-is-a-piglet.md": "pig-authored",
+    "windows.md": "adapted-pi"
+  },
+  "navigation": [
+    {
+      "title": "Coming from Pi",
+      "items": [
+        {
+          "title": "Coming from Pi",
+          "path": "coming-from-pi.md"
+        }
+      ]
+    },
+    {
+      "title": "Get Started",
+      "items": [
+        {
+          "title": "Overview",
+          "path": "index.md"
+        },
+        {
+          "title": "Quickstart",
+          "path": "quickstart.md"
+        },
+        {
+          "title": "Your First Ten Minutes",
+          "path": "first-run.md"
+        },
+        {
+          "title": "How PiG Works",
+          "path": "how-pig-works.md"
+        },
+        {
+          "title": "What Is a Piglet",
+          "path": "what-is-a-piglet.md"
+        }
+      ]
+    },
+    {
+      "title": "Applied Use Cases",
+      "items": [
+        {
+          "title": "Overview and Safety",
+          "path": "applied-use-cases.md"
+        },
+        {
+          "title": "Summarise a Folder of PDFs",
+          "path": "usecase-summarise-pdfs.md"
+        },
+        {
+          "title": "Clean a Spreadsheet",
+          "path": "usecase-clean-spreadsheet.md"
+        },
+        {
+          "title": "Draft and Edit a Document",
+          "path": "usecase-draft-document.md"
+        },
+        {
+          "title": "Automate a Weekly Report",
+          "path": "usecase-weekly-report.md"
+        },
+        {
+          "title": "Organise Files",
+          "path": "usecase-organise-files.md"
+        }
+      ]
+    },
+    {
+      "title": "Guides",
+      "items": [
+        {
+          "title": "Run PiG",
+          "items": [
+            {
+              "title": "Use PiG in the Terminal",
+              "path": "usage.md"
+            },
+            {
+              "title": "Choose a Model",
+              "path": "models.md"
+            },
+            {
+              "title": "Use MCP Servers",
+              "path": "mcp.md"
+            },
+            {
+              "title": "Run Scripts with Codemode",
+              "path": "codemode.md"
+            },
+            {
+              "title": "Manage Sessions and Context",
+              "path": "sessions.md"
+            },
+            {
+              "title": "Run PiG Safely",
+              "path": "security.md"
+            },
+            {
+              "title": "Control Project Trust",
+              "path": "trust.md"
+            },
+            {
+              "title": "Isolate PiG",
+              "path": "containerization.md"
+            },
+            {
+              "title": "Run Local Models",
+              "path": "llama-cpp.md"
+            },
+            {
+              "title": "Run Local Models on NVIDIA RTX",
+              "path": "nvidia-rtx-llama-cpp.md"
+            },
+            {
+              "title": "Configure Your Terminal",
+              "path": "terminal-setup.md"
+            },
+            {
+              "title": "Configure Shell Commands",
+              "path": "shell-aliases.md"
+            },
+            {
+              "title": "Run PiG in tmux",
+              "path": "tmux.md"
+            },
+            {
+              "title": "Run PiG on Windows",
+              "path": "windows.md"
+            },
+            {
+              "title": "Run PiG on Android",
+              "path": "termux.md"
+            }
+          ]
+        },
+        {
+          "title": "Customize PiG",
+          "items": [
+            {
+              "title": "Configure PiG",
+              "path": "configuration.md"
+            },
+            {
+              "title": "Create Prompt Templates",
+              "path": "prompt-templates.md"
+            },
+            {
+              "title": "Add Skills",
+              "path": "skills.md"
+            },
+            {
+              "title": "Create Themes",
+              "path": "themes.md"
+            },
+            {
+              "title": "Use PiG Packages",
+              "path": "packages.md"
+            },
+            {
+              "title": "Publish a Package or Piglet",
+              "path": "publishing.md"
+            },
+            {
+              "title": "Create Virtual Models",
+              "path": "virtual-models.md"
+            }
+          ]
+        },
+        {
+          "title": "Build on PiG",
+          "items": [
+            {
+              "title": "Your First Extension",
+              "path": "first-extension.md"
+            },
+            {
+              "title": "Port Your Extension",
+              "path": "port-your-extension.md"
+            },
+            {
+              "title": "Build Extensions",
+              "path": "extensions.md"
+            },
+            {
+              "title": "Call Another Extension",
+              "path": "event-bus.md"
+            },
+            {
+              "title": "Reload a Go Extension",
+              "path": "go-hot-reload.md"
+            },
+            {
+              "title": "Add Custom Providers",
+              "path": "custom-provider.md"
+            },
+            {
+              "title": "Build Terminal UI Components",
+              "path": "tui.md"
+            },
+            {
+              "title": "Build Extension Views",
+              "path": "ui-views.md"
+            },
+            {
+              "title": "Integrate with the CLI",
+              "path": "cli-integration.md"
+            },
+            {
+              "title": "Use the SDK",
+              "path": "sdk.md"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Reference",
+      "items": [
+        {
+          "title": "CLI",
+          "path": "cli.md"
+        },
+        {
+          "title": "Command Line by Example",
+          "path": "cli-examples.md"
+        },
+        {
+          "title": "Slash Commands",
+          "path": "slash-commands.md"
+        },
+        {
+          "title": "Settings",
+          "path": "settings.md"
+        },
+        {
+          "title": "Models Configuration",
+          "path": "models-configuration.md"
+        },
+        {
+          "title": "Settings by Example",
+          "path": "settings-examples.md"
+        },
+        {
+          "title": "Environment Variables",
+          "path": "environment-variables.md"
+        },
+        {
+          "title": "Keybindings",
+          "path": "keybindings.md"
+        },
+        {
+          "title": "Provider Authentication",
+          "path": "providers.md"
+        },
+        {
+          "title": "Session File Format",
+          "path": "session-format.md"
+        },
+        {
+          "title": "Compaction and Branch Summaries",
+          "path": "compaction.md"
+        },
+        {
+          "title": "JSON Event Stream",
+          "path": "json.md"
+        },
+        {
+          "title": "RPC Protocol",
+          "path": "rpc.md"
+        },
+        {
+          "title": "RPC Commands",
+          "path": "rpc-commands.md"
+        },
+        {
+          "title": "RPC Extension UI",
+          "path": "rpc-extension-ui.md"
+        },
+        {
+          "title": "Message Types",
+          "path": "message-types.md"
+        }
+      ]
+    },
+    {
+      "title": "PiG",
+      "items": [
+        {
+          "title": "PiG Concepts",
+          "path": "concepts.md"
+        },
+        {
+          "title": "Glossary",
+          "path": "glossary.md"
+        },
+        {
+          "title": "Piglets",
+          "path": "piglets.md"
+        },
+        {
+          "title": "Piglet Lifecycle",
+          "path": "piglet-lifecycle.md"
+        },
+        {
+          "title": "Piglet Binaries",
+          "path": "piglet-binaries.md"
+        },
+        {
+          "title": "TypeScript Extension Runtimes",
+          "path": "typescript-runtimes.md"
+        },
+        {
+          "title": "Derivative Harnesses",
+          "path": "derivative-harnesses.md"
+        },
+        {
+          "title": "Install and Troubleshooting",
+          "path": "install-troubleshooting.md"
+        },
+        {
+          "title": "Knowledge Graph",
+          "path": "knowledge-graph.md"
+        },
+        {
+          "title": "Harness Benchmarks",
+          "path": "evals.md"
+        },
+        {
+          "title": "Benchmarks on Kubernetes",
+          "path": "benchmarking.md"
+        },
+        {
+          "title": "Bug Fix Ledger",
+          "path": "bug-ledger.md"
+        },
+        {
+          "title": "Develop PiG",
+          "path": "development.md"
+        }
+      ]
+    }
+  ],
+  "redirects": [
+    {
+      "from": "session.md",
+      "to": "session-format.md"
+    },
+    {
+      "from": "tree.md",
+      "to": "sessions.md"
+    },
+    {
+      "from": "usage.md#cli-verbs",
+      "to": "cli.md#cli-verbs"
+    },
+    {
+      "from": "usage.md#generic-subcommands",
+      "to": "cli.md#generic-subcommands"
+    },
+    {
+      "from": "usage.md#pig-docs",
+      "to": "cli.md#pig-docs"
+    },
+    {
+      "from": "usage.md#slash-commands-tui",
+      "to": "slash-commands.md"
+    },
+    {
+      "from": "usage.md#core",
+      "to": "slash-commands.md#core"
+    },
+    {
+      "from": "usage.md#piglet-composition",
+      "to": "slash-commands.md#piglet-composition"
+    },
+    {
+      "from": "usage.md#parity-harness-only-when-pig_parity_harness1",
+      "to": "slash-commands.md#parity-harness-only-when-pig_parity_harness1"
+    },
+    {
+      "from": "rpc.md#supported-commands",
+      "to": "rpc-commands.md#supported-commands"
+    },
+    {
+      "from": "rpc.md#prompt",
+      "to": "rpc-commands.md#prompt"
+    },
+    {
+      "from": "rpc.md#abort",
+      "to": "rpc-commands.md#abort"
+    },
+    {
+      "from": "rpc.md#state",
+      "to": "rpc-commands.md#state"
+    },
+    {
+      "from": "rpc.md#select-a-model",
+      "to": "rpc-commands.md#select-a-model"
+    },
+    {
+      "from": "rpc.md#thinking-level",
+      "to": "rpc-commands.md#thinking-level"
+    },
+    {
+      "from": "rpc.md#compaction-and-retry",
+      "to": "rpc-commands.md#compaction-and-retry"
+    },
+    {
+      "from": "rpc.md#steer-and-follow-up",
+      "to": "rpc-commands.md#steer-and-follow-up"
+    },
+    {
+      "from": "rpc.md#bash",
+      "to": "rpc-commands.md#bash"
+    },
+    {
+      "from": "rpc.md#session-data",
+      "to": "rpc-commands.md#session-data"
+    },
+    {
+      "from": "rpc.md#session-replacement-and-export",
+      "to": "rpc-commands.md#session-replacement-and-export"
+    },
+    {
+      "from": "rpc.md#command-catalogue",
+      "to": "rpc-commands.md#command-catalogue"
+    },
+    {
+      "from": "rpc.md#extension-ui-records",
+      "to": "rpc-extension-ui.md"
+    },
+    {
+      "from": "process-integration.md",
+      "to": "cli-integration.md"
+    }
+  ]
+}

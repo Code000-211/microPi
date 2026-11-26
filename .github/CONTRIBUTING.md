@@ -1,0 +1,171 @@
+<!--
+SPDX-License-Identifier: MIT
+-->
+
+# Contributing to PiG
+
+Read [`AGENTS.md`](AGENTS.md), [`docs/project/CONTEXT.md`](../docs/project/CONTEXT.md), and the
+[repository quality standard](../docs/project/repository-quality.md) before
+changing source.
+
+## Contribution principles
+
+- Preserve observable Pi behavior unless an approved numbered divergence applies.
+- Keep Stock PiG product-neutral.
+- Put product behavior in an extension or explicitly selected Piglet.
+- Add the smallest change that satisfies the stated contract.
+- Derive tests from upstream behavior or another documented requirement.
+- Do not weaken parity checks, comparators, test counts, or security gates.
+- Update licensing and provenance records when source or generated data changes.
+
+## Developer Certificate of Origin
+
+This project uses the [Developer Certificate of Origin 1.1](https://developercertificate.org/).
+
+Add a `Signed-off-by` line to each commit:
+
+```bash
+git commit --signoff
+```
+
+The sign-off certifies that you have the right to submit the contribution under the project license. It is not a copyright assignment or a cryptographic signature.
+
+One commit needs no sign-off: the merge of `main` that GitHub's **Update branch** button adds to a pull request. GitHub commits it, nobody can add the line to it, and it holds no contribution of its own. The pre-flight exempts it only when it has exactly two parents, GitHub committed it and verifies its signature, its second parent is on the base branch, and its tree is the one git's own merge of the two parents writes; a merge you make yourself, a merge of another branch, and a merge with a conflict resolution or an edit need the line like every other commit, and so does every commit the pull request adds on either side of the merge.
+
+### Signing off a commit afterwards
+
+If a commit you authored lacks the sign-off and its history cannot be rewritten, add a later commit to the same pull request that signs it off. Author it as the same identity (name and email) as the unsigned commit, or as another identity that `automation/ci/dco-identities.txt` lists as the same person, with an empty change and a remediation block in the message:
+
+```text
+I, Jane Doe, retroactively sign off on these commits:
+0123456789abcdef0123456789abcdef01234567 fix the parser
+89abcdef01 add the flag
+
+Signed-off-by: Jane Doe <jane@example.com>
+```
+
+```bash
+git commit --allow-empty --signoff -S -F message.txt
+```
+
+Each row is a commit SHA (at least 10 hex characters) followed by its subject, and the block ends at the first blank line. `automation/ci/check-dco.sh` accepts an unsigned commit only if a later commit in the pull request has the same author (or a mapped identity of that person), names the unsigned commit in a block whose lead line carries the author's name, and has its own `Signed-off-by` line for its own author. `dco-identities.txt` lists one person per line, identities joined by ` = `; changing it needs the maintainer review CODEOWNERS requires. A remediation by someone else, or one that precedes the commit it names, does not count. Prefer amending the commit while the branch is still private.
+
+The single-line form the DCO bot writes is accepted too, one line per commit, naming the unsigned commit's author identity and its full 40-character sha (a short sha does not count), in a later commit of the same author that carries its own `Signed-off-by` line:
+
+```text
+I, Jane Doe <jane@example.com>, hereby add my Signed-off-by to this commit: 0123456789abcdef0123456789abcdef01234567
+
+Signed-off-by: Jane Doe <jane@example.com>
+```
+
+The name and email in the line must match the unsigned commit's author, ignoring case like a `Signed-off-by` line. The check lists each accepted commit as `<short sha> <subject>: remedied by <short sha>`.
+
+PiG does not require a Contributor License Agreement.
+
+## Signed commits
+
+Every commit requires a signature that GitHub marks **Verified**. DCO sign-off is separate and is also required. A `Signed-off-by` line does not satisfy the signature requirement.
+
+To sign with an existing SSH key, configure Git in your checkout:
+
+```bash
+git config gpg.format ssh
+git config user.signingkey /path/to/key.pub
+git config commit.gpgsign true
+```
+
+Add the public key to GitHub under **Settings → SSH and GPG keys → New SSH key**. Select **Signing Key** as the key type, even if you already added the same key for authentication. See [GitHub's SSH signing setup](https://docs.github.com/en/authentication/managing-commit-signature-verification/telling-git-about-your-signing-key#telling-git-about-your-ssh-key).
+
+Create commits with `git commit --signoff`. Git signs them automatically with the configuration above. Confirm that GitHub shows **Verified** after you push.
+
+To sign an existing unsigned tip commit without changing its message:
+
+```bash
+git commit --amend -S --no-edit
+```
+
+To sign every commit on a linear topic branch (one with no merge commits), replace `<base>` with its base commit:
+
+```bash
+git rebase --exec 'git commit --amend -S --no-edit' <base>
+```
+
+A default rebase drops merge commits, including any conflict resolution they contain, so rebase onto the current `main` first to make the branch linear. These commands rewrite commit IDs. Coordinate with a maintainer before replacing commits already pushed. Keep each DCO sign-off in the commit message.
+
+One commit is not yours: when CI's bookkeeping job finds committed derived files out of date on a pull request from this repository, the autofix workflow adds a single `Regenerate stale derived files` commit as `github-actions[bot]`. GitHub signs it (Verified) and it carries the bot's `Signed-off-by` and an `Autofix: derived files` trailer. Pull it (`git pull --ff-only`) before you push more; from a fork, CI comments the `make` commands to run instead. See `.github/AGENTS.md`.
+
+If you cannot set up signing, say so in the pull request. A maintainer can land your change in a maintainer-signed commit that credits you with a `Co-authored-by:` trailer, which GitHub shows as Verified. Re-signing a commit that keeps you as its author is not enough if your account uses vigilant mode, because GitHub then marks it only Partially verified.
+
+## Agent-assisted contributions
+
+Agent assistance is allowed. The contributor remains responsible for every
+claim, change, test, and dependency in the submission.
+
+Before submitting agent-assisted work:
+
+- read and understand the changed code;
+- reproduce the reported problem yourself;
+- confirm that the tests can detect the behavior they claim;
+- check agent output against [Faithful, general implementations](AGENTS.md#faithful-general-implementations);
+- remove generated speculation, unrelated changes, and private data; and
+- be prepared to explain the design and its interaction with the rest of PiG.
+
+Do not submit unattended, high-volume, or unreviewed generated issues or pull
+requests. Maintainers review technical evidence, not the apparent fluency of the
+submission.
+
+## Development workflow
+
+If you need help preparing a development host, load the repository setup Skill:
+
+```bash
+pig --skill ./.agents/skills/setup-pig
+```
+
+The Skill checks only the tools required for the selected task and asks before
+installing software.
+
+1. Search existing issues and pull requests.
+2. Open or link an issue when the change needs design agreement or coordination.
+3. Use a focused topic branch.
+4. Read the pinned upstream source and tests before changing parity-bound behavior.
+5. Add or identify a test that can fail on the behavior under review.
+6. Implement the smallest correct change through Pi's shared data-driven paths, without uncited provider/model special cases.
+7. Run the relevant local tests early across applicable provider shapes, not only Copilot or `test-faux`.
+8. If you change exported Go API, CLI flags, settings, parity scenarios, or docs mirrors, run `make generate` and commit the result. CI's drift gates compare these files.
+9. If a commit is titled as a fix (`Fix ...`, `fix: ...` or `<area>: fix ...`) and changes shipped code, or a changelog `### Fixed` section gains an item, run `make bug-ledger` and commit `docs/bug-ledger.json` and `docs/site/docs/bug-ledger.md`. `make bug-ledger-check` fails without them. `make bug-ledger` keeps the commits, the tests and the derived cause of a committed entry, and takes again what the tree alone decides: the impact and platform classes of the entry's text, and whatever its changelog bullet states with a marker. To rebuild an entry whose symptom or title now comes out differently at its source (a divergence record, a changelog bullet), delete that entry from `docs/bug-ledger.json` and run it again. The ledger lists entries by ID and carries no totals, and `make bug-ledger` changes only the entries your branch adds, so two branches that each add a fix merge without a conflict and a merge of `main` needs no regeneration; a release runs `make bug-ledger-refresh`. A fix of something that never shipped carries a `Bug-Ledger: exempt <category>: <reason>` trailer. A follow-up of an earlier fix carries `Bug-Ledger: see <commit>`. A user-facing change goes in a fragment `changelog.d/<lane>-<sha>.md`, where `<sha>` is a commit of your branch; every `### Fixed` bullet ends with `<!-- fix: <sha> -->` naming the commit that fixes it, so the ledger never guesses and never credits a squash commit's tests to your bullet. State the cause and the regression tests of the fix where the ledger takes them as written: in the bullet, as `<!-- cause: <why the bug happened> -->` and `<!-- tests: <test>[, <test>...] -->` after the fix marker (HTML comments, so the changelog does not show them, and a bullet can still be edited after its fix is committed), or in the fix commit's message, as a `Root-Cause: <text>` trailer (or a paragraph that starts `Root cause:`) and `Regression-Test: <test>[, <test>...]` trailers; the bullet wins. A `<test>` is a Go test name, `<file>::<Name>`, a parity scenario `<area>/<nn-name>` or the path of a test file. Without them the ledger reads the cause from the prose of the commit message (a paragraph that says why, else the first paragraph of the body) and never from a paragraph that reports how the fix was checked (one that starts `Tests:`, `Ran:`, `Evidence:`, `Verified on ...`, `Job <name>:` or with the name of a test); it lists the tests the fix commit adds or edits and the tests its message names in a test file the commit touches, so a test the message only mentions (where the bug was seen, another failure) is not listed. `make bug-ledger-check` fails for a fix whose newest commit has an author instant at or after 2026-11-14T05:00:00Z (UTC; the instant is compared, not the author's calendar date, so the author's time zone does not matter; the time printed in the message is the commit's own instant in UTC) for which no cause can be derived, and says where to state it; a root cause is published on the ledger page as written, so keep commands and paths out of it or in code spans that are true for a reader. `make changelog-check` fails a bullet without a marker and a marker or fragment name that names a commit `HEAD` does not reach; after a rebase, squash or amend, rename the fragment and update its markers to the commits that replaced them, then run `make bug-ledger`: the entry is recorded under the commits the marker names, and `make bug-ledger-check` fails while the committed entry still names a commit `HEAD` does not reach. A squash commit on `main` can keep a replaced commit nameable instead: a `Fix-Commit: <full 40-hex sha>` trailer in its message, one per replaced commit, makes a marker or fragment name that is a prefix (7 or more digits) of that sha resolve to the squash commit, and the ledger then attributes the squash commit's diff to the bullet (an abbreviated trailer, a trailer for another sha, or no trailer does not resolve; a commit `HEAD` reaches is never replaced by a trailer). It needs the full history (`git fetch --unshallow` in a shallow clone).
+10. Run `make check` before requesting review (it includes `make model-data-check`, which fails when the pinned Pi source or its published model data is not installed; `MODEL_DATA_ORACLE=skip make model-data-check` is the opt-out, prints that the data was not checked, and no gate sets it), and `make fixture-guard` before every push: fixtures must be minimal synthetic shapes generated in the test, never captured provider output (reasoning text, encrypted blobs, billing rows, ids, or your paths).
+11. Sign off and cryptographically sign every commit. Confirm that GitHub marks each signature **Verified**.
+12. Describe the problem, change, verification, and any divergence in the pull request.
+
+A documentation-only or mechanical change can explain why it does not need an issue.
+
+A pull request that adds a feature can carry fix-titled commits that repair code the same pull request adds, and commits already public cannot be retitled. Nothing released was broken, so `Fix: yes` would force a bug-ledger entry and a `### Fixed` line that are not true, and `Fix: no` fails the pre-flight for the titles. Ask a maintainer for a `fix-title-exempt` entry in `automation/ci/preflight/config.yaml`: the maintainer adds it in a separate, reviewed pull request, because the pre-flight reads main's configuration. The entry names your pull request, a written reason, and the exact full shas it exempts. A fix-titled commit you push later is not exempt until a maintainer reviews the list again, and the exemption never covers a changelog `### Fixed` line or a `Fix: yes` answer. A fix of something that shipped is never exempt: it gets its ledger entry.
+
+
+Maintainers squash-merge pull requests, which keeps you as the commit author, so you appear on GitHub's contributors page. When a maintainer lands your change inside a larger commit, the commit carries a `Co-authored-by:` trailer for you.
+
+## Pull request requirements
+
+A pull request must:
+
+- have a clear and bounded purpose;
+- pass required checks;
+- include both a DCO `Signed-off-by` line and a GitHub-verified signature on every commit;
+- contain no credentials or private data;
+- include tests or explain why the existing tests prove the change;
+- update `docs/parity/DIVERGENCES.md` for an approved observable difference (the record's `SCRUTINIZED:approved` line binds a hash of its text and only the owner approves a changed text with `make divergence-approve`; a contributor lists the record in `automation/ci/divergence-reapproval-pending.txt` instead, see `docs/parity/divergences/head.md`);
+- update extension conformance coverage for an SDK contract change;
+- update SBOM, notice, or provenance inputs when dependencies or copied material change;
+- update `vendorHash` in `nix/package.nix` when Go modules change (the `Nix vendor hash` check prints the value; `nix/vendor-hash.sh update` computes it where Nix is installed); and
+- resolve review findings before merge.
+
+Do not edit generated files by hand. Use the repository generator named by the file or gate.
+
+## Upstream collaboration
+
+Pi is the reference implementation. Keep PiG-specific discussion respectful and factual. Do not imply endorsement by Pi or its maintainers. A contribution to Pi follows Pi's own contribution policy and uses a separately approved contribution route.
+
+## Conduct and security
+
+Follow [`.github/CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Report vulnerabilities through the private route in [`.github/SECURITY.md`](SECURITY.md).

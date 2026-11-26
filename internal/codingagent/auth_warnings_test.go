@@ -1,0 +1,221 @@
+package codingagent
+
+import (
+	"context"
+	"errors"
+	"io"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/tui"
+)
+
+func newAnthropicWarningMode(t *testing.T, model *ai.Model) (*InteractiveMode, *ai.AuthStorage) {
+	t.Helper()
+	agentDir := t.TempDir()
+	store, err := ai.NewAuthStorage(filepath.Join(agentDir, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRequestAuthRuntime(t.Context(), RequestAuthRuntimeOptions{Credentials: store, AgentDir: agentDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &InteractiveMode{
+		opts: InteractiveModeOptions{
+			AgentDir:           agentDir,
+			Model:              model,
+			SettingsManager:    NewSettingsManager(t.TempDir(), agentDir),
+			RequestAuthRuntime: runtime,
+		},
+		chatContainer: tui.NewContainer(),
+		tuiInst:       tui.NewWithOutput(io.Discard, 120, 40),
+	}
+	return m, store
+}
+
+func anthropicWarningTestModel() *ai.Model {
+	return &ai.Model{
+		ID:       "claude-test",
+		Provider: ai.NewAnthropicProvider(ai.AnthropicConfig{ProviderID: "anthropic", Model: "claude-test"}),
+	}
+}
+
+func TestMaybeWarnAboutAnthropicSubscriptionAuthWarnsOnce(t *testing.T) {
+	const wantWarning = "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings."
+	m, store := newAnthropicWarningMode(t, anthropicWarningTestModel())
+	if err := store.Set("anthropic", ai.Credential{Type: ai.CredentialAPIKey, Key: "sk-ant-oat01-test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	m.maybeWarnAboutAnthropicSubscriptionAuth(t.Context())
+	m.maybeWarnAboutAnthropicSubscriptionAuth(t.Context())
+
+	if !m.anthropicSubWarningShown {
+		t.Fatal("subscription warning was not marked shown")
+	}
+	if got := m.chatContainer.ChildCount(); got != 2 {
+		t.Fatalf("chat children = %d, want one warning block", got)
+	}
+	if anthropicSubscriptionAuthWarning != wantWarning {
+		t.Fatalf("warning = %q, want upstream text %q", anthropicSubscriptionAuthWarning, wantWarning)
+	}
+	if rendered := strings.Join(m.chatContainer.Render(500), "\n"); !strings.Contains(rendered, wantWarning) {
+		t.Fatalf("warning output = %q, want %q", rendered, wantWarning)
+	}
+}
+
+func TestMaybeWarnAboutAnthropicSubscriptionAuthUsesResolvedEnvironmentAuth(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-oat01-environment")
+	m, _ := newAnthropicWarningMode(t, anthropicWarningTestModel())
+
+	m.maybeWarnAboutAnthropicSubscriptionAuth(t.Context())
+
+	if !m.anthropicSubWarningShown {
+		t.Fatal("subscription key resolved from ANTHROPIC_API_KEY did not show the upstream warning")
+	}
+}
+
+func TestMaybeWarnAboutAnthropicSubscriptionAuthWarnsForStoredOAuth(t *testing.T) {
+	m, store := newAnthropicWarningMode(t, anthropicWarningTestModel())
+	if err := store.Set("anthropic", ai.Credential{Type: ai.CredentialOAuth, Refresh: "refresh", Access: "expired"}); err != nil {
+		t.Fatal(err)
+	}
+
+	m.maybeWarnAboutAnthropicSubscriptionAuth(t.Context())
+
+	if !m.anthropicSubWarningShown || m.chatContainer.ChildCount() != 2 {
+		t.Fatalf("shown = %t children = %d, want one OAuth warning", m.anthropicSubWarningShown, m.chatContainer.ChildCount())
+	}
+}
+
+func TestMaybeWarnAboutAnthropicSubscriptionAuthIgnoresOtherModels(t *testing.T) {
+	model := &ai.Model{
+		ID:       "openai-test",
+		Provider: ai.NewOpenAIProvider(ai.OpenAIConfig{ProviderID: "openai", Model: "openai-test"}),
+	}
+	m, store := newAnthropicWarningMode(t, model)
+	if err := store.Set("anthropic", ai.Credential{Type: ai.CredentialOAuth, Refresh: "refresh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	m.maybeWarnAboutAnthropicSubscriptionAuth(t.Context())
+
+	if m.anthropicSubWarningShown || m.chatContainer.ChildCount() != 0 {
+		t.Fatalf("shown = %t children = %d, want no warning", m.anthropicSubWarningShown, m.chatContainer.ChildCount())
+	}
+}
+
+// Pi: packages/coding-agent/src/core/settings-manager.ts:1528 (SettingsManager.setWarnings).
+func TestMaybeWarnAboutAnthropicSubscriptionAuthHonorsDisabledSetting(t *testing.T) {
+	m, store := newAnthropicWarningMode(t, anthropicWarningTestModel())
+	if err := store.Set("anthropic", ai.Credential{Type: ai.CredentialOAuth, Refresh: "refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.opts.SettingsManager.SetWarnings(WarningSettings{AnthropicExtraUsage: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	m.maybeWarnAboutAnthropicSubscriptionAuth(t.Context())
+
+	if m.anthropicSubWarningShown || m.chatContainer.ChildCount() != 0 {
+		t.Fatalf("shown = %t children = %d, want no warning", m.anthropicSubWarningShown, m.chatContainer.ChildCount())
+	}
+}
+
+// Pi passes the installation's device ID to every interactive login (interactive-mode.ts:6297); Sign in with
+// ChatGPT fails without it (#146).
+func TestInteractiveLoginDeviceIDComesFromSettings(t *testing.T) {
+	sm := NewSettingsManager(t.TempDir(), t.TempDir())
+	m := &InteractiveMode{opts: InteractiveModeOptions{SettingsManager: sm}}
+	id := m.loginDeviceID()
+	if id == "" || id != sm.GetOrCreateDeviceID() {
+		t.Fatalf("login device ID = %q, settings = %q", id, sm.GetOrCreateDeviceID())
+	}
+}
+
+// Both interactive login paths hand the provider the settings manager's device ID (#146): a registered provider and
+// the OpenAI Codex flow.
+func TestRegisteredOAuthLoginReceivesSettingsDeviceID(t *testing.T) {
+	m := newPostLoginTestMode(t)
+	m.layout = tui.NewContainer(m.chatContainer, m.editorContainer)
+	sm := NewSettingsManager(t.TempDir(), t.TempDir())
+	m.opts.SettingsManager = sm
+	provider := &initiationCaptureOAuthProvider{callbacks: make(chan ai.OAuthLoginCallbacks, 1)}
+	done := make(chan error, 1)
+	go func() { done <- m.runLoginRegisteredOAuth(t.Context(), provider, testOAuthLoginName(provider), "") }()
+	callbacks := <-provider.callbacks
+	if callbacks.GetDeviceID == nil {
+		t.Fatal("registered OAuth login has no GetDeviceID callback")
+	}
+	if got, want := callbacks.GetDeviceID(), sm.GetOrCreateDeviceID(); want == "" || got != want {
+		t.Fatalf("device ID = %q, settings = %q", got, want)
+	}
+	// The stub's error rejects the login, which closes the dialog (interactive-mode.ts:6564) and is reported by the caller.
+	if err := <-done; err == nil || err.Error() != "Failed to login to "+testOAuthLoginName(provider)+": stop after callback capture" {
+		t.Fatalf("rejected login err = %v", err)
+	}
+}
+
+func TestOpenAICodexLoginReceivesSettingsDeviceID(t *testing.T) {
+	captured := make(chan ai.OAuthLoginCallbacks, 1)
+	original := loginOpenAICodex
+	t.Cleanup(func() { loginOpenAICodex = original })
+	loginOpenAICodex = func(_ context.Context, cb ai.OAuthLoginCallbacks) (ai.OAuthCredentials, error) {
+		captured <- cb
+		return ai.OAuthCredentials{}, errors.New("stop after callback capture")
+	}
+	m := newPostLoginTestMode(t)
+	m.layout = tui.NewContainer(m.chatContainer, m.editorContainer)
+	sm := NewSettingsManager(t.TempDir(), t.TempDir())
+	m.opts.SettingsManager = sm
+	done := make(chan error, 1)
+	go func() { done <- m.runLoginOpenAICodex(t.Context()) }()
+	waitForRender(t, m.editorContainer, "Select OpenAI Codex login method")
+	deliverModalInput(t, m, []byte("\r"))
+	callbacks := <-captured
+	if callbacks.GetDeviceID == nil {
+		t.Fatal("Codex login has no GetDeviceID callback")
+	}
+	if got, want := callbacks.GetDeviceID(), sm.GetOrCreateDeviceID(); want == "" || got != want {
+		t.Fatalf("device ID = %q, settings = %q", got, want)
+	}
+	// The stub's error rejects the login, which closes the dialog (interactive-mode.ts:6564) and is reported by the caller.
+	if err := <-done; err == nil || err.Error() != "Failed to login to "+buildAuthProviderName("openai-codex")+": stop after callback capture" {
+		t.Fatalf("rejected login err = %v", err)
+	}
+}
+
+// Pi checks for Anthropic subscription auth after Ctrl+P cycles to a model (interactive-mode.ts:4510).
+func TestCycleModelChecksAnthropicSubscriptionAuth(t *testing.T) {
+	anthropic := anthropicWarningTestModel()
+	m, _ := newAnthropicWarningMode(t, anthropic)
+	m.statusLine = NewFooterComponent(nil, "test", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.runCtx, m.backgroundCtx = ctx, ctx
+	m.uiTaskCh = make(chan func(), 8)
+	m.opts.RequestAuthRuntime.providerByID["anthropic"].Auth = ai.ProviderAuth{APIKey: &ai.APIKeyAuth{}}
+	m.opts.SessionHandle = &recordingCompactHandle{cycleResults: []*ModelCycleResult{{Model: anthropic}}}
+
+	var checks atomic.Int32
+	m.opts.RequestAuthRuntime.providerByID["anthropic"].Auth.APIKey.Check = func(context.Context, ai.APIKeyAuthInput) (*ai.AuthCheck, error) {
+		checks.Add(1)
+		return &ai.AuthCheck{Type: ai.CredentialOAuth}, nil
+	}
+	m.cycleModel(true)
+	runOwnerTasksUntil(t, m, func() bool { return strings.HasPrefix(m.lastStatusMessage, "Switched to") })
+	deadline := time.Now().Add(5 * time.Second)
+	for checks.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The warning itself needs the owner loop, which this test does not run.
+	cancel()
+	m.backgroundTasks.Wait()
+	if got := checks.Load(); got != 1 {
+		t.Fatalf("Anthropic auth checks after cycling = %d, want 1", got)
+	}
+}

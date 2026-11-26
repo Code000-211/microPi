@@ -1,0 +1,26 @@
+# Go extension JSON codec
+
+This package is the shared host/Go-SDK JSON codec. It preserves the native `internal/jsstring` WTF-8 representation of unmatched UTF-16 units. It writes those units as standard JSON surrogate escapes and decodes those escapes back to WTF-8. Ordinary paired characters remain UTF-8. Other malformed UTF-8 retains Go's replacement behavior.
+
+A post-processing wrapper around `encoding/json.Marshal` or `Unmarshal` cannot recover replaced units. Reflective projection would duplicate struct-field selection, custom marshalers, omission, cycle and map-key rules. This package instead retains Go's codec and changes the two string primitives. Use it at payload construction and decoding, not only at final envelope framing. Already-corrupted `json.RawMessage` data cannot be repaired.
+
+## Provenance
+
+The production files derive from the Go 1.27.1 `src/encoding/json` v1 implementation: `decode.go`, `encode.go`, `fold.go`, `indent.go`, `scanner.go`, `stream.go`, `tables.go`, and `tags.go`. The Go Authors' BSD license is retained in `LICENSE` and each source header. Source: <https://github.com/golang/go/tree/go1.27.1/src/encoding/json>.
+
+Local changes are the surrogate branches in `appendString` and `unquoteBytes`, string-contract comments, removal of the standard library's internal experiment build tags, aliases for `encoding/json.RawMessage` and `encoding/json.Number`, a pool for `Unmarshal`'s decode state, scanner stack and error context (`decodeStatePool`, so a small message decodes without allocating them), overflow-safe allocation sizes (`addSize`, `mulSize` in `allocsize.go`) where `unquoteBytes` and `Grow` size a buffer, and narrow lint fixes or explanations, and `quoteChar`, which is `strconv.QuoteRune` in place of the standard library's hand-written quoting. The experiment tags belong to Go's selection of its own implementation; this package always uses these sources. The aliases preserve interoperability with callers of the standard library.
+
+`UnmarshalFrame` takes a document nested 64 levels past the standard library's 10000: a frame the host sends holds arguments nested to 10000 levels inside an envelope.
+
+Other local changes (lw-json):
+
+- The JSON.stringify mode: `MarshalStringify`/`AppendStringify`, `encOpts.jsStrings` and `appendCompactJS` for nested Marshaler output, plus the `StringifyAppender` splice.
+- `UnmarshalTrusted`.
+- Frame decode (`fast_valid.go`, `decode.go`): `validate` is the validity pass of every `Unmarshal` and `UnmarshalFrame`; it crosses string bytes eight bytes at a time and runs the scanner (`checkValid`) only on a document it does not accept, so the error is the scanner's. `skip` counts brackets and crosses strings instead of stepping the scanner, `unquote` copies runs between escapes and well-formed multi-byte runs, `rescanLiteral` finds a string's end eight bytes at a time, and `UnmarshalFrame` hands a `RawMessage` member the frame's own bytes (capacity-limited) instead of a copy. Decoding into an interface value shares short ASCII strings through a per-state table (`nameCache`) and returns one boxed value for each integer 0 to 255. Equivalence: `FuzzValidateMatchesCheckValid`, `FuzzUnquoteMatchesReference` (the pre-change `unquoteBytes`), `TestDecodeCrossesValuesWithoutLosingItsPlace`, `TestUnmarshalFrameErrorsAreTheScannersErrors`, `TestInterfaceNumbers`, `TestInterfaceStringsAreTheirOwnText`.
+- Member order of decoded objects (`object_order.go`, `UnmarshalObject`, `UnmarshalTrustedObject`, `ObjectOrder`): a decode into a `map[string]any` can record the keys of every object it builds, in the order the text wrote them (a repeated key keeps its first place), and `MarshalJSOrdered` writes a map in that order. An object is known by its own map, so an object a caller moves, copies into another list, edits or hands back keeps the order it was decoded with.
+- An eight-byte scan in `appendString`.
+- A plain-slice `encodeState` buffer in place of the embedded `bytes.Buffer`, with pooled buffers capped at 64 KiB.
+- The verify mode (`verify_off.go`/`verify_on.go`, build tag `pigjson_verify`).
+- Key order (`encode_order.go`, `MarshalJSOrdered`, `encOpts.order`): a map whose member order a `KeyOrder` knows is written in that order, then the rest in byte order. A Go map has no insertion order, so the SDK uses it to write an object the host sent an extension, and the extension handed back, in the order the host wrote it.
+
+When updating the toolchain, compare these files with that exact Go source tree and retain the string regression suite. Do not replace the codec with placeholder characters or a second wire shape. SDK staging includes this subpackage and its license.

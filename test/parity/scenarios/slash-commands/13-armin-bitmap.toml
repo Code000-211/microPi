@@ -1,0 +1,82 @@
+# Upstream evidence: Pi 0.87.1 through 1.0.0 armin.ts chooses one of seven effects and draws Armin's 31 by 36 XBM labeled
+# "ARMIN SAYS HI". Compare the settled bitmap, not nondeterministic intermediate frame timing; armin-oracle.mjs runs the
+# pinned armin.ts with PiG's image and compares every intermediate frame under the same random stream, including
+# non-terminating rain.
+# pig divergence (D87, owner decision 2026-10-01): PiG draws a 31 by 34 pig head labeled "pigsayhi" with the same effects,
+# so each binary waits for its own settled image (wait_visible_contains_pig / _pi) and the image rows are asserted per
+# binary instead of compared with each other. Both show it on the exact command, in the accent color, after a spacer.
+# Completion barrier: every bitmap row visible together (wait_visible_contains searches only the current pane, so rows
+# from different frames cannot satisfy it) and the pane unchanged for 500 ms.
+# armin.ts tickRain has no completion signal: after a column's last pixel settles, its drop still falls through the whole
+# column drawing "▓" over settled cells, starting up to 5 frames (167 ms at 30 fps) after it settles. A quiet window
+# longer than that entry gap means no drop remains.
+# lint-known-gap: D87 replaces the whole crop (Armin's image and label) with PiG's pig head and label, so no equality
+# comparator applies; the [diverge] rows assert each binary's settled image instead.
+# The crop retains the spacer, all image rows and the label, excluding startup/footer identity.
+# Pi 1.0.1 plays a 3D Armin (easter-egg-3d.ts playArmin3d) in fullscreen mode, its default, and the inline armin.ts
+# component only outside it; PiG shows the inline pig head in every mode (D87). Both binaries run --tui-mode regular so
+# the inline components are compared.
+name = "13-armin-bitmap"
+description = "Hidden Armin command converges to the complete accent-colored half-block bitmap: Pi's Armin, PiG's pig head (D87)"
+covers = ["packages/coding-agent/src/modes/interactive/components/armin.ts"]
+tags = ["hermetic", "tui"]
+driver = "interactive-tmux"
+
+[tmux]
+width = 80
+height = 50
+ready_pattern_pig = "(auto)"
+ready_pattern_pi = "(auto)"
+ready_timeout_seconds = 20
+capture_start = "Session name set: armin-anchor"
+capture_end = "Session name set: armin-end"
+
+[[tmux.steps]]
+keys = ["/name armin-anchor", "Enter"]
+wait_contains = ["Session name set: armin-anchor"]
+
+[[tmux.steps]]
+keys = ["/arminsayshi", "Enter"]
+wait_visible_contains_pi = [
+ "         ▄▄▄▄", "          ▀▄ ▀▄", "            █  ▀▄▄",
+ "      ▄▀▀▀▀▀     █", "      █▄   ▄▄▄▄▀▀▀▀▄", "    ▄▀  ▀▀▀  ▄▄▄▄▀▀ █",
+ "    █              ▄█▄", "    ▀▄   ▄▄▄▀▀▀▀▀▀▀▀▄█  ▄▄▄▄▄",
+ "  ▄▄▄▀▀▀▀▄▄▄▄▄▄▄▄▄▄█▄ ▄▀   ▄ ▀▄", "  █▄▄▄▄        ▀▀▀▀  █     ▀█ █",
+ "      ██ ▄█      █   █ ▄      █", "      ▀█████▄▄▄▄███▄▄▀▄▀▄▄▄  ▄▀",
+ "        ▀██████▀▀▀▀   ▀▄▄▄▄▄▀", "          ▀████████▀  ▄▄ ▄▄▄",
+ "            ▀█████▀  ██▀ ██▄", "                     ██  ▄▄▄",
+ "                      █  ▀█▀", "                       ▀▀▀", " ARMIN SAYS HI",
+]
+wait_visible_contains_pig = [
+ "  ▄▄                         ▄▄", "  █ ▀▀▄▄                 ▄▄▀▀ █", "  █     ▀▀▄▄         ▄▄▀▀     █",
+ "  █         ▀▀▀▀▀▀▀▀▀         █", "  █                           █", " █                             █",
+ " █      ▄██▄         ▄██▄      █", " █      ▀██▀         ▀██▀      █", " █                             █",
+ " █       ▄▄▀▀▀▀▀▀▀▀▀▀▀▄▄       █", " █      █    ▄▄   ▄▄    █      █", " █      █   ▀██▀ ▀██▀   █      █",
+ " █       ▀▄▄         ▄▄▀       █", "  █         ▀▀▀▀▀▀▀▀▀         █", "   █           ▄ ▄           █",
+ "    ▀▀▄▄        ▀        ▄▄▀▀", "        ▀▀▀▄▄▄▄▄▄▄▄▄▄▄▀▀▀", " pigsayhi",
+]
+wait_stable_milliseconds = 500
+wait_timeout_seconds = 30
+
+[[tmux.steps]]
+keys = ["/name armin-end", "Enter"]
+wait_contains = ["Session name set: armin-end"]
+
+[env]
+pig = ["PIG_CODING_AGENT_DIR=../model-resolver-selector/testdata/model-picker-defaults"]
+pi = ["PI_CODING_AGENT_DIR=../model-resolver-selector/testdata/model-picker-defaults"]
+pig_args = ["--no-extensions", "--offline", "--tui-mode", "regular", "--session-dir", "{{TEMP}}/sessions"]
+pi_args = ["--no-extensions", "--offline", "--tui-mode", "regular", "--session-dir", "{{TEMP}}/sessions"]
+
+[assert]
+both_reach_ready = true
+both_not_contain = ["panic:", "goroutine "]
+runs = 3
+
+[diverge]
+pig_contains = [
+ "  ▄▄                         ▄▄", " █      ▄██▄         ▄██▄      █", " █      █   ▀██▀ ▀██▀   █      █",
+ "        ▀▀▀▄▄▄▄▄▄▄▄▄▄▄▀▀▀", " pigsayhi",
+]
+pi_contains = ["         ▄▄▄▄", "  ▄▄▄▀▀▀▀▄▄▄▄▄▄▄▄▄▄█▄ ▄▀   ▄ ▀▄", " ARMIN SAYS HI"]
+reason = "D87: PiG's /arminsayshi draws a pig head labeled pigsayhi with Pi's effects; Pi draws Armin."

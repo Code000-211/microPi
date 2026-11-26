@@ -1,0 +1,377 @@
+package codingagent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/tui"
+)
+
+type startupComponent interface {
+	tui.Component
+	HandleInput(string)
+	Done() bool
+}
+
+// dispatchStartupInput applies one decoded terminal batch. The caller retains
+// any returned sequences for the next focused component.
+func dispatchStartupInput(component startupComponent, chunks []string) []string {
+	if component.Done() {
+		return chunks
+	}
+	for i, chunk := range chunks {
+		if !tui.ShouldDeliverKey(component, chunk) {
+			continue
+		}
+		component.HandleInput(chunk)
+		if component.Done() {
+			return chunks[i+1:]
+		}
+	}
+	return nil
+}
+
+var startupInputCarryover struct {
+	sync.Mutex
+	chunks []string
+}
+
+func retainStartupInput(chunks []string) {
+	if len(chunks) == 0 {
+		return
+	}
+	startupInputCarryover.Lock()
+	startupInputCarryover.chunks = append(startupInputCarryover.chunks, chunks...)
+	startupInputCarryover.Unlock()
+}
+
+func takeStartupInput() []string {
+	startupInputCarryover.Lock()
+	defer startupInputCarryover.Unlock()
+	chunks := startupInputCarryover.chunks
+	startupInputCarryover.chunks = nil
+	return chunks
+}
+
+type StartupUIOptions struct {
+	AgentDir   string
+	Settings   Settings
+	ThemePaths []string
+}
+
+// SelectStartupSession is Pi's selectSession(currentSessionsLoader, allSessionsLoader, settingsManager) (cli/session-picker.ts:15-54), the --resume picker. Ports packages/coding-agent/src/cli/session-picker.ts.
+// It runs the same session selector used by /resume before cwd-bound runtime services exist. Loaders run off the input owner, receive cancellation and progress options, and settle before teardown returns. Confirmed deletion tries trash before unlink; renaming is unavailable. It returns selected=false when the user cancels, where Pi resolves null.
+func SelectStartupSession(
+	currentLoader func(SessionListOptions) ([]SessionInfo, error),
+	allLoader func(SessionListOptions) ([]SessionInfo, error),
+	opts StartupUIOptions,
+) (path string, selected bool, err error) {
+	ui := tui.New()
+	ui.SetLogDirectory(opts.AgentDir)
+	return selectStartupSession(currentLoader, allLoader, opts, ui, tui.NewStdioProcessTerminal())
+}
+
+// selectStartupSession is SelectStartupSession on the given renderer and terminal. As selectSession does, it themes the prompt, loads the user's keybindings into the selector and the TUI (session-picker.ts:22-23), shows the selector without a rename hint (session-picker.ts:42) and resolves the first select or cancel (session-picker.ts:25-36).
+func selectStartupSession(
+	currentLoader func(SessionListOptions) ([]SessionInfo, error),
+	allLoader func(SessionListOptions) ([]SessionInfo, error),
+	opts StartupUIOptions,
+	ui *tui.TuiMainScreen,
+	terminal startupTerminal,
+) (path string, selected bool, err error) {
+	keybindings := configureStartupTui(opts)
+	selector, outcome := newStartupSessionSelector(currentLoader, allLoader, keybindings)
+	completed, err := runStartupComponentWith(selector, opts, false, ui, terminal)
+	if err != nil {
+		return "", false, err
+	}
+	if !completed || outcome.cancelled {
+		return "", false, nil
+	}
+	return outcome.path, outcome.path != "", nil
+}
+
+// newStartupSessionSelector mirrors Pi's --resume picker: deletion operates on the path returned by the loaders, without rename or its hint.
+func newStartupSessionSelector(currentLoader, allLoader func(SessionListOptions) ([]SessionInfo, error), keybindings *KeybindingsManager) (*SessionSelectorComponent, *sessionSelectorOutcome) {
+	outcome := &sessionSelectorOutcome{}
+	loader := func(list func(SessionListOptions) ([]SessionInfo, error)) SessionsLoader {
+		return func(ctx context.Context, onProgress SessionListProgress) ([]SessionInfo, error) {
+			return list(SessionListOptions{Context: ctx, OnProgress: onProgress})
+		}
+	}
+	// session-picker.ts:26-48: no rename, no rename hint, deletion by deleteSessionFile; the host stops the startup UI when a callback ran.
+	selector := NewSessionSelectorComponent(loader(currentLoader), loader(allLoader), outcome.onSelect, outcome.onCancel, nil, nil, &SessionSelectorOptions{ShowRenameHint: new(false), Keybindings: keybindings})
+	return selector, outcome
+}
+
+// ShowStartupSelector displays a small pre-runtime choice list. It returns
+// selected=false when the user cancels.
+func ShowStartupSelector(title string, options []string, opts StartupUIOptions) (index int, selected bool, err error) {
+	selector := newStartupSelector(title, options, opts)
+	completed, err := runStartupComponent(selector, opts, true)
+	if err != nil {
+		return -1, false, err
+	}
+	if !completed || selector.Cancelled() {
+		return -1, false, nil
+	}
+	index = selector.SelectedIndex()
+	return index, index >= 0 && index < len(options), nil
+}
+
+// ShowStartupInput displays the extension text-input surface before runtime
+// services exist. It returns selected=false when the user cancels.
+func ShowStartupInput(title, placeholder string, opts StartupUIOptions) (value string, selected bool, err error) {
+	input := newStartupInput(title, placeholder, opts)
+	completed, err := runStartupComponent(input, opts, true)
+	if err != nil {
+		return "", false, err
+	}
+	if !completed || input.Cancelled() {
+		return "", false, nil
+	}
+	return input.Text(), true, nil
+}
+
+// newStartupSelector builds the selector after the startup theme is configured. Pi's showStartupSelector awaits
+// createStartupTui, which registers the themes and marks the terminal colors pending, before it constructs the
+// component (cli/startup-ui.ts:84-92,185-189), and ExtensionSelectorComponent themes its title and rows when it
+// is constructed (extension-selector.ts:48-84), so they are drawn under the grayscale system theme.
+func newStartupSelector(title string, options []string, opts StartupUIOptions) *tui.ExtensionSelectorComponent {
+	configureStartupTui(opts)
+	return tui.NewExtensionSelectorComponent(title, options, nil, nil)
+}
+
+// newStartupInput builds the input after the startup theme is configured, as showStartupInput does (cli/startup-ui.ts:238-262).
+func newStartupInput(title, placeholder string, opts StartupUIOptions) *tui.ExtensionInputComponent {
+	configureStartupTui(opts)
+	return tui.NewExtensionInputComponent(title, placeholder, nil, nil)
+}
+
+// startupTerminal is the terminal surface a startup prompt drives.
+type startupTerminal interface {
+	StartWithReadError(onInput func([]byte), onResize func(), onReadError func(error)) error
+	Stop()
+	Write(data string)
+}
+
+// runStartupComponent runs a component built after configureStartupTui.
+func runStartupComponent(component startupComponent, opts StartupUIOptions, clear bool) (bool, error) {
+	ui := tui.New()
+	ui.SetLogDirectory(opts.AgentDir)
+	return runStartupComponentWith(component, opts, clear, ui, tui.NewStdioProcessTerminal())
+}
+
+// runStartupComponentWith runs a startup prompt on ui and terminal. Mirrors
+// upstream startStartupTui: the prompt renders at once while the terminal's
+// colors are queried; replies, including those after the timeout, retheme the
+// prompt and are never delivered as input.
+// Ports packages/tui/src/tui.ts (terminal color reply consumption).
+func runStartupComponentWith(component startupComponent, opts StartupUIOptions, clear bool, ui *tui.TuiMainScreen, terminal startupTerminal) (bool, error) {
+	asyncSelector, _ := component.(*SessionSelectorComponent)
+	var updates <-chan func()
+	var ready <-chan struct{}
+	if asyncSelector != nil {
+		defer asyncSelector.close()
+		updates = asyncSelector.work.updates
+		ready = asyncSelector.work.ready
+		asyncSelector.drainLoadUpdates()
+	}
+	// Mirrors upstream createStartupTui, which applies the terminal
+	// capability overrides before the prompt renders.
+	tui.SetCapabilityOverrides(opts.Settings.GetTerminalCapabilityOverrides())
+	ui.SetShowHardwareCursor(opts.Settings.GetShowHardwareCursor())
+	ui.SetClearOnShrink(opts.Settings.GetClearOnShrink())
+	ui.Add(component)
+
+	inputCh := make(chan []byte, 32)
+	inputErrCh := make(chan error, 1)
+	resizeCh := make(chan struct{}, 1)
+	if err := terminal.StartWithReadError(func(data []byte) {
+		inputCh <- append([]byte(nil), data...)
+	}, func() {
+		select {
+		case resizeCh <- struct{}{}:
+		default:
+		}
+	}, func(err error) {
+		inputErrCh <- err
+	}); err != nil {
+		return false, fmt.Errorf("startup UI terminal: %w", err)
+	}
+	stopped := false
+	ui.HideCursor()
+	defer ui.Stop()
+	ui.Render()
+
+	// The terminal's colors regenerate the system theme and resolve "" tokens; re-rendering rebuilds the prompt with them.
+	themeSetting := opts.Settings.themeSetting()
+	themed, _ := component.(interface{ startupTheme() string })
+	applyColors := func(colors tui.TerminalColors) {
+		tui.SetTerminalColors(colors)
+		name, ok := tui.ResolveThemeSettingPresence(themeSetting, tui.GetTerminalTheme())
+		if !ok {
+			name = tui.SystemThemeName
+		}
+		if themed != nil {
+			name = themed.startupTheme()
+		}
+		tui.SetThemeByName(name)
+		ui.Invalidate()
+		ui.Render()
+	}
+	colorResults := ui.QueryTerminalColors(tui.TerminalColorQueryOptions{TimeoutMs: float64(terminalColorQueryTimeout / time.Millisecond), OnLateReply: applyColors})
+
+	// settleColors applies a completed query. A completed query is applied before the next input chunk is dispatched, as upstream's promise continuation runs before the next terminal input event.
+	settleColors := func(result tui.TerminalColorsResult) {
+		colorResults = nil
+		// A failed query applies no colors, like a terminal that does not report them.
+		if result.Err != nil {
+			result.Colors = tui.TerminalColors{}
+		}
+		applyColors(result.Colors)
+	}
+	dispatch := func(chunks []string) {
+		select {
+		case result := <-colorResults:
+			settleColors(result)
+		default:
+		}
+		input := chunks[:0:0]
+		for _, chunk := range chunks {
+			if ui.ConsumeTerminalColorResponse(chunk) {
+				continue
+			}
+			if chunk != "" {
+				input = append(input, chunk)
+			}
+		}
+		// Sequences after the confirming key belong to the next focused
+		// component (the next startup prompt or the interactive editor).
+		retainStartupInput(dispatchStartupInput(component, input))
+		ui.Render()
+	}
+	stopAndDrain := func(preserve bool) {
+		if stopped {
+			return
+		}
+		done := make(chan struct{})
+		go func() {
+			terminal.Stop()
+			close(done)
+		}()
+		for {
+			select {
+			case data := <-inputCh:
+				if preserve {
+					dispatch([]string{string(data)})
+				}
+			case <-done:
+				for {
+					select {
+					case data := <-inputCh:
+						if preserve {
+							dispatch([]string{string(data)})
+						}
+					default:
+						stopped = true
+						return
+					}
+				}
+			}
+		}
+	}
+	defer stopAndDrain(false)
+	dispatch(takeStartupInput())
+
+	for !component.Done() {
+		select {
+		case <-ready:
+			asyncSelector.drainLoadUpdates()
+			ui.Render()
+		case result := <-asyncSelector.loadResult(sessionScopeCurrent):
+			asyncSelector.finishLoad(sessionScopeCurrent, result)
+			ui.Render()
+		case result := <-asyncSelector.loadResult(sessionScopeAll):
+			asyncSelector.finishLoad(sessionScopeAll, result)
+			ui.Render()
+		case update := <-updates:
+			update()
+			ui.Render()
+		case <-asyncSelector.statusTimeout():
+			asyncSelector.clearStatusMessage()
+			ui.Render()
+		case data := <-inputCh:
+			dispatch([]string{string(data)})
+		case result := <-colorResults:
+			settleColors(result)
+		case <-resizeCh:
+			ui.Render()
+		case err := <-inputErrCh:
+			if errors.Is(err, io.EOF) {
+				return false, nil
+			}
+			return false, fmt.Errorf("startup UI terminal input: %w", err)
+		}
+	}
+
+	if asyncSelector != nil && asyncSelector.operationError != nil {
+		return false, asyncSelector.operationError
+	}
+
+	if clear {
+		ui.Clear()
+		ui.Render()
+		// upstream: cli/startup-ui.ts:118-122 clearStartupTui waits 25 ms after the clear for the render requestRender queued; Render here draws before it returns.
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// upstream: cli/startup-ui.ts:163-164,235-236 stop the terminal once the clear has settled. Stop joins the terminal's decoder before retaining its final
+	// events for the next owner.
+	stopAndDrain(true)
+	return true, nil
+}
+
+// configureStartupTui mirrors createStartupTui (cli/startup-ui.ts:84-92): it applies the terminal capability
+// overrides before it creates the theme, so the theme, and every prompt row built under it, uses the overridden
+// color mode, and it installs the keybindings of the agent directory for the prompt (startup-ui.ts:91
+// setKeybindings(KeybindingsManager.create())), so a prompt answers to the user's keybindings.json and to no binding
+// installed earlier in the process. It returns that manager.
+func configureStartupTui(opts StartupUIOptions) *KeybindingsManager {
+	settings, paths := opts.Settings, opts.ThemePaths
+	tui.SetCapabilityOverrides(settings.GetTerminalCapabilityOverrides())
+	registry := tui.NewThemeRegistry()
+	// paths are in upstream precedence order, the first theme of a name
+	// winning; the registry keeps the last one added.
+	for _, path := range slices.Backward(paths) {
+
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			_ = registry.LoadDir(path)
+			continue
+		}
+		if theme, err := tui.LoadThemeFile(path); err == nil {
+			registry.AddFile(theme, path)
+		}
+	}
+	tui.SetThemeRegistry(registry)
+	customThemesDir := ""
+	if opts.AgentDir != "" {
+		customThemesDir = filepath.Join(opts.AgentDir, "themes")
+	}
+	tui.SetCustomThemesDir(customThemesDir)
+	// The system theme starts in grayscale until the terminal reports its colors.
+	tui.MarkTerminalColorsPending()
+	tui.SetThemeSettingPresence(settings.themeSetting())
+	return NewKeybindingsManager(opts.AgentDir)
+}

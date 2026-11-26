@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Unit tests for pack_npm.py (run: python3 -m unittest automation/release/npm/test_pack_npm.py)."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import pathlib
+import sys
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pack_npm  # noqa: E402
+
+VERSION = "0.2.0"
+
+
+def make_archives(directory: pathlib.Path, version: str = VERSION) -> None:
+    lines = []
+    for goos, goarch in sorted(pack_npm.TARGETS):
+        prefix = f"pig-{version}-{goos}-{goarch}"
+        files = {
+            pack_npm.binary_name(goos): f"binary {goos}/{goarch}".encode(),
+            "LICENSE": b"MIT License\n",
+            "NOTICE": b"notice\n",
+            "THIRD_PARTY_NOTICES.md": b"third party\n",
+            "LICENSES/MIT.txt": b"mit\n",
+        }
+        archive = directory / pack_npm.archive_name(version, goos, goarch)
+        if goos == "windows":
+            with zipfile.ZipFile(archive, "w") as zf:
+                for name, data in files.items():
+                    zf.writestr(f"{prefix}/{name}", data)
+        else:
+            with tarfile.open(archive, "w:gz") as tf:
+                for name, data in files.items():
+                    info = tarfile.TarInfo(f"{prefix}/{name}")
+                    info.size = len(data)
+                    info.mode = 0o755
+                    tf.addfile(info, io.BytesIO(data))
+        lines.append(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+    (directory / "SHA256SUMS").write_text("".join(lines))
+
+
+class ManifestTest(unittest.TestCase):
+    def test_os_cpu_mapping_covers_seven_targets(self):
+        self.assertEqual(
+            sorted(pack_npm.TARGETS.values()),
+            [("android", "arm64"), ("darwin", "arm64"), ("darwin", "x64"), ("linux", "arm64"), ("linux", "x64"), ("win32", "arm64"), ("win32", "x64")],
+        )
+        self.assertEqual(pack_npm.TARGETS[("windows", "amd64")], ("win32", "x64"))
+        self.assertEqual(pack_npm.TARGETS[("linux", "amd64")], ("linux", "x64"))
+
+    def test_npm_version_strips_build_metadata(self):
+        self.assertEqual(pack_npm.npm_version("0.2.0"), "0.2.0")
+        self.assertEqual(pack_npm.npm_version("v0.2.0+0.87.1"), "0.2.0")
+        self.assertEqual(pack_npm.npm_version("1.0.0-rc.1"), "1.0.0-rc.1")
+        with self.assertRaises(pack_npm.PackError):
+            pack_npm.npm_version("0.2")
+
+    def test_platform_manifest(self):
+        m = pack_npm.platform_manifest("0.2.0", "win32", "arm64", "windows", "0.87.1")
+        self.assertEqual(m["name"], "@pi-in-go/pig-win32-arm64")
+        self.assertEqual(m["version"], "0.2.0")
+        self.assertEqual(m["os"], ["win32"])
+        self.assertEqual(m["cpu"], ["arm64"])
+        self.assertIn("pig.exe", m["files"])
+        self.assertIn("LICENSE", m["files"])
+        self.assertIn("NOTICE", m["files"])
+        self.assertIn("Pi 0.87.1", m["description"])
+        self.assertEqual(m["license"], "MIT")
+        self.assertNotIn("scripts", m)
+
+    def test_the_android_package_is_for_android_only(self):
+        # Node on Termux reports process.platform "android"; npm installs a package only when its os field names that platform.
+        self.assertEqual(pack_npm.TARGETS[("android", "arm64")], ("android", "arm64"))
+        m = pack_npm.platform_manifest("0.2.0", "android", "arm64", "android", None)
+        self.assertEqual((m["name"], m["os"], m["cpu"]), ("@pi-in-go/pig-android-arm64", ["android"], ["arm64"]))
+        self.assertEqual(pack_npm.platform_manifest("0.2.0", "linux", "arm64", "linux", None)["os"], ["linux"])
+
+    def test_launcher_manifest(self):
+        m = pack_npm.launcher_manifest("0.2.0", "0.87.1")
+        self.assertEqual(m["name"], "@pi-in-go/pig")
+        self.assertEqual(m["bin"], {"pig": "bin/pig.js"})
+        self.assertEqual(m["engines"], {"node": ">=18"})
+        self.assertEqual(len(m["optionalDependencies"]), 7)
+        self.assertEqual(m["optionalDependencies"]["@pi-in-go/pig-android-arm64"], "0.2.0")
+        self.assertTrue(all(v == "0.2.0" for v in m["optionalDependencies"].values()))
+        self.assertIn("@pi-in-go/pig-linux-x64", m["optionalDependencies"])
+        self.assertIn("Pi 0.87.1", m["description"])
+        self.assertNotIn("scripts", m, "no install scripts: binaries arrive as packages, not downloads")
+        self.assertNotIn("dependencies", m)
+
+    def test_launcher_package_names_match_generator(self):
+        launcher = (pathlib.Path(pack_npm.HERE) / "launcher" / "bin" / "pig.js").read_text()
+        self.assertIn(f'const SCOPE = "{pack_npm.SCOPE}";', launcher)
+        for npm_os, npm_cpu in pack_npm.TARGETS.values():
+            self.assertIn(f'"{npm_os} {npm_cpu}": `${{SCOPE}}/pig-{npm_os}-{npm_cpu}`', launcher)
+
+    def test_upstream_version_reads_pigversion(self):
+        self.assertRegex(pack_npm.upstream_version() or "", r"^\d+\.\d+\.\d+")
+
+
+class GenerateTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.archives = self.root / "release"
+        self.archives.mkdir()
+        self.out = self.root / "npm"
+        make_archives(self.archives)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_generates_eight_packages_in_publish_order(self):
+        order = pack_npm.generate(self.archives, VERSION, self.out, "0.87.1")
+        self.assertEqual(len(order), 8)
+        self.assertEqual(order[-1].name, "pig")
+        for pkg_dir in order[:-1]:
+            manifest = json.loads((pkg_dir / "package.json").read_text())
+            npm_os, npm_cpu = manifest["os"][0], manifest["cpu"][0]
+            self.assertEqual(pkg_dir.name, f"pig-{npm_os}-{npm_cpu}")
+            binary = pkg_dir / ("pig.exe" if npm_os == "win32" else "pig")
+            goos = {"win32": "windows"}.get(npm_os, npm_os)
+            goarch = {"x64": "amd64"}.get(npm_cpu, npm_cpu)
+            self.assertEqual(binary.read_bytes(), f"binary {goos}/{goarch}".encode())
+            self.assertTrue(binary.stat().st_mode & 0o111)
+            for notice in ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"):
+                self.assertTrue((pkg_dir / notice).is_file(), notice)
+            self.assertFalse((pkg_dir / "LICENSES").exists())
+        launcher = order[-1]
+        self.assertTrue((launcher / "bin" / "pig.js").is_file())
+        self.assertIn("npm install -g @pi-in-go/pig", (launcher / "README.md").read_text())
+
+    def test_rejects_checksum_mismatch(self):
+        archive = self.archives / pack_npm.archive_name(VERSION, "linux", "arm64")
+        archive.write_bytes(archive.read_bytes() + b"tampered")
+        with self.assertRaisesRegex(pack_npm.PackError, "checksum mismatch"):
+            pack_npm.generate(self.archives, VERSION, self.out, None)
+
+    def test_rejects_archive_missing_from_sums(self):
+        sums = self.archives / "SHA256SUMS"
+        sums.write_text("".join(l + "\n" for l in sums.read_text().splitlines() if "darwin-x64" not in l and "darwin-amd64" not in l))
+        with self.assertRaisesRegex(pack_npm.PackError, "not listed in SHA256SUMS"):
+            pack_npm.generate(self.archives, VERSION, self.out, None)
+
+    def test_rejects_missing_archive(self):
+        (self.archives / pack_npm.archive_name(VERSION, "windows", "arm64")).unlink()
+        with self.assertRaisesRegex(pack_npm.PackError, "missing release archive"):
+            pack_npm.generate(self.archives, VERSION, self.out, None)
+
+    def test_rejects_missing_sums(self):
+        (self.archives / "SHA256SUMS").unlink()
+        with self.assertRaisesRegex(pack_npm.PackError, "SHA256SUMS"):
+            pack_npm.generate(self.archives, VERSION, self.out, None)
+
+
+class PackShellTest(unittest.TestCase):
+    def test_destination_never_becomes_windows_shell_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            # Neither cmd metacharacters nor environment references are code.
+            out = root / "packages&echo.INJECTED" / "%TOKEN%!bang!"
+            package = root / "package"
+            package.mkdir()
+            (package / "package.json").write_text('{"name":"@pig/pack-test"}')
+            for platform in ("win32", "linux"):
+                with self.subTest(platform=platform):
+                    def run(argv, **kwargs):
+                        self.assertEqual(argv, ["npm", "pack", "--json"])
+                        self.assertEqual(kwargs["cwd"], package)
+                        self.assertEqual(kwargs["env"]["npm_config_pack_destination"], str(out.resolve()))
+                        self.assertEqual(kwargs["shell"], platform == "win32")
+                        return pack_npm.subprocess.CompletedProcess(argv, 0, stdout='[{"name":"@pig/pack-test","filename":"package.tgz"}]')
+
+                    with patch.object(pack_npm.sys, "platform", platform), patch.object(pack_npm.subprocess, "run", side_effect=run):
+                        self.assertEqual(pack_npm.npm_pack(package, out), out / "package.tgz")
+
+
+class PackedFilenameTest(unittest.TestCase):
+    """npm 11 prints an array, npm 12 an object keyed by package name (Pi 6fb2e781)."""
+
+    def test_npm11_array(self):
+        self.assertEqual(pack_npm.packed_filename([{"name": "pig", "filename": "pig-1.tgz"}], "pig"), "pig-1.tgz")
+
+    def test_npm12_object_keyed_by_package_name(self):
+        parsed = {"@pig/linux-x64": {"name": "@pig/linux-x64", "filename": "pig-linux-x64-1.tgz"}}
+        self.assertEqual(pack_npm.packed_filename(parsed, "@pig/linux-x64"), "pig-linux-x64-1.tgz")
+
+    def test_rejects_unexpected_results(self):
+        entry = {"name": "pig", "filename": "pig-1.tgz"}
+        for label, parsed in {
+            "empty array": [],
+            "two entries": [entry, entry],
+            "other package": {"other": {"name": "other", "filename": "x.tgz"}},
+            "key without entry for the name": {"pig": {"name": "other", "filename": "x.tgz"}},
+            "no filename": [{"name": "pig"}],
+            "non-string filename": [{"name": "pig", "filename": 3}],
+            "scalar": "pig-1.tgz",
+        }.items():
+            with self.subTest(label), self.assertRaisesRegex(pack_npm.PackError, "unexpected result for pig"):
+                pack_npm.packed_filename(parsed, "pig")
+
+
+if __name__ == "__main__":
+    unittest.main()

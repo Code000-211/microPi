@@ -1,0 +1,451 @@
+//go:build windows
+
+package tui
+
+// Ports packages/tui/src/terminal.ts (ProcessTerminal on Windows: console input and the terminal size).
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"io"
+	"os"
+	"runtime"
+	"sync"
+	"syscall"
+	"time"
+	"unicode/utf16"
+	"unicode/utf8"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/term"
+)
+
+// resizePollInterval is how often the Windows resize watcher samples the
+// console size. Windows has no SIGWINCH, so pig polls (the spike on the
+// joe-jump host confirmed GetConsoleScreenBufferInfo tracks live resizes over
+// ConPTY). ~120ms is imperceptible for re-render yet cheap.
+const resizePollInterval = 120 * time.Millisecond
+
+// pollReadable is a no-op drain probe on Windows: it always reports "not
+// readable" so DrainInput returns immediately without ever issuing a blocking
+// console read.
+//
+// The unix drain guards against slow-SSH key-release bytes leaking into the
+// parent shell on exit. Windows skips the drain, so a restore never issues a
+// console read that could block.
+func pollReadable(_ uintptr, _ int) (int, error) { return 0, nil }
+
+type terminalInputWaiter struct {
+	ctx         context.Context
+	cancelEvent windows.Handle
+	// pipe: the input is a pipe, whose handle signals whether or not input is queued, so it is read in a cancellable ReadFile instead of waited on (readPipe). Any other input signals its handle when it has input.
+	pipe         bool
+	stopCallback func() bool
+	callbackDone chan struct{}
+
+	// mu orders a pipe wait's start and end against abortPipeWait, so an abort reaches only the zero-byte read it was made for.
+	mu       sync.Mutex
+	handle   windows.Handle // the pipe the wait numbered waitID blocks on
+	waitID   uint64
+	blocking bool // a pipe wait is between setting up its zero-byte read and leaving it
+}
+
+func newTerminalInputWaiter(ctx context.Context, file *os.File) (*terminalInputWaiter, error) {
+	cancelEvent, err := windows.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	fileType, _ := windows.GetFileType(windows.Handle(file.Fd()))
+	w := &terminalInputWaiter{
+		ctx:          ctx,
+		cancelEvent:  cancelEvent,
+		pipe:         fileType == windows.FILE_TYPE_PIPE,
+		callbackDone: make(chan struct{}),
+	}
+	w.stopCallback = context.AfterFunc(ctx, func() {
+		_ = windows.SetEvent(cancelEvent)
+		w.abortPipeWait(0)
+		//portlint:allow doubleclose context.AfterFunc runs this function at most once, and only it closes callbackDone
+		close(w.callbackDone)
+	})
+	return w, nil
+}
+
+// wait waits for either console input or cancellation before issuing ReadFile.
+// Stop therefore cannot leave an old reader blocked inside the read that
+// belongs to the next terminal owner. A pipe is not waited on but read (readPipe).
+func (w *terminalInputWaiter) wait(file *os.File, ms int) (bool, error) {
+	handle := windows.Handle(file.Fd())
+	timeout := uint32(windows.INFINITE)
+	if ms >= 0 {
+		timeout = uint32(min(int64(ms), int64(windows.INFINITE)-1))
+	}
+	event, err := windows.WaitForMultipleObjects(
+		[]windows.Handle{handle, w.cancelEvent},
+		false,
+		timeout,
+	)
+	if w.ctx.Err() != nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return event == windows.WAIT_OBJECT_0, nil
+}
+
+// readPipe reads a pipe in one cancellable system call and reports whether file is a pipe at all; any other input is waited on by wait and read by the caller. A pipe handle is signalled from the moment the pipe exists and again after every read, so waiting on it cannot tell an empty pipe from one with input, and a reader sent into ReadFile on an empty pipe could not be stopped. So the read is the wait: CancelIoEx aborts a ReadFile blocked on an empty pipe with ERROR_OPERATION_ABORTED and no byte taken, and a read that completes as the cancel lands returns its bytes to the caller (libuv's uv_pipe_zero_readfile_thread_proc and uv__pipe_interrupt_read cancel their blocking read the same way). ms bounds the read as the framing deadline does (without limit when negative; zero only takes what is queued); a read that is cancelled or runs out of time returns no data, with the context's error if it was cancelled. A bounded read looks at the pipe first, so queued input arms no timer.
+func (w *terminalInputWaiter) readPipe(file *os.File, ms int) (data []byte, isPipe bool, err error) {
+	if !w.pipe {
+		return nil, false, nil
+	}
+	handle := windows.Handle(file.Fd())
+	queued := ms >= 0 && pipeReadable(handle)
+	if ms == 0 && !queued {
+		return nil, true, nil
+	}
+	w.mu.Lock()
+	if err := w.ctx.Err(); err != nil {
+		w.mu.Unlock()
+		return nil, true, err
+	}
+	w.waitID++
+	id := w.waitID
+	w.handle, w.blocking = handle, true
+	w.mu.Unlock()
+	if ms > 0 && !queued {
+		timer := time.AfterFunc(time.Duration(ms)*time.Millisecond, func() { w.abortPipeWait(id) })
+		defer timer.Stop()
+	}
+	buf := make([]byte, 256)
+	var n uint32
+	err = windows.ReadFile(handle, buf, &n, nil)
+	w.mu.Lock()
+	w.blocking = false
+	w.mu.Unlock()
+	switch {
+	case errors.Is(err, windows.ERROR_OPERATION_ABORTED):
+		return nil, true, w.ctx.Err()
+	case errors.Is(err, windows.ERROR_BROKEN_PIPE):
+		return buf[:n], true, io.EOF
+	}
+	return buf[:n], true, err
+}
+
+// abortPipeWait ends the pipe wait numbered id, or the current one when id is zero. CancelIoEx finds nothing while the wait has yet to enter ReadFile, so it repeats until the wait has left, which takes a few turns of the scheduler.
+func (w *terminalInputWaiter) abortPipeWait(id uint64) {
+	for {
+		w.mu.Lock()
+		if !w.blocking || id != 0 && w.waitID != id {
+			w.mu.Unlock()
+			return
+		}
+		_ = windows.CancelIoEx(w.handle, nil)
+		w.mu.Unlock()
+		runtime.Gosched()
+	}
+}
+
+func (w *terminalInputWaiter) close() {
+	if !w.stopCallback() {
+		<-w.callbackDone
+	}
+	_ = windows.CloseHandle(w.cancelEvent)
+}
+
+// consoleInputs holds one reader per console input handle. Every terminal that
+// reads the handle shares it, so input one terminal took from the console but
+// has not delivered passes to the next terminal, as it did when all of them
+// read os.Stdin.
+var consoleInputs sync.Map // windows.Handle -> *consoleInput
+
+// terminalInput returns the reader for keyboard input from file: the shared
+// consoleInput for a console handle, and file itself for anything else.
+func terminalInput(file *os.File) io.Reader {
+	handle := windows.Handle(file.Fd())
+	if c, ok := consoleInputs.Load(handle); ok {
+		return c.(*consoleInput)
+	}
+	var mode uint32
+	if windows.GetConsoleMode(handle, &mode) != nil {
+		return file
+	}
+	c, _ := consoleInputs.LoadOrStore(handle, &consoleInput{handle: handle})
+	return c.(*consoleInput)
+}
+
+// terminalInputBuffered reports whether file's reader holds input it has
+// already taken from the console. That input does not signal the handle.
+func terminalInputBuffered(file *os.File) bool {
+	c, ok := terminalInput(file).(*consoleInput)
+	return ok && c.buffered()
+}
+
+// terminalHungUp reports whether the terminal behind file has been hung up; a console handle has no hang-up state.
+func terminalHungUp(*os.File) bool { return false }
+
+// terminalInputPending reports, after file's handle has signalled, whether a
+// read returns without blocking. See consoleInput.pending.
+func terminalInputPending(file *os.File) (bool, error) {
+	c, ok := terminalInput(file).(*consoleInput)
+	if !ok {
+		return true, nil
+	}
+	return c.pending()
+}
+
+// consoleInput reads a console input handle as UTF-8. os.File.Read on a console
+// reports a Ctrl+Z (0x1A) at the start of a read as end of file and ends a read
+// before a later one. Node's TTY, which Pi reads, delivers Ctrl+Z as a key, and
+// Pi binds it to undo on win32.
+type consoleInput struct {
+	mu     sync.Mutex
+	handle windows.Handle
+	units  [256]uint16
+	high   rune // a high surrogate whose low half the next read returns
+	buf    []byte
+	off    int
+}
+
+func (c *consoleInput) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.off == len(c.buf) {
+		var n uint32
+		if err := windows.ReadConsole(c.handle, &c.units[0], uint32(len(c.units)), &n, nil); err != nil {
+			return 0, err
+		}
+		if n == 0 {
+			return 0, io.EOF
+		}
+		c.buf, c.off = c.appendUTF8(c.buf[:0], c.units[:n]), 0
+	}
+	n := copy(b, c.buf[c.off:])
+	c.off += n
+	return n, nil
+}
+
+func (c *consoleInput) buffered() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.off < len(c.buf)
+}
+
+// pending removes the leading console input records that yield no character,
+// such as key releases, bare modifier presses and focus changes, and reports
+// whether a read now returns without blocking. ReadConsoleW skips those
+// records too, but when they are all the console holds it blocks until the
+// next keystroke, where a stopped terminal's reader could not be ended.
+func (c *consoleInput) pending() (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.off < len(c.buf) {
+		return true, nil
+	}
+	var records [64]inputRecord
+	for {
+		n, err := peekConsoleInput(c.handle, records[:])
+		if err != nil || n == 0 {
+			return false, err
+		}
+		skip := 0
+		for skip < n && !records[skip].yieldsCharacter() {
+			skip++
+		}
+		if skip > 0 {
+			if _, err := readConsoleInput(c.handle, records[:skip]); err != nil {
+				return false, err
+			}
+		}
+		if skip < n {
+			return true, nil
+		}
+	}
+}
+
+// inputRecord is the Win32 INPUT_RECORD: an event type and its event.
+type inputRecord struct {
+	EventType uint16
+	_         uint16
+	Event     [16]byte
+}
+
+// yieldsCharacter reports whether ReadConsoleW can return a character for the
+// record in raw virtual-terminal input mode. A key press does unless it only
+// presses a modifier; with ENABLE_VIRTUAL_TERMINAL_INPUT, arrows and function
+// keys yield escape sequences. A release yields nothing, except releasing Alt
+// after a code typed on the numeric keypad, which delivers the composed
+// character.
+func (r *inputRecord) yieldsCharacter() bool {
+	if r.EventType != windows.KEY_EVENT {
+		return false
+	}
+	// KEY_EVENT_RECORD: bKeyDown, wRepeatCount, wVirtualKeyCode,
+	// wVirtualScanCode, uChar, dwControlKeyState.
+	keyDown := binary.LittleEndian.Uint32(r.Event[0:4]) != 0
+	virtualKey := binary.LittleEndian.Uint16(r.Event[6:8])
+	char := binary.LittleEndian.Uint16(r.Event[10:12])
+	if !keyDown {
+		return virtualKey == windows.VK_MENU && char != 0
+	}
+	switch virtualKey {
+	case windows.VK_SHIFT, windows.VK_CONTROL, windows.VK_MENU, windows.VK_CAPITAL,
+		windows.VK_NUMLOCK, windows.VK_SCROLL, windows.VK_LWIN, windows.VK_RWIN,
+		windows.VK_LSHIFT, windows.VK_RSHIFT, windows.VK_LCONTROL, windows.VK_RCONTROL,
+		windows.VK_LMENU, windows.VK_RMENU:
+		return char != 0
+	}
+	return true
+}
+
+var (
+	kernel32              = windows.NewLazySystemDLL("kernel32.dll")
+	procPeekConsoleInputW = kernel32.NewProc("PeekConsoleInputW")
+	procReadConsoleInputW = kernel32.NewProc("ReadConsoleInputW")
+	procPeekNamedPipe     = kernel32.NewProc("PeekNamedPipe")
+)
+
+// pipeReadable reports whether a read of the pipe returns without blocking: input is queued, or the pipe has ended and the read reports the end of input. A pipe that cannot be peeked is readable too, so the read reports its failure.
+func pipeReadable(handle windows.Handle) bool {
+	var available uint32
+	r1, _, _ := syscall.SyscallN(procPeekNamedPipe.Addr(), uintptr(handle), 0, 0, 0, uintptr(unsafe.Pointer(&available)), 0) //nolint:gosec // G103: PeekNamedPipe writes the count of bytes queued, and x/sys has no wrapper for it. SyscallN, unlike LazyProc.Call, keeps the count and the argument list on the stack.
+	return r1 == 0 || available != 0
+}
+
+// peekConsoleInput copies the console's queued input records into records
+// without removing them and returns how many it copied.
+func peekConsoleInput(handle windows.Handle, records []inputRecord) (int, error) {
+	return consoleInputCall(procPeekConsoleInputW, handle, records)
+}
+
+// readConsoleInput removes len(records) queued input records into records.
+func readConsoleInput(handle windows.Handle, records []inputRecord) (int, error) {
+	return consoleInputCall(procReadConsoleInputW, handle, records)
+}
+
+func consoleInputCall(proc *windows.LazyProc, handle windows.Handle, records []inputRecord) (int, error) {
+	var n uint32
+	r1, _, err := proc.Call(uintptr(handle), uintptr(unsafe.Pointer(&records[0])), uintptr(len(records)), uintptr(unsafe.Pointer(&n))) //nolint:gosec // G103: PeekConsoleInputW and ReadConsoleInputW fill the INPUT_RECORD array inputRecord mirrors and write the count, and x/sys has no wrapper for them.
+	if r1 == 0 {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// appendUTF8 appends units to buf as UTF-8, joining a surrogate pair split
+// across reads and replacing an unpaired surrogate with U+FFFD.
+func (c *consoleInput) appendUTF8(buf []byte, units []uint16) []byte {
+	for _, unit := range units {
+		r := rune(unit)
+		if c.high != 0 {
+			pair := utf16.DecodeRune(c.high, r)
+			c.high = 0
+			if pair != utf8.RuneError {
+				buf = utf8.AppendRune(buf, pair)
+				continue
+			}
+			buf = utf8.AppendRune(buf, utf8.RuneError)
+		}
+		if r >= 0xD800 && r < 0xDC00 {
+			c.high = r
+			continue
+		}
+		buf = utf8.AppendRune(buf, r)
+	}
+	return buf
+}
+
+// inForeground is always true: a Windows console has no foreground process group that stops a background writer.
+func (*ProcessTerminal) inForeground() (bool, error) { return true, nil }
+
+// isEINTR reports whether a read error is an interrupted syscall. Windows has
+// no EINTR, so this is always false.
+func isEINTR(_ error) bool { return false }
+
+// CacheSizeUntilResize keeps no size on Windows: no SIGWINCH announces a console resize there (Node polls the console size),
+// so Columns and Rows read the console size every time. The returned funcs do nothing.
+func (t *ProcessTerminal) CacheSizeUntilResize() (invalidate, stop func()) {
+	return func() {}, func() {}
+}
+
+// startResizeWatcher polls the console size and invokes onResize on change,
+// kicking once on startup. Returns a stop func; the goroutine also exits when
+// ctx is cancelled. This is pig's platform mechanism for the same observable
+// "resize -> re-render" behavior upstream gets from Node's stdout "resize"
+// event (no user-visible divergence).
+func (t *ProcessTerminal) startResizeWatcher(ctx context.Context, onResize func()) func() {
+	refreshTerminalDimensions(true, os.Getpid(), nil)
+	go func() {
+		ticker := time.NewTicker(resizePollInterval)
+		defer ticker.Stop()
+		lastW, lastH := t.Columns(), t.Rows()
+		onResize() // startup kick, mirroring the unix SIGWINCH self-send
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				w, h := t.Columns(), t.Rows()
+				if w != lastW || h != lastH {
+					lastW, lastH = w, h
+					onResize()
+				}
+			}
+		}
+	}()
+	return func() {} // goroutine stops on ctx cancellation
+}
+
+// enableVTProcessing configures the output console for pig's ANSI renderer and
+// returns a restore func. No-op when stdout is not a console.
+//
+// Two flags matter, together giving the same exact cursor control pig assumes
+// on unix:
+//   - ENABLE_VIRTUAL_TERMINAL_PROCESSING: interpret pig's ANSI escapes.
+//   - DISABLE_NEWLINE_AUTO_RETURN: stop conhost from auto-scrolling / returning
+//     the cursor on a write to the last column/row. Without it, bottom-row
+//     writes desync pig's cursor-precise incremental renderer (symptom: typed
+//     input not painting until a full-clear repaint forced by a resize).
+func (t *ProcessTerminal) enableVTProcessing() func() {
+	if t.stdout == nil {
+		return func() {}
+	}
+	h := windows.Handle(t.stdout.Fd())
+	var mode uint32
+	if err := windows.GetConsoleMode(h, &mode); err != nil {
+		return func() {} // not a console (redirected / print mode)
+	}
+	want := mode | windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING | windows.DISABLE_NEWLINE_AUTO_RETURN
+	if want == mode {
+		return func() {} // already configured
+	}
+	if err := windows.SetConsoleMode(h, want); err != nil {
+		return func() {}
+	}
+	return func() { _ = windows.SetConsoleMode(h, mode) }
+}
+
+// libuvRawMode puts the console input at fd into the mode Node's setRawMode(true) and Pi's ProcessTerminal.start() leave it in (packages/tui/src/terminal.ts
+// :229-233): libuv's uv_tty_set_mode (deps/uv/src/win/tty.c, libuv 1.52.1) sets the input mode to exactly ENABLE_WINDOW_INPUT, and Pi's native helper then adds
+// ENABLE_VIRTUAL_TERMINAL_INPUT, where the console takes it. Every other flag is off: no processed, line or echo input, and no ENABLE_QUICK_EDIT_MODE, which
+// stops a program's output while the user selects text in the window, no ENABLE_MOUSE_INPUT. x/term's MakeRaw only clears the first three and leaves the
+// rest as the console had them. The state returned is the mode before, for the restore.
+func libuvRawMode(fd int) (*term.State, error) {
+	state, err := term.GetState(fd)
+	if err != nil {
+		return nil, err
+	}
+	handle := windows.Handle(fd)
+	if err := windows.SetConsoleMode(handle, windows.ENABLE_WINDOW_INPUT|windows.ENABLE_VIRTUAL_TERMINAL_INPUT); err != nil {
+		// libuv's own fallback: a console without virtual terminal input gets the mode without it.
+		if err := windows.SetConsoleMode(handle, windows.ENABLE_WINDOW_INPUT); err != nil {
+			return nil, err
+		}
+	}
+	return state, nil
+}

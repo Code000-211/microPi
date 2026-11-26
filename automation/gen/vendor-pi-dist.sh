@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# Copy the pinned Pi runtime graphs and exact dependencies installed by the
+# extensions/sdk-ts lock. This command performs no package resolution or install.
+#
+# shims/pi-dist/<package>/ mirrors the package's published dist directory.
+# Import specifiers point at private dependency copies. The audited seams are
+# D2 config paths, D74 provider API leaves, and connection-owned SDK Sessions.
+# Whole coding-agent modules, docs, examples, themes and image-worker assets
+# remain available for source verification and absolute package-root imports.
+# bundle-pi-sdk.mjs compiles the same graph without changing its API bodies.
+# pi-identity-patches.mjs replaces Pi's identity literals with PiG's (D26).
+# vendor-manifest.json records package identities, input/output hashes and seams.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+agent="$root/extensions/sdk-ts/node_modules/@earendil-works/pi-coding-agent"
+ai="$agent/node_modules/@earendil-works/pi-ai"
+tui="$agent/node_modules/@earendil-works/pi-tui"
+yaml="$agent/node_modules/yaml"
+eaw="$agent/node_modules/get-east-asian-width"
+pjson="$agent/node_modules/partial-json"
+marked="$agent/node_modules/marked"
+markedCjk="$agent/node_modules/marked-cjk-friendly"
+hljs="$agent/node_modules/highlight.js"
+jiti="$agent/node_modules/jiti"
+core="$agent/node_modules/@earendil-works/pi-agent-core"
+codemode="$agent/node_modules/@earendil-works/pi-codemode"
+telemetry="$agent/node_modules/@earendil-works/pi-telemetry"
+schema="$agent/node_modules/@earendil-works/pi-schema"
+mcp="$agent/node_modules/@earendil-works/pi-mcp"
+ignore="$agent/node_modules/ignore"
+jsdiff="$agent/node_modules/diff"
+shims=${PIG_VENDOR_SHIMS:-"$root/coding/extension/host/subprocess/runtime-node/shims"} # PIG_VENDOR_SHIMS writes the vendored runtime elsewhere, so a pin leap can try a new Pi without touching the committed one
+dist="$shims/pi-dist"
+
+# copy <package dist> <target dir> <file>...: verbatim copies, keeping paths.
+copy() {
+  local from=$1 to=$2 file
+  shift 2
+  for file in "$@"; do
+    mkdir -p "$to/$(dirname -- "$file")"
+    cp "$from/$file" "$to/$file"
+  done
+}
+
+# The installed oracle already carries the post-release backports (automation/pin/oracle.py applies them when it builds the oracle), so the copies below inherit them: verify before anything is deleted, never apply them a second time.
+node "$root/automation/gen/pi-post-release-backports.mjs" --verify-packages "pi-ai=$ai" "pi-coding-agent=$agent" "pi-mcp=$mcp" "pi-tui=$tui" || { echo "vendor-pi-dist: the installed Pi does not carry the post-release backports exactly once; run make parity-deps (pin.py install-oracle --force)" >&2; exit 1; }
+
+# The oracle builds are read-only, and cp keeps their modes: make what an earlier run copied owner-writable so rm can remove it.
+if [ -e "$shims" ]; then chmod -R u+w "$shims"; fi # every copy, including the third-party packages the dependency vendoring wrote and removes again below
+rm -rf "$dist" "$shims/yaml" "$shims/get-east-asian-width" "$shims/partial-json" "$shims/marked" "$shims/marked-cjk-friendly" "$shims/highlight.js" "$shims/jiti" "$shims/ignore" "$shims/diff"
+mkdir -p "$dist" "$shims/yaml" "$shims/get-east-asian-width" "$shims/partial-json/dist" "$shims/marked/lib" "$shims/marked-cjk-friendly/dist" "$shims/highlight.js" "$shims/jiti" "$shims/ignore" "$shims/diff"
+printf '{\n  "type": "module"\n}\n' >"$dist/package.json"
+
+# pi-tui: every runtime module, including locally constructed screens and scroll views. Native helpers keep the package's platform/architecture layout at one of getNativeModuleCandidates' unchanged lookup locations.
+while IFS= read -r file; do
+  copy "$tui/dist" "$dist/pi-tui" "$file"
+done < <(cd "$tui/dist" && find . -name '*.js' | sed 's#^\./##' | sort)
+cp -R "$tui/native" "$dist/pi-tui/native"
+sed 's#^export { Marked } from "marked";$#export { Marked } from "../../marked/lib/marked.esm.js";#' \
+  "$tui/dist/index.js" >"$dist/pi-tui/index.js"
+sed 's#^import { eastAsianWidth } from "get-east-asian-width";$#import { eastAsianWidth } from "../../get-east-asian-width/index.js";#' \
+  "$tui/dist/utils.js" >"$dist/pi-tui/utils.js"
+sed -e 's#^import { Marked, Tokenizer } from "marked";$#import { Marked, Tokenizer } from "../../../marked/lib/marked.esm.js";#' \
+  -e 's#^import markedCjkFriendly from "marked-cjk-friendly";$#import markedCjkFriendly from "../../../marked-cjk-friendly/dist/index.js";#' \
+  "$tui/dist/components/markdown.js" >"$dist/pi-tui/components/markdown.js"
+
+# pi-telemetry: the runtime modules pi-ai's telemetry.ts imports (the testing entry is test support).
+while IFS= read -r file; do
+  copy "$telemetry/dist" "$dist/pi-telemetry" "$file"
+done < <(cd "$telemetry/dist" && find . -name '*.js' -not -path './testing/*' | sed 's#^\./##' | sort)
+
+# pi-schema: every runtime module (the validator pi-ai's tool-argument validation and configuration schemas compile with); it imports nothing outside itself.
+while IFS= read -r file; do
+  copy "$schema/dist" "$dist/pi-schema" "$file"
+done < <(cd "$schema/dist" && find . -name '*.js' | sed 's#^\./##' | sort)
+
+# pi-ai: the whole release (its compat entry is what Pi serves for the pi-ai
+# root), except the builtin API implementations and google-shared, which vendor-pi-ai-apis.mjs writes: bridge stand-ins
+# plus the Pi modules they re-export from (D74).
+own_apis=$(node "$root/automation/gen/vendor-pi-ai-apis.mjs" --names)
+(cd "$ai/dist" && find . \( -name '*.js' -o -path './providers/data/*.json' \) | sed 's#^\./##' | sort) | while read -r file; do
+  case "$file" in
+    utils/json-parse.js | api/openrouter-images.js) continue ;;
+  esac
+  name=${file#api/}
+  name=${name%.js}
+  if [ "$file" = "api/$name.js" ] && [[ " $own_apis " == *" $name "* ]]; then
+    continue
+  fi
+  copy "$ai/dist" "$dist/pi-ai" "$file"
+done
+node "$root/automation/gen/vendor-pi-ai-apis.mjs" "$shims" "$ai" "$agent/node_modules/@google/genai"
+sed 's#^\(import .* from \)"@earendil-works/pi-telemetry";$#\1"../pi-telemetry/index.js";#' "$ai/dist/telemetry.js" >"$dist/pi-ai/telemetry.js"
+sed 's#^import { parse as partialParse } from "partial-json";$#import { parse as partialParse } from "../../../partial-json/dist/index.js";#' \
+  "$ai/dist/utils/json-parse.js" >"$dist/pi-ai/utils/json-parse.js"
+
+# Every copied pi-ai module that imports pi-schema (tool-argument validation, the model and compat schemas, and any a later Pi adds) reaches the vendored copy by its own depth.
+while IFS= read -r file; do
+  prefix=".."
+  rest=${file%/*}
+  [ "$rest" = "$file" ] || while :; do
+    prefix="$prefix/.."
+    case "$rest" in */*) rest=${rest%/*} ;; *) break ;; esac
+  done
+  sed -i.bak -e "s#\(from \)\"@earendil-works/pi-schema\";\$#\1\"$prefix/pi-schema/index.js\";#" \
+    -e "s#\(from \)\"@earendil-works/pi-schema/formats\";\$#\1\"$prefix/pi-schema/formats/index.js\";#" "$dist/pi-ai/$file"
+  rm -f "$dist/pi-ai/$file.bak"
+done < <(cd "$dist/pi-ai" && grep -lE 'from "@earendil-works/pi-schema(/formats)?";$' -r . --include=*.js | sed 's#^\./##' | sort)
+
+# Every other copied pi-ai module that imports typebox (any a later Pi adds) reaches the vendored typebox shims by its own depth.
+while IFS= read -r file; do
+  prefix="../.."
+  rest=${file%/*}
+  [ "$rest" = "$file" ] || while :; do
+    prefix="$prefix/.."
+    case "$rest" in */*) rest=${rest%/*} ;; *) break ;; esac
+  done
+  sed -i.bak -e "s#^\(import .* from \)\"typebox\";\$#\1\"$prefix/typebox.mjs\";#" \
+    -e "s#^\(import .* from \)\"typebox/value\";\$#\1\"$prefix/typebox-value.mjs\";#" \
+    -e "s#^\(import .* from \)\"typebox/compile\";\$#\1\"$prefix/typebox-compile.mjs\";#" "$dist/pi-ai/$file"
+  rm -f "$dist/pi-ai/$file.bak"
+done < <(cd "$dist/pi-ai" && grep -lE '^import .* from "typebox(/value|/compile)?";$' -r . --include=*.js | sed 's#^\./##' | sort)
+
+
+# pi-coding-agent and pi-agent-core use their complete public module graphs.
+node "$root/automation/gen/vendor-pi-closure.mjs" "$shims" "$(cat <<JSON
+{
+  "entries": ["$core/dist/index.js", "$agent/dist/index.js", "$agent/dist/core/sdk.js", "$agent/dist/core/tools/file-mutation-queue.js", "$agent/dist/utils/image-resize-worker.js", "$agent/dist/extensions/codemode/worker.js"],
+  "packages": {
+    "@earendil-works/pi-coding-agent": { "root": "$agent", "to": "pi-dist/pi-coding-agent" },
+    "@earendil-works/pi-agent-core": { "root": "$core", "to": "pi-dist/pi-agent-core" },
+    "@earendil-works/pi-codemode": { "root": "$codemode", "to": "pi-dist/pi-codemode" },
+    "@earendil-works/pi-mcp": { "root": "$mcp", "to": "pi-dist/pi-mcp" },
+    "@earendil-works/pi-telemetry": { "root": "$telemetry", "to": "pi-dist/pi-telemetry", "vendored": true },
+    "@earendil-works/pi-schema": { "root": "$schema", "to": "pi-dist/pi-schema", "vendored": true },
+    "@earendil-works/pi-ai": { "root": "$ai", "to": "pi-dist/pi-ai", "vendored": true }
+  },
+  "overrides": {
+    "@earendil-works/pi-coding-agent/index.js": "pi-coding-agent.mjs",
+    "@earendil-works/pi-coding-agent/core/sdk.js": "independent-session.mjs",
+    "@earendil-works/pi-coding-agent/core/tools/file-mutation-queue.js": "file-mutation-queue-bridge.mjs"
+  },
+  "externalPrefixes": { "highlight.js/lib/": "highlight.js/lib/" },
+  "external": {
+    "@earendil-works/pi-tui": "pi-tui.mjs",
+    "chalk": "chalk/source/index.js",
+    "proper-lockfile": "proper-lockfile.mjs",
+    "jiti": "jiti/lib/jiti.mjs",
+    "jiti/static": "jiti/lib/jiti-static.mjs",
+    "undici": "undici/index.js",
+    "semver": "semver/index.js",
+    "minimatch": "minimatch/dist/esm/index.js",
+    "hosted-git-info": "hosted-git-info/lib/index.js",
+    "lovely-mermaid": "lovely-mermaid/dist/index.js",
+    "@silvia-odwyer/photon-node": "photon-node/photon_rs.js",
+    "typebox": "typebox.mjs",
+    "typebox/value": "typebox-value.mjs",
+    "typebox/compile": "typebox-compile.mjs",
+    "yaml": "yaml/index.js",
+    "ignore": "ignore/index.js",
+    "diff": "diff/libesm/index.js",
+    "cross-spawn": "cross-spawn/index.js",
+    "quickjs-wasi": "quickjs-wasi/dist/index.js"
+  }
+}
+JSON
+)"
+
+# Third-party packages the vendored modules import.
+for dependency in chalk undici semver minimatch hosted-git-info lovely-mermaid proper-lockfile quickjs-wasi; do
+  rm -rf "${shims:?}/$dependency"
+  node "$root/automation/gen/vendor-node-dependencies.mjs" "$agent/node_modules/$dependency/package.json" "$shims/$dependency"
+done
+rm -rf "$shims/photon-node"
+node "$root/automation/gen/vendor-node-dependencies.mjs" "$agent/node_modules/@silvia-odwyer/photon-node/package.json" "$shims/photon-node"
+node "$root/automation/gen/vendor-pi-session-seams.mjs" "$agent" "$dist/pi-coding-agent"
+node "$root/automation/gen/vendor-pi-startup-seams.mjs" "$dist/pi-coding-agent"
+# PiG's product identity for Pi's outbound identity literals and hosted endpoints (D26); the same values the Go host sends.
+node "$root/automation/gen/pi-identity-patches.mjs" "$dist"
+rm -rf "$shims/cross-spawn"
+node "$root/automation/gen/vendor-node-dependencies.mjs" "$agent/node_modules/cross-spawn/package.json" "$shims/cross-spawn"
+cp -R "$yaml/browser/dist" "$shims/yaml/dist"
+cp "$yaml/browser/index.js" "$yaml/browser/package.json" "$yaml/LICENSE" "$shims/yaml/"
+cp "$eaw"/index.js "$eaw"/lookup.js "$eaw"/lookup-data.js "$eaw"/utilities.js "$eaw"/license "$eaw"/package.json "$shims/get-east-asian-width/"
+cp "$pjson/dist/index.js" "$pjson/dist/options.js" "$shims/partial-json/dist/"
+cp "$pjson/package.json" "$pjson/LICENSE" "$shims/partial-json/"
+cp "$marked/lib/marked.esm.js" "$shims/marked/lib/"
+cp "$marked/package.json" "$marked/LICENSE" "$shims/marked/"
+cp "$markedCjk/dist/index.js" "$shims/marked-cjk-friendly/dist/"
+cp "$markedCjk/package.json" "$markedCjk/LICENSE" "$shims/marked-cjk-friendly/"
+cp -R "$hljs/lib" "$shims/highlight.js/lib"
+cp "$hljs/package.json" "$hljs/LICENSE" "$shims/highlight.js/"
+cp -R "$jiti/lib" "$jiti/dist" "$shims/jiti/"
+cp "$jiti/package.json" "$jiti/LICENSE" "$shims/jiti/"
+cp "$ignore/index.js" "$ignore/package.json" "$ignore/LICENSE-MIT" "$shims/ignore/"
+cp -R "$jsdiff/libesm" "$shims/diff/libesm"
+chmod -R u+w "$shims/diff" # the copy of a read-only oracle build is read-only
+find "$shims/diff/libesm" -name '*.d.ts' -delete -o -name '*.d.ts.map' -delete
+cp "$jsdiff/package.json" "$jsdiff/LICENSE" "$shims/diff/"
+
+# Every rewritten specifier must have matched: a pin change that alters an import line fails here instead of shipping a module that cannot load.
+# The expectations derive from the pinned source: a module that still imports the original specifier must carry the rewritten one and no longer the original; a module that stopped importing it needs no rewrite.
+rewrote() {
+  local vendored=$1 source=$2 original=$3 rewritten=$4
+  [ -f "$source" ] || { echo "vendor-pi-dist: $source is gone from the pinned Pi; update the rewrite list" >&2; exit 1; }
+  if grep -qF "\"$original\"" "$source"; then
+    if ! grep -qF "\"$rewritten\"" "$vendored" || grep -qF "\"$original\"" "$vendored"; then
+      echo "vendor-pi-dist: import rewrite failed in $vendored" >&2
+      exit 1
+    fi
+  fi
+}
+rewrote "$dist/pi-tui/index.js" "$tui/dist/index.js" marked ../../marked/lib/marked.esm.js
+rewrote "$dist/pi-tui/utils.js" "$tui/dist/utils.js" get-east-asian-width ../../get-east-asian-width/index.js
+rewrote "$dist/pi-tui/components/markdown.js" "$tui/dist/components/markdown.js" marked ../../../marked/lib/marked.esm.js
+rewrote "$dist/pi-tui/components/markdown.js" "$tui/dist/components/markdown.js" marked-cjk-friendly ../../../marked-cjk-friendly/dist/index.js
+rewrote "$dist/pi-ai/utils/json-parse.js" "$ai/dist/utils/json-parse.js" partial-json ../../../partial-json/dist/index.js
+rewrote "$dist/pi-ai/utils/validation.js" "$ai/dist/utils/validation.js" @earendil-works/pi-schema ../../pi-schema/index.js
+rewrote "$dist/pi-ai/utils/validation.js" "$ai/dist/utils/validation.js" @earendil-works/pi-schema/formats ../../pi-schema/formats/index.js
+rewrote "$dist/pi-ai/providers/model-schema.js" "$ai/dist/providers/model-schema.js" @earendil-works/pi-schema ../../pi-schema/index.js
+rewrote "$dist/pi-ai/telemetry.js" "$ai/dist/telemetry.js" @earendil-works/pi-telemetry ../pi-telemetry/index.js
+rewrote "$dist/pi-coding-agent/utils/frontmatter.js" "$agent/dist/utils/frontmatter.js" yaml ../../../yaml/index.js
+rewrote "$dist/pi-coding-agent/utils/syntax-highlight.js" "$agent/dist/utils/syntax-highlight.js" highlight.js/lib/core.js ../../../highlight.js/lib/core.js
+rewrote "$dist/pi-coding-agent/core/settings-manager.js" "$agent/dist/core/settings-manager.js" proper-lockfile ../../../proper-lockfile.mjs
+rewrote "$dist/pi-coding-agent/core/settings-manager.js" "$agent/dist/core/settings-manager.js" @earendil-works/pi-ai ../../pi-ai/sdk-bundle/index.js
+rewrote "$dist/pi-coding-agent/modes/interactive/components/custom-editor.js" "$agent/dist/modes/interactive/components/custom-editor.js" @earendil-works/pi-tui ../../../../../pi-tui.mjs
+# No vendored module may keep a bare typebox import: the shims have no node_modules.
+if grep -rEq --include=*.js '^import .* from "typebox(/value|/compile)?";$' "$dist"; then
+  echo "vendor-pi-dist: a vendored module still imports typebox by its package name:" >&2
+  grep -rEl --include=*.js '^import .* from "typebox(/value|/compile)?";$' "$dist" >&2
+  exit 1
+fi
+
+# Required helpers must exist in the complete copied modules.
+for check in \
+  "$dist/pi-coding-agent/utils/paths.js:export function resolvePath(" \
+  "$dist/pi-coding-agent/core/http-dispatcher.js:export function parseHttpIdleTimeoutMs("; do
+  grep -qF "${check#*:}" "${check%%:*}" || { echo "vendor-pi-dist: required helper missing in ${check%%:*}" >&2; exit 1; }
+done
+
+node "$root/automation/gen/bundle-pi-libraries.mjs" "$shims"
+node "$root/automation/gen/bundle-pi-sdk.mjs" "$shims"
+# After the bundles: a package root entry may forward to a bundled module.
+node "$root/automation/gen/vendor-pi-package-roots.mjs" "$shims" "$agent"
+node "$root/automation/gen/vendor-node-manifest.mjs" "$shims" "$agent"
+
+# Leave every copy owner-writable, so the next run (and a checkout cleanup) can remove it; u+w changes no content.
+chmod -R u+w "$shims"
+
+version() { node -p "require('$1/package.json').version"; }
+echo "vendored Pi $(version "$agent") dist modules, yaml $(version "$yaml"), get-east-asian-width $(version "$eaw"), partial-json $(version "$pjson"), marked $(version "$marked"), marked-cjk-friendly $(version "$markedCjk"), highlight.js $(version "$hljs"), jiti $(version "$jiti"), ignore $(version "$ignore") and diff $(version "$jsdiff") into $shims"

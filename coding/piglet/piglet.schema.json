@@ -1,0 +1,727 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pig.dev/schemas/piglet.json",
+  "title": "Pig Profile",
+  "description": "Closed current vocabulary for a Pig Profile. This schema mirrors the Go parser's accepted vocabulary; Go adds semantic validation (path safety, origin resolution, inheritance) on top.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "description": {
+      "type": "string"
+    },
+    "extends": {
+      "$ref": "#/$defs/extendsSpec"
+    },
+    "packages": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]*:\\S+$"
+      }
+    },
+    "extensions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/extensionEntry"
+      }
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/skillEntry"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "description": "Built-in tools the Piglet keeps. The list limits the tools; it does not activate them. A run activates only the default active tools (read, bash, edit, write) that the list keeps.",
+      "items": {
+        "type": "string",
+        "enum": [
+          "read",
+          "bash",
+          "powershell",
+          "edit",
+          "write",
+          "grep",
+          "find",
+          "ls"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "model": {
+      "$ref": "#/$defs/modelConfig"
+    },
+    "slots": {
+      "$ref": "#/$defs/slots"
+    },
+    "systemPrompt": {
+      "$ref": "#/$defs/promptRef"
+    },
+    "discovery": {
+      "$ref": "#/$defs/discovery"
+    },
+    "contextFiles": {
+      "type": "string",
+      "enum": [
+        "all",
+        "trusted-only"
+      ],
+      "description": "Which project context files (AGENTS.md, CLAUDE.md) load. all is Pi's behaviour. trusted-only withholds the project's context files until the project is trusted, and makes a project that has one need a trust decision."
+    },
+    "viewClient": {
+      "type": "string",
+      "enum": [
+        "none",
+        "terminal"
+      ],
+      "description": "The client an interactive session attaches to its plugin view registry (D614). none is Stock PiG: no client, so an extension's ui.view mount fails unsupported. terminal attaches the TUI, which draws mounts in its widget and panel regions."
+    },
+    "viewEndpoint": {
+      "type": "string",
+      "enum": [
+        "none",
+        "socket"
+      ],
+      "description": "Whether an interactive session serves its plugin view registry to clients outside the process (D614). none is Stock PiG: nothing listens. socket serves the ui_view carrier on a Unix socket in the agent directory that only this user can connect to; a client of it draws mounts and raises their intents and can do nothing else. Print, JSON and RPC mode ignore the key."
+    },
+    "agentEnv": {
+      "$ref": "#/$defs/agentEnvironment"
+    },
+    "secrets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/secretDeclaration"
+      }
+    },
+    "release": {
+      "$ref": "#/$defs/releaseSpec"
+    },
+    "build": {
+      "$ref": "#/$defs/buildSpec"
+    },
+    "strip": {
+      "$ref": "#/$defs/stripSpec"
+    }
+  },
+  "$defs": {
+    "secretDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "from"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "from": {
+          "$ref": "#/$defs/secretSource"
+        }
+      }
+    },
+    "secretSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "env"
+          ],
+          "properties": {
+            "env": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file"
+          ],
+          "properties": {
+            "file": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ref"
+          ],
+          "properties": {
+            "ref": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*:\\S+$"
+            }
+          }
+        }
+      ]
+    },
+    "extendsSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*:\\S+$"
+        },
+        "version": {
+          "type": "string"
+        },
+        "allowWiden": {
+          "type": "boolean"
+        },
+        "remove": {
+          "$ref": "#/$defs/removeSpec"
+        }
+      }
+    },
+    "removeSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "slots": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "frontend"
+            ]
+          }
+        },
+        "strip": {
+          "$ref": "#/$defs/stripLists"
+        }
+      }
+    },
+    "stripSpec": {
+      "description": "Built-ins a Piglet strips. Each list is in deny mode (it names what is stripped) or, under keep, in keep mode (it names what stays; every other ID of that list, including IDs a later core adds, is stripped). One list is never in both modes in one Piglet file.",
+      "$ref": "#/$defs/stripListProperties",
+      "properties": {
+        "keep": {
+          "$ref": "#/$defs/stripLists"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "stripLists": {
+      "$ref": "#/$defs/stripListProperties",
+      "unevaluatedProperties": false
+    },
+    "stripListProperties": {
+      "type": "object",
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripToolId"
+          },
+          "uniqueItems": true
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripCommandId"
+          },
+          "uniqueItems": true
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripExtensionId"
+          },
+          "uniqueItems": true
+        },
+        "apis": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripApiId"
+          },
+          "uniqueItems": true
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stripFeatureId"
+          },
+          "uniqueItems": true
+        }
+      },
+      "$comment": "The ID enums (stripToolId and the four defs after it) are written by `make piglet-strip-ids` from the registrations."
+    },
+    "stripToolId": {
+      "type": "string",
+      "enum": [
+        "bash",
+        "edit",
+        "find",
+        "grep",
+        "ls",
+        "powershell",
+        "project_search",
+        "read",
+        "write"
+      ]
+    },
+    "stripCommandId": {
+      "type": "string",
+      "enum": [
+        "/bug",
+        "/changelog",
+        "/clone",
+        "/compact",
+        "/copy",
+        "/debug",
+        "/docs",
+        "/export",
+        "/fork",
+        "/hotkeys",
+        "/import",
+        "/login",
+        "/logout",
+        "/model",
+        "/name",
+        "/new",
+        "/piglet",
+        "/quit",
+        "/reload",
+        "/resume",
+        "/scoped-models",
+        "/session",
+        "/settings",
+        "/share",
+        "/thinking",
+        "/tree",
+        "/trust"
+      ]
+    },
+    "stripExtensionId": {
+      "type": "string",
+      "enum": [
+        "codemode",
+        "llama.cpp",
+        "mcp",
+        "pig-login",
+        "tool-search"
+      ]
+    },
+    "stripApiId": {
+      "type": "string",
+      "enum": [
+        "bedrock-converse-stream",
+        "google-vertex",
+        "mistral-conversations"
+      ]
+    },
+    "stripFeatureId": {
+      "type": "string",
+      "enum": [
+        "changelog",
+        "docs",
+        "export-html",
+        "extension-sdk-go",
+        "extension-sdk-lisp",
+        "extension-sdk-python",
+        "extension-sdk-rust",
+        "mermaid",
+        "node-extensions",
+        "piglet-builder",
+        "prompt-templates",
+        "self-update",
+        "skills",
+        "syntax-highlight",
+        "themes",
+        "word-dictionaries"
+      ]
+    },
+    "skillEntry": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "origins": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*:\\S+$"
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "extensionEntry": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            },
+            "origins": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*:\\S+$"
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "workspace",
+              "user"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "workspace",
+              "user"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "promptRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "agentEnvironment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "string"
+        },
+        "devContainer": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "pigRuntime": {
+          "$ref": "#/$defs/agentPigRuntime"
+        },
+        "policy": {
+          "$ref": "#/$defs/agentEnvironmentPolicy"
+        },
+        "workspace": {
+          "$ref": "#/$defs/agentWorkspace"
+        },
+        "mounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/agentMount"
+          }
+        },
+        "secrets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/agentSecretBinding"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "image"
+          ],
+          "properties": {
+            "image": {
+              "pattern": "\\S"
+            }
+          }
+        },
+        {
+          "required": [
+            "devContainer"
+          ],
+          "properties": {
+            "devContainer": {
+              "pattern": "\\S"
+            }
+          }
+        },
+        {
+          "required": [
+            "source"
+          ],
+          "properties": {
+            "source": {
+              "pattern": "\\S"
+            }
+          }
+        }
+      ]
+    },
+    "agentSecretBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "secretRef",
+        "target"
+      ],
+      "properties": {
+        "secretRef": {
+          "type": "string"
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "env"
+          ],
+          "properties": {
+            "env": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            }
+          }
+        }
+      }
+    },
+    "agentPigRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "inject",
+            "image"
+          ]
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "agentEnvironmentPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preset": {
+          "type": "string",
+          "enum": [
+            "minimal",
+            "standard",
+            "elevated"
+          ]
+        }
+      }
+    },
+    "agentWorkspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "folder": {
+          "type": "string"
+        },
+        "readonly": {
+          "type": "boolean"
+        }
+      }
+    },
+    "agentMount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "readonly": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source",
+        "target"
+      ]
+    },
+    "modelConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "contextWindow": {
+          "type": "integer"
+        },
+        "thinking": {
+          "type": "string"
+        }
+      }
+    },
+    "buildSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*$"
+          },
+          "uniqueItems": true
+        },
+        "outputName": {
+          "type": "string",
+          "pattern": "^[^/\\\\]*$",
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
+        },
+        "extensionRealization": {
+          "enum": [
+            "fused"
+          ]
+        },
+        "fusedReload": {
+          "enum": [
+            "source"
+          ],
+          "description": "What the Piglet Binary does with a fused member whose source changed after the build (D31). Absent: the compiled copy runs. source: the build bakes each fused member's source digest, and a start or /reload given the member's source with another digest runs the member as a subprocess built from it, until the Piglet is built again."
+        },
+        "closed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "slots": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "frontend": {
+          "$ref": "#/$defs/slotMember"
+        }
+      }
+    },
+    "slotMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "member"
+      ],
+      "properties": {
+        "member": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "releaseSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^((0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*)){0,2}|(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?)?$",
+          "description": "Semantic Version; the Go parser also accepts the short forms 1 and 1.2."
+        }
+      }
+    }
+  }
+}

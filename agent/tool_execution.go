@@ -1,0 +1,717 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"reflect"
+	"sync"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/stackprime"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsloop"
+	"github.com/MichaelKinsy/PiG/internal/procpolicy"
+)
+
+// Tool-call execution for one assistant message.
+// Ports packages/agent/src/agent-loop.ts (executeToolCalls and its helpers).
+
+// executedToolCallBatch is the outcome of one assistant message's tool calls.
+type executedToolCallBatch struct {
+	messages  []ToolResultMessage
+	terminate bool
+}
+
+// preparedToolCall is a call that passed lookup, argument preparation,
+// validation, and the before hooks, and may execute.
+type preparedToolCall struct {
+	call pendingToolCall
+	tool AgentTool
+	args json.RawMessage
+}
+
+// finalizedToolCall is a call's final result. executed is false for calls
+// that never ran (unknown tool, invalid arguments, blocked, aborted).
+type finalizedToolCall struct {
+	call     pendingToolCall
+	result   AgentToolResult
+	isError  bool
+	executed bool
+	duration time.Duration
+}
+
+// toolCtx is the context tools and tool hooks run under: the run's context
+// carrying the session state tools may export.
+func (r *loopRun) toolCtx() context.Context {
+	ctx := WithToolEnvironment(r.ctx, r.h.toolEnvironment(r.model, r.thinking))
+	return ctx
+}
+
+// executeToolCalls runs a batch sequentially when the loop is configured for
+// sequential execution or any call targets a tool whose ExecutionMode is
+// sequential; otherwise in parallel.
+func (r *loopRun) executeToolCalls(assistant *AssistantMessage, calls []pendingToolCall) executedToolCallBatch {
+	if r.h.cfg.ToolExecution == ToolModeSequential || r.hasSequentialToolCall(calls) {
+		// The hooks of these calls run one at a time, so they receive the run's own messages, as Pi's hooks do (hookView).
+		ctx := WithToolCallHookContext(r.toolCtx(), r.toolCallHookContext(assistant, hookView(r.context)))
+		return r.executeToolCallsSequential(ctx, calls)
+	}
+	return r.executeToolCallsParallel(r.toolCtx(), assistant, calls)
+}
+
+func (r *loopRun) hasSequentialToolCall(calls []pendingToolCall) bool {
+	for _, call := range calls {
+		if tool := r.h.findTool(call.name); tool != nil && tool.ExecutionMode() == ToolModeSequential {
+			return true
+		}
+	}
+	return false
+}
+
+// executeToolCallsSequential prepares, executes, and finalizes each call
+// before the next one starts, emitting each call's tool-result message as soon
+// as the call is finalized. An aborted run does not end the batch early: the
+// calls it had not reached are still started and answered (prepareToolCall),
+// so no call is left without a result (Pi 4438c58ba, #9986).
+func (r *loopRun) executeToolCallsSequential(ctx context.Context, calls []pendingToolCall) executedToolCallBatch {
+	finalized := make([]finalizedToolCall, 0, len(calls))
+	messages := make([]ToolResultMessage, 0, len(calls))
+	for _, call := range calls {
+		r.h.emitToolExecutionStart(call)
+		var f finalizedToolCall
+		if outcome := r.h.prepareToolCall(ctx, call); outcome.prepared != nil {
+			executed, err := r.h.executePreparedToolCall(ctx, *outcome.prepared)
+			if err != nil {
+				panic(runFailure{err: err})
+			}
+			f = r.h.finalizeExecutedToolCall(ctx, *outcome.prepared, executed)
+		} else {
+			f = *outcome.finalized
+		}
+		r.h.emitToolExecutionEnd(f)
+		messages = append(messages, r.appendToolResult(f))
+		finalized = append(finalized, f)
+	}
+	return executedToolCallBatch{messages: messages, terminate: shouldTerminateToolBatch(finalized)}
+}
+
+// executeToolCallsParallel emits tool_execution_start and prepares every call
+// sequentially in source order, then executes the prepared calls
+// concurrently. tool_execution_end follows completion order (the order the
+// calls' tools settled, when the tool reports it: ToolSettleFromContext); tool-result
+// messages follow source order once every call has finished (Promise.all).
+//
+// A tool implementing QueueOrderable has its shared-queue position reserved
+// here too, in this same source-order loop, before any goroutine starts:
+// upstream's Promise.all(calls.map(...)) runs each call's synchronous
+// prefix — including a file-mutation-queue registration — in call order,
+// before any call's async work begins, and Go's per-call goroutines below
+// have no equivalent guarantee on their own (see QueueOrderable).
+// executeToolCallsParallel runs the calls at once. Every call is handed the run's own messages (hookView), as Pi hands every call
+// currentContext (prepareToolCall, and each call's closure under Promise.all): what a before hook, a tool or an after hook replaces in
+// place, the batch's other calls and the next request see. The run does not read or write that array from the start of the first
+// call's tool to the end of the last call's after hooks. The before hooks run one after another here. The after hooks of a call start
+// once the hooks of every call that settled before it returned or invoked their first extension handler (finalizeCalledTool), so the
+// batch's hooks write the array one at a time. The tools run at the same time, which Pi's never do (one thread): a tool that reads or
+// writes the messages while another call's tool or after hook does shares memory with that code and synchronizes with it.
+func (r *loopRun) executeToolCallsParallel(ctx context.Context, assistant *AssistantMessage, calls []pendingToolCall) executedToolCallBatch {
+	outcomes := make([]toolCallOutcome, 0, len(calls))
+	callCtxs := make([]context.Context, 0, len(calls))
+	var registration registrationOrder
+	for _, call := range calls {
+		r.h.emitToolExecutionStart(call)
+		callCtx := WithToolCallHookContext(ctx, r.toolCallHookContext(assistant, hookView(r.context)))
+		outcome := r.h.prepareToolCall(callCtx, call)
+		if outcome.prepared != nil {
+			tool := outcome.prepared.tool
+			if mayTake, ok := tool.(MayTakeFileMutationQueue); ok && mayTake.MayTakeFileMutationQueue() {
+				callCtx = registration.extensionTool(callCtx, call.id)
+			}
+			if orderer, ok := tool.(QueueOrderable); ok {
+				registers, _ := tool.(RegistersInFileMutationQueue)
+				if registers != nil && registers.RegistersInFileMutationQueue() {
+					// An extension tool before this call may take the queue in its first statement: the call registers after that tool's start window
+					// (registrationOrder), on its own goroutine.
+					var late bool
+					if callCtx, late = registration.registersLate(callCtx, call.id, orderer, outcome.prepared.args); late {
+						orderer = nil
+					}
+				}
+				if orderer != nil {
+					if ticket, has := orderer.ReserveMutationOrder(outcome.prepared.args); has {
+						callCtx = WithMutationTicket(callCtx, ticket)
+					}
+				}
+			}
+		}
+		if outcome.finalized != nil {
+			r.h.emitToolExecutionEnd(*outcome.finalized)
+		}
+		outcomes = append(outcomes, outcome)
+		callCtxs = append(callCtxs, callCtx)
+	}
+
+	registration.prepared()
+	finalized := make([]finalizedToolCall, len(outcomes))
+	prepared := 0
+	for i, outcome := range outcomes {
+		if outcome.prepared == nil {
+			finalized[i] = *outcome.finalized
+		} else {
+			prepared++
+		}
+	}
+	failure := func() error {
+		// pig additive (D174): two or more prepared calls run in a procpolicy parallel section, so their in-process tool work runs at the
+		// runtime default width rather than on the capped Ps. The section closes once the last call has settled.
+		if prepared >= 2 {
+			defer procpolicy.Widen()()
+		}
+		var wg sync.WaitGroup
+		var failureMu sync.Mutex
+		var failure error
+		// The calls' tool_execution_end events follow the order their tools settle (jsloop.SettleGate).
+		var settleGate jsloop.SettleGate
+		batch := toolBatches.Add(1)
+		for i, outcome := range outcomes {
+			if outcome.prepared == nil {
+				continue
+			}
+			slot := settleGate.NewSlot()
+			callCtx := withToolSettle(callCtxs[i], slot, outcome.prepared.call.id, batch)
+			// Pi awaits Promise.all over every prepared call, so all calls run at
+			// once. A CPU-count cap would serialize I/O-bound tools on small machines.
+			wg.Go(func() {
+				defer slot.Close()
+				stackprime.Prime()
+				if window := ToolStartWindowFromContext(callCtx, outcome.prepared.call.id); window != nil {
+					// The call's start window closes when the call ends at the latest, whether or not the extension reported its prefix over.
+					defer window.Close()
+				}
+				callCtx := enterRegistrationOrder(callCtx, outcome.prepared.call.id)
+				var err error
+				finalized[i], err = r.h.runPreparedToolCall(callCtx, *outcome.prepared)
+				if err != nil {
+					failureMu.Lock()
+					if failure == nil {
+						failure = err
+					}
+					failureMu.Unlock()
+				}
+			})
+		}
+		wg.Wait()
+		return failure
+	}()
+	// Promise.all rejects with the first rejected call; the run fails on its own goroutine once every call has settled.
+	if failure != nil {
+		panic(runFailure{err: failure})
+	}
+
+	messages := make([]ToolResultMessage, 0, len(finalized))
+	for _, f := range finalized {
+		messages = append(messages, r.appendToolResult(f))
+	}
+	return executedToolCallBatch{messages: messages, terminate: shouldTerminateToolBatch(finalized)}
+}
+
+// runPreparedToolCall executes and finalizes one call of a parallel batch,
+// then emits its tool_execution_end. It runs on its own goroutine, so a sink
+// failure is returned for the run to raise.
+func (h *loopHost) runPreparedToolCall(ctx context.Context, prepared preparedToolCall) (finalizedToolCall, error) {
+	var finalized finalizedToolCall
+	if ctx.Err() != nil {
+		// This call never reaches Execute, so a mutation ticket reserved for
+		// it (executeToolCallsParallel's ReserveMutationOrder) must still be
+		// retired here, or the chain's tail stays open and strands every
+		// later same-path call forever. Upstream has no equivalent branch:
+		// its registration happens inside tool.execute itself
+		// (agent-loop.ts:616-623 aborts before that call), so an aborted
+		// call never registers a file mutation in the first place. Wait
+		// before Release, not just Release: this call must still take its
+		// turn behind its real predecessor before handing off to whoever is
+		// queued behind it, or a later caller could run concurrently with
+		// that still-in-flight predecessor.
+		if ticket, ok := MutationTicketFromContext(ctx); ok {
+			ticket.Wait()
+			ticket.Release()
+		}
+		finalized = immediateToolCall(prepared.call, errorToolResult("Operation aborted"))
+	} else {
+		executed, err := h.executePreparedToolCall(ctx, prepared)
+		if err != nil {
+			return finalizedToolCall{}, err
+		}
+		finalized = h.finalizeCalledTool(ctx, prepared, executed)
+	}
+	var err error
+	deliver := func() { err = h.deliver(toolExecutionEndEvent(finalized)) }
+	if slot := ToolSettleFromContext(ctx, prepared.call.id); slot != nil {
+		// A call ends after every call whose tool settled before its own (jsloop.SettleGate).
+		slot.Run(deliver)
+	} else {
+		deliver()
+	}
+	return finalized, err
+}
+
+// finalizeCalledTool finalizes an executed call of a parallel batch. agent-loop.ts:619-647: each call continues from its own execute promise, so
+// the calls' after-tool-call hooks start in the order their tools settled, and a hook runs to its first await before the next one starts. The
+// call's hooks wait for the hooks of the calls that settled before it to start; the first extension handler a hook invokes reports its start
+// (ToolHookStartedFromContext), and the batch reports it once the hooks returned, so a call whose hooks started no handler cannot hold the later
+// calls back.
+func (h *loopHost) finalizeCalledTool(ctx context.Context, prepared preparedToolCall, executed finalizedToolCall) finalizedToolCall {
+	slot := ToolSettleFromContext(ctx, prepared.call.id)
+	if slot == nil {
+		return h.finalizeExecutedToolCall(ctx, prepared, executed)
+	}
+	began := slot.Begin()
+	defer began()
+	return h.finalizeExecutedToolCall(withToolHookStart(ctx, began), prepared, executed)
+}
+
+// failToolCallsFromTruncatedMessage fails every tool call of an assistant
+// message that hit the output token limit. Streamed tool-call arguments are
+// finalized with a best-effort salvage parser, so a truncated message can
+// yield arguments that parse and validate but are silently incomplete.
+func (r *loopRun) failToolCallsFromTruncatedMessage(calls []pendingToolCall) executedToolCallBatch {
+	messages := make([]ToolResultMessage, 0, len(calls))
+	for _, call := range calls {
+		r.h.emitToolExecutionStart(call)
+		finalized := immediateToolCall(call, errorToolResult(`Tool call "`+call.name+
+			`" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.`))
+		r.h.emitToolExecutionEnd(finalized)
+		messages = append(messages, r.appendToolResult(finalized))
+	}
+	return executedToolCallBatch{messages: messages}
+}
+
+// shouldTerminateToolBatch reports whether every finalized result of a
+// non-empty batch asks the agent to stop.
+func shouldTerminateToolBatch(finalized []finalizedToolCall) bool {
+	if len(finalized) == 0 {
+		return false
+	}
+	for _, f := range finalized {
+		if !f.result.Terminate {
+			return false
+		}
+	}
+	return true
+}
+
+// toolCallOutcome is prepareToolCall's result: exactly one field is set.
+type toolCallOutcome struct {
+	prepared  *preparedToolCall
+	finalized *finalizedToolCall
+}
+
+func immediateOutcome(call pendingToolCall, result AgentToolResult) toolCallOutcome {
+	finalized := immediateToolCall(call, result)
+	return toolCallOutcome{finalized: &finalized}
+}
+
+func immediateToolCall(call pendingToolCall, result AgentToolResult) finalizedToolCall {
+	return finalizedToolCall{call: call, result: result, isError: true}
+}
+
+// errorToolResult is upstream createErrorToolResult: the text and an empty details object, and no isError. The
+// caller reports the failure separately, as finalizedToolCall.isError (agent-loop.ts:906-910).
+func errorToolResult(message string) AgentToolResult {
+	return AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: message}}, Details: map[string]any{}}
+}
+
+func (h *loopHost) findTool(name string) AgentTool { return findTool(h.tools(), name) }
+
+func findTool(tools []AgentTool, name string) AgentTool {
+	for _, t := range tools {
+		if t.Name() == name {
+			return t
+		}
+	}
+	return nil
+}
+
+// toolCallHooks is the hook set every tool call of this run goes through.
+func (h *loopHost) toolCallHooks() ToolCallHooks {
+	return ToolCallHooks{BeforeToolCall: h.cfg.BeforeToolCall, AfterToolCall: h.cfg.AfterToolCall, BeforeToolCallHooks: h.cfg.BeforeToolCallHooks, AfterToolCallHooks: h.cfg.AfterToolCallHooks, PrepareToolResult: h.cfg.PrepareToolResult}
+}
+
+// prepareToolCall looks the tool up, prepares and validates the arguments,
+// and runs the before hooks. Mirrors upstream prepareToolCall: hooks see the
+// validated arguments, arguments a hook returns execute without
+// revalidation, and a panic while preparing becomes an error result the way
+// upstream's catch turns a thrown error into one.
+func (h *loopHost) prepareToolCall(ctx context.Context, call pendingToolCall) toolCallOutcome {
+	return prepareToolCall(ctx, h.tools(), h.toolCallHooks(), call)
+}
+
+// prepareToolCall resolves the call against tools; see Agent.prepareToolCall.
+// Mirrors upstream prepareToolCall, whose config is ToolCallHooks and whose
+// tools default to the context's (.upstream/v0.99.1/packages/agent/src/agent-loop.ts:707-716).
+//
+// Once aborted, it skips preparation and the hooks: the answer is "Operation
+// aborted" before the tool lookup, the argument preparation, the validation
+// and the before hooks. Callers still record this result, so no call is left
+// without one (Pi 4438c58ba agent-loop.ts:716-725, #9986).
+func prepareToolCall(ctx context.Context, tools []AgentTool, hooks ToolCallHooks, call pendingToolCall) (outcome toolCallOutcome) {
+	if ctx.Err() != nil {
+		return immediateOutcome(call, errorToolResult("Operation aborted"))
+	}
+	tool := findTool(tools, call.name)
+	if tool == nil {
+		return immediateOutcome(call, errorToolResult("Tool "+call.name+" not found"))
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			outcome = immediateOutcome(call, errorToolResult(thrownMessage(recovered)))
+		}
+	}()
+	// The tool reads the call's own argument bytes, as Pi passes toolCall.arguments itself; nothing writes them after the call is built.
+	args := json.RawMessage(call.args)
+	if preparer, ok := tool.(ArgumentPreparer); ok {
+		prepared, err := preparer.PrepareArguments(args)
+		if err != nil {
+			return immediateOutcome(call, errorToolResult(err.Error()))
+		}
+		if len(prepared) > 0 {
+			args = prepared
+		}
+	}
+	// Pi validates tool.parameters itself, in the member order the tool authored them (validation.ts:59: getValidator(tool.parameters).parse).
+	var parameters json.RawMessage
+	if schemaTool, ok := tool.(interface{ ArgumentSchema() json.RawMessage }); ok {
+		parameters = schemaTool.ArgumentSchema()
+	} else if declared := tool.Schema(); declared.Parameters != nil {
+		encoded, err := declared.ParametersJSON()
+		if err != nil {
+			return immediateOutcome(call, errorToolResult(err.Error()))
+		}
+		parameters = encoded
+	} else {
+		parameters = json.RawMessage("{}")
+	}
+	args, validationErr := ai.ValidateToolArgumentsJSON(call.name, parameters, args)
+	if validationErr != nil {
+		return immediateOutcome(call, errorToolResult(validationErr.Error()))
+	}
+	for _, hook := range hooks.before() {
+		hookResult := hook(ctx, call.id, call.name, args)
+		// upstream awaits the hook to its end and then finds the signal aborted (agent-loop.ts:747-753): the answer is the abort's. A Go hook
+		// that stops waiting because the run was aborted returns the context's own error (a handler in another process is not awaited past the
+		// abort); that is the abort, not an error the hook threw, which upstream's catch still reports under an aborted signal.
+		if hookResult.Err != nil && (ctx.Err() == nil || !errors.Is(hookResult.Err, ctx.Err())) {
+			return immediateOutcome(call, errorToolResult(hookResult.Err.Error()))
+		}
+		if ctx.Err() != nil {
+			return immediateOutcome(call, errorToolResult("Operation aborted"))
+		}
+		if hookResult.Block {
+			reason := hookResult.Reason
+			if reason == "" {
+				reason = "Tool execution was blocked"
+			}
+			result := errorToolResult(reason)
+			result.Terminate = hookResult.Terminate
+			return immediateOutcome(call, result)
+		}
+		if hookResult.Args != nil {
+			args = hookResult.Args
+		}
+	}
+	return toolCallOutcome{prepared: &preparedToolCall{call: call, tool: tool, args: args}}
+}
+
+// executePreparedToolCall runs the tool for the loop: every accepted update
+// becomes a tool_execution_update event, and the call's duration is recorded.
+// Updates may arrive on the tool's goroutines, so a sink failure is returned
+// once the call settled, as upstream's awaited update promises reject the call.
+func (h *loopHost) executePreparedToolCall(ctx context.Context, prepared preparedToolCall) (finalizedToolCall, error) {
+	rawArgs := json.RawMessage(prepared.call.args)
+	executed, err := executePreparedToolCall(ctx, prepared, func(partial AgentToolResult) error {
+		return h.deliver(ToolExecutionUpdateEvent{
+			ToolCallID:    prepared.call.id,
+			ToolName:      prepared.call.name,
+			PartialResult: partial,
+			Args:          rawArgs,
+		})
+	}, h.toolUpdatesObserved)
+	if err != nil {
+		return finalizedToolCall{}, err
+	}
+	h.timings.RecordTool(prepared.call.name, executed.duration)
+	return executed, nil
+}
+
+// executePreparedToolCall runs the tool. Progress updates are accepted only
+// while Execute runs, and every accepted update is delivered to onUpdate
+// before the call completes (upstream awaits its pending update emissions). A
+// tool may call its update callback from its own goroutines. A returned error
+// is upstream's thrown one: createErrorToolResult without isError. A result with
+// IsError set is an error outcome that keeps its details and its own isError
+// (upstream `isError: result.isError === true`, agent-loop.ts:840).
+//
+// An update the sink rejects does not stop the tool or the later updates. Once the tool returned and every update settled, the first rejection is returned and the result is dropped: upstream awaits `Promise.all(updateEvents)` in the try body and again in the catch, so the rejection leaves the function either way (agent-loop.ts:833-845).
+//
+// observed reports whether anything could see the updates now; nil means always. The tool reads it through
+// ToolUpdatesObserved with the callback it was given.
+func executePreparedToolCall(ctx context.Context, prepared preparedToolCall, onUpdate ToolUpdateSink, observed func() bool) (finalizedToolCall, error) {
+	var mu sync.Mutex
+	accepting := true
+	var firstRejection error
+	var inflight sync.WaitGroup
+	sink := func(partial AgentToolResult) {
+		mu.Lock()
+		if !accepting {
+			mu.Unlock()
+			return
+		}
+		inflight.Add(1)
+		mu.Unlock()
+		defer inflight.Done()
+		if err := onUpdate(partial); err != nil {
+			mu.Lock()
+			if firstRejection == nil {
+				firstRejection = err
+			}
+			mu.Unlock()
+		}
+	}
+
+	// A gate set by an enclosing call (a tool that runs another through RunToolCall) never describes this call's callback.
+	var gate *toolUpdateGate
+	if observed != nil {
+		gate = &toolUpdateGate{observed: observed, callback: reflect.ValueOf(sink).Pointer()}
+	}
+	if gate != nil || ctx.Value(toolUpdateGateKey{}) != nil {
+		ctx = context.WithValue(ctx, toolUpdateGateKey{}, gate)
+	}
+	start := time.Now()
+	result, err := executeTool(ctx, prepared, sink)
+	// upstream: agent-loop.ts:841-846 reads elapsed() before it awaits the update events.
+	duration := time.Since(start)
+	mu.Lock()
+	accepting = false
+	mu.Unlock()
+	inflight.Wait()
+	mu.Lock()
+	rejection := firstRejection
+	mu.Unlock()
+	if rejection != nil {
+		return finalizedToolCall{}, rejection
+	}
+	isError := result.IsError
+	switch {
+	case err != nil:
+		result, isError = errorToolResult(err.Error()), true
+	case result.Thrown:
+		result.IsError, result.Thrown, isError = false, false, true
+	}
+	return finalizedToolCall{call: prepared.call, result: result, isError: isError, executed: true, duration: duration}, nil
+}
+
+// executeTool runs the tool. A panic becomes an error, as upstream's catch
+// around tool.execute turns a thrown error into an error tool result instead
+// of ending the run without one.
+func executeTool(ctx context.Context, prepared preparedToolCall, onUpdate ToolUpdateCallback) (result AgentToolResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result, err = AgentToolResult{}, errors.New(thrownMessage(recovered))
+		}
+	}()
+	// A tool awaits real work, so the task of Pi's loop that started it ends here (jsloop.Task). What the tool runs is not the run's own, so it sees no Task.
+	if task := jsloop.TaskFrom(ctx); task != nil {
+		task.End()
+		ctx = jsloop.WithTask(ctx, nil)
+	}
+	// Pi's loop turns while a tool awaits its I/O, so the timer callbacks an extension queued run (jsloop.Turns). A tool that runs in an extension (ExtensionTool) turns the loop only if its own code awaits, which the extension runtime reports itself: it marks the calls of a timer that fires after the handler returned.
+	if extension, ok := prepared.tool.(ExtensionTool); !ok || !extension.RunsInExtension() {
+		defer jsloop.TurnsFrom(ctx).Wait()()
+	}
+	return prepared.tool.Execute(ctx, prepared.call.id, prepared.args, onUpdate)
+}
+
+// thrownMessage mirrors upstream's `error instanceof Error ? error.message :
+// String(error)` for a recovered panic value.
+func thrownMessage(recovered any) string {
+	if err, ok := recovered.(error); ok {
+		return err.Error()
+	}
+	return fmt.Sprint(recovered)
+}
+
+// runAfterToolCallHook calls one after hook; ok is false when it panicked.
+func runAfterToolCallHook(ctx context.Context, hook AfterToolCallHook, prepared preparedToolCall, result AgentToolResult) (override AfterToolCallResult, message string, ok bool) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			message, ok = thrownMessage(recovered), false
+		}
+	}()
+	return hook(ctx, prepared.call.id, prepared.call.name, prepared.args, result), "", true
+}
+
+func (h *loopHost) finalizeExecutedToolCall(ctx context.Context, prepared preparedToolCall, executed finalizedToolCall) finalizedToolCall {
+	return finalizeExecutedToolCall(ctx, h.toolCallHooks(), prepared, executed)
+}
+
+// finalizeExecutedToolCall applies the after hooks' overrides field by field.
+// Mirrors upstream finalizeExecutedToolCall, including its catch: a hook that
+// panics replaces the result with an error result. Structured content that
+// the hook did not replace along with the content is dropped, because it may
+// no longer match it (agent-loop.ts:877-889); a JSON null counts as absent, as
+// `??` does.
+//
+// A hook's isError replaces the call's flag, not the result's own: the spread
+// keeps the tool's (agent-loop.ts:890). Hooks see the call's flag in
+// result.IsError, as upstream's context.isError beside the result. A hook that
+// returns an empty override leaves the result as it was, as a hook that returns
+// undefined does.
+func finalizeExecutedToolCall(ctx context.Context, hooks ToolCallHooks, prepared preparedToolCall, executed finalizedToolCall) finalizedToolCall {
+	result, isError := executed.result, executed.isError
+	for _, hook := range hooks.after() {
+		seen := result
+		seen.IsError = isError
+		override, message, ok := runAfterToolCallHook(ctx, hook, prepared, seen)
+		if !ok {
+			result, isError = errorToolResult(message), true
+			break
+		}
+		if override.isZero() {
+			continue
+		}
+		structuredContent := override.StructuredContent
+		if isNullishJSON(structuredContent) {
+			structuredContent = nil
+			if override.Content == nil {
+				structuredContent = result.StructuredContent
+			}
+		}
+		if override.Content != nil {
+			result.Content = override.Content
+		}
+		if override.Details != nil {
+			result.Details = override.Details
+		}
+		if override.Usage != nil {
+			result.Usage = override.Usage
+		}
+		if override.Terminate != nil {
+			result.Terminate = *override.Terminate
+		}
+		hadStructuredContent := len(result.StructuredContent) > 0
+		result.StructuredContent = structuredContent
+		switch {
+		case len(structuredContent) == 0:
+			result.StructuredContentAppended = false
+		case !hadStructuredContent:
+			result.StructuredContentAppended = true
+		}
+		if override.IsError != nil {
+			isError = *override.IsError
+		}
+	}
+	if hooks.PrepareToolResult != nil {
+		seen := result
+		seen.IsError = isError
+		prepared := hooks.PrepareToolResult(ctx, seen)
+		isError = prepared.IsError
+		prepared.IsError = result.IsError
+		result = prepared
+	}
+	executed.result, executed.isError = result, isError
+	return executed
+}
+
+// isZero reports an override that changes nothing: upstream's hook returned undefined.
+func (r AfterToolCallResult) isZero() bool {
+	return r.Content == nil && r.Details == nil && r.IsError == nil && r.Usage == nil && r.Terminate == nil && len(r.StructuredContent) == 0
+}
+
+// isNullishJSON reports upstream's null-or-undefined for a structured-content value.
+func isNullishJSON(raw json.RawMessage) bool {
+	return len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null"
+}
+
+func (h *loopHost) emitToolExecutionStart(call pendingToolCall) {
+	label := ""
+	if tool := h.findTool(call.name); tool != nil {
+		label = tool.Label()
+	}
+	h.emit(ToolExecutionStartEvent{ToolCallID: call.id, ToolName: call.name, ToolLabel: label, Args: json.RawMessage(call.args)})
+}
+
+func (h *loopHost) emitToolExecutionEnd(finalized finalizedToolCall) {
+	h.emit(toolExecutionEndEvent(finalized))
+}
+
+func toolExecutionEndEvent(finalized finalizedToolCall) ToolExecutionEndEvent {
+	return ToolExecutionEndEvent{ToolCallID: finalized.call.id, ToolName: finalized.call.name, Result: finalized.result, IsError: finalized.isError, DurationMs: finalized.durationMs()}
+}
+
+// durationMs is upstream's durationMs on a finalized outcome: the milliseconds execute() took, rounded like Math.round, and
+// absent when the tool did not run. upstream: agent-loop.ts:826-852,908
+func (f finalizedToolCall) durationMs() *int64 {
+	if !f.executed {
+		return nil
+	}
+	//portlint:allow numbers agent-loop.ts:826-852 Math.round(durationMs): a time.Duration is a finite non-negative nanosecond count, so the quotient is finite and in int64 range, and math.Round equals Math.round off negative halves
+	return new(int64(math.Round(float64(f.duration) / float64(time.Millisecond))))
+}
+
+// appendToolResult emits a finalized call's tool-result message and records it.
+func (r *loopRun) appendToolResult(finalized finalizedToolCall) ToolResultMessage {
+	msg := createToolResultMessage(finalized, time.Now().UnixMilli())
+	r.appendMessage(AgentMessage{ToolResult: &msg})
+	return msg
+}
+
+func createToolResultMessage(finalized finalizedToolCall, timestamp int64) ToolResultMessage {
+	result := finalized.result
+	content := result.Content
+	if content == nil {
+		content = []ai.ToolResultMessageContent{}
+	}
+	return ToolResultMessage{
+		Role:        RoleToolResult,
+		ToolCallID:  finalized.call.id,
+		ToolName:    finalized.call.name,
+		Content:     content,
+		Details:     result.Details,
+		DetailsNull: result.DetailsNull(),
+		Usage:       result.Usage,
+		IsError:     finalized.isError,
+		DurationMs:  finalized.durationMs(),
+		Timestamp:   timestamp,
+	}
+}
+
+// toolUpdateGate is what ToolUpdatesObserved knows about the update callback executePreparedToolCall hands a tool.
+type toolUpdateGate struct {
+	observed func() bool
+	// callback is the code pointer of executePreparedToolCall's sink. A callback of any other code is not this gate's:
+	// a tool another tool runs with a callback of its own (an extension wrapping bash) reports to that callback.
+	callback uintptr
+}
+
+type toolUpdateGateKey struct{}
+
+// ToolUpdatesObserved reports whether anything could see an update the tool sends to onUpdate now: false for a nil
+// callback, and for the loop's callback while no agent listener, Agent option, session listener, Events consumer or
+// extension tool_execution_update handler is there to see one. Every other callback is observed. A tool that skips its
+// update work while this is false asks again as it runs, so an observer that appears during the execution gets the
+// updates from then on, as a Pi listener added mid-execution sees the updates emitted after it subscribed.
+func ToolUpdatesObserved(ctx context.Context, onUpdate ToolUpdateCallback) bool {
+	if onUpdate == nil {
+		return false
+	}
+	gate, _ := ctx.Value(toolUpdateGateKey{}).(*toolUpdateGate)
+	if gate == nil || reflect.ValueOf(onUpdate).Pointer() != gate.callback {
+		return true
+	}
+	return gate.observed()
+}

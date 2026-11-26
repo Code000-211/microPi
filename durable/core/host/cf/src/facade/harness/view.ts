@@ -1,0 +1,52 @@
+// The `attach` of upstream harness/view.ts `conversationViews(harness)`, for the Pi tests that attach a view observer. Partial: no `state` or
+// `watch`, and each call builds its own instance where Pi keeps one per Harness. The core mounts the view; this attaches one observer to it,
+// with its own window. An observer that throws is reported through the Harness and the others still get the frame; the Session's close
+// reaches `end` once.
+import type { Context } from "@earendil-works/chord/context"
+import type { WatchCall, WatchEnd } from "@earendil-works/chord/watch"
+import type { ConversationWindow } from "@earendil-works/pi-durable"
+import { Harness } from "../harness.ts"
+
+type Observer = {
+  advance?(call: WatchCall<unknown>, context: Context): void
+  end(end: WatchEnd): void
+}
+
+export class ConversationViews {
+  readonly #harness: Harness
+  constructor(harness: Harness) { this.#harness = harness }
+
+  /** Register an observer created from the first revision of its window: it sees every later publication and nothing earlier. */
+  async attach<O extends Observer>(
+    id: number,
+    window: ConversationWindow | undefined,
+    create: (value: unknown, release: () => void, storage: unknown) => O | Promise<O>,
+    context: Context,
+  ): Promise<{ observer: O; detach: () => void }> {
+    let observer: O | undefined
+    const made = Promise.withResolvers<O>()
+    let detach!: () => void
+    const early: ((observer: O) => void)[] = []
+    const deliver = (call: (observer: O) => void) => { if (observer !== undefined) call(observer); else early.push(call) }
+    const ready = await this.#harness.attachView(id, window, context, (value: unknown, release: () => void) => {
+      detach = release
+      void Promise.resolve(create(value, release, this.#harness.storageOf())).then(created => {
+        observer = created
+        made.resolve(created)
+        for (const call of early.splice(0)) { try { call(created) } catch (error) { this.#harness.report(error) } }
+      }, error => made.reject(error))
+      return {
+        advance: (call, frameContext) => deliver(o => o.advance?.(call, frameContext)),
+        end: end => deliver(o => o.end(end)),
+      }
+    })
+    if (ready === undefined) throw new Error(`Conversation ${id} does not exist`)
+    return { observer: await made.promise, detach }
+  }
+}
+
+/** The view mounts of a Harness. */
+export function conversationViews(harness: object): ConversationViews {
+  if (!(harness instanceof Harness)) throw new Error("Not a Harness")
+  return new ConversationViews(harness)
+}

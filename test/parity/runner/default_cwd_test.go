@@ -1,0 +1,208 @@
+//go:build parity
+
+package runner
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"unicode/utf16"
+
+	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
+	"github.com/MichaelKinsy/PiG/internal/pioracle"
+)
+
+func TestMkdirTempFixedWidth(t *testing.T) {
+	dir, err := mkdirTempFixed("parity-snap-cwd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	base := filepath.Base(dir)
+	digits := strings.TrimPrefix(base, "parity-snap-cwd-")
+	if len(digits) != snapshotIDDigits || strings.Trim(digits, "0123456789") != "" {
+		t.Fatalf("snapshot dir %q: want %d-digit suffix", base, snapshotIDDigits)
+	}
+}
+
+func TestMaskSnapshotIDsKeepsWidth(t *testing.T) {
+	pig := "/tmp/parity-snap-cwd-0123456789 (main)\n~/x/parity-snap-cwd-98..."
+	pi := "/tmp/parity-snap-cwd-9876543210 (main)\n~/x/parity-snap-cwd-12..."
+	gotPig, gotPi := maskSnapshotIDs(pig), maskSnapshotIDs(pi)
+	if gotPig != gotPi {
+		t.Fatalf("masked outputs differ:\n%q\n%q", gotPig, gotPi)
+	}
+	if len(gotPig) != len(pig) {
+		t.Fatalf("masking changed width: %d -> %d", len(pig), len(gotPig))
+	}
+	if want := "/tmp/parity-snap-cwd-0000000000 (main)\n~/x/parity-snap-cwd-00..."; gotPig != want {
+		t.Fatalf("masked = %q, want %q", gotPig, want)
+	}
+	if other := "parity-snap-PIG_HOME-0123456789"; maskSnapshotIDs(other) != other {
+		t.Fatalf("masked a non-cwd snapshot name")
+	}
+}
+
+func TestMaskSnapshotIDsCoversExtensionSnapshots(t *testing.T) {
+	pig := ` Extension "/tmp/parity-snap-extension-0123456789/error-stack.mjs" error: stack` + "\n" + ` parity-snap-extension-98...`
+	pi := ` Extension "/tmp/parity-snap-extension-9876543210/error-stack.mjs" error: stack` + "\n" + ` parity-snap-extension-12...`
+	gotPig, gotPi := maskSnapshotIDs(pig), maskSnapshotIDs(pi)
+	if gotPig != gotPi {
+		t.Fatalf("masked outputs differ:\n%q\n%q", gotPig, gotPi)
+	}
+	if want := ` Extension "/tmp/parity-snap-extension-0000000000/error-stack.mjs" error: stack` + "\n" + ` parity-snap-extension-00...`; gotPig != want {
+		t.Fatalf("masked = %q, want %q", gotPig, want)
+	}
+}
+
+// An extension error prints the snapshot path and the TUI wraps it, so the two binaries' snapshot paths must have one length: a one-digit difference moves a wrap point between their screens.
+func TestSnapshotExtensionPathHasFixedWidthSuffix(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "extension.mjs")
+	if err := os.WriteFile(source, []byte("export default function () {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// os.MkdirTemp's suffix is one to ten digits, nine in a fifth of the names: 200 names make a pass by chance impossible in practice.
+	for range 200 {
+		snapshot, err := snapshotExtensionPath(t, source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := filepath.Base(filepath.Dir(snapshot))
+		digits, ok := strings.CutPrefix(base, extensionSnapshotPrefix)
+		if !ok || len(digits) != snapshotIDDigits || strings.Trim(digits, "0123456789") != "" {
+			t.Fatalf("snapshot directory %q: want %q followed by %d digits", base, extensionSnapshotPrefix, snapshotIDDigits)
+		}
+	}
+}
+
+func TestDefaultCWDIsOutsideCheckout(t *testing.T) {
+	dir, err := defaultCWD(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkout, err := findRepoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkout, err = filepath.EvalSymlinks(checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(dir, checkout+string(filepath.Separator)) {
+		t.Fatalf("default cwd %s is inside the checkout %s", dir, checkout)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "AGENTS.md")); err != nil {
+		t.Fatalf("default cwd lacks the fixture AGENTS.md: %v", err)
+	}
+}
+
+func TestPiPackageRootFindsOwningPackage(t *testing.T) {
+	root := t.TempDir()
+	pkg := filepath.Join(root, "node_modules", "@earendil-works", "pi-coding-agent")
+	if err := os.MkdirAll(filepath.Join(pkg, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"@earendil-works/pi-coding-agent"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cli := filepath.Join(pkg, "dist", "cli.js")
+	if err := os.WriteFile(cli, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "node_modules", ".bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(binDir, "pi")
+	if err := os.Symlink(cli, bin); err != nil {
+		t.Fatal(err)
+	}
+	got, err := piPackageRoot(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := filepath.EvalSymlinks(pkg)
+	if got != want {
+		t.Fatalf("piPackageRoot = %s, want %s", got, want)
+	}
+}
+
+// On Windows npm installs node_modules/.bin/pi.cmd, a batch shim that names
+// its script relative to its own directory, where other hosts get a symlink.
+func TestPiPackageRootFollowsNpmCmdShim(t *testing.T) {
+	root := t.TempDir()
+	pkg := filepath.Join(root, "node_modules", "@earendil-works", "pi-coding-agent")
+	if err := os.MkdirAll(filepath.Join(pkg, "dist", "bundle"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"@earendil-works/pi-coding-agent"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "dist", "bundle", "cli.js"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "node_modules", ".bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// npm's cmd-shim output for the pinned Pi package.
+	shim := "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n" +
+		"IF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n" +
+		"endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\..\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js\" %*\r\n"
+	bin := filepath.Join(binDir, "pi.cmd")
+	if err := os.WriteFile(bin, []byte(shim), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := piPackageRoot(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := filepath.EvalSymlinks(pkg)
+	if got != want {
+		t.Fatalf("piPackageRoot = %s, want %s", got, want)
+	}
+}
+
+func TestPromptPathLengthsBalance(t *testing.T) {
+	// Pi prints PI_PACKAGE_DIR resolved to an absolute path and pig prints
+	// PIG_HOME as given, so only an absolute root prints the same on both.
+	if !filepath.IsAbs(promptPathRoot) {
+		t.Fatalf("promptPathRoot %q is not absolute; Pi would print a longer root than pig", promptPathRoot)
+	}
+	pigHome := filepath.Join(promptPathRoot, pigHomePrefix+strings.Repeat("0", pigHomeIDDigits))
+	piPackage := filepath.Join(promptPathRoot, piPackagePrefix+strings.Repeat("0", snapshotIDDigits), piPackageLink)
+	pig := 2*(len(pigHome)+len("/docs")+pigBundleDirLen) + d22ConstantGap
+	pi := 3 * len(piPackage)
+	if pig != pi {
+		t.Fatalf("docs path characters: pig %d, pi %d; the system prompts would differ in length", pig, pi)
+	}
+	if pigHomePrefix != "parity-snap-PIG_HOME-" {
+		t.Fatalf("pigHomePrefix %q must match snapshotEnvDirs naming", pigHomePrefix)
+	}
+}
+
+// The context estimate of a faux turn is chars/4 of the system message, so one character of difference between the two prompts can move a token. The runner's docs paths exist to make pig's preamble and docs section exactly as long as Pi's; TestPromptPathLengthsBalance only checks that the constants add up. This test measures the real sections at the runner's path lengths, so a wording change on either side (such as Pi 705d047c dropping four product-name spellings from its docs section) fails here and names the constant to set, rather than appearing as a one-token drift in rpc/26-rpc-session-stats-context-estimate and fullscreen/10-main-screen-compaction-settled.
+func TestPromptPathLengthsMatchRealPrompts(t *testing.T) {
+	pigHome := filepath.Join(promptPathRoot, pigHomePrefix+strings.Repeat("0", pigHomeIDDigits))
+	pigDocs := filepath.Join(pigHome, "docs") + "/" + strings.Repeat("b", pigBundleDirLen-len("/"))
+	piPackage := filepath.Join(promptPathRoot, piPackagePrefix+strings.Repeat("0", snapshotIDDigits), piPackageLink)
+
+	var pigChars int
+	for _, section := range prompts.BuildSystemPromptSections(prompts.Options{Cwd: "/tmp", PigDocsPath: pigDocs}) {
+		if section.Name == "preamble" || section.Name == "docs" {
+			pigChars += len(utf16.Encode([]rune(*section.Value)))
+		}
+	}
+	var pi struct{ Preamble, Docs string }
+	pioracle.Run(t, `
+const { buildSystemPromptSections } = await load("pi-coding-agent/core/system-prompt.js");
+const sections = buildSystemPromptSections({ cwd: "/tmp" });
+emit({ Preamble: sections.preamble, Docs: sections.docs });`, nil, &pi, "PI_PACKAGE_DIR="+piPackage)
+	piChars := len(utf16.Encode([]rune(pi.Preamble + pi.Docs)))
+
+	if pigChars != piChars {
+		t.Fatalf("pig's preamble and docs section are %d characters, Pi's are %d at the runner's docs paths: set d22ConstantGap to %d and size pigHomeIDDigits and piPackageLink so that 3*len(piPackageDir) == 2*(len(pigHome)+len(\"/docs\")+pigBundleDirLen) + d22ConstantGap",
+			pigChars, piChars, d22ConstantGap+pigChars-piChars)
+	}
+}

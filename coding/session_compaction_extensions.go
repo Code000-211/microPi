@@ -1,0 +1,144 @@
+package coding
+
+import (
+	"context"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/compaction"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+)
+
+type sessionCompactionData struct {
+	Summary          string
+	FirstKeptEntryID string
+	TokensBefore     int
+	Usage            *ai.Usage
+	// UsageNull marks a nil Usage the extension wrote as null (agent-session.ts compact: `usage = extensionCompaction.usage`).
+	UsageNull bool
+	// UsageRaw is the usage object as the extension wrote it, which the entry holds as Pi's does.
+	UsageRaw json.RawMessage
+	Details  any
+}
+
+func (s *Session) extensionCompaction(
+	ctx context.Context,
+	preparation *compaction.CompactionPreparation,
+	entries []icodingagent.SessionEntry,
+	customInstructions, reason string,
+	willRetry bool,
+) (*sessionCompactionData, bool, error) {
+	runner := s.currentRunner()
+	if runner == nil || !runner.HasHandlers(icodingagent.EventSessionBeforeCompact) {
+		return nil, false, nil
+	}
+	branchEntries := make([]extension.SessionEntry, len(entries))
+	copy(branchEntries, entries)
+	// runner.ts emit awaits every handler with event.signal aborted and keeps their results; the abort reaches a handler as that signal, not as the end of its dispatch.
+	result, err := runner.Emit(context.WithoutCancel(ctx), extension.SessionBeforeCompactEvent{
+		Type:               icodingagent.EventSessionBeforeCompact,
+		Preparation:        *preparation,
+		BranchEntries:      branchEntries,
+		CustomInstructions: customInstructions,
+		Reason:             reason,
+		WillRetry:          willRetry,
+		Signal:             ctx,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if result == nil {
+		return nil, false, nil
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return nil, false, err
+	}
+	var envelope struct {
+		Cancel     bool            `json:"cancel"`
+		Compaction json.RawMessage `json:"compaction"`
+	}
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		return nil, false, err
+	}
+	if envelope.Cancel {
+		return nil, false, errCompactionCancelled
+	}
+	if len(envelope.Compaction) == 0 || string(envelope.Compaction) == "null" {
+		return nil, false, nil
+	}
+	var wire struct {
+		Summary          string          `json:"summary"`
+		FirstKeptEntryID string          `json:"firstKeptEntryId"`
+		TokensBefore     int             `json:"tokensBefore"`
+		Usage            *ai.Usage       `json:"usage,omitempty"`
+		Details          json.RawMessage `json:"details,omitempty"`
+	}
+	if err := json.Unmarshal(envelope.Compaction, &wire); err != nil {
+		return nil, false, err
+	}
+	// The details are the value the extension wrote; keep its member order, and a null apart from no member.
+	details := orderedjson.Member(wire.Details)
+	var usageRaw json.RawMessage
+	if wire.Usage != nil {
+		usageRaw = orderedjson.ContainerMember(envelope.Compaction, "usage")
+	}
+	return &sessionCompactionData{
+		Summary:          wire.Summary,
+		FirstKeptEntryID: wire.FirstKeptEntryID,
+		TokensBefore:     wire.TokensBefore,
+		Usage:            wire.Usage,
+		UsageNull:        wire.Usage == nil && orderedjson.IsNullMember(envelope.Compaction, "usage"),
+		UsageRaw:         usageRaw,
+		Details:          details,
+	}, true, nil
+}
+
+func generatedCompactionData(result compaction.CompactionResult) *sessionCompactionData {
+	return &sessionCompactionData{
+		Summary:          result.Summary,
+		FirstKeptEntryID: result.FirstKeptEntryID,
+		TokensBefore:     result.TokensBefore,
+		Usage:            result.Usage,
+		Details:          result.Details,
+	}
+}
+
+// emitSessionCompact notifies extensions that a compaction entry was saved
+// (agent-session.ts awaits runner.emit session_compact after appendCompaction).
+// Upstream's emit takes no signal and checks none, so an abort raised after the
+// last check, or by a handler during this dispatch, never skips an extension
+// and never fails the saved compaction: dispatch must not inherit the
+// cancellation that aborts the compaction.
+func (s *Session) emitSessionCompact(ctx context.Context, entry icodingagent.SessionEntry, fromExtension bool, reason string, willRetry bool) {
+	runner := s.currentRunner()
+	if runner == nil || !runner.HasHandlers(icodingagent.EventSessionCompact) {
+		return
+	}
+	var compactionEntry extension.CompactionEntry
+	if raw, err := json.Marshal(entry); err != nil || json.Unmarshal(raw, &compactionEntry) != nil {
+		return
+	}
+	_, _ = runner.Emit(context.WithoutCancel(ctx), extension.SessionCompactEvent{
+		Type:            icodingagent.EventSessionCompact,
+		CompactionEntry: compactionEntry,
+		FromExtension:   fromExtension,
+		Reason:          reason,
+		WillRetry:       willRetry,
+	})
+}
+
+// emitSessionCompactFailed notifies extensions that compaction failed or was
+// aborted (agent-session.ts _emitSessionCompactFailed). Upstream awaits it
+// after compaction_end, including after an abort, so dispatch must not
+// inherit the cancellation that aborted the compaction.
+func (s *Session) emitSessionCompactFailed(ctx context.Context, event extension.SessionCompactFailedEvent) {
+	runner := s.currentRunner()
+	if runner == nil || !runner.HasHandlers(icodingagent.EventSessionCompactFailed) {
+		return
+	}
+	event.Type = icodingagent.EventSessionCompactFailed
+	_, _ = runner.Emit(context.WithoutCancel(ctx), event)
+}

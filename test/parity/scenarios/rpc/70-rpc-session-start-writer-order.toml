@@ -1,0 +1,56 @@
+# Behavior family: rpc
+# Surface: which events a session_start handler's appendEntry and setSessionName put on stdout, at startup, from a command and for a replacement.
+#
+# Upstream evidence (Pi 1.5.2 + beffcde92dea, #12230, #10470): rpc-mode.ts rebindSession subscribes the stdout writer BEFORE `await session.bindExtensions(...)`, so the entry_appended and session_info_changed events a session_start handler emits reach the client, during startup and for a replacement; the handler's notify goes through the UI context as before. A replacement command (new_session) is rebound once, by the runtime's callback, so its session_start runs once and its events are written once. A command's appends after startup are written. Before the commit (Pi 1.3.0+1402973a to 1.5.2) the writer was subscribed after the bind: startup wrote neither event, and a replacement bound twice (rpc-mode.ts rebindSession again after runtimeHost.newSession), the first bind's events not written and the second's written.
+# PiG held the name listener and the entry_appended writer back until the first session_start returned (rpcModeSession.writing) and announced a replacement's session_start twice (rpcHost.rebindAgain). Scenario 84 isolates the startup events and 83 the other replacement commands.
+# Entry IDs and clocks are masked as bijections/timestamps; the member order and every other byte compare.
+name = "70-rpc-session-start-writer-order"
+description = "RPC writes the entry_appended and session_info_changed events of a session_start handler at startup and for a replacement, and from a command"
+covers = ["packages/coding-agent/src/modes/rpc/rpc-mode.ts", "packages/coding-agent/src/core/agent-session.ts"]
+tags = ["hermetic", "fast"]
+driver = "rpc-mode"
+
+[rpc]
+timeout_seconds = 20
+
+[[rpc.steps]]
+line = '{"id":"after","type":"prompt","message":"/writer-after"}'
+wait_event = '{"id":"after","type":"response","command":"prompt","success":true}'
+wait_timeout_seconds = 10
+
+[[rpc.steps]]
+line = '{"id":"new","type":"new_session"}'
+wait_event = '{"id":"new","type":"response","command":"new_session","success":true}'
+wait_timeout_seconds = 10
+
+[[rpc.steps]]
+line = '{"id":"state","type":"get_state"}'
+wait_event = '{"id":"state","type":"response","command":"get_state","success":true}'
+wait_timeout_seconds = 10
+
+[env]
+pig = ["PIG_TEST_FAUX=1", "PIG_HOME=testdata/pig-home"]
+pig_extensions = ["testdata/writer-session-start.mjs"]
+pig_args = ["--model", "test-faux/faux-1", "--no-session", "--no-extensions", "--system-prompt", "P.", "--no-context-files", "--no-skills"]
+pi_extensions = ["../../testdata/test-faux-provider.ts", "testdata/writer-session-start.mjs"]
+pi_args = ["--model", "test-faux/faux-1", "--no-session", "--no-extensions", "--system-prompt", "P.", "--no-context-files", "--no-skills"]
+
+[assert]
+json_output_ordered_equal = true
+stderr_equal = true
+exit_code = 0
+runs = 10
+both_contain = ['"customType":"probe-after"', '"name":"after-name"', '"message":"start-notify-startup"', '"message":"start-notify-new"', '"customType":"probe-start","data":{"phase":"startup"}', '"name":"start-name-startup"', '"customType":"probe-start","data":{"phase":"new"}', '"name":"start-name-new"']
+both_not_contain = ['"success":false', 'extension_error']
+
+[[assert.json_aliases]]
+paths = ["/**/id", "/**/parentId", "/**/sessionId"]
+kind = "id"
+group = "runtime"
+pattern = '^[0-9a-f-]{8,36}$'
+reason = "Entry, session and UI request IDs vary per run. A bijection preserves distinct identities and every parent reference; the literal command IDs (after, new, state) do not match the pattern and stay unchanged."
+
+[[assert.json_aliases]]
+paths = ["/**/timestamp"]
+kind = "timestamp"
+reason = "Independent entry wall clocks vary; retain presence, type and valid syntax."

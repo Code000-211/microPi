@@ -1,0 +1,292 @@
+# Packages
+
+A package is a versioned PiG/Pi distribution envelope for resources: extensions, skills, prompts, themes, hooks, MCP definitions, agent environments, and compatible cross-tool agents. Install packages to add capabilities to PiG. Use an independent [piglet](/docs/latest/piglets) to select and scope capabilities into one named agent.
+
+Return to the [docs router](/docs/latest) or read the short [concept model](/docs/latest/concepts).
+
+## What a package may carry
+
+| Resource | Purpose |
+|---|---|
+| Extension | executable capability: tools, commands, hooks, providers, UI |
+| Skill | task instructions |
+| Prompt | reusable prompt/template |
+| Theme | terminal appearance |
+| Hook | event command metadata |
+| MCP definition | external tool-server configuration |
+| Agent environment | standard Dev Container definition and portable local closure |
+| Cross-tool agent | compatible plugin roots may expose agent declarations |
+
+A Package does not author Piglet, Piglet Binary, or Piglet Image manifests.
+
+## Package source layout
+
+Put owned resources directly under the package root:
+
+```text
+base-coding/
+├── package.json
+├── extensions/
+├── skills/
+├── prompts/
+├── themes/
+├── hooks/
+├── mcp/
+└── .devcontainer/
+```
+
+Do not add `resources/` between the package root and those directories. The upstream-compatible `package.json` `pi` block may select explicit members:
+
+```json
+{
+  "name": "@example/base-coding",
+  "version": "1.0.0",
+  "pi": {
+    "extensions": ["extensions/*"],
+    "skills": ["skills/*"],
+    "prompts": ["prompts/*.md"],
+    "themes": ["themes/*.json"]
+  }
+}
+```
+
+PiG-specific membership uses the additive `pig` block without changing Pi's fields. As in Pi, a package with a `pi` block loads only what it declares: its hooks, MCP servers, and agent environments come from the `pig` block, not from conventional directories.
+
+```json
+{
+  "pig": {
+    "hooks": ["hooks/*.json"],
+    "mcpServers": ["mcp/*.json"],
+    "agentEnvironments": [".devcontainer/go/devcontainer.json"]
+  }
+}
+```
+
+## Author and validate
+
+Author Package membership directly in ordinary `package.json`, using the standard `pi` block and optional PiG Resource fields above. Validate without installing:
+
+```bash
+pig package validate ./base-coding
+pig package validate ./base-coding --json
+```
+
+Validation rejects malformed manifests and JSON Resources, missing members, duplicate non-skill public names, lexical or symlink escape, missing Compose services, and absolute or escaping bind mounts.
+
+At startup, duplicate skill names keep the first valid definition and produce a `[Skill warnings]` warning with the selected and skipped paths, as in Pi. Resolved project, user and Package skills precede additional `--skill` paths. Use `--no-skills` to load only explicitly requested skills. Project skills, including ancestor `.agents/skills`, require project trust. A skill entry may name a Markdown file or a directory. Manifest globstars such as `prompts/**/*.md` match files at the root of that directory and at any depth below it. A manifest entry with `*` or `?` is expanded as Node's `fs.globSync` expands it in Pi, so brace sets, extglobs such as `*.@(md|txt)` and POSIX classes work, and on Windows and macOS a wildcard segment ignores case. A manifest glob, override or Package filter that Pi cannot compile drops that resource kind and the later ones from a local Package, and stops startup for an npm or git Package, as in Pi.
+
+Direct Package installation preserves upstream behavior: it records the Package in settings and normal discovery exposes enabled members, defaulting to all unless Package filters narrow them. Installation does not copy Piglets or Agents, merge MCP configuration, create diagnostics, or generate entry points. A Piglet Package dependency resolves through the same materializer without mutating global/project settings; only explicit member selections activate.
+
+## Show a changelog
+
+After a Package update, PiG can show what changed. On the next fresh launch it reads the Package changelog and shows entries newer than the last seen version under "Extension Updates", the way it shows its own changelog. The first time PiG sees a Package, it records the version without showing anything. The last seen versions are stored in the `extensionChangelogVersions` setting.
+
+This applies to Packages that load at least one extension. Packages that only provide skills, prompt templates, or themes do not show a changelog.
+
+By default PiG reads `CHANGELOG.md` from the Package root. Point `pi.changelogPath` at another file inside the Package, or set it to `""` to disable the changelog. A path that leaves the Package root, directly or through a symbolic link, is ignored:
+
+```json
+{
+  "name": "my-pi-package",
+  "version": "1.2.0",
+  "pi": {
+    "changelogPath": "./docs/CHANGELOG.md"
+  }
+}
+```
+
+A `pi` object that holds only metadata such as `changelogPath` does not make the manifest an explicit resource list: the Package's resources are still found by directory auto-discovery. Use version headings in the same format as PiG's changelog, such as `## [1.2.0]` or `## 1.2.0 - 2026-01-01`. Entries are matched against the `version` field in `package.json`, so a git Package only shows a changelog when that field increases. The `collapseChangelog` setting condenses the section to one line per Package.
+
+## Install
+
+```bash
+pig install ./local-package
+pig install git:https://github.com/example/package.git
+pig install 'git:https://github.com/example/monorepo.git@v2#subdirectory=packages%2Freview'
+pig install npm:@example/package
+pig install 'npm:@example/private@1.2.3?registry=https%3A%2F%2Fnpm.example.com%2Fteam'
+```
+
+Use `npm:` for registry sources and `git:` for Git shorthand such as `github.com/user/repo` or `git@github.com:user/repo`. Without a prefix, those spellings are local paths, even when the path does not exist. Explicit HTTPS and SSH URLs do not require `git:`.
+
+PiG parses Git sources as Pi does, with these differences (D110). A `git://host/org/repo` source is a `git://` protocol URL, and an upper-case scheme such as `HTTPS://` works as its lower-case form. Pi turns both into a URL that no Git client can clone. A fragment that starts with `subdirectory=` selects a subdirectory; Pi reads every `#<text>` as a ref.
+
+Ordinary npm libraries, such as `npm:is-number@7.0.0`, install and appear in `pig list` even when they contain no Pi resources. PiG does not import their JavaScript to classify them during installation. A root that statically proves a Go, Rust, or Python extension contract but contributes no Package resources is refused instead (D57); load that extension directly with `pig -e <path>`.
+
+A Git subdirectory selector is `#subdirectory=<URL-escaped-relative-path>`. PiG clones one repository checkout under the canonical Git root, resolves the selected Package root inside it, rejects missing or symlink-escaping selections, and keeps the checkout while another configured Package still uses a sibling subdirectory.
+
+A custom npm registry selector is `?registry=<URL-escaped-absolute-HTTPS-URL>`. PiG gives each registry a distinct managed root and passes the non-secret URL to npm, pnpm, or Bun. Registry URLs with embedded credentials, query strings, or fragments are rejected. Configure tokens and custom CAs through that package manager's normal `.npmrc`, environment, or certificate mechanism; PiG never accepts or writes a registry token.
+
+For user-scoped packages, version metadata lookups run from managed package storage and do not consult the invoking project's `.npmrc` (security divergence D79). Your user configuration and explicit `npmCommand` arguments still apply. Trusted project-scoped packages keep Pi's project `.npmrc` behavior.
+
+PiG chooses npm, pnpm, or Bun flags from the `npmCommand` executable name, or the name after its last `--` separator. It removes only a `.cmd` or `.exe` suffix and preserves case. It does not run a version probe to identify the package manager.
+
+Products may add source schemes through PiG's install-resolver contract. For example, a product-enabled PiG may accept a `marketplace:` source. Raw PiG does not need to know that product's HTTP or authentication protocol.
+
+## Validate without installing
+
+```bash
+pig install ./extension --validate-only --json
+pig install --validate-only --set ./ext-a,./ext-b --json
+```
+
+Validation resolves, builds, starts, and registers the selected extension set without changing package settings. Use it before publishing or before claiming that a piglet's extensions work together.
+
+### Check the configured local Packages
+
+```bash
+pig install --validate-only
+pig install --validate-only --json
+```
+
+With no source, `--validate-only` checks each local-path entry of `packages[]` in your user settings and your trusted project settings. It resolves the entry against its settings directory under the current agent directory, names every entry whose directory does not exist with the path it resolved to and the `pig remove` command that drops it, and exits 1 when any is missing. A session start warns about the same entry; Pi skips a missing local Package without a word (D216). npm and git entries are not checked, because that needs the network.
+
+```json
+{"valid": false, "checked": 2, "missing": [{"source": "/abs/gone", "scope": "user", "path": "/abs/gone", "error": "Path does not exist: /abs/gone", "remove": "pig remove /abs/gone"}]}
+```
+
+`valid` is true when `missing` is empty, `checked` counts the local entries examined, and `missing` is always an array. A project entry's `remove` ends in ` -l`. `path` is omitted when the source does not resolve to a path. With a source or `--set`, the command validates those sources and does not read `packages[]`.
+
+## Scope
+
+Installs are user-scoped by default. `--local` records a workspace dependency in `.pig/settings.json`:
+
+```bash
+pig install ./workspace-extension --local
+```
+
+PiG materializes managed sources once:
+
+| Scope/source | Root |
+|---|---|
+| user npm | `$PIG_CODING_AGENT_DIR/npm` (default `~/.pig/agent/npm`) |
+| user Git | `$PIG_CODING_AGENT_DIR/git` |
+| downloaded catalog bundle | `$PIG_CODING_AGENT_DIR/catalog` |
+| project npm | `<workspace>/.pig/npm` |
+| project Git | `<workspace>/.pig/git` |
+| local path | remains at its authored path |
+
+Plugin and Package records may refer to the same materialized source root; PiG does not duplicate it into separate caches.
+
+## Share a Package
+
+Publish the Package to npm or to a Git host. Other users install it from that source with `pig install npm:<name>` or `pig install git:<url>`. See [Install](#install).
+
+To list a Package on npm, add the keyword `pig-package` and a description to `package.json` and run `npm publish`. `pig package publish [<dir>] --to npm` is optional sugar that validates the Package, checks the fields the catalog reads and that `name@version` is free, shows npm's dry run, and publishes only with `--yes`. The pi-in-go.dev catalog finds packages by npm keyword when its site builds each day. See [Publish a Package or Piglet](/docs/latest/publishing).
+
+## Editors and ACP: pig-acp
+
+`pig install npm:@pi-in-go/pigpen-acp` installs the Package, whose `/acp` command prints the editor settings. It does not install the `pig-acp` executable. An editor that speaks the Agent Client Protocol (Zed, JetBrains) starts `pig-acp`, and `pig-acp` starts `pig --mode rpc` for each session. From PiG 0.8.0 on, each PiG release attaches prebuilt `pig-acp` archives, one per target: `pig-acp-<version>-<os>-<arch>.tar.gz` (`.zip` on Windows) for `linux`, `darwin` and `windows` on `amd64` and `arm64`, each with the `pig` of the same release beside `pig-acp`. Extract an archive into a directory of your choosing; it has no top-level folder. To build `pig-acp` yourself from the source the Package ships (for an earlier PiG, or any other target), one command does it; it has no dependencies and needs Go 1.26 or later (`pig setup go` installs one).
+
+```sh
+pig install npm:@pi-in-go/pigpen-acp
+pig acp install
+pig-acp --version        # pig-acp 0.2.3 (ACP protocol version 1)
+```
+
+`pig acp install` works offline from the installed Package's files, builds with the local Go toolchain, and writes `pig-acp` (`pig-acp.exe` on Windows) next to `pig`: in the directory of `$PIG_BIN`, else `~/.local/bin`. It prints the path, and says so when that directory is not on your `PATH`; use the full path as the editor command then.
+
+Then point the editor at it. In Zed `settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "PiG": {
+      "type": "custom",
+      "command": "pig-acp",
+      "args": ["--pig", "/path/to/pig"],
+      "env": {}
+    }
+  }
+}
+```
+
+`--pig` names the `pig` executable (or a built Piglet Binary) to drive. A relative path with a separator (`./pig`, `bin/pig`) resolves against the directory of `pig-acp`, not the session's working directory; an absolute path is used as is; a bare name (`pig`) is looked up on `PATH`. Without `--pig`, `pig-acp` tries its own override variable (see `pig-acp --help`), then the `pig` beside the `pig-acp` executable, then `pig` on `PATH`. If pig has no model or key yet, the editor shows an authentication error with `pig-acp --terminal-login`, which starts pig in the editor's terminal so you can sign in. Installing the Package or building the `acp` Piglet does not turn a Piglet Binary into an ACP server; the editor always runs `pig-acp`.
+
+## Manage installed Packages
+
+PiG keeps upstream Pi's top-level Package verbs:
+
+```bash
+pig package list
+pig update
+pig update --self
+pig update <source>
+pig update --extension <source>
+pig update --extensions
+pig update --models
+pig update --all
+pig update --force
+pig remove <source>
+pig uninstall <source>
+pig uninstall <source> --local --approve
+```
+
+`uninstall` is an alias for `remove`, including `--local` and help. Both commands remove the Package from the selected settings scope. Removing the last Package retains `"packages": []` in that settings file.
+
+Package commands show `Installing`, `Removing`, or `Updating` before work starts. npm and Git write their own output to the terminal. A failed child command prints its diagnostics before the CLI reports `Error: <command> failed with code <n>` and exits with status 1.
+
+npm updates batch eligible Packages by scope. Git updates reconcile the configured ref and reinstall dependencies when the checkout changes or dependencies are missing. Installing another ref of an already configured Package replaces its source without discarding resource filters. A failed new Git installation removes its incomplete checkout.
+
+Every resource load installs the configured npm and Git Packages that are missing: startup, `/reload`, and each session replacement (`/new`, `/resume`, `/fork`; RPC `new_session`, `switch_session`, `fork`). An npm Package needs an installed manifest version that satisfies its configured pin or range. If installation fails or offline mode prevents it, the old installation does not supply Resources. In the interactive TUI a failed install is listed under [Extension issues] with the end of the command's output, and the rest of the load goes on; during the TUI, git and npm output is not written to the terminal. Package listing still reports the physical installation. A project override with `autoload: false` uses the inherited user Package's installation and version requirement while retaining project Resource metadata.
+
+Bare update, `--self`, and the `self`/`pig` positional targets update PiG. `--extensions` updates installed Packages only; `--all` updates Packages before PiG. `--extension` names one Package and `--force` reinstalls the current PiG release. `--models` forces a model-catalog refresh through the shared model runtime without updating PiG or installed Packages. It cannot be combined with another update target. Conflicting targets fail before either update path starts.
+
+With the global `extensionsAutoUpgrade` setting on, `pig update` also runs the `pig extension upgrade` rules on Go extensions written for an older SDK (see [Extensions](/docs/latest/extensions#upgrade-a-go-extension-written-for-an-older-sdk)).
+
+PiG's own management commands use full-word noun/verb forms such as `pig package list`, and keep upstream-compatible install, remove, and update behavior. Bare `pig list` keeps upstream-compatible Package listing. Use `pig --help` as the authority for the binary you are running.
+
+### Enable or disable one installed Resource
+
+Use Package filters when you no longer want one Resource without removing the whole Package. Package filters apply after manifest selection, so they cannot restore a resource excluded by the manifest. Within a filter, plain patterns select resources, `!pattern` excludes glob matches, `+path` restores an exact path, and `-path` disables an exact path even if it was restored. These groups apply in that order, regardless of their order in the array. An empty filter array disables every resource of that type. A leading `~` in a pattern expands to your home directory, as it does in a plain entry and as in Pi 1.6.0. Pi 1.1.0 matched such a pattern against the literal text (Pi #10765).
+
+```bash
+pig config
+pig config --local
+```
+
+Use `pig config --local` to edit project-scoped overrides. New Package override entries include `autoload: false`. Cycling back to inherit removes an override-only entry but retains an explicitly installed project Package and unrelated resource filters. Empty Package and resource-filter arrays remain empty when settings are saved and reloaded.
+
+The TUI updates settings. It does not update the Package's `package.json`. At startup a declared extension, skill, prompt, or theme that matches nothing is skipped, as Pi skips it, and the rest of the Package loads; `pig config` lists it as missing so you can disable it. `pig package validate` remains strict for publication.
+
+Startup ignores malformed `package.json` JSON and discovers conventional directories instead. A `pi` object loads only its valid resource arrays. A wrong-typed field declares no resources and does not discard valid sibling fields. These manifest cases produce no diagnostic, as in Pi. Explicit installation and publication validation remain strict.
+
+## Toolchains and first use
+
+In a conventional `extensions/` directory, each top-level `.ts` or `.js` file is an independent extension unless a `pi.extensions` manifest or `index.ts`/`index.js` selects directory entries. A `main.ts`, `main.js`, or `extension.ts` filename does not hide sibling extensions. A `package.json` without extension entries does not select the directory by itself.
+
+Installing materializes source. It does not necessarily build every extension immediately. A source extension builds into a content-addressed runtime cell on first use:
+
+| Extension language | Host requirement on first source build |
+|---|---|
+| Go | Go toolchain |
+| Rust | Cargo/Rust toolchain |
+| Python | Python and dependencies |
+| Node/TypeScript | Node runtime and dependencies |
+
+The cache makes later matching loads fast, but the cache path is not a package version or reproducibility identity.
+
+## Hand off a Piglet
+
+To give a Piglet to someone else, distribute its source or a Piglet Binary that you built with `pig piglet build`. Use infrastructure you manage, such as a Git repository or a file share. The recipient installs a source with `pig piglet add`, or runs the Binary directly.
+
+Publish signed Binaries as one GitHub Release with `pig piglet publish <name> --to github --repo <owner/repo> --sign-key <key>`. Publication is a dry run until `--yes` is present. The recipient installs a signed Binary with `pig piglet pull <release-index-url|github:owner/repo@version>`. See [Piglet Binaries](/docs/latest/piglet-binaries#publish-to-github-releases).
+
+Publish a Piglet's source to npm with `pig piglet publish <name> --to npm`; `pig piglet add npm:<name>` installs it. See [Publish a Package or Piglet](/docs/latest/publishing). `pig piglet pull` does not accept an installed Piglet name. See [Piglets](/docs/latest/piglets#planned-not-in-this-release-named-pulls-and-image-artifacts).
+
+## Packages and piglets
+
+| Package | Piglet |
+|---|---|
+| distributes source/Resources | selects/scopes one independent named agent and may build a Binary artifact; Image is reserved |
+| installed and updated as a unit | runs through Host or Binary carrier; Image output is reserved |
+| never owns a Piglet | may reference zero or more Packages plus direct origins |
+| preserves source provenance | records agent defaults and exact component realization/materialization |
+
+Piglets remain independent from Packages. A Piglet release publishes signed Binary facets to GitHub Releases with `pig piglet publish --to github` and its source to npm with `--to npm`. `pig piglet build --format image` is reserved and does not produce an Image.
+
+## Authoring safety
+
+Do not copy every resource from a running session into a new package implicitly. A session may contain third-party resources whose licenses and provenance do not permit rebundling. Package authoring should add explicit resources and preserve their source/version information. Piglet creation from a session is safer because it writes references rather than copying source.
+
+See [upstream Pi's package documentation](https://pi.dev/docs/latest/packages) for the reference implementation.

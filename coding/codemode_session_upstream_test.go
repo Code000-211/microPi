@@ -1,0 +1,810 @@
+//go:build !pig_strip_codemode
+
+package coding
+
+import (
+	"context"
+	"encoding/json"
+	"math"
+	"os"
+	"reflect"
+	"regexp"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/builtin/codemode"
+	"github.com/MichaelKinsy/PiG/internal/pigstrip"
+)
+
+// Ports packages/coding-agent/test/suite/agent-session-codemode.test.ts (Pi 1.0.0, 21 cases: 19 here, and 2 session-free cases plus the session-free half of "declares models only for the session's own codemode tool" in coding/extension/builtin/codemode/session_free_upstream_test.go). The built-in codemode
+// extension is Pi's own code in the Node cell (docs/specs/builtin-codemode-tool-search.md); the Session, the nested-tool
+// pipeline (ctx.executeTool), tool exposure and the settings, classifier and usage plumbing are other families'.
+
+func codemodeCall(code string) scriptedResponse {
+	return boundaryToolReply("codemode", ai.JsonObject{"code": code}, ai.StopReasonToolUse)
+}
+
+func codemodeDone() scriptedResponse { return boundaryReply("done", ai.StopReasonStop, 0) }
+
+// codemodeResult is upstream's getToolResult(harness, "codemode").
+func codemodeResult(t *testing.T, h *codemodeHarness) agent.ToolResultMessage {
+	t.Helper()
+	messages := h.session.Messages()
+	for _, message := range slices.Backward(messages) {
+		if result := message.ToolResult; result != nil && result.ToolName == "codemode" {
+			return *result
+		}
+	}
+	t.Fatal("no codemode tool result")
+	return agent.ToolResultMessage{}
+}
+
+var scriptHeader = regexp.MustCompile(`^Script (completed|failed)\nWall time \d+\.\d seconds\nOutput:\n$`)
+
+// codemodeResultText is upstream's resultText: the output after the script header, which is checked on the way.
+func codemodeResultText(t *testing.T, message agent.ToolResultMessage) string {
+	t.Helper()
+	if len(message.Content) == 0 {
+		t.Fatal("empty tool result")
+	}
+	header, ok := message.Content[0].(ai.TextContent)
+	if !ok || !scriptHeader.MatchString(header.Text) {
+		t.Fatalf("header = %#v", message.Content[0])
+	}
+	var items []string
+	for _, block := range message.Content[1:] {
+		if text, ok := block.(ai.TextContent); ok {
+			items = append(items, text.Text)
+		} else {
+			items = append(items, "<image>")
+		}
+	}
+	return strings.Join(items, "\n")
+}
+
+type codemodeNestedCall struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Args     string   `json:"args"`
+	Status   string   `json:"status"`
+	Error    string   `json:"error"`
+	Cost     *float64 `json:"cost"`
+	Duration *float64 `json:"durationMs"`
+}
+
+type codemodeDetails struct {
+	Calls          []codemodeNestedCall `json:"calls"`
+	FullOutputPath string               `json:"fullOutputPath"`
+}
+
+func codemodeDetailsOf(t *testing.T, message agent.ToolResultMessage) codemodeDetails {
+	t.Helper()
+	raw, err := json.Marshal(message.Details)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var details codemodeDetails
+	if err := json.Unmarshal(raw, &details); err != nil {
+		t.Fatal(err)
+	}
+	return details
+}
+
+func codemodeRun(t *testing.T, h *codemodeHarness, code string) agent.ToolResultMessage {
+	t.Helper()
+	h.provider.mu.Lock()
+	h.provider.responses = append(h.provider.responses, codemodeCall(code), codemodeDone())
+	h.provider.mu.Unlock()
+	boundaryPrompt(t, h.recoveryHarness, "go")
+	return codemodeResult(t, h)
+}
+
+func codemodeUsage(input int, cost float64) ai.Usage {
+	return ai.Usage{Input: input, TotalTokens: input, Cost: ai.UsageCost{Input: cost, Total: cost}}
+}
+
+func TestUpstreamCodemodeOptionsAndStore(t *testing.T) {
+	// No tools override: the session builds its own codemode tool, including the store writer.
+	setup := func(t *testing.T) *codemodeHarness {
+		t.Helper()
+		return newCodemodeHarness(t, codemodeHarnessOptions{activeTools: []string{"codemode"}})
+	}
+	storeEntries := func(t *testing.T, h *codemodeHarness) []any {
+		t.Helper()
+		var out []any
+		for _, entry := range h.session.Inner().GetBranch() {
+			var fields struct {
+				Type       string `json:"type"`
+				CustomType string `json:"customType"`
+				Data       any    `json:"data"`
+			}
+			if err := json.Unmarshal(entry.Raw(), &fields); err != nil {
+				t.Fatal(err)
+			}
+			if fields.Type == "custom" && fields.CustomType == "codemode-store" {
+				out = append(out, fields.Data)
+			}
+		}
+		return out
+	}
+	const increment = "const next = (load(\"count\") ?? 0) + 1;\nstore(\"count\", next);\nreturn next;"
+
+	t.Run("applies the timeout_ms option and rejects invalid options", func(t *testing.T) {
+		h := setup(t)
+		timedOut := codemodeRun(t, h, "// @options: {\"timeout_ms\": 200}\nwhile (true) {}")
+		if !timedOut.IsError || !strings.Contains(codemodeResultText(t, timedOut), "Script error:\nScript timed out") {
+			t.Errorf("timed out result = %#v", timedOut)
+		}
+		invalid := codemodeRun(t, h, "// @options: {\"yield\": 1}\ntext(1)")
+		want := []ai.ToolResultMessageContent{ai.TextContent{Text: "@options only supports `max_output_tokens` and `timeout_ms`; got `yield`"}}
+		if !invalid.IsError || !reflect.DeepEqual(invalid.Content, want) {
+			t.Errorf("invalid options result = %#v", invalid)
+		}
+		// Pi #10631: a misplaced options line fails before the script runs instead of running without a deadline.
+		misplaced := codemodeRun(t, h, "// count\n// @options: {\"timeout_ms\": 200}\nwhile (true) {}")
+		wantMisplaced := []ai.ToolResultMessageContent{ai.TextContent{Text: "The // @options: line must be the first line of the input; found one on line 2"}}
+		if !misplaced.IsError || !reflect.DeepEqual(misplaced.Content, wantMisplaced) {
+			t.Errorf("misplaced options result = %#v", misplaced)
+		}
+	})
+
+	t.Run("limits script memory so runaway allocations fail inside the script", func(t *testing.T) {
+		h := setup(t)
+		result := codemodeRun(t, h, "// @options: {\"timeout_ms\": 30000}\nlet a = [];\ntry { while (true) a.push(\"x\".repeat(1 << 20) + a.length); } catch (error) { const n = a.length; a = null; return { n, error: String(error) }; }")
+		if result.IsError {
+			t.Fatalf("isError: %s", codemodeResultText(t, result))
+		}
+		var value struct {
+			N     int    `json:"n"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(codemodeResultText(t, result)), &value); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(value.Error, "out of memory") {
+			t.Errorf("error = %q", value.Error)
+		}
+		// Each entry holds at least 1 MiB, so the limit stops the script well before wasm32's 4 GiB.
+		if value.N >= 512 {
+			t.Errorf("n = %d, want fewer than 512", value.N)
+		}
+	})
+
+	t.Run("truncates output to the token budget and spills the full text", func(t *testing.T) {
+		h := setup(t)
+		result := codemodeRun(t, h, "// @options: {\"max_output_tokens\": 30}\nfor (let i = 0; i < 100; i++) text(\"row \" + i);\nimage(\"data:image/png;base64,"+tinyPNGBase64+"\");")
+		path := codemodeDetailsOf(t, result).FullOutputPath
+		if path == "" {
+			t.Fatal("No spill file")
+		}
+		defer os.Remove(path)
+		text := codemodeResultText(t, result)
+		if !strings.HasPrefix(text, "Warning: truncated output") {
+			t.Errorf("text = %.60q", text)
+		}
+		for _, want := range []string{"row 0\n", "tokens truncated", "row 99\n", "[Full output: " + path + " (read with offset/limit)]"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("text lacks %q", want)
+			}
+		}
+		if strings.Contains(text, "row 50\n") {
+			t.Error("text keeps row 50")
+		}
+		// Images follow the truncated text, each after the path it was saved to.
+		if got := checkSavedImages(t, strings.Split(text, "\n")[len(strings.Split(text, "\n"))-2]); got != "<saved>" {
+			t.Errorf("label before the image = %q", got)
+		}
+		if last, ok := result.Content[len(result.Content)-1].(ai.ImageContent); !ok || last.Data != tinyPNGBase64 || last.MimeType != "image/png" {
+			t.Errorf("last block = %#v", result.Content[len(result.Content)-1])
+		}
+		if runtime.GOOS != "windows" {
+			if info, err := os.Stat(path); err != nil || info.Mode().Perm()&0o077 != 0 {
+				t.Errorf("spill file %s: %v, %v, want user-only", path, info, err)
+			}
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var want []string
+		for i := range 100 {
+			want = append(want, "==> text "+strconv.Itoa(i+1)+"/100 <==\nrow "+strconv.Itoa(i))
+		}
+		if string(data) != strings.Join(want, "\n") {
+			t.Errorf("spill file = %.80q", data)
+		}
+
+		// execute.ts joins adjacent text items before truncation (v1.1.0), so a text item that ends in a newline adds none.
+		trailing := codemodeRun(t, h, "// @options: {\"max_output_tokens\": 1}\ntext(\"first line\\n\");\ntext(\"second line\");")
+		trailingPath := codemodeDetailsOf(t, trailing).FullOutputPath
+		if trailingPath == "" {
+			t.Fatal("no spill file for the trailing-newline output")
+		}
+		defer os.Remove(trailingPath)
+		if data, err := os.ReadFile(trailingPath); err != nil || string(data) != "==> text 1/2 <==\nfirst line\n==> text 2/2 <==\nsecond line" {
+			t.Errorf("spill file = %q, %v", data, err)
+		}
+
+		small := codemodeRun(t, h, "return { ok: true };")
+		if got := codemodeDetailsOf(t, small).FullOutputPath; got != "" {
+			t.Errorf("fullOutputPath = %q for a small result", got)
+		}
+	})
+
+	// Pi 1.2.0 #10678: joining the text items was quadratic, about 10 s here for the item limit. Pi bounds the run's wall time (5 s), which
+	// measures the machine as much as the formatting; this bounds the work instead. After a warm-up run (the first run also pays one-time
+	// setup), the heap bytes a run allocates for its second 50,000 items stay within twice those of its first 50,000 (linear work gives a
+	// ratio near 1; a join that copies the growing text on every item gives about 3).
+	t.Run("formats output at the item limit in linear time", func(t *testing.T) {
+		h := setup(t)
+		run := func(items int) (agent.ToolResultMessage, uint64) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			result := codemodeRun(t, h, "for (let i = 0; i < "+strconv.Itoa(items)+"; i++) text(\"\");")
+			runtime.ReadMemStats(&after)
+			if path := codemodeDetailsOf(t, result).FullOutputPath; path != "" {
+				_ = os.Remove(path)
+			}
+			return result, after.TotalAlloc - before.TotalAlloc
+		}
+		run(0)
+		_, none := run(0)
+		_, half := run(50000)
+		result, full := run(100000)
+		if result.IsError {
+			t.Errorf("isError: %.200s", codemodeResultText(t, result))
+		}
+		if text := codemodeResultText(t, result); !strings.Contains(text, "==> text 100000/100000 <==") {
+			t.Errorf("text lacks the last item header: %.200q", text)
+		}
+		first, second := float64(half)-float64(none), float64(full)-float64(half)
+		t.Logf("heap bytes allocated: 0 items %d, 50,000 items %d, 100,000 items %d", none, half, full)
+		if first <= 0 || second > 2*first {
+			t.Errorf("the second 50,000 items allocated %.0f bytes, the first %.0f: the formatting is not linear", second, first)
+		}
+	})
+
+	t.Run("resolves bash calls to structured results, also for non-zero exit codes", func(t *testing.T) {
+		h := newCodemodeHarness(t, codemodeHarnessOptions{activeTools: []string{"codemode", "bash"}})
+		result := codemodeRun(t, h, "const r = await tools.bash({ command: \"echo out; exit 3\" });\ntext(JSON.stringify([r.output, r.exit_code, typeof r.wall_time_seconds]));")
+		if result.IsError {
+			t.Fatalf("isError: %s", codemodeResultText(t, result))
+		}
+		if got, want := codemodeResultText(t, result), `["out\n",3,"number"]`; got != want {
+			t.Errorf("result = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("persists store() writes as custom entries for later calls", func(t *testing.T) {
+		h := setup(t)
+		if got := codemodeResultText(t, codemodeRun(t, h, increment)); got != "1" {
+			t.Errorf("first run = %q", got)
+		}
+		if got := codemodeResultText(t, codemodeRun(t, h, increment)); got != "2" {
+			t.Errorf("second run = %q", got)
+		}
+		want := []any{
+			map[string]any{"set": map[string]any{"count": float64(1)}, "delete": []any{}},
+			map[string]any{"set": map[string]any{"count": float64(2)}, "delete": []any{}},
+		}
+		if got := storeEntries(t, h); !reflect.DeepEqual(got, want) {
+			t.Errorf("store entries = %v, want %v", got, want)
+		}
+		appended := 0
+		for _, event := range h.settle(t) {
+			if entry, ok := event.(agent.EntryAppendedEvent); ok {
+				var fields struct {
+					Type       string `json:"type"`
+					CustomType string `json:"customType"`
+				}
+				if err := json.Unmarshal(entry.Entry, &fields); err != nil {
+					t.Fatal(err)
+				}
+				if fields.Type == "custom" && fields.CustomType == "codemode-store" {
+					appended++
+				}
+			}
+		}
+		if appended != 2 {
+			t.Errorf("entry_appended custom codemode-store events = %d, want 2", appended)
+		}
+
+		if got := codemodeResultText(t, codemodeRun(t, h, "store(\"count\", undefined);\nreturn load(\"count\") === undefined;")); got != "true" {
+			t.Errorf("delete run = %q", got)
+		}
+		entries := storeEntries(t, h)
+		if last := entries[len(entries)-1]; !reflect.DeepEqual(last, map[string]any{"set": map[string]any{}, "delete": []any{"count"}}) {
+			t.Errorf("last store entry = %v", last)
+		}
+	})
+
+	t.Run("appends nothing for failed scripts or scripts without writes", func(t *testing.T) {
+		h := setup(t)
+		if !codemodeRun(t, h, "store(\"count\", 5);\nthrow new Error(\"boom\");").IsError {
+			t.Error("failed script is not an error result")
+		}
+		if codemodeRun(t, h, "return load(\"count\") ?? \"missing\";").IsError {
+			t.Error("read-only script is an error result")
+		}
+		if got := storeEntries(t, h); len(got) != 0 {
+			t.Errorf("store entries = %v, want none", got)
+		}
+	})
+
+	t.Run("loads the values written on the current branch", func(t *testing.T) {
+		h := setup(t)
+		codemodeRun(t, h, increment)
+		var firstPrompt string
+		for _, entry := range h.session.Inner().GetBranch() {
+			if entry.Base().Type == "message" {
+				firstPrompt = entry.Base().ID
+				break
+			}
+		}
+		if firstPrompt == "" {
+			t.Fatal("No first prompt entry")
+		}
+		if got := codemodeResultText(t, codemodeRun(t, h, increment)); got != "2" {
+			t.Errorf("second run = %q", got)
+		}
+
+		// Branch from the first prompt: the store entries written after it are on another path.
+		// upstream: harness.sessionManager.branch(firstPrompt.id) moves the leaf (session-manager.ts:1579-1584); Go's Branch only reads the path.
+		if err := h.session.Inner().SetLeafID(&firstPrompt); err != nil {
+			t.Fatal(err)
+		}
+		if got := codemodeResultText(t, codemodeRun(t, h, increment)); got != "1" {
+			t.Errorf("branched run = %q", got)
+		}
+	})
+
+}
+
+// setupWithImages is the "codemode models" setup (agent-session-codemode.test.ts:580-649, v1.0.0): a Session with the
+// built-in codemode extension and the scorer provider's classifier and image models.
+func setupWithImages(t *testing.T) (*codemodeHarness, func() []classifierCall, func() int, func() []imagesCall) {
+	t.Helper()
+	h := newCodemodeHarness(t, codemodeHarnessOptions{activeTools: []string{"codemode"}})
+	observed, maxActive, imageRequests := h.registerScorerProvider(t)
+	h.session.SetActiveToolsByName([]string{"codemode"})
+	return h, observed, maxActive, imageRequests
+}
+
+func TestUpstreamCodemodeModels(t *testing.T) {
+	const questions = `{ approved: { type: "bool", instructions: "Approval?", criteria: { true: "yes", false: "no" } } }`
+	setup := func(t *testing.T) (*codemodeHarness, func() []classifierCall, func() int) {
+		t.Helper()
+		h, observed, maxActive, _ := setupWithImages(t)
+		return h, observed, maxActive
+	}
+
+	t.Run("declares models only for the session's own codemode tool", func(t *testing.T) {
+		h, _, _ := setup(t)
+		var description string
+		for _, tool := range h.session.Tools() {
+			if tool.Name() == "codemode" {
+				description = tool.Schema().Description
+			}
+		}
+		// The description names the models globals and points to the docs for the API.
+		if !strings.Contains(description, "`models`: classifiers and image generation") {
+			t.Errorf("description lacks the models global: %q", description)
+		}
+		// upstream CODEMODE_DOCS_PATH is join(getDocsPath(), "codemode.md"), never empty; an empty path would make the
+		// containment check below pass vacuously.
+		// pig additive (D92): a build that strips docs writes no page, so no text points at one.
+		if docs := codemode.DocsPath(); pigstrip.Has(pigstrip.ListFeatures, pigstrip.Docs) {
+			if docs != "" || strings.Contains(description, "codemode.md") {
+				t.Errorf("a build without docs names the codemode docs path %q: %q", docs, description)
+			}
+		} else if docs == "" || !strings.Contains(description, docs) {
+			t.Errorf("description lacks the codemode docs path %q: %q", docs, description)
+		}
+
+		// upstream: createHarness({ tools: [createCodemodeTool() as AgentTool] }): a codemode tool created without model
+		// access, with no built-in codemode extension.
+		plainDefinition := codemode.Definition(codemode.Options{})
+		plainExtension := extension.Extension{Name: "plain-codemode", Path: "<inline:plain-codemode>", ResolvedPath: "<inline:plain-codemode>",
+			Tools: map[string]extension.RegisteredTool{plainDefinition.Name: {Definition: plainDefinition}}, ToolOrder: []string{plainDefinition.Name}}
+		overridden := newCodemodeHarness(t, codemodeHarnessOptions{noExtension: true, goExtensions: []extension.Extension{plainExtension}})
+		var plain string
+		found := false
+		for _, tool := range overridden.session.Tools() {
+			if tool.Name() == "codemode" {
+				plain, found = tool.Schema().Description, true
+			}
+		}
+		if !found {
+			t.Fatal("the overridden harness has no codemode tool")
+		}
+		if strings.Contains(plain, "`models`") {
+			t.Errorf("a codemode tool created without model access names `models`: %q", plain)
+		}
+	})
+
+	t.Run("lists models and classifies with catalog auth, ignoring script-supplied fields", func(t *testing.T) {
+		h, observed, maxActive := setup(t)
+		// Pi's limiter admits four calls at once: the six classifications must fill the first wave of four before any completes.
+		h.classifierFirstWave.Store(4)
+		result := codemodeRun(t, h, `
+			const [model] = await models.getAvailableOfType("classifier", "scorer");
+			const listed = await models.getModelsOfType("classifier");
+			const same = await models.getModelOfType("classifier", "scorer", "judge");
+			const texts = ["good", "bad", "good", "bad", "good", "bad"];
+			const results = await Promise.all(
+				texts.map((text) => models.classify({ ...model, baseUrl: "https://evil.test" }, { state: { text }, questions: `+questions+` })),
+			);
+			return {
+				id: model.id,
+				headers: "headers" in model,
+				listed: listed.some((entry) => entry.provider === "scorer" && entry.id === "judge"),
+				same: same.id,
+				missing: (await models.getModelOfType("classifier", "scorer", "nope")) === undefined,
+				probabilities: results.map((r) => r.answers.approved.probability),
+				cost: results[0].usage.cost.total,
+			};
+		`)
+		if result.IsError {
+			t.Fatalf("isError: %s", codemodeResultText(t, result))
+		}
+		var value map[string]any
+		if err := json.Unmarshal([]byte(codemodeResultText(t, result)), &value); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{
+			"id": "judge", "headers": false, "listed": true, "same": "judge", "missing": true,
+			"probabilities": []any{0.9, 0.1, 0.9, 0.1, 0.9, 0.1}, "cost": 0.001,
+		}
+		if !reflect.DeepEqual(value, want) {
+			t.Errorf("value = %v, want %v", value, want)
+		}
+		calls := observed()
+		if len(calls) != 6 {
+			t.Fatalf("classifier calls = %d, want 6", len(calls))
+		}
+		for _, call := range calls {
+			if call.BaseURL != "https://classifier.test/v1" || call.APIKey != "secret-key" {
+				t.Errorf("call = %+v, want the catalog base URL and key", call)
+			}
+		}
+		// Six classifications with at most four in flight.
+		if got := maxActive(); got != 4 {
+			t.Errorf("max concurrent classifications = %d, want 4", got)
+		}
+		details := codemodeDetailsOf(t, result)
+		if len(details.Calls) != 6 {
+			t.Fatalf("nested calls = %d, want 6", len(details.Calls))
+		}
+		for _, call := range details.Calls {
+			if call.Name != "models.classify" || call.Args != "scorer/judge" || call.Status != "ok" || call.Cost == nil || *call.Cost != 0.001 {
+				t.Errorf("nested call = %+v", call)
+			}
+		}
+		// The classifications' usage becomes the codemode result's usage.
+		if result.Usage == nil || result.Usage.Input != 1800 || math.Abs(result.Usage.Cost.Total-0.006) > 1e-10 {
+			t.Errorf("usage = %+v, want input 1800, cost 0.006", result.Usage)
+		}
+		if got := h.session.GetSessionStats().Cost; math.Abs(got-0.006) > 1e-10 {
+			t.Errorf("session cost = %v, want 0.006", got)
+		}
+	})
+
+	t.Run("generates images with catalog auth and attaches them through image()", func(t *testing.T) {
+		h, _, _, imageRequests := setupWithImages(t)
+		result := codemodeRun(t, h, `
+			const [model] = await models.getAvailableOfType("image", "scorer");
+			const reference = { type: "image", data: "`+tinyPNGBase64+`", mimeType: "image/png" };
+			const generated = await models.generateImages(
+				{ ...model, baseUrl: "https://evil.test" },
+				{ input: [{ type: "text", text: "a fox" }, reference] },
+			);
+			for (const block of generated.output) {
+				if (block.type === "image") image(block);
+				else text(block.text);
+			}
+			const failed = await models.generateImages(model, { input: [{ type: "text", text: "explode" }] });
+			const attempt = async (fn) => { try { await fn(); return "ok"; } catch (error) { return error.message; } };
+			return {
+				id: model.id,
+				stopReason: generated.stopReason,
+				failed: [failed.stopReason, failed.errorMessage],
+				wrongType: await attempt(() => models.generateImages({ provider: "scorer", id: "judge" }, { input: [] })),
+			};
+		`)
+		if result.IsError {
+			t.Errorf("isError: %s", codemodeResultText(t, result))
+		}
+		lines := strings.Split(checkSavedImages(t, codemodeResultText(t, result)), "\n")
+		if lines[0] != "==> text 1/2 <==" || lines[1] != "painted a fox" {
+			t.Errorf("text = %q, want the header and %q", lines[:2], "painted a fox")
+		}
+		if len(lines) < 5 || lines[2] != "<saved>" || lines[3] != "<image>" || lines[4] != "==> text 2/2 <==" {
+			t.Fatalf("result lines = %q, want the text, then <saved>, <image>, then the returned value", lines)
+		}
+		var value map[string]any
+		if err := json.Unmarshal([]byte(strings.Join(lines[5:], "\n")), &value); err != nil {
+			t.Fatalf("returned value %q: %v", strings.Join(lines[5:], "\n"), err)
+		}
+		want := map[string]any{
+			"id":         "painter",
+			"stopReason": "stop",
+			"failed":     []any{"error", "painter exploded"},
+			"wrongType":  `"scorer/judge" is a classifier model, not an image model. List the image models you can use with models.getAvailableOfType("image").`,
+		}
+		if !reflect.DeepEqual(value, want) {
+			t.Errorf("value = %v, want %v", value, want)
+		}
+		if len(result.Content) < 3 || !reflect.DeepEqual(result.Content[2], ai.ToolResultMessageContent(ai.ImageContent{Data: tinyPNGBase64, MimeType: "image/png"})) {
+			t.Errorf("content = %#v, want the generated image at index 2", result.Content)
+		}
+		requests := imageRequests()
+		var pairs [][2]string
+		for _, request := range requests {
+			pairs = append(pairs, [2]string{request.BaseURL, request.APIKey})
+		}
+		if want := [][2]string{{"https://images.test/v1", "secret-key"}, {"https://images.test/v1", "secret-key"}}; !reflect.DeepEqual(pairs, want) {
+			t.Errorf("image requests = %v, want %v", pairs, want)
+		}
+		if len(requests) > 0 {
+			want := []ai.ContentBlock{ai.TextContent{Text: "a fox"}, ai.ImageContent{Data: tinyPNGBase64, MimeType: "image/png"}}
+			if !reflect.DeepEqual(requests[0].Input, want) {
+				t.Errorf("first request input = %#v, want %#v", requests[0].Input, want)
+			}
+		}
+		type row struct {
+			Name, Args, Status string
+			Cost               *float64
+			Error              string
+		}
+		var rows []row
+		for _, call := range codemodeDetailsOf(t, result).Calls {
+			rows = append(rows, row{call.Name, call.Args, call.Status, call.Cost, call.Error})
+		}
+		cost := 0.04
+		if want := []row{
+			{"models.generateImages", "scorer/painter", "ok", &cost, ""},
+			{"models.generateImages", "scorer/painter", "error", nil, "painter exploded"},
+		}; !reflect.DeepEqual(rows, want) {
+			t.Errorf("calls = %+v, want %+v", rows, want)
+		}
+		if result.Usage == nil || math.Abs(result.Usage.Cost.Total-0.04) > 1e-10 {
+			t.Errorf("usage = %+v, want cost 0.04", result.Usage)
+		}
+		if got := h.session.GetSessionStats().Cost; math.Abs(got-0.04) > 1e-10 {
+			t.Errorf("session cost = %v, want 0.04", got)
+		}
+	})
+
+	t.Run("notes generated images that the script did not show", func(t *testing.T) {
+		h, _, _ := setup(t)
+		result := codemodeRun(t, h, `
+			const [model] = await models.getAvailableOfType("image", "scorer");
+			const generated = await models.generateImages(model, { input: [{ type: "text", text: "a fox" }] });
+			return generated.stopReason;
+		`)
+		if result.IsError {
+			t.Errorf("isError: %s", codemodeResultText(t, result))
+		}
+		if got, want := codemodeResultText(t, result), "stop\nNote: models.generateImages() returned 1 image that the script did not show. Show each image block of result.output with image(block)."; got != want {
+			t.Errorf("result = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("reports provider errors as results and invalid arguments as exceptions", func(t *testing.T) {
+		h, _, _ := setup(t)
+		result := codemodeRun(t, h, `
+			const model = await models.getModelOfType("classifier", "scorer", "judge");
+			const failed = await models.classify(model, { state: { text: "explode" }, questions: `+questions+` });
+			const textOnly = await models.classify(model, {
+				state: { text: "good" },
+				images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+				questions: `+questions+`,
+			});
+			const attempt = async (fn) => { try { await fn(); return "ok"; } catch (error) { return error.message; } };
+			return {
+				failed: [failed.stopReason, failed.errorMessage],
+				textOnly: [textOnly.stopReason, textOnly.errorMessage],
+				badClassifierImage: await attempt(() =>
+					models.classify(model, { state: {}, images: [{ data: "aW1hZ2U=" }], questions: `+questions+` }),
+				),
+				badType: await attempt(() => models.getModelsOfType("video")),
+				unknown: await attempt(() => models.classify({ provider: "scorer", id: "nope" }, {})),
+				noModel: await attempt(() => models.classify("judge", {})),
+				undefinedModel: await attempt(() => models.classify(undefined, {})),
+				noState: await attempt(() => models.classify(model, { questions: `+questions+` })),
+				badQuestion: await attempt(() =>
+					models.classify(model, { state: {}, questions: { kind: { type: "choice", instructions: "Kind?", criteria: ["a", "b"] } } }),
+				),
+				badImage: await attempt(() => models.generateImages({ provider: "scorer", id: "painter" }, { prompt: "a fox" })),
+				arrayModel: await attempt(() => models.classify(["scorer", "judge"], {})),
+				arrayContext: await attempt(() => models.classify(model, [])),
+				arrayState: await attempt(() => models.classify(model, { state: [], questions: `+questions+` })),
+				arrayQuestions: await attempt(() => models.classify(model, { state: {}, questions: [] })),
+				arrayQuestion: await attempt(() => models.classify(model, { state: {}, questions: { kind: [] } })),
+				noInstructions: await attempt(() =>
+					models.classify(model, { state: {}, questions: { kind: { type: "bool", criteria: { true: "y", false: "n" } } } }),
+				),
+				badBool: await attempt(() =>
+					models.classify(model, { state: {}, questions: { kind: { type: "bool", instructions: "Ok?", criteria: ["y", "n"] } } }),
+				),
+				badKind: await attempt(() =>
+					models.classify(model, { state: {}, questions: { kind: { type: "rank", instructions: "Rank?" } } }),
+				),
+				arrayImagesContext: await attempt(() => models.generateImages({ provider: "scorer", id: "painter" }, [])),
+				badImageBlock: await attempt(() =>
+					models.generateImages({ provider: "scorer", id: "painter" }, { input: [{ type: "text", text: "a fox" }, { type: "image", data: "aW1hZ2U=" }] }),
+				),
+				badSplit: await attempt(() => models.getModelOfType("classifier", "scorer/judge")),
+			};
+		`)
+		if result.IsError {
+			t.Fatalf("isError: %s", codemodeResultText(t, result))
+		}
+		var value struct {
+			Failed             []string `json:"failed"`
+			TextOnly           []string `json:"textOnly"`
+			BadClassifierImage string   `json:"badClassifierImage"`
+			BadType            string   `json:"badType"`
+			Unknown            string   `json:"unknown"`
+			NoModel            string   `json:"noModel"`
+			UndefinedModel     string   `json:"undefinedModel"`
+			NoState            string   `json:"noState"`
+			BadQuestion        string   `json:"badQuestion"`
+			BadImage           string   `json:"badImage"`
+			BadSplit           string   `json:"badSplit"`
+			// Pi 1.2.0 cases (the isRecord checks replaced by explicit object/array checks).
+			ArrayModel         string `json:"arrayModel"`
+			ArrayContext       string `json:"arrayContext"`
+			ArrayState         string `json:"arrayState"`
+			ArrayQuestions     string `json:"arrayQuestions"`
+			ArrayQuestion      string `json:"arrayQuestion"`
+			NoInstructions     string `json:"noInstructions"`
+			BadBool            string `json:"badBool"`
+			BadKind            string `json:"badKind"`
+			ArrayImagesContext string `json:"arrayImagesContext"`
+			BadImageBlock      string `json:"badImageBlock"`
+		}
+		if err := json.Unmarshal([]byte(codemodeResultText(t, result)), &value); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(value.Failed, []string{"error", "classifier exploded"}) {
+			t.Errorf("failed = %v", value.Failed)
+		}
+		if !reflect.DeepEqual(value.TextOnly, []string{"error", "Model scorer/judge does not accept image input"}) {
+			t.Errorf("textOnly = %v", value.TextOnly)
+		}
+		if want := "models.classify() context.images[0] must be an image block, got { data }."; !strings.Contains(value.BadClassifierImage, want) {
+			t.Errorf("badClassifierImage = %q, want it to contain %q", value.BadClassifierImage, want)
+		}
+		if !strings.Contains(value.BadType, `Unknown model type "video"`) {
+			t.Errorf("badType = %q", value.BadType)
+		}
+		if want := `Unknown classifier model "scorer/nope". List the classifier models you can use with models.getAvailableOfType("classifier").`; value.Unknown != want {
+			t.Errorf("unknown = %q, want %q", value.Unknown, want)
+		}
+		for _, check := range []struct{ name, got, want string }{
+			{"noModel", value.NoModel, "models.classify() expects a classifier model as its first argument, got a string."},
+			{"undefinedModel", value.UndefinedModel, "models.getModelOfType() returns undefined for an unknown provider or id."},
+			{"noState", value.NoState, "models.classify() context.state must be an object, got undefined."},
+			{"badQuestion", value.BadQuestion, `context.questions.kind is a "choice" question, so criteria must map each label to its meaning.`},
+			{"badImage", value.BadImage, "models.generateImages() context.input must be a non-empty array of blocks, got undefined."},
+			{"badSplit", value.BadSplit, "The provider and the id are separate arguments"},
+			{"arrayModel", value.ArrayModel, "models.classify() expects a classifier model as its first argument, got an array."},
+			{"arrayContext", value.ArrayContext, "models.classify() expects a context object as its second argument, got an empty array."},
+			{"arrayState", value.ArrayState, "models.classify() context.state must be an object, got an empty array."},
+			{"arrayQuestions", value.ArrayQuestions, "models.classify() context.questions must map question IDs to questions, got an empty array."},
+			{"arrayQuestion", value.ArrayQuestion, "models.classify() context.questions.kind must be a question object, got an empty array."},
+			{"noInstructions", value.NoInstructions, "models.classify() context.questions.kind.instructions must be a string."},
+			{"badBool", value.BadBool, `context.questions.kind is a "bool" question, so criteria must be { true: string, false: string }.`},
+			{"badKind", value.BadKind, `context.questions.kind.type must be "choice", "score", or "bool", got "rank".`},
+			{"arrayImagesContext", value.ArrayImagesContext, "models.generateImages() expects a context object as its second argument, got an empty array."},
+			{"badImageBlock", value.BadImageBlock, "models.generateImages() context.input[1] must be a text or image block, got { type, data }."},
+		} {
+			if !strings.Contains(check.got, check.want) {
+				t.Errorf("%s = %q, want it to contain %q", check.name, check.got, check.want)
+			}
+		}
+		// The error points at the docs page; a build that strips docs writes none and names none.
+		if stripped := pigstrip.Has(pigstrip.ListFeatures, pigstrip.Docs); strings.Contains(value.NoState, "codemode.md") == stripped {
+			t.Errorf("noState = %q, docs stripped = %v", value.NoState, stripped)
+		}
+		calls := codemodeDetailsOf(t, result).Calls
+		if len(calls) != 2 || calls[0].Name != "models.classify" || calls[0].Status != "error" || calls[0].Error != "classifier exploded" ||
+			calls[1].Name != "models.classify" || calls[1].Status != "error" || calls[1].Error != "Model scorer/judge does not accept image input" {
+			t.Errorf("nested calls = %+v", calls)
+		}
+		if result.Usage != nil {
+			t.Errorf("usage = %+v, want none", result.Usage)
+		}
+	})
+}
+
+// Ports .upstream/current/packages/coding-agent/test/suite/agent-session-codemode.test.ts "summarizes union and multi-line output
+// types instead of inlining them" (Pi f6ee9ce9, #11501).
+func TestUpstreamAgentSessionCodemodeSummarizesUnionAndMultiLineOutputTypes(t *testing.T) {
+	outputTool := func(name, outputSchema string) extension.RegisteredTool {
+		return extension.RegisteredTool{Definition: extension.ToolDefinition{
+			Name: name, Label: name, Description: name + " tool",
+			Parameters:   json.RawMessage(`{"type":"object","properties":{}}`),
+			OutputSchema: json.RawMessage(outputSchema),
+			Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+				return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{}, Details: map[string]any{}}, nil
+			},
+		}}
+	}
+	process := outputTool("process", `{"anyOf":[`+
+		`{"type":"object","properties":{"action":{"const":"start","type":"string"},"process":{"type":"object","properties":{"id":{"description":"Process id","type":"string"},"pid":{"type":"integer"}},"required":["id","pid"]}},"required":["action","process"]},`+
+		`{"type":"object","properties":{"action":{"const":"list","type":"string"},"processes":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},"truncated":{"type":"boolean"}},"required":["action","processes"]}]}`)
+	entries := outputTool("entries", `{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"size":{"type":"integer"}},"required":["id","size"]}}`)
+	count := outputTool("count", `{"type":"number"}`)
+	h := newCodemodeHarness(t, codemodeHarnessOptions{goExtensions: []extension.Extension{{
+		Name: "outputs", Path: "<inline:outputs>", ResolvedPath: "<inline:outputs>",
+		Tools:     map[string]extension.RegisteredTool{"process": process, "entries": entries, "count": count},
+		ToolOrder: []string{"process", "entries", "count"},
+	}}, activeTools: []string{"codemode"}})
+	h.session.SetActiveToolsByName([]string{"process", "entries", "count", "codemode"})
+	description := func(name string) string {
+		for _, tool := range h.session.Tools() {
+			if tool.Name() == name {
+				return tool.Schema().Description
+			}
+		}
+		return ""
+	}
+	for name, want := range map[string]string{
+		"process": "process tool\n\nCodemode: `tools.process(args)` resolves to `{ action: \"start\", process } | { action: \"list\", processes, truncated? }`.",
+		"entries": "entries tool\n\nCodemode: `tools.entries(args)` resolves to a value; `await describeTool(\"entries\")` shows its type.",
+		"count":   "count tool\n\nCodemode: `tools.count(args)` resolves to `number`.",
+	} {
+		if got := description(name); got != want {
+			t.Errorf("description(%s) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// Ports .upstream/v1.5.0+c23b9ec1/packages/coding-agent/test/suite/agent-session-codemode.test.ts "summarizes output fields behind local
+// schema references" (Pi 6d3e342b2, #11803): the session-level tool description, not only describeOutput, follows local `$ref`s through
+// the root, a field, a const and the variants of a union.
+func TestUpstreamAgentSessionCodemodeSummarizesOutputFieldsBehindLocalSchemaReferences(t *testing.T) {
+	outputTool := func(name, outputSchema string) extension.RegisteredTool {
+		return extension.RegisteredTool{Definition: extension.ToolDefinition{
+			Name: name, Label: name, Description: name + " tool",
+			Parameters:   json.RawMessage(`{"type":"object","properties":{}}`),
+			OutputSchema: json.RawMessage(outputSchema),
+			Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+				return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{}, Details: map[string]any{}}, nil
+			},
+		}}
+	}
+	report := outputTool("report", `{"$ref":"#/$defs/Report","$defs":{"Report":{"type":"object","properties":{"kind":{"$ref":"#/$defs/Kind"},"summary":{"$ref":"#/$defs/Summary"}},"required":["kind","summary"]},"Kind":{"const":"ledger"},"Summary":{"type":"object","properties":{"total":{"type":"number"}},"required":["total"]}}}`)
+	result := outputTool("result", `{"anyOf":[{"$ref":"#/$defs/Ok"},{"$ref":"#/$defs/Failed"}],"$defs":{"Ok":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]},"Failed":{"type":"object","properties":{"error":{"type":"string"}},"required":["error"]}}}`)
+	h := newCodemodeHarness(t, codemodeHarnessOptions{goExtensions: []extension.Extension{{
+		Name: "outputs", Path: "<inline:outputs>", ResolvedPath: "<inline:outputs>",
+		Tools:     map[string]extension.RegisteredTool{"report": report, "result": result},
+		ToolOrder: []string{"report", "result"},
+	}}, activeTools: []string{"codemode"}})
+	h.session.SetActiveToolsByName([]string{"report", "result", "codemode"})
+	description := func(name string) string {
+		for _, tool := range h.session.Tools() {
+			if tool.Name() == name {
+				return tool.Schema().Description
+			}
+		}
+		return ""
+	}
+	for name, want := range map[string]string{
+		"report": "report tool\n\nCodemode: `tools.report(args)` resolves to `{ kind: \"ledger\", summary: { total } }`.",
+		"result": "result tool\n\nCodemode: `tools.result(args)` resolves to `{ value } | { error }`.",
+	} {
+		if got := description(name); got != want {
+			t.Errorf("description(%s) = %q, want %q", name, got, want)
+		}
+	}
+}

@@ -1,0 +1,308 @@
+// Watches and attached states over the core's `watch.open` / `watch.close` api requests (ABI section 8.1). The core answers
+// `watch.open` with the first frame and then publishes every later frame in a `published` notice carrying the `watchId`
+// (host/PROTOCOL.md). A frame is `{value, ops}`, `{retired: true}` for the retirement of the document a watch follows, or `{end: true}`
+// once the owner task of a task document ended; a watch follows its address across retirements (session.ts #observeDocument).
+import { withColdLoad } from "./coldload.ts"
+import type { Context } from "@earendil-works/chord/context"
+import { Watch, type WatchCall, type WatchEnd } from "@earendil-works/chord/watch"
+import { BACKGROUND_CONTEXT, awaitWithContext } from "@earendil-works/chord/context"
+import { applyImmutable, type Op } from "@earendil-works/chord/delta"
+import type { CoreClient } from "../client.ts"
+import { migrateRead } from "./tx.ts"
+import { currentCommit } from "./commit-context.ts"
+import { rememberSnapshot, revisionAt, sameContent, shareSnapshot } from "./snapshots.ts"
+import { sharedChange } from "./publications.ts"
+import { ENDED, guardObserver, observation, type GuardedObserver } from "./observation.ts"
+import type { Observation, Observer } from "./watch-types.ts"
+
+/** What a watch observes. */
+export type WatchTarget =
+  | { kind: "doc"; address: unknown; def?: unknown }
+  | { kind: "view"; conversationId: number; window?: { from?: number; min?: number; max?: number } }
+  | { kind: "graph" }
+
+/** `value` is absent in a view frame: the host applies `ops` to the value it holds. A retirement and an end frame carry neither. */
+export type Frame = { value?: unknown; ops?: readonly Op[]; retired?: boolean; end?: boolean }
+
+/** An `Observer` of the mount's value, with what the host adds: the end of a task document's owner. */
+type Sink = {
+  advance(call: WatchCall<unknown>, context: Context): void
+  /** The owner task of the task document ended, after the retirement change (session.ts endWatch, endGuarded). */
+  ownerEnded?(): void
+  end(end: WatchEnd): void
+}
+
+type Mount = { watchId: number; answeredMount?: boolean; request?: Promise<unknown>; result?: { value: unknown } | undefined; first?: unknown; frames?: Frame[]; waiting: number; members: Set<Sink>; ready: Promise<{ value: unknown } | undefined> }
+
+export class WatchHub {
+  private nextId = 1
+  private readonly sinks = new Map<number, Sink>()
+  /** Frames that arrive between the core's answer and the moment the caller holds the watch. */
+  private readonly early = new Map<number, Frame[]>()
+  /** The value each open watch holds: a view frame carries ops only. */
+  private readonly values = new Map<number, unknown>()
+  private readonly targets = new Map<number, WatchTarget>()
+  /** Frames that arrive while the watch's acquisition on a replacement core is unanswered: they follow its first value. */
+  private readonly reattaching = new Map<number, Frame[]>()
+
+  private closing = false
+  private readonly mounts = new Map<string, Mount>()
+
+  private readonly client: CoreClient
+  private readonly report: (error: Error) => void
+  private readonly context: Context
+
+  constructor(client: CoreClient, report: (error: Error) => void, context: Context) {
+    this.client = client; this.report = report; this.context = context
+  }
+
+  /** A frame the core published; `published` notices with a `watchId` end up here. */
+  deliver(watchId: number, frame: Frame) {
+    const sink = this.sinks.get(watchId)
+    // The frame of a document watch repeats a change of the commit's publication: it holds that change's objects.
+    const change = this.targets.get(watchId)?.kind === "doc" && frame.ops !== undefined ? sharedChange(this.client, frame as { value?: unknown; ops: readonly Op[] }) : undefined
+    if (change !== undefined) frame = { ...frame, ...(frame.value === undefined ? {} : { value: change.value }), ops: change.ops as never }
+    if (!sink) { this.early.get(watchId)?.push(frame); return }
+    const queued = this.reattaching.get(watchId)
+    if (queued !== undefined) { queued.push(frame); return }
+    this.apply(watchId, sink, frame, currentCommit(this.client) ?? this.context)
+  }
+
+  private apply(watchId: number, sink: Sink, frame: Frame, context: Context) {
+    if (frame.end === true) { sink.ownerEnded?.(); return }
+    const before = this.values.get(watchId)
+    // A retirement repeats the last value the watch was given, with no ops.
+    // The watch keeps no value while the address is absent (session.ts #observeDocument): the new incarnation's frame carries its own.
+    if (frame.retired === true) { this.values.delete(watchId); sink.advance({ kind: "value", value: before, ops: [], retired: true }, context); return }
+    const frameOps = frame.ops ?? []
+    const target = this.targets.get(watchId)
+    // The frame of a commit this host wrote carries the revision its draft prepared (snapshots.ts Revision), as the Storage write and the publication do.
+    const revision = target?.kind === "doc" ? revisionAt(this.client, target.address as never) : undefined
+    const value = revision !== undefined && frame.value !== undefined && frame.value !== null && sameContent(frame.value, revision.value) ? revision.value : frame.value
+    const ops = revision !== undefined && sameContent(frameOps, revision.ops) ? revision.ops as never[] : frameOps
+    const after = this.shareDocs(watchId, target, value !== undefined ? value : ops.length > 0 ? applyImmutable(before as never, ops as never) : before)
+    this.values.set(watchId, after)
+    if (target?.kind === "doc" && after !== undefined && after !== null ) rememberSnapshot(this.client, target.address, target.def as { kind?: unknown } | undefined, after)
+    if (ops.length > 0 || value !== undefined) sink.advance({ kind: "value", value: after, ops, retired: false }, context)
+  }
+
+  /**
+   * The documents of a conversation view are the mount's: the observers of one conversation, each with its own window over the
+   * entries, hold one `docs` object (view.ts). The core keeps a watch per observer, so a value whose documents equal those another
+   * observer of the conversation holds takes that object; the observer that applies a revision second adopts the first's.
+   */
+  private shareDocs<V>(watchId: number, target: WatchTarget | undefined, value: V): V {
+    const docs = target?.kind === "view" ? (value as { docs?: unknown } | undefined)?.docs : undefined
+    if (target?.kind !== "view" || docs === undefined) return value
+    for (const [id, other] of this.targets) {
+      if (id === watchId || other.kind !== "view" || other.conversationId !== target.conversationId) continue
+      const held = (this.values.get(id) as { docs?: unknown } | undefined)?.docs
+      if (held === undefined) continue
+      if (held === docs) return value
+      if (sameContent(held, docs)) return { ...(value as object), docs: held } as V
+    }
+    return value
+  }
+
+  /**
+   * Open a watch. Resolves with the first value and a function that builds the consumer; frames queue until it does. The task
+   * graph is one mount for the Session, shared by its observers. A view is one watch of the core per observer: each has its own
+   * window over the entries, which the core keeps (view.go), so observers of one conversation do not share a mount.
+   * An acquisition the caller cancels, or that the handle's close overtakes, rejects; a watch the core opened for it is closed.
+   */
+  private async open<T>(target: WatchTarget, context: Context, attach: (value: T, release: () => void) => Sink): Promise<Sink | undefined> {
+    context.abortSignal?.throwIfAborted()
+    const key = target.kind === "graph" ? "graph" : undefined
+    let mount = key === undefined ? undefined : this.mounts.get(key)
+    let creator = false
+    if (mount === undefined) {
+      creator = true
+      mount = { watchId: 0, waiting: 0, members: new Set(), ready: undefined as never }
+      if (key !== undefined) this.mounts.set(key, mount)
+      const owner = mount
+      if (target.kind === "view") {
+        // The observer resumes on the core's answer itself, as `await this.attach(...)` resumes on readOnLine's run promise
+        // (view.ts attach).
+        const request = owner.request = this.requestView(target, owner)
+        owner.ready = request.then(first => this.answered<T>(target, owner, first as never), error => { this.early.delete(owner.watchId); throw error })
+      } else owner.ready = this.acquire<T>(target, owner)
+      owner.ready.then(first => { if (first === undefined && key !== undefined && this.mounts.get(key) === owner) this.mounts.delete(key) }, () => { if (key !== undefined && this.mounts.get(key) === owner) this.mounts.delete(key) })
+    }
+    const joined = mount
+    joined.waiting++
+    try {
+      let value: { value: T } | undefined
+      if (creator && joined.request !== undefined) {
+        await this.until(joined.request, context)
+        value = joined.result as { value: T } | undefined
+      } else {
+        // A mount that has answered is not awaited: Pi's attach goes straight to the Session line.
+        value = joined.answeredMount ? joined.result as { value: T } | undefined : await this.until(joined.ready, context) as { value: T } | undefined
+      }
+      if (value === undefined) return undefined
+      context.abortSignal?.throwIfAborted()
+      // The acquisition ran on the line after close sealed admission: it rejects, as a queued Session job does.
+      if (this.closing) throw new Error("Harness is closed")
+      const frames = joined.frames
+      joined.frames = undefined
+      const member = attach((frames === undefined ? this.values.get(joined.watchId) : joined.first) as T, () => this.leave(key, joined, member))
+      joined.members.add(member)
+      // The mount keeps no value: the Watch and the sinks hold the current one, and a retired incarnation's must be collectable.
+      joined.first = undefined
+      if (joined.result !== undefined) joined.result.value = undefined
+      for (const f of frames ?? []) this.apply(joined.watchId, this.sinks.get(joined.watchId)!, f, this.context)
+      return member
+    } finally {
+      joined.waiting--
+      // Every caller that waited for this mount gave up: the core's watch has no observer.
+      if (joined.waiting === 0 && joined.members.size === 0 && joined.watchId !== 0 && this.sinks.has(joined.watchId)) {
+        if (key !== undefined && this.mounts.get(key) === joined) this.mounts.delete(key)
+        this.release(joined.watchId)
+      }
+    }
+  }
+
+  private release(watchId: number) {
+    this.values.delete(watchId)
+    this.targets.delete(watchId)
+    if (!this.sinks.delete(watchId) || this.closing) return
+    this.client.api("watch.close", { watchId }).catch(error => this.report(error as Error))
+  }
+
+  /** The first value of a mount, or undefined when the target is absent. The core's watch stays open while the mount has members. */
+  private async acquire<T>(target: WatchTarget, mount: Mount): Promise<{ value: T } | undefined> {
+    const watchId = mount.watchId = this.nextId++
+    this.early.set(watchId, [])
+    let first: { value: T | null }
+    try {
+      const migrating = target.kind === "doc" ? (target.def as { migrate?: unknown } | undefined) ?? {} : {}
+      const open = () => migrateRead(migrating, migrated => this.client.api<{ value: T | null }>("watch.open", { watchId, target: migrated === undefined ? target : { ...target, migrated } }))
+      first = await (target.kind === "doc" ? withColdLoad(this.client, target.address, BACKGROUND_CONTEXT, open) : open())
+    } catch (error) {
+      this.early.delete(watchId)
+      throw error
+    }
+    return this.answered<T>(target, mount, first)
+  }
+
+  /** The core's watch.open of a view: its id, and the api promise of the one call. */
+  private requestView(target: WatchTarget, mount: Mount) {
+    const watchId = mount.watchId = this.nextId++
+    this.early.set(watchId, [])
+    return this.client.api<{ value: unknown }>("watch.open", { watchId, target })
+  }
+
+  /** The core answered watch.open: the mount holds the first value and the frames of the answer's own step. */
+  private answered<T>(target: WatchTarget, mount: Mount, first: { value: T | null }): { value: T } | undefined {
+    const watchId = mount.watchId
+    mount.answeredMount = true
+    const frames = this.early.get(watchId) ?? []
+    this.early.delete(watchId)
+    // Absent: nothing to observe. The core opened no watch to close.
+    if (first.value === null) return mount.result = undefined
+    if (target.kind === "doc") first.value = shareSnapshot(this.client, target.address, target.def as { kind?: unknown } | undefined, first.value) as T
+    else first.value = this.shareDocs(watchId, target, first.value)
+    this.values.set(watchId, first.value)
+    this.targets.set(watchId, target)
+    this.sinks.set(watchId, this.fanOut(mount))
+    // Frames of the answer's own step reach the first observer once it holds the first value.
+    mount.first = first.value
+    mount.frames = frames
+    // Every caller gave up while the core answered: close the watch it opened for them.
+    if (mount.waiting === 0) { for (const [k, m] of this.mounts) if (m === mount) this.mounts.delete(k); this.release(watchId) }
+    return mount.result = { value: first.value }
+  }
+
+  private fanOut(mount: Mount): Sink {
+    const each = (call: (sink: Sink) => void) => { for (const sink of [...mount.members]) { try { call(sink) } catch (error) { this.report(error as Error) } } }
+    return {
+      advance: (call, context) => each(sink => sink.advance(call, context)),
+      ownerEnded: () => each(sink => sink.ownerEnded?.()),
+      end: end => each(sink => sink.end(end)),
+    }
+  }
+
+  /** Wait for `promise` unless the caller's context ends first. */
+  private until<T>(promise: Promise<T>, context: Context): Promise<T> {
+    return awaitWithContext(promise, context)
+  }
+
+  /** A member left its mount: the last one closes the core's watch. */
+  private leave(key: string | undefined, mount: Mount, member: Sink) {
+    if (!mount.members.delete(member) || mount.members.size > 0) return
+    if (key !== undefined && this.mounts.get(key) === mount) this.mounts.delete(key)
+    this.release(mount.watchId)
+  }
+
+  /** A serialized exact-frame watch, or undefined when the target is absent (upstream: `watchDoc` resolves undefined). */
+  async watch<T>(target: WatchTarget, context: Context): Promise<Watch<T> | undefined> {
+    let watch: Watch<T> | undefined
+    await this.open<T>(target, context, (value, release) => {
+      const made = watch = new Watch<T>(value, release, error => this.report(error as Error))
+      // A task document's watch delivers the retirement that ends its task, then ends (session.ts endWatch).
+      return { advance: (call, context) => made.advance(call as WatchCall<T>, context), ownerEnded: () => made.endAfterDelivery(), end: end => made.end(end) }
+    })
+    // A watch ends `aborted` when its caller's context is aborted later (session.ts watchDoc, view.ts watch: observeAbort).
+    if (watch !== undefined && context.abortSignal !== undefined) watch.observeAbort(context.abortSignal)
+    return watch
+  }
+
+  /**
+   * Attach `observer` to the target, behind `guardObserver()`: `undefined` when the target is absent. The attachment's `context`
+   * governs only the attachment: aborted while attaching, the promise rejects and nothing stays attached.
+   */
+  async observe<T>(target: WatchTarget, observer: Observer<T>, context: Context): Promise<Observation<T> | undefined> {
+    let value!: T
+    let guarded!: GuardedObserver<WatchCall<T>>
+    const sink = await this.open<T>(target, context, (current, release) => {
+      value = current
+      guarded = guardObserver(observer, release, error => this.report(error as Error))
+      return { advance: (call, context) => guarded.advance(call as WatchCall<T>, context), ownerEnded: () => guarded.end(ENDED), end: end => guarded.end(end) }
+    })
+    if (sink === undefined) return undefined
+    const signal = context.abortSignal
+    if (signal?.aborted) {
+      guarded.detach()
+      throw signal.reason
+    }
+    return observation(value, guarded)
+  }
+
+  /** Attach a custom observer to a target (conversationViews().attach): `make` receives the first value and the release function. Undefined when the target is absent. */
+  async attach<T>(target: WatchTarget, context: Context, make: (value: T, release: () => void) => Sink): Promise<Sink | undefined> {
+    return this.open<T>(target, context, make)
+  }
+
+  /**
+   * The host replaced the core handle: the watches the old core held are gone. Each established watch is opened again under its ID;
+   * the commits that reached this host were all published before the replacement, so the first value equals the value held and the
+   * frames that follow continue it: they wait for the answer, which a commit published after the acquisition can overtake. A first
+   * value that differs (the store changed under the host) replaces the value.
+   */
+  reattach() {
+    if (this.closing) return
+    for (const [watchId, target] of [...this.targets]) {
+      const migrating = target.kind === "doc" ? (target.def as { migrate?: unknown } | undefined) ?? {} : {}
+      const queued: Frame[] = []
+      this.reattaching.set(watchId, queued)
+      // The first value is the store's at the core's acquisition boundary; a commit published after it is a frame, which can reach the host before the answer does.
+      const settle = (first: { value: unknown } | undefined) => {
+        this.reattaching.delete(watchId)
+        const sink = this.sinks.get(watchId)
+        if (sink === undefined) return
+        if (first !== undefined && first.value !== null && first.value !== undefined && !sameContent(first.value, this.values.get(watchId))) this.apply(watchId, sink, { value: first.value, ops: [] }, this.context)
+        for (const frame of queued) this.apply(watchId, sink, frame, this.context)
+      }
+      migrateRead(migrating, migrated => this.client.api<{ value: unknown }>("watch.open", { watchId, target: migrated === undefined ? target : { ...target, migrated } })).then(settle, error => { settle(undefined); this.report(error as Error) })
+    }
+  }
+
+  /** The handle is closing: every watch and state ends with `session_closed` without a `watch.close` the core cannot answer. */
+  closeSession(end: WatchEnd) {
+    this.closing = true
+    const sinks = [...this.sinks.values()]
+    this.sinks.clear()
+    this.mounts.clear()
+    for (const sink of sinks) sink.end(end)
+  }
+}

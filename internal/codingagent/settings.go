@@ -1,0 +1,4436 @@
+package codingagent
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"math"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/google/uuid"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/allocsize"
+	"github.com/MichaelKinsy/PiG/internal/atomicfile"
+	"github.com/MichaelKinsy/PiG/internal/changeobservers"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/configroot"
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsonparse"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+	"github.com/MichaelKinsy/PiG/internal/nodeerrno"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
+	"github.com/MichaelKinsy/PiG/internal/text"
+	"github.com/MichaelKinsy/PiG/tui"
+)
+
+// PackageSource mirrors upstream settings-manager.ts PackageSource.
+// JSON accepts either a bare string source or an object with resource filters and optional autoload selection.
+type PackageSource struct {
+	Source     string   `json:"source,omitempty"`
+	Autoload   *bool    `json:"autoload,omitempty"`
+	Extensions []string `json:"extensions,omitempty"`
+	Skills     []string `json:"skills,omitempty"`
+	Prompts    []string `json:"prompts,omitempty"`
+	Themes     []string `json:"themes,omitempty"`
+
+	// WasObject tracks whether the JSON was an object (vs bare string).
+	// Upstream considers ANY object-format package as "filtered"
+	// (typeof pkg === "object"), even if no filter fields are set.
+	WasObject bool `json:"-"`
+
+	// keyOrder is the order of the keys in the parsed object. Pi keeps an existing package object's own order when it writes the list back (`{ ...existing, source }`), so MarshalJSON writes these keys first.
+	keyOrder []string
+	// unknown holds the parsed object's members that PackageSource has no field for. Pi's spread keeps them, so MarshalJSON writes them back.
+	unknown map[string]json.RawMessage
+}
+
+// Filtered reports whether the package was specified in object form.
+// Upstream: `filtered: typeof pkg === "object"`: any object form is filtered.
+// For programmatically constructed sources, filter fields also signal filtering.
+func (p PackageSource) Filtered() bool {
+	return p.WasObject || p.Autoload != nil || p.Extensions != nil || p.Skills != nil || p.Prompts != nil || p.Themes != nil
+}
+
+// MarshalJSON preserves upstream's string-or-object wire shape.
+func (p PackageSource) MarshalJSON() ([]byte, error) {
+	if !p.Filtered() {
+		return json.Marshal(p.Source)
+	}
+	fields := map[string]any{"source": p.Source}
+	if p.Autoload != nil {
+		fields["autoload"] = *p.Autoload
+	}
+	if p.Extensions != nil {
+		fields["extensions"] = p.Extensions
+	}
+	if p.Skills != nil {
+		fields["skills"] = p.Skills
+	}
+	if p.Prompts != nil {
+		fields["prompts"] = p.Prompts
+	}
+	if p.Themes != nil {
+		fields["themes"] = p.Themes
+	}
+	for key, value := range p.unknown {
+		fields[key] = value
+	}
+	return orderedjson.MarshalMap(fields, slices.Concat(p.keyOrder, []string{"source", "autoload", "extensions", "skills", "prompts", "themes"})...)
+}
+
+// UnmarshalJSON preserves upstream's string-or-object wire shape.
+func (p *PackageSource) UnmarshalJSON(data []byte) error {
+	var source string
+	if err := json.Unmarshal(data, &source); err == nil {
+		*p = PackageSource{Source: source}
+		return nil
+	}
+	type packageSourceObject PackageSource
+	var obj packageSourceObject
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return err
+	}
+	*p = PackageSource(obj)
+	p.WasObject = true
+	if parsed, err := orderedjson.Parse(data); err == nil {
+		p.keyOrder = parsed.Keys()
+		for _, key := range p.keyOrder {
+			switch key {
+			case "source", "autoload", "extensions", "skills", "prompts", "themes":
+				continue
+			}
+			if p.unknown == nil {
+				p.unknown = map[string]json.RawMessage{}
+			}
+			p.unknown[key], _ = parsed.Get(key)
+		}
+	}
+	return nil
+}
+
+// ─── Compaction settings types ───────────────────────────────────────────────
+
+// CompactionConfig mirrors compaction.CompactionSettings but lives here to
+// avoid an import cycle (compaction imports codingagent for SessionEntry).
+type CompactionConfig struct {
+	Enabled          bool
+	ReserveTokens    int
+	KeepRecentTokens int
+}
+
+// defaultCompactionConfig mirrors DEFAULT_COMPACTION_SETTINGS (compaction.ts).
+var defaultCompactionConfig = CompactionConfig{
+	Enabled:          true,
+	ReserveTokens:    16384,
+	KeepRecentTokens: 20000,
+}
+
+// BranchSummaryConfig mirrors compaction.BranchSummarySettings but lives here
+// to avoid an import cycle.
+type BranchSummaryConfig struct {
+	ReserveTokens    int  `json:"reserveTokens,omitempty"`
+	SkipPrompt       bool `json:"skipPrompt,omitempty"`
+	reserveTokensSet bool `json:"-"`
+	skipPromptSet    bool `json:"-"`
+}
+
+type branchSummaryWire struct {
+	ReserveTokens *int  `json:"reserveTokens,omitempty"`
+	SkipPrompt    *bool `json:"skipPrompt,omitempty"`
+}
+
+// CompactionSettingsJSON mirrors upstream Settings.compaction JSON shape
+// (settings-manager.ts:74). Pointer to *bool for enabled to distinguish
+// absent vs. explicitly-false.
+type CompactionSettingsJSON struct {
+	Enabled *bool `json:"enabled,omitempty"`
+	// ReserveTokens and KeepRecentTokens retain JavaScript numbers until getter validation, including zero, fractions, and non-finite runtime overrides.
+	ReserveTokens    *float64 `json:"reserveTokens,omitempty"`
+	KeepRecentTokens *float64 `json:"keepRecentTokens,omitempty"`
+	MaxContextTokens *float64 `json:"maxContextTokens,omitempty"`
+	// ModelOverrides maps exact "provider/modelId" keys to token settings
+	// that take precedence for that model.
+	ModelOverrides map[string]CompactionModelOverride `json:"modelOverrides,omitempty"`
+	extra          map[string]json.RawMessage
+}
+
+// CompactionModelOverride mirrors upstream CompactionModelOverride. Pointers
+// keep an explicit zero, as upstream's `override ?? ordinary` does.
+type CompactionModelOverride struct {
+	ReserveTokens    *float64 `json:"reserveTokens,omitempty"`
+	KeepRecentTokens *float64 `json:"keepRecentTokens,omitempty"`
+	extra            map[string]json.RawMessage
+	invalidEntry     json.RawMessage
+}
+
+// ProviderRetrySettings mirrors upstream retry.provider settings.
+// Used for provider/SDK-level request retries and deadlines.
+type ProviderRetrySettings struct {
+	TimeoutMs  *int `json:"timeoutMs,omitempty"`
+	MaxRetries *int `json:"maxRetries,omitempty"`
+	// MaxRetryDelayMs is a pointer so an explicit 0 (upstream disables the cap:
+	// provider-retry.ts "set it to zero to disable the limit") is distinguishable
+	// from unset (nil -> 60s default). A plain int cannot tell 0 from absent.
+	MaxRetryDelayMs *int `json:"maxRetryDelayMs,omitempty"`
+}
+
+// RetrySettingsJSON mirrors upstream Settings.retry JSON shape
+// (settings-manager.ts:682-690). Defaults: enabled=true, maxRetries=3,
+// baseDelayMs=2000.
+type RetrySettingsJSON struct {
+	Enabled *bool `json:"enabled,omitempty"`
+	// MaxRetries and BaseDelayMs are pointers so an explicit 0 is kept, as
+	// upstream's `?? default` does.
+	MaxRetries  *int `json:"maxRetries,omitempty"`
+	BaseDelayMs *int `json:"baseDelayMs,omitempty"`
+	// MaxAgentDelayMs caps each agent-level retry delay (default 60000).
+	MaxAgentDelayMs *int                   `json:"maxAgentDelayMs,omitempty"`
+	Provider        *ProviderRetrySettings `json:"provider,omitempty"`
+}
+
+// ThinkingBudgetsSettings mirrors upstream ThinkingBudgetsSettings.
+// Custom token budgets for each thinking level.
+// Mirrors upstream settings-manager.ts ThinkingBudgetsSettings.
+type ThinkingBudgetsSettings struct {
+	Minimal *int `json:"minimal,omitempty"`
+	Low     *int `json:"low,omitempty"`
+	Medium  *int `json:"medium,omitempty"`
+	High    *int `json:"high,omitempty"`
+}
+
+// MarkdownSettings mirrors upstream MarkdownSettings.
+// Mirrors upstream settings-manager.ts MarkdownSettings.
+type MarkdownSettings struct {
+	// CodeBlockIndent is a pointer because Pi keeps an authored empty string (no indent) and defaults only an absent value.
+	CodeBlockIndent *string `json:"codeBlockIndent,omitempty"`
+	Mermaid         string  `json:"mermaid,omitempty"`
+	// codeBlockIndentNull records an authored `"codeBlockIndent": null`: Pi's merge lets it override the other layer, and `?? "  "` then reads the default.
+	codeBlockIndentNull bool
+}
+
+type markdownSettingsWire struct {
+	CodeBlockIndent json.RawMessage `json:"codeBlockIndent,omitempty"`
+	Mermaid         string          `json:"mermaid,omitempty"`
+}
+
+// UnmarshalJSON keeps an authored null codeBlockIndent apart from an absent one.
+func (m *MarkdownSettings) UnmarshalJSON(data []byte) error {
+	var w struct {
+		CodeBlockIndent json.RawMessage `json:"codeBlockIndent"`
+		Mermaid         string          `json:"mermaid"`
+	}
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	*m = MarkdownSettings{Mermaid: w.Mermaid}
+	if len(w.CodeBlockIndent) == 0 {
+		return nil
+	}
+	if string(w.CodeBlockIndent) == "null" {
+		m.codeBlockIndentNull = true
+		return nil
+	}
+	var indent string
+	if err := json.Unmarshal(w.CodeBlockIndent, &indent); err != nil {
+		return err
+	}
+	m.CodeBlockIndent = &indent
+	return nil
+}
+
+// MarshalJSON writes an authored null codeBlockIndent back as null.
+func (m MarkdownSettings) MarshalJSON() ([]byte, error) {
+	w := markdownSettingsWire{Mermaid: m.Mermaid}
+	switch {
+	case m.CodeBlockIndent != nil:
+		raw, err := json.Marshal(*m.CodeBlockIndent)
+		if err != nil {
+			return nil, err
+		}
+		w.CodeBlockIndent = raw
+	case m.codeBlockIndentNull:
+		w.CodeBlockIndent = json.RawMessage("null")
+	}
+	return json.Marshal(w)
+}
+
+// WarningSettings mirrors upstream warning settings.
+type WarningSettings struct {
+	AnthropicExtraUsage    bool `json:"anthropicExtraUsage,omitempty"`
+	anthropicExtraUsageSet bool `json:"-"`
+}
+
+func (w WarningSettings) MarshalJSON() ([]byte, error) {
+	type warningSettingsWire struct {
+		AnthropicExtraUsage *bool `json:"anthropicExtraUsage,omitempty"`
+	}
+	wire := warningSettingsWire{}
+	if w.anthropicExtraUsageSet || w.AnthropicExtraUsage {
+		wire.AnthropicExtraUsage = new(w.AnthropicExtraUsage)
+	}
+	return json.Marshal(wire)
+}
+
+func (w *WarningSettings) UnmarshalJSON(data []byte) error {
+	type warningSettingsWire struct {
+		AnthropicExtraUsage *bool `json:"anthropicExtraUsage,omitempty"`
+	}
+	var wire warningSettingsWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*w = WarningSettings{}
+	if wire.AnthropicExtraUsage != nil {
+		w.AnthropicExtraUsage = *wire.AnthropicExtraUsage
+		w.anthropicExtraUsageSet = true
+	}
+	return nil
+}
+
+// terminalSettingsWire mirrors upstream terminal nested settings.
+type terminalSettingsWire struct {
+	ShowImages           *bool `json:"showImages,omitempty"`
+	ImageWidthCells      *int  `json:"imageWidthCells,omitempty"`
+	ClearOnShrink        *bool `json:"clearOnShrink,omitempty"`
+	ShowTerminalProgress *bool `json:"showTerminalProgress,omitempty"`
+	// ScreenWriter is PiG's own key; see Settings.TerminalScreenWriter.
+	ScreenWriter string `json:"screenWriter,omitempty"`
+	// FramePacing is PiG's own key; see Settings.TerminalFramePacing.
+	FramePacing string `json:"framePacing,omitempty"`
+	// Hyperlinks, Images, and TrueColor keep the authored JSON value; see
+	// Settings.GetTerminalCapabilityOverrides.
+	Hyperlinks json.RawMessage `json:"hyperlinks,omitempty"`
+	Images     json.RawMessage `json:"images,omitempty"`
+	TrueColor  json.RawMessage `json:"trueColor,omitempty"`
+}
+
+// imageSettingsWire mirrors upstream images nested settings.
+type imageSettingsWire struct {
+	AutoResize  *bool `json:"autoResize,omitempty"`
+	BlockImages *bool `json:"blockImages,omitempty"`
+}
+
+// settingsWire mirrors upstream settings JSON.
+type settingsWire struct {
+	LastChangelogVersion       string                  `json:"lastChangelogVersion,omitempty"`
+	ExtensionChangelogVersions map[string]string       `json:"extensionChangelogVersions,omitzero"`
+	DefaultProvider            *string                 `json:"defaultProvider,omitempty"`
+	DefaultModel               *string                 `json:"defaultModel,omitempty"`
+	DefaultThinkingLevel       string                  `json:"defaultThinkingLevel,omitempty"`
+	Transport                  string                  `json:"transport,omitempty"`
+	SessionShareDestination    SessionShareDestination `json:"sessionShareDestination,omitempty"`
+	SteeringMode               string                  `json:"steeringMode,omitempty"`
+	FollowUpMode               string                  `json:"followUpMode,omitempty"`
+	TuiMode                    string                  `json:"tuiMode,omitempty"`
+	FullscreenExitOutput       FullscreenExitOutput    `json:"fullscreenExitOutput,omitempty"`
+	FullscreenScrollbar        string                  `json:"fullscreenScrollbar,omitempty"`
+	FullscreenCopyOnSelect     *bool                   `json:"fullscreenCopyOnSelect,omitempty"`
+	// FullscreenWheelScrollLines keeps the authored JSON value, including null.
+	FullscreenWheelScrollLines  json.RawMessage         `json:"fullscreenWheelScrollLines,omitempty"`
+	DeviceID                    string                  `json:"deviceId,omitempty"`
+	Codemode                    *CodemodeSettings       `json:"codemode,omitempty"`
+	MaskSecretInput             *bool                   `json:"maskSecretInput,omitempty"`
+	ExtensionsAutoUpgrade       *bool                   `json:"extensionsAutoUpgrade,omitempty"`
+	ExtensionsTypescriptRuntime *string                 `json:"extensionsTypescriptRuntime,omitempty"`
+	Theme                       *string                 `json:"theme,omitempty"`
+	Compaction                  *CompactionSettingsJSON `json:"compaction,omitempty"`
+	BranchSummary               *branchSummaryWire      `json:"branchSummary,omitempty"`
+	Retry                       *RetrySettingsJSON      `json:"retry,omitempty"`
+	HideThinkingBlock           *bool                   `json:"hideThinkingBlock,omitempty"`
+	ShellPath                   *string                 `json:"shellPath,omitempty"`
+	// QuietStartup keeps the authored JSON value, including null, which replaces a lower layer's value as in upstream deepMergeSettings.
+	QuietStartup           json.RawMessage          `json:"quietStartup,omitempty"`
+	ShellCommandPrefix     *string                  `json:"shellCommandPrefix,omitempty"`
+	NpmCommand             []string                 `json:"npmCommand,omitzero"`
+	SelfUpdateCommand      []string                 `json:"selfUpdateCommand,omitzero"`
+	CollapseChangelog      *bool                    `json:"collapseChangelog,omitempty"`
+	ShowCacheMissNotices   *bool                    `json:"showCacheMissNotices,omitempty"`
+	EnableInstallTelemetry *bool                    `json:"enableInstallTelemetry,omitempty"`
+	EnableAnalytics        *bool                    `json:"enableAnalytics,omitempty"`
+	TrackingID             string                   `json:"trackingId,omitempty"`
+	Packages               []PackageSource          `json:"packages,omitzero"`
+	Extensions             []string                 `json:"extensions,omitzero"`
+	Skills                 []string                 `json:"skills,omitzero"`
+	Prompts                []string                 `json:"prompts,omitzero"`
+	Themes                 []string                 `json:"themes,omitzero"`
+	EnableSkillCommands    *bool                    `json:"enableSkillCommands,omitempty"`
+	Terminal               *terminalSettingsWire    `json:"terminal,omitempty"`
+	Images                 *imageSettingsWire       `json:"images,omitempty"`
+	EnabledModels          []string                 `json:"enabledModels,omitzero"`
+	DefaultTools           []string                 `json:"defaultTools,omitzero"`
+	ModelThinkingLevels    map[string]string        `json:"modelThinkingLevels,omitempty"`
+	DoubleEscapeAction     string                   `json:"doubleEscapeAction,omitempty"`
+	TreeFilterMode         string                   `json:"treeFilterMode,omitempty"`
+	DefaultProjectTrust    string                   `json:"defaultProjectTrust,omitempty"`
+	ThinkingBudgets        *ThinkingBudgetsSettings `json:"thinkingBudgets,omitempty"`
+	EditorPaddingX         *int                     `json:"editorPaddingX,omitempty"`
+	OutputPad              *int                     `json:"outputPad,omitempty"`
+	ExternalEditor         *string                  `json:"externalEditor,omitempty"`
+	AutocompleteMaxVisible *int                     `json:"autocompleteMaxVisible,omitempty"`
+	ShowHardwareCursor     *bool                    `json:"showHardwareCursor,omitempty"`
+	Markdown               *MarkdownSettings        `json:"markdown,omitempty"`
+	Warnings               *WarningSettings         `json:"warnings,omitempty"`
+	SessionDir             string                   `json:"sessionDir,omitempty"`
+	// HTTPIdleTimeoutMs keeps the raw JSON value: upstream accepts numbers,
+	// numeric strings and "disabled".
+	HTTPProxy                 string           `json:"httpProxy,omitempty"`
+	WebSocketConnectTimeoutMs any              `json:"websocketConnectTimeoutMs,omitempty"`
+	HTTPIdleTimeoutMs         any              `json:"httpIdleTimeoutMs,omitempty"`
+	CacheWarming              CacheWarmingMode `json:"cacheWarming,omitempty"`
+}
+
+const defaultHTTPIdleTimeoutMs = 300_000
+
+// WheelScrollLines is the number of lines a wheel event scrolls, or Auto for velocity-based acceleration (upstream `WheelScrollLines = number | "auto"`). Lines is 1 to 100 when read from settings.
+type WheelScrollLines struct {
+	Auto  bool
+	Lines float64
+}
+
+// CodemodeMode is how the codemode tool presents tools while it is active. Mirrors upstream CodemodeMode (settings-manager.ts:101).
+type CodemodeMode string
+
+const (
+	// CodemodeModeOn appends the codemode declaration to each callable tool's description and lists only tools without direct exposure in the codemode description.
+	CodemodeModeOn CodemodeMode = "on"
+	// CodemodeModeOnly lists every callable tool in the codemode description and does not declare active direct tools to the model.
+	CodemodeModeOnly CodemodeMode = "only"
+)
+
+// CodemodeSettings mirrors upstream CodemodeSettings (settings-manager.ts:103).
+type CodemodeSettings struct {
+	// Mode defaults to on.
+	Mode CodemodeMode `json:"mode,omitempty"`
+	// InlineBudget is the estimated tokens (characters / 4) the codemode description may spend on tool declarations. Default 3000.
+	InlineBudget *int `json:"inlineBudget,omitempty"`
+}
+
+// CacheWarmingMode selects when prompt caches are kept warm. Mirrors upstream
+// settings-manager.ts CacheWarmingMode.
+type CacheWarmingMode string
+
+// CacheWarmingModes lists the modes in Pi's order (CACHE_WARMING_MODES).
+var CacheWarmingModes = []CacheWarmingMode{"off", "streaming", "idle"}
+
+// defaultCacheWarmingMode is Pi's default (settings-defaults.ts cacheWarming): warm during runs and, for up to 30 minutes, between them.
+const defaultCacheWarmingMode CacheWarmingMode = "idle"
+
+func parseHTTPIdleTimeoutMs(value any) (int, bool) {
+	switch v := value.(type) {
+	case nil:
+		return 0, false
+	case int:
+		if v < 0 {
+			return 0, false
+		}
+		return v, true
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			return 0, false
+		}
+		// Pi keeps any finite double; Go's int cannot hold one of 2^63 or more (float64(math.MaxInt) is 2^63), so it saturates (a timeout that long is none).
+		if floored := math.Floor(v); floored < math.MaxInt {
+			return int(floored), true
+		}
+		return math.MaxInt, true
+	case string:
+		// upstream: core/http-dispatcher.ts:parseHttpIdleTimeoutMs trims with String.prototype.trim and converts with Number(trimmed).
+		trimmed := jsstring.Trim(v)
+		if jsstring.ToLower(trimmed) == "disabled" {
+			return 0, true
+		}
+		if trimmed == "" {
+			return 0, false
+		}
+		return parseHTTPIdleTimeoutMs(jsnumber.Parse(trimmed))
+	default:
+		return 0, false
+	}
+}
+
+// QuietStartup mirrors upstream QuietStartup (settings-manager.ts:111-112), the union boolean | "header": true hides all startup output, "header" keeps only the startup header.
+type QuietStartup uint8
+
+const (
+	// QuietStartupFalse is false: the startup header and details show. It is the default.
+	QuietStartupFalse QuietStartup = iota
+	// QuietStartupTrue is true: the startup header and details are hidden.
+	QuietStartupTrue
+	// QuietStartupHeader is "header": the startup header shows and the details are hidden.
+	QuietStartupHeader
+)
+
+// String returns the value as upstream's String(quietStartup) spells it: "false", "true" or "header".
+func (q QuietStartup) String() string {
+	switch q {
+	case QuietStartupTrue:
+		return "true"
+	case QuietStartupHeader:
+		return "header"
+	default:
+		return "false"
+	}
+}
+
+// MarshalJSON writes the upstream JSON value: false, true or "header".
+func (q QuietStartup) MarshalJSON() ([]byte, error) {
+	if q == QuietStartupHeader {
+		return []byte(`"header"`), nil
+	}
+	return []byte(q.String()), nil
+}
+
+// UnmarshalJSON reads a settings value as upstream getQuietStartup does (settings-manager.ts:1089-1092): true and "header" keep their meaning and every other value is false.
+func (q *QuietStartup) UnmarshalJSON(data []byte) error {
+	switch strings.TrimSpace(string(data)) {
+	case "true":
+		*q = QuietStartupTrue
+	case `"header"`:
+		*q = QuietStartupHeader
+	default:
+		*q = QuietStartupFalse
+	}
+	return nil
+}
+
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+// Settings mirrors upstream Settings interface.
+type Settings struct {
+	// ignored names each setting dropped for its wrong JSON type, with the type it expects. Loading reports it once (D158).
+	ignored []string
+	// extra holds the top-level members PiG does not model, as written, after migrateSettings: Pi keeps every member of the file, so
+	// getGlobalSettings returns them, deepMergeSettings merges them and JSON.stringify writes them.
+	extra                map[string]json.RawMessage
+	DefaultProvider      string `json:"defaultProvider,omitempty"`
+	DefaultModel         string `json:"defaultModel,omitempty"`
+	DefaultThinkingLevel string `json:"defaultThinkingLevel,omitempty"`
+	// HideThinkingBlock mirrors upstream settings.hideThinkingBlock
+	// (settings-manager.ts:77). When true, thinking blocks show as
+	// "Thinking..." stubs instead of the full reasoning trace. Toggled
+	// by Ctrl+T; persisted so the preference survives sessions.
+	HideThinkingBlock    bool `json:"hideThinkingBlock,omitempty"`
+	hideThinkingBlockSet bool `json:"-"`
+	// imageWidthCellsSet records that terminal.imageWidthCells was authored, so 0 and negative numbers are values (getImageWidthCells: Math.max(1, Math.floor(width))) and not absence.
+	imageWidthCellsSet bool `json:"-"`
+	// Theme is the configured name. JSON and SettingsManager.SetTheme preserve explicitly empty values.
+	Theme      string `json:"theme,omitempty"`
+	themeEmpty bool   `json:"-"`
+	// emptyStrings records which of defaultProvider, defaultModel, shellPath, shellCommandPrefix and externalEditor the file holds as an empty string: Pi writes and keeps
+	// those keys (a defined value), where the plain string fields cannot tell "" from absent.
+	emptyStrings emptyStringSet
+	// themeNonString records a theme key whose JSON value is not a string, such as null. It replaces a lower layer's theme and reads as unset.
+	themeNonString bool   `json:"-"`
+	ShellPath      string `json:"shellPath,omitempty"`
+	// CommandPrefix prepended to every bash tool invocation as a
+	// separate first line (e.g. "set -e\n" or "export PATH=...\n").
+	CommandPrefix                  string          `json:"commandPrefix,omitempty"`
+	QuietStartup                   QuietStartup    `json:"quietStartup,omitempty"`
+	quietStartupSet                bool            `json:"-"`
+	Packages                       []PackageSource `json:"packages,omitzero"`
+	Extensions                     []string        `json:"extensions,omitempty"`
+	Skills                         []string        `json:"skills,omitempty"`
+	Prompts                        []string        `json:"prompts,omitempty"`
+	Themes                         []string        `json:"themes,omitempty"`
+	SessionDir                     string          `json:"sessionDir,omitempty"`
+	HTTPProxy                      string          `json:"httpProxy,omitempty"`
+	WebSocketConnectTimeoutMs      *int            `json:"websocketConnectTimeoutMs,omitempty"`
+	webSocketConnectTimeoutInvalid any
+	webSocketConnectTimeoutNull    bool
+	HTTPIdleTimeoutMs              *int     `json:"httpIdleTimeoutMs,omitempty"`
+	EnabledModels                  []string `json:"enabledModels,omitempty"`
+	// DefaultTools is the initial built-in tool selection; nil means the
+	// upstream default read, bash, edit and write.
+	DefaultTools []string `json:"defaultTools,omitempty"`
+	// ModelThinkingLevels holds per-model default thinking levels keyed by
+	// "provider/modelId".
+	ModelThinkingLevels map[string]string `json:"modelThinkingLevels,omitempty"`
+
+	// httpIdleTimeoutInvalid holds a present httpIdleTimeoutMs value that
+	// does not parse; GetHttpIdleTimeoutMs reports it as an error.
+	httpIdleTimeoutInvalid any
+	// httpIdleTimeoutNull records an authored null: upstream keeps it (a null overrides the other layer) and getHttpIdleTimeoutMs throws on it.
+	httpIdleTimeoutNull bool
+
+	// CacheWarming is read from global settings only, because each refresh
+	// costs money. Mirrors upstream settings.cacheWarming.
+	CacheWarming CacheWarmingMode `json:"cacheWarming,omitempty"`
+
+	// LastChangelogVersion records the binary version at which the
+	// user last saw the startup changelog notification. Used to gate
+	// "what's new" display to only new entries since last run.
+	// Mirrors upstream settings.lastChangelogVersion (settings-manager.ts:66).
+	LastChangelogVersion string `json:"lastChangelogVersion,omitempty"`
+	// ExtensionChangelogVersions records the last changelog version seen per extension package, keyed by GetSourcePackageKey.
+	// Mirrors upstream settings.extensionChangelogVersions (settings-schema.ts).
+	ExtensionChangelogVersions map[string]string `json:"extensionChangelogVersions,omitzero"`
+
+	// Compaction mirrors upstream settings.compaction (settings-manager.ts:74).
+	// Nested to match upstream JSON schema:
+	// { "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000 } }
+	Compaction *CompactionSettingsJSON `json:"compaction,omitempty"`
+
+	// BranchSummary mirrors upstream settings.branchSummary
+	// (settings-manager.ts:75). Nested to match upstream JSON schema:
+	// { "branchSummary": { "skipPrompt": true, "reserveTokens": 16384 } }
+	BranchSummary *BranchSummaryConfig `json:"branchSummary,omitempty"`
+
+	// DoubleEscapeAction controls what double-Esc with empty editor does.
+	// Values: "fork", "tree", "none". Default: "tree".
+	// Mirrors upstream settings.doubleEscapeAction (settings-manager.ts:93).
+	DoubleEscapeAction string `json:"doubleEscapeAction,omitempty"`
+
+	// TreeFilterMode controls the default /tree filter.
+	// Values: "default", "no-tools", "user-only", "labeled-only", "all".
+	// Default: "default".
+	// Mirrors upstream settings.treeFilterMode (settings-manager.ts:94).
+	TreeFilterMode string `json:"treeFilterMode,omitempty"`
+
+	// DefaultProjectTrust is the fallback when no extension or saved decision
+	// resolves project trust. Values: "ask" | "always" | "never". Default: "ask".
+	// Global setting only. Mirrors upstream settings.defaultProjectTrust
+	// (settings-manager.ts:94).
+	DefaultProjectTrust string `json:"defaultProjectTrust,omitempty"`
+
+	// SteeringMode controls queue dispatch when multiple messages are queued.
+	// Values: "all" | "one-at-a-time". Default: "one-at-a-time".
+	// Mirrors upstream settings.steeringMode (settings-manager.ts:71).
+	SteeringMode string `json:"steeringMode,omitempty"`
+
+	// FollowUpMode controls how queued follow-up messages are dispatched.
+	// Values: "all" | "one-at-a-time". Default: "one-at-a-time".
+	// Mirrors upstream settings.followUpMode (settings-manager.ts:72).
+	FollowUpMode string `json:"followUpMode,omitempty"`
+
+	// TuiMode selects the regular or fullscreen terminal layout. Default: fullscreen.
+	TuiMode string `json:"tuiMode,omitempty"`
+
+	// FullscreenExitOutput controls whether fullscreen exit prints the transcript
+	// or restores the previous screen. Values: transcript, resume-hint. Default: transcript.
+	FullscreenExitOutput FullscreenExitOutput `json:"fullscreenExitOutput,omitempty"`
+
+	// FullscreenScrollbar controls fullscreen scrollbars. Values: auto, always,
+	// hidden. Default: auto; it has no effect in regular mode.
+	FullscreenScrollbar string `json:"fullscreenScrollbar,omitempty"`
+
+	// FullscreenCopyOnSelect controls automatic clipboard copy when a fullscreen
+	// text selection completes. Default: true; it has no effect in regular mode.
+	FullscreenCopyOnSelect *bool `json:"fullscreenCopyOnSelect,omitempty"`
+
+	// FullscreenWheelScrollLines holds the authored `fullscreenWheelScrollLines` JSON value, a line count or "auto". GetFullscreenWheelScrollLines validates it. A present JSON null is kept because it overrides a lower layer.
+	FullscreenWheelScrollLines json.RawMessage `json:"fullscreenWheelScrollLines,omitempty"`
+
+	// DeviceID is the stable UUID of this installation. Only the global layer is read for it: GetOrCreateDeviceID ignores project settings.
+	// Mirrors upstream settings.deviceId (settings-manager.ts:156).
+	DeviceID string `json:"deviceId,omitempty"`
+
+	// Codemode configures how the codemode tool presents tools. Mirrors upstream settings.codemode (settings-manager.ts:176).
+	Codemode *CodemodeSettings `json:"codemode,omitempty"`
+
+	// MaskSecretInput controls configurable login-input privacy. Nil means true; false restores Pi's plain-text prompts.
+	MaskSecretInput *bool `json:"maskSecretInput,omitempty"`
+
+	// ExtensionsAutoUpgrade runs the Go extension upgrade rules without asking when an extension fails to build for an older SDK, and after `pig update`. Global setting only; nil means false.
+	// pig additive (D109): Pi loads extension source in process and has no SDK to drift from. Pi's `extensions` setting is an array, so the key cannot nest under it.
+	ExtensionsAutoUpgrade *bool `json:"extensionsAutoUpgrade,omitempty"`
+
+	// ExtensionsTypescriptRuntime names the runtime that runs TypeScript and JavaScript extensions: "node" (the default) or a runtime an extension or Piglet installed into the runtime slot. PIG_TS_RUNTIME overrides it. Global setting only.
+	// pig additive (D19): Pi runs extensions inside its own Node process. Pi's `extensions` setting is an array, so the key cannot nest under it.
+	ExtensionsTypescriptRuntime *string `json:"extensionsTypescriptRuntime,omitempty"`
+
+	// CollapseChangelog shows condensed startup update notices. The /changelog command always shows every released entry.
+	CollapseChangelog    bool `json:"collapseChangelog,omitempty"`
+	collapseChangelogSet bool `json:"-"`
+
+	// ShowCacheMissNotices controls transcript notices for significant prompt
+	// cache misses. Default: false. Mirrors upstream settings.showCacheMissNotices
+	// (settings-manager.ts:96).
+	ShowCacheMissNotices    bool `json:"showCacheMissNotices,omitempty"`
+	showCacheMissNoticesSet bool `json:"-"`
+
+	// EnableSkillCommands, when false, hides skill commands from the
+	// /skill:name autocomplete popup. Default: true.
+	// Mirrors upstream settings.enableSkillCommands (settings-manager.ts:89).
+	// Note: this is a *bool so false can explicitly disable (vs absent=true default).
+	// Use GetEnableSkillCommands() instead of reading directly.
+	EnableSkillCommands *bool `json:"enableSkillCommands,omitempty"`
+
+	// EnableInstallTelemetry controls whether package-install telemetry may be sent
+	// by pig-specific install telemetry hooks when they are configured.
+	// Default: true.
+	// Mirrors upstream settings.enableInstallTelemetry (settings-manager.ts), but
+	// the transport itself is a separate implementation concern.
+	EnableInstallTelemetry *bool `json:"enableInstallTelemetry,omitempty"`
+
+	// EnableAnalytics is the opt-in analytics data sharing setting (default
+	// false). Mirrors upstream settings plumbing only: nothing sends data.
+	EnableAnalytics *bool `json:"enableAnalytics,omitempty"`
+	// TrackingID is the analytics tracking identifier generated on the first
+	// opt-in. Bug reports strip it.
+	TrackingID string `json:"trackingId,omitempty"`
+
+	// Retry mirrors upstream settings.retry (settings-manager.ts:682-690).
+	// Nested JSON: { "retry": { "enabled": true, "maxRetries": 2,
+	//   "baseDelayMs": 10000, "maxDelayMs": 60000 } }
+	Retry *RetrySettingsJSON `json:"retry,omitempty"`
+
+	// ShowImages controls whether inline images are rendered in tool results
+	// and assistant messages. Default: true.
+	// Mirrors upstream settings.showImages (settings-manager.ts:84).
+	ShowImages *bool `json:"showImages,omitempty"`
+
+	// ImageWidthCells is the max width (in terminal columns) for inline images.
+	// Default: 60. Mirrors upstream settings.imageWidthCells (settings-manager.ts:85).
+	ImageWidthCells int `json:"imageWidthCells,omitempty"`
+
+	// BlockImages, when true, blocks image rendering entirely. Default: false.
+	// Mirrors upstream settings.blockImages (settings-manager.ts:86).
+	BlockImages    bool `json:"blockImages,omitempty"`
+	blockImagesSet bool `json:"-"`
+
+	// ImageAutoResize, when true, automatically resizes images to fit the
+	// terminal width. Default: true.
+	// Mirrors upstream settings.imageAutoResize (settings-manager.ts:87).
+	ImageAutoResize *bool `json:"imageAutoResize,omitempty"`
+
+	// Transport controls HTTP transport behavior.
+	// Values: "sse" | "websocket" | "websocket-cached" | "auto". Default: "auto".
+	// Mirrors upstream settings.transport (settings-manager.ts:70).
+	Transport string `json:"transport,omitempty"`
+
+	// SessionShareDestination is Pi's /share destination (settings-schema.ts sessionShareDestination). Values: "auto" | "gist" | "radius". Default: "auto".
+	SessionShareDestination SessionShareDestination `json:"sessionShareDestination,omitempty"`
+
+	// ShowHardwareCursor controls whether the hardware cursor is shown.
+	// Default: false (or PI_HARDWARE_CURSOR=1 env).
+	// Mirrors upstream settings.showHardwareCursor (settings-manager.ts:944).
+	ShowHardwareCursor *bool `json:"showHardwareCursor,omitempty"`
+
+	// EditorPaddingX is horizontal padding (in cells) for the editor.
+	// Range: 0-3. Default: 0.
+	// Mirrors upstream settings.editorPaddingX (settings-manager.ts:951).
+	EditorPaddingX *int `json:"editorPaddingX,omitempty"`
+
+	// OutputPad is horizontal padding (in cells) for chat output.
+	// Range: 0-1. Default: 1.
+	// Mirrors upstream settings.outputPad (settings-manager.ts:116).
+	OutputPad *int `json:"outputPad,omitempty"`
+
+	// ExternalEditor is the command Ctrl+G uses before VISUAL/EDITOR fallbacks.
+	// Mirrors upstream settings.externalEditor (settings-manager.ts:93).
+	ExternalEditor string `json:"externalEditor,omitempty"`
+
+	// AutocompleteMaxVisible is the max number of autocomplete suggestions shown.
+	// Range: 3-20. Default: 5.
+	// Mirrors upstream settings.autocompleteMaxVisible (settings-manager.ts:958).
+	AutocompleteMaxVisible *int `json:"autocompleteMaxVisible,omitempty"`
+
+	// ClearOnShrink controls whether the screen is cleared when terminal shrinks.
+	// Default: false.
+	// Mirrors upstream settings.clearOnShrink (settings-manager.ts:891).
+	ClearOnShrink *bool `json:"clearOnShrink,omitempty"`
+
+	// ShowTerminalProgress controls OSC 9;4 terminal progress indicators.
+	// Default: false.
+	ShowTerminalProgress *bool `json:"showTerminalProgress,omitempty"`
+
+	// TerminalScreenWriter is terminal.screenWriter, what a fullscreen terminal is sent: "writer" for only what changes its screen, "pi" for Pi's bytes; see GetTerminalScreenWriter. PIG_TUI_SCREEN_WRITER overrides it. It is read once, when interactive mode starts. Global setting only.
+	// pig divergence (D624): Pi has no such key; it writes every row a frame holds.
+	TerminalScreenWriter string `json:"screenWriter,omitempty"`
+
+	// TerminalFramePacing is terminal.framePacing, how soon a streaming reply's next frame may begin in fullscreen mode: "pi" for Pi's 16 ms, the default, "adaptive" for the last frame's cost times four between 10 and 16 ms; see GetTerminalFramePacing. PIG_FRAME_PACING overrides it. It is read once, when interactive mode starts. Global setting only.
+	// pig additive (D625): Pi has no such key; its frame interval is one constant, which is what the key unset selects.
+	TerminalFramePacing string `json:"framePacing,omitempty"`
+
+	// terminalHyperlinks, terminalImages, and terminalTrueColor hold the
+	// authored terminal.hyperlinks, terminal.images, and terminal.trueColor
+	// JSON values. Upstream types them boolean | "auto",
+	// "kitty" | "iterm2" | "auto" | false, and boolean | "auto", keeps whatever
+	// the file holds, and lets getTerminalCapabilityOverrides ignore the rest.
+	terminalHyperlinks json.RawMessage
+	terminalImages     json.RawMessage
+	terminalTrueColor  json.RawMessage
+
+	// ThinkingBudgets controls per-level token budgets for extended thinking.
+	// Mirrors upstream settings.thinkingBudgets (settings-manager.ts:857).
+	ThinkingBudgets *ThinkingBudgetsSettings `json:"thinkingBudgets,omitempty"`
+
+	// NpmCommand overrides the npm command used for package operations.
+	// Default: ["npm"].
+	// Mirrors upstream settings.npmCommand (settings-manager.ts:830).
+	NpmCommand []string `json:"npmCommand,omitempty"`
+
+	// SelfUpdateCommand is the argv `pi update` runs to update the program itself, with {packageName}, {version}
+	// and {installSpec} placeholders. Only the global settings file is read for it, so a project cannot inject a
+	// command; PI_SELF_UPDATE_COMMAND takes precedence.
+	// Mirrors upstream settings.selfUpdateCommand (settings-schema.ts).
+	SelfUpdateCommand []string `json:"selfUpdateCommand,omitzero"`
+
+	// Markdown holds markdown rendering settings.
+	// Mirrors upstream settings.markdown (settings-manager.ts:965).
+	Markdown *MarkdownSettings `json:"markdown,omitempty"`
+
+	// Warnings holds persisted warning-dismissal preferences.
+	Warnings *WarningSettings `json:"warnings,omitempty"`
+}
+
+func cloneIntPtr(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	x := *v
+	return &x
+}
+
+func cloneStringPtr(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	clone := *v
+	return &clone
+}
+
+func cloneBoolPtr(v *bool) *bool {
+	if v == nil {
+		return nil
+	}
+	x := *v
+	return &x
+}
+
+func cloneFloatPtr(v *float64) *float64 {
+	if v == nil {
+		return nil
+	}
+	return new(*v)
+}
+
+func cloneCompactionSettings(v *CompactionSettingsJSON) *CompactionSettingsJSON {
+	if v == nil {
+		return nil
+	}
+	out := &CompactionSettingsJSON{
+		Enabled:          cloneBoolPtr(v.Enabled),
+		extra:            maps.Clone(v.extra),
+		ReserveTokens:    cloneFloatPtr(v.ReserveTokens),
+		KeepRecentTokens: cloneFloatPtr(v.KeepRecentTokens),
+		MaxContextTokens: cloneFloatPtr(v.MaxContextTokens),
+	}
+	if v.ModelOverrides != nil {
+		out.ModelOverrides = make(map[string]CompactionModelOverride, len(v.ModelOverrides))
+		for key, override := range v.ModelOverrides {
+			out.ModelOverrides[key] = CompactionModelOverride{
+				extra: maps.Clone(override.extra), invalidEntry: bytes.Clone(override.invalidEntry),
+				ReserveTokens:    cloneFloatPtr(override.ReserveTokens),
+				KeepRecentTokens: cloneFloatPtr(override.KeepRecentTokens),
+			}
+		}
+	}
+	return out
+}
+
+// mergeCompactionModelOverrides deep-merges project model overrides into
+// merged, field by field, as upstream deepMergeSettings merges nested objects.
+func mergeCompactionModelOverrides(merged *CompactionSettingsJSON, project map[string]CompactionModelOverride) {
+	if len(project) == 0 {
+		return
+	}
+	if merged.ModelOverrides == nil {
+		merged.ModelOverrides = make(map[string]CompactionModelOverride, len(project))
+	}
+	for key, override := range project {
+		current := merged.ModelOverrides[key]
+		if override.invalidEntry != nil || current.invalidEntry != nil {
+			current = CompactionModelOverride{invalidEntry: bytes.Clone(override.invalidEntry)}
+		}
+		if current.extra == nil {
+			current.extra = make(map[string]json.RawMessage)
+		}
+		maps.Copy(current.extra, override.extra)
+		mergeCompactionNumber(&current.ReserveTokens, current.extra, "reserveTokens", override.ReserveTokens, override.extra)
+		mergeCompactionNumber(&current.KeepRecentTokens, current.extra, "keepRecentTokens", override.KeepRecentTokens, override.extra)
+		merged.ModelOverrides[key] = current
+	}
+}
+
+func cloneProviderRetrySettings(v *ProviderRetrySettings) *ProviderRetrySettings {
+	if v == nil {
+		return nil
+	}
+	out := &ProviderRetrySettings{
+		TimeoutMs:  cloneIntPtr(v.TimeoutMs),
+		MaxRetries: cloneIntPtr(v.MaxRetries),
+	}
+	if v.MaxRetryDelayMs != nil {
+		d := *v.MaxRetryDelayMs
+		out.MaxRetryDelayMs = &d
+	}
+	return out
+}
+
+func cloneRetrySettings(v *RetrySettingsJSON) *RetrySettingsJSON {
+	if v == nil {
+		return nil
+	}
+	return &RetrySettingsJSON{
+		Enabled:         cloneBoolPtr(v.Enabled),
+		MaxRetries:      cloneIntPtr(v.MaxRetries),
+		BaseDelayMs:     cloneIntPtr(v.BaseDelayMs),
+		MaxAgentDelayMs: cloneIntPtr(v.MaxAgentDelayMs),
+		Provider:        cloneProviderRetrySettings(v.Provider),
+	}
+}
+
+func cloneBranchSummary(v *BranchSummaryConfig) *BranchSummaryConfig {
+	if v == nil {
+		return nil
+	}
+	return &BranchSummaryConfig{
+		ReserveTokens:    v.ReserveTokens,
+		SkipPrompt:       v.SkipPrompt,
+		reserveTokensSet: v.reserveTokensSet,
+		skipPromptSet:    v.skipPromptSet,
+	}
+}
+
+func cloneThinkingBudgets(v *ThinkingBudgetsSettings) *ThinkingBudgetsSettings {
+	if v == nil {
+		return nil
+	}
+	return &ThinkingBudgetsSettings{
+		Minimal: cloneIntPtr(v.Minimal),
+		Low:     cloneIntPtr(v.Low),
+		Medium:  cloneIntPtr(v.Medium),
+		High:    cloneIntPtr(v.High),
+	}
+}
+
+func cloneMarkdownSettings(v *MarkdownSettings) *MarkdownSettings {
+	if v == nil {
+		return nil
+	}
+	return &MarkdownSettings{CodeBlockIndent: cloneStringPtr(v.CodeBlockIndent), Mermaid: v.Mermaid, codeBlockIndentNull: v.codeBlockIndentNull}
+}
+
+func cloneWarningSettings(v *WarningSettings) *WarningSettings {
+	if v == nil {
+		return nil
+	}
+	return &WarningSettings{AnthropicExtraUsage: v.AnthropicExtraUsage, anthropicExtraUsageSet: v.anthropicExtraUsageSet}
+}
+
+func cloneCodemodeSettings(v *CodemodeSettings) *CodemodeSettings {
+	if v == nil {
+		return nil
+	}
+	return &CodemodeSettings{Mode: v.Mode, InlineBudget: cloneIntPtr(v.InlineBudget)}
+}
+
+// mergeCodemodeSettings merges the nested codemode object field by field, project over global (upstream deepMergeObjects).
+func mergeCodemodeSettings(global, project *CodemodeSettings) *CodemodeSettings {
+	if project == nil {
+		return global
+	}
+	merged := cloneCodemodeSettings(global)
+	if merged == nil {
+		merged = &CodemodeSettings{}
+	}
+	if project.Mode != "" {
+		merged.Mode = project.Mode
+	}
+	if project.InlineBudget != nil {
+		merged.InlineBudget = cloneIntPtr(project.InlineBudget)
+	}
+	return merged
+}
+
+func clonePackageSources(src []PackageSource) []PackageSource {
+	if src == nil {
+		return nil
+	}
+	out := make([]PackageSource, len(src))
+	for i, pkg := range src {
+		out[i] = PackageSource{
+			Source:     pkg.Source,
+			Autoload:   cloneBoolPtr(pkg.Autoload),
+			Extensions: slices.Clone(pkg.Extensions),
+			Skills:     slices.Clone(pkg.Skills),
+			Prompts:    slices.Clone(pkg.Prompts),
+			Themes:     slices.Clone(pkg.Themes),
+			WasObject:  pkg.WasObject,
+			keyOrder:   slices.Clone(pkg.keyOrder),
+			unknown:    maps.Clone(pkg.unknown),
+		}
+	}
+	return out
+}
+
+// emptyStringSet flags the string settings that are present as "".
+type emptyStringSet struct{ defaultProvider, defaultModel, shellPath, commandPrefix, externalEditor bool }
+
+// optionalString is the settings value as the wire writes it: present when non-empty or flagged empty.
+func optionalString(value string, empty bool) *string {
+	if value == "" && !empty {
+		return nil
+	}
+	return &value
+}
+
+func presentString(value *string) (string, bool) {
+	if value == nil {
+		return "", false
+	}
+	return *value, *value == ""
+}
+
+func cloneSettings(s Settings) Settings {
+	return Settings{
+		emptyStrings:                   s.emptyStrings,
+		extra:                          maps.Clone(s.extra),
+		DefaultProvider:                s.DefaultProvider,
+		DefaultModel:                   s.DefaultModel,
+		DefaultThinkingLevel:           s.DefaultThinkingLevel,
+		HideThinkingBlock:              s.HideThinkingBlock,
+		hideThinkingBlockSet:           s.hideThinkingBlockSet,
+		Theme:                          s.Theme,
+		themeEmpty:                     s.themeEmpty,
+		themeNonString:                 s.themeNonString,
+		ShellPath:                      s.ShellPath,
+		CommandPrefix:                  s.CommandPrefix,
+		QuietStartup:                   s.QuietStartup,
+		quietStartupSet:                s.quietStartupSet,
+		Packages:                       clonePackageSources(s.Packages),
+		Extensions:                     slices.Clone(s.Extensions),
+		Skills:                         slices.Clone(s.Skills),
+		Prompts:                        slices.Clone(s.Prompts),
+		Themes:                         slices.Clone(s.Themes),
+		SessionDir:                     s.SessionDir,
+		HTTPProxy:                      s.HTTPProxy,
+		WebSocketConnectTimeoutMs:      cloneIntPtr(s.WebSocketConnectTimeoutMs),
+		webSocketConnectTimeoutNull:    s.webSocketConnectTimeoutNull,
+		webSocketConnectTimeoutInvalid: s.webSocketConnectTimeoutInvalid,
+		HTTPIdleTimeoutMs:              cloneIntPtr(s.HTTPIdleTimeoutMs),
+		httpIdleTimeoutInvalid:         s.httpIdleTimeoutInvalid,
+		httpIdleTimeoutNull:            s.httpIdleTimeoutNull,
+		CacheWarming:                   s.CacheWarming,
+		EnabledModels:                  slices.Clone(s.EnabledModels),
+		DefaultTools:                   slices.Clone(s.DefaultTools),
+		ModelThinkingLevels:            maps.Clone(s.ModelThinkingLevels),
+		LastChangelogVersion:           s.LastChangelogVersion,
+		ExtensionChangelogVersions:     maps.Clone(s.ExtensionChangelogVersions),
+		Compaction:                     cloneCompactionSettings(s.Compaction),
+		BranchSummary:                  cloneBranchSummary(s.BranchSummary),
+		DoubleEscapeAction:             s.DoubleEscapeAction,
+		TreeFilterMode:                 s.TreeFilterMode,
+		DefaultProjectTrust:            s.DefaultProjectTrust,
+		SteeringMode:                   s.SteeringMode,
+		FollowUpMode:                   s.FollowUpMode,
+		TuiMode:                        s.TuiMode,
+		FullscreenExitOutput:           s.FullscreenExitOutput,
+		FullscreenScrollbar:            s.FullscreenScrollbar,
+		FullscreenCopyOnSelect:         cloneBoolPtr(s.FullscreenCopyOnSelect),
+		FullscreenWheelScrollLines:     slices.Clone(s.FullscreenWheelScrollLines),
+		DeviceID:                       s.DeviceID,
+		Codemode:                       cloneCodemodeSettings(s.Codemode),
+		MaskSecretInput:                cloneBoolPtr(s.MaskSecretInput),
+		ExtensionsAutoUpgrade:          cloneBoolPtr(s.ExtensionsAutoUpgrade),
+		ExtensionsTypescriptRuntime:    cloneStringPtr(s.ExtensionsTypescriptRuntime),
+		CollapseChangelog:              s.CollapseChangelog,
+		collapseChangelogSet:           s.collapseChangelogSet,
+		ShowCacheMissNotices:           s.ShowCacheMissNotices,
+		showCacheMissNoticesSet:        s.showCacheMissNoticesSet,
+		EnableSkillCommands:            cloneBoolPtr(s.EnableSkillCommands),
+		EnableInstallTelemetry:         cloneBoolPtr(s.EnableInstallTelemetry),
+		EnableAnalytics:                cloneBoolPtr(s.EnableAnalytics),
+		TrackingID:                     s.TrackingID,
+		Retry:                          cloneRetrySettings(s.Retry),
+		ShowImages:                     cloneBoolPtr(s.ShowImages),
+		ImageWidthCells:                s.ImageWidthCells,
+		imageWidthCellsSet:             s.imageWidthCellsSet,
+		BlockImages:                    s.BlockImages,
+		blockImagesSet:                 s.blockImagesSet,
+		ImageAutoResize:                cloneBoolPtr(s.ImageAutoResize),
+		Transport:                      s.Transport,
+		SessionShareDestination:        s.SessionShareDestination,
+		ShowHardwareCursor:             cloneBoolPtr(s.ShowHardwareCursor),
+		EditorPaddingX:                 cloneIntPtr(s.EditorPaddingX),
+		OutputPad:                      cloneIntPtr(s.OutputPad),
+		ExternalEditor:                 s.ExternalEditor,
+		AutocompleteMaxVisible:         cloneIntPtr(s.AutocompleteMaxVisible),
+		ClearOnShrink:                  cloneBoolPtr(s.ClearOnShrink),
+		ShowTerminalProgress:           cloneBoolPtr(s.ShowTerminalProgress),
+		TerminalScreenWriter:           s.TerminalScreenWriter,
+		TerminalFramePacing:            s.TerminalFramePacing,
+		terminalHyperlinks:             slices.Clone(s.terminalHyperlinks),
+		terminalImages:                 slices.Clone(s.terminalImages),
+		terminalTrueColor:              slices.Clone(s.terminalTrueColor),
+		ThinkingBudgets:                cloneThinkingBudgets(s.ThinkingBudgets),
+		NpmCommand:                     slices.Clone(s.NpmCommand),
+		SelfUpdateCommand:              slices.Clone(s.SelfUpdateCommand),
+		Markdown:                       cloneMarkdownSettings(s.Markdown),
+		Warnings:                       cloneWarningSettings(s.Warnings),
+	}
+}
+
+func (s Settings) themeSetting() *string {
+	if s.Theme == "" && !s.themeEmpty {
+		return nil
+	}
+	return new(s.Theme)
+}
+
+// MarshalJSON emits upstream's settings wire shape while preserving pig's
+// internal flattened representation.
+func (s Settings) MarshalJSON() ([]byte, error) {
+	w := settingsWire{
+		LastChangelogVersion:        s.LastChangelogVersion,
+		DefaultProvider:             optionalString(s.DefaultProvider, s.emptyStrings.defaultProvider),
+		DefaultModel:                optionalString(s.DefaultModel, s.emptyStrings.defaultModel),
+		DefaultThinkingLevel:        s.DefaultThinkingLevel,
+		Transport:                   s.Transport,
+		SessionShareDestination:     s.SessionShareDestination,
+		SteeringMode:                s.SteeringMode,
+		FollowUpMode:                s.FollowUpMode,
+		TuiMode:                     s.TuiMode,
+		FullscreenExitOutput:        s.FullscreenExitOutput,
+		FullscreenScrollbar:         s.FullscreenScrollbar,
+		FullscreenCopyOnSelect:      s.FullscreenCopyOnSelect,
+		FullscreenWheelScrollLines:  s.FullscreenWheelScrollLines,
+		DeviceID:                    s.DeviceID,
+		Codemode:                    s.Codemode,
+		MaskSecretInput:             s.MaskSecretInput,
+		ExtensionsAutoUpgrade:       s.ExtensionsAutoUpgrade,
+		ExtensionsTypescriptRuntime: s.ExtensionsTypescriptRuntime,
+		Theme:                       s.themeSetting(),
+		Compaction:                  s.Compaction,
+		Retry:                       s.Retry,
+		ShellPath:                   optionalString(s.ShellPath, s.emptyStrings.shellPath),
+		NpmCommand:                  s.NpmCommand,
+		SelfUpdateCommand:           s.SelfUpdateCommand,
+		EnableInstallTelemetry:      s.EnableInstallTelemetry,
+		EnableAnalytics:             s.EnableAnalytics,
+		TrackingID:                  s.TrackingID,
+		Packages:                    s.Packages,
+		Extensions:                  s.Extensions,
+		Skills:                      s.Skills,
+		Prompts:                     s.Prompts,
+		Themes:                      s.Themes,
+		EnableSkillCommands:         s.EnableSkillCommands,
+		EnabledModels:               s.EnabledModels,
+		DefaultTools:                s.DefaultTools,
+		ModelThinkingLevels:         s.ModelThinkingLevels,
+		ExtensionChangelogVersions:  s.ExtensionChangelogVersions,
+		DoubleEscapeAction:          s.DoubleEscapeAction,
+		TreeFilterMode:              s.TreeFilterMode,
+		DefaultProjectTrust:         s.DefaultProjectTrust,
+		ThinkingBudgets:             s.ThinkingBudgets,
+		EditorPaddingX:              s.EditorPaddingX,
+		OutputPad:                   s.OutputPad,
+		ExternalEditor:              optionalString(s.ExternalEditor, s.emptyStrings.externalEditor),
+		AutocompleteMaxVisible:      s.AutocompleteMaxVisible,
+		ShowHardwareCursor:          s.ShowHardwareCursor,
+		Markdown:                    s.Markdown,
+		Warnings:                    s.Warnings,
+		SessionDir:                  s.SessionDir,
+		HTTPProxy:                   s.HTTPProxy,
+		WebSocketConnectTimeoutMs:   webSocketConnectTimeoutWire(s),
+		HTTPIdleTimeoutMs:           httpIdleTimeoutWire(s),
+		CacheWarming:                s.CacheWarming,
+	}
+	if s.hideThinkingBlockSet {
+		v := s.HideThinkingBlock
+		w.HideThinkingBlock = &v
+	}
+	if s.quietStartupSet {
+		w.QuietStartup, _ = s.QuietStartup.MarshalJSON()
+	}
+	w.ShellCommandPrefix = optionalString(s.CommandPrefix, s.emptyStrings.commandPrefix)
+	if s.collapseChangelogSet {
+		v := s.CollapseChangelog
+		w.CollapseChangelog = &v
+	}
+	if s.showCacheMissNoticesSet {
+		v := s.ShowCacheMissNotices
+		w.ShowCacheMissNotices = &v
+	}
+	if s.BranchSummary != nil {
+		w.BranchSummary = &branchSummaryWire{}
+		if s.BranchSummary.reserveTokensSet || s.BranchSummary.ReserveTokens != 0 {
+			w.BranchSummary.ReserveTokens = new(s.BranchSummary.ReserveTokens)
+		}
+		if s.BranchSummary.skipPromptSet {
+			v := s.BranchSummary.SkipPrompt
+			w.BranchSummary.SkipPrompt = &v
+		}
+	}
+	if s.ShowImages != nil || s.ImageWidthCells > 0 || s.imageWidthCellsSet || s.ClearOnShrink != nil || s.ShowTerminalProgress != nil ||
+		s.TerminalScreenWriter != "" || s.TerminalFramePacing != "" || s.terminalHyperlinks != nil || s.terminalImages != nil || s.terminalTrueColor != nil {
+		w.Terminal = &terminalSettingsWire{
+			ShowImages:           s.ShowImages,
+			ImageWidthCells:      imageWidthCellsWire(s),
+			ClearOnShrink:        s.ClearOnShrink,
+			ShowTerminalProgress: s.ShowTerminalProgress,
+			ScreenWriter:         s.TerminalScreenWriter,
+			FramePacing:          s.TerminalFramePacing,
+			Hyperlinks:           s.terminalHyperlinks,
+			Images:               s.terminalImages,
+			TrueColor:            s.terminalTrueColor,
+		}
+	}
+	if s.ImageAutoResize != nil || s.blockImagesSet {
+		w.Images = &imageSettingsWire{AutoResize: s.ImageAutoResize}
+		if s.blockImagesSet {
+			v := s.BlockImages
+			w.Images.BlockImages = &v
+		}
+	}
+	data, err := json.Marshal(w)
+	if err != nil {
+		return nil, err
+	}
+	return orderedjson.AppendMembers(data, s.extra)
+}
+
+// UnmarshalJSON accepts upstream's settings wire shape after migrateSettings' rewrites.
+func (s *Settings) UnmarshalJSON(data []byte) error {
+	var legacy map[string]any
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	if _, ok := legacy["steeringMode"]; !ok {
+		if queueMode, ok := legacy["queueMode"]; ok {
+			legacy["steeringMode"] = queueMode
+			delete(legacy, "queueMode")
+		}
+	}
+	if _, ok := legacy["transport"]; !ok {
+		if websockets, ok := legacy["websockets"].(bool); ok {
+			if websockets {
+				legacy["transport"] = "websocket"
+			} else {
+				legacy["transport"] = "sse"
+			}
+			delete(legacy, "websockets")
+		}
+	}
+	if rawSkills, ok := legacy["skills"].(map[string]any); ok {
+		if _, exists := legacy["enableSkillCommands"]; !exists {
+			if enabled, ok := rawSkills["enableSkillCommands"]; ok {
+				legacy["enableSkillCommands"] = enabled
+			}
+		}
+		if dirs, ok := rawSkills["customDirectories"].([]any); ok && len(dirs) > 0 {
+			legacy["skills"] = dirs
+		} else {
+			delete(legacy, "skills")
+		}
+	}
+	if rawRetry, ok := legacy["retry"].(map[string]any); ok {
+		provider, _ := rawRetry["provider"].(map[string]any)
+		if maxDelayMs, ok := rawRetry["maxDelayMs"]; ok {
+			if provider == nil {
+				provider = map[string]any{}
+			}
+			if _, exists := provider["maxRetryDelayMs"]; !exists {
+				provider["maxRetryDelayMs"] = maxDelayMs
+			}
+			rawRetry["provider"] = provider
+			delete(rawRetry, "maxDelayMs")
+		}
+	}
+	// Decoding drops a mistyped theme, so record its presence first.
+	rawTheme, themePresent := legacy["theme"]
+	_, themeIsString := rawTheme.(string)
+	extra, err := unmodeledSettings(data, legacy)
+	if err != nil {
+		return err
+	}
+	s.extra = extra
+	w, ignored, err := decodeSettingsWire(legacy)
+	if err != nil {
+		return err
+	}
+	s.ignored = ignored
+	s.LastChangelogVersion = w.LastChangelogVersion
+	s.DefaultProvider, s.emptyStrings.defaultProvider = presentString(w.DefaultProvider)
+	s.DefaultModel, s.emptyStrings.defaultModel = presentString(w.DefaultModel)
+	s.DefaultThinkingLevel = w.DefaultThinkingLevel
+	s.Transport = w.Transport
+	s.SessionShareDestination = w.SessionShareDestination
+	s.SteeringMode = w.SteeringMode
+	s.FollowUpMode = w.FollowUpMode
+	s.TuiMode = w.TuiMode
+	s.FullscreenExitOutput = w.FullscreenExitOutput
+	s.FullscreenScrollbar = w.FullscreenScrollbar
+	s.FullscreenCopyOnSelect = w.FullscreenCopyOnSelect
+	s.FullscreenWheelScrollLines = w.FullscreenWheelScrollLines
+	s.DeviceID = w.DeviceID
+	s.Codemode = w.Codemode
+	s.MaskSecretInput = w.MaskSecretInput
+	s.ExtensionsAutoUpgrade = w.ExtensionsAutoUpgrade
+	s.ExtensionsTypescriptRuntime = w.ExtensionsTypescriptRuntime
+	s.Theme = ""
+	s.themeEmpty = w.Theme != nil && *w.Theme == ""
+	s.themeNonString = themePresent && !themeIsString
+	if w.Theme != nil {
+		s.Theme = *w.Theme
+	}
+	s.Compaction = w.Compaction
+	if w.BranchSummary != nil {
+		s.BranchSummary = &BranchSummaryConfig{}
+		if w.BranchSummary.ReserveTokens != nil {
+			s.BranchSummary.ReserveTokens = *w.BranchSummary.ReserveTokens
+			s.BranchSummary.reserveTokensSet = true
+		}
+		if w.BranchSummary.SkipPrompt != nil {
+			s.BranchSummary.SkipPrompt = *w.BranchSummary.SkipPrompt
+			s.BranchSummary.skipPromptSet = true
+		}
+	} else {
+		s.BranchSummary = nil
+	}
+	s.Retry = w.Retry
+	if w.HideThinkingBlock != nil {
+		s.HideThinkingBlock = *w.HideThinkingBlock
+		s.hideThinkingBlockSet = true
+	}
+	s.ShellPath, s.emptyStrings.shellPath = presentString(w.ShellPath)
+	if w.QuietStartup != nil {
+		_ = s.QuietStartup.UnmarshalJSON(w.QuietStartup)
+		s.quietStartupSet = true
+	}
+	s.CommandPrefix, s.emptyStrings.commandPrefix = presentString(w.ShellCommandPrefix)
+	if w.CollapseChangelog != nil {
+		s.CollapseChangelog = *w.CollapseChangelog
+		s.collapseChangelogSet = true
+	}
+	if w.ShowCacheMissNotices != nil {
+		s.ShowCacheMissNotices = *w.ShowCacheMissNotices
+		s.showCacheMissNoticesSet = true
+	}
+	s.EnableInstallTelemetry = w.EnableInstallTelemetry
+	s.EnableAnalytics = w.EnableAnalytics
+	s.TrackingID = w.TrackingID
+	s.Packages = w.Packages
+	if len(w.Packages) > 0 {
+		// The wire decode went through a map, which lost each package object's key order.
+		if object, err := orderedjson.Parse(data); err == nil {
+			var ordered []PackageSource
+			if raw, ok := object.Get("packages"); ok && json.Unmarshal(raw, &ordered) == nil && len(ordered) == len(w.Packages) {
+				s.Packages = ordered
+			}
+		}
+	}
+	s.Extensions = w.Extensions
+	s.Skills = w.Skills
+	s.Prompts = w.Prompts
+	s.Themes = w.Themes
+	s.EnableSkillCommands = w.EnableSkillCommands
+	if w.Terminal != nil {
+		s.ShowImages = w.Terminal.ShowImages
+		if w.Terminal.ImageWidthCells != nil {
+			s.ImageWidthCells, s.imageWidthCellsSet = *w.Terminal.ImageWidthCells, true
+		}
+		s.ClearOnShrink = w.Terminal.ClearOnShrink
+		s.ShowTerminalProgress = w.Terminal.ShowTerminalProgress
+		s.TerminalScreenWriter = w.Terminal.ScreenWriter
+		s.TerminalFramePacing = w.Terminal.FramePacing
+		s.terminalHyperlinks = w.Terminal.Hyperlinks
+		s.terminalImages = w.Terminal.Images
+		s.terminalTrueColor = w.Terminal.TrueColor
+	}
+	if w.Images != nil {
+		s.ImageAutoResize = w.Images.AutoResize
+		if w.Images.BlockImages != nil {
+			s.BlockImages = *w.Images.BlockImages
+			s.blockImagesSet = true
+		}
+	}
+	s.EnabledModels = w.EnabledModels
+	s.DefaultTools = w.DefaultTools
+	s.ModelThinkingLevels = w.ModelThinkingLevels
+	s.ExtensionChangelogVersions = w.ExtensionChangelogVersions
+	s.DoubleEscapeAction = w.DoubleEscapeAction
+	s.TreeFilterMode = w.TreeFilterMode
+	s.DefaultProjectTrust = w.DefaultProjectTrust
+	s.ThinkingBudgets = w.ThinkingBudgets
+	s.EditorPaddingX = w.EditorPaddingX
+	s.OutputPad = w.OutputPad
+	s.ExternalEditor, s.emptyStrings.externalEditor = presentString(w.ExternalEditor)
+	s.AutocompleteMaxVisible = w.AutocompleteMaxVisible
+	s.ShowHardwareCursor = w.ShowHardwareCursor
+	s.Markdown = w.Markdown
+	s.Warnings = w.Warnings
+	s.SessionDir = w.SessionDir
+	s.HTTPProxy = w.HTTPProxy
+	s.webSocketConnectTimeoutNull = false
+	if value, present := legacy["websocketConnectTimeoutMs"]; present && value == nil {
+		s.webSocketConnectTimeoutNull = true
+	}
+	s.WebSocketConnectTimeoutMs, s.webSocketConnectTimeoutInvalid = nil, nil
+	if w.WebSocketConnectTimeoutMs != nil {
+		if timeout, ok := parseHTTPIdleTimeoutMs(w.WebSocketConnectTimeoutMs); ok {
+			s.WebSocketConnectTimeoutMs = &timeout
+		} else {
+			s.webSocketConnectTimeoutInvalid = w.WebSocketConnectTimeoutMs
+		}
+	}
+	s.HTTPIdleTimeoutMs, s.httpIdleTimeoutInvalid = nil, nil
+	s.httpIdleTimeoutNull = false
+	if value, present := legacy["httpIdleTimeoutMs"]; present && value == nil {
+		s.httpIdleTimeoutNull = true
+	}
+	if w.HTTPIdleTimeoutMs != nil {
+		if timeoutMs, ok := parseHTTPIdleTimeoutMs(w.HTTPIdleTimeoutMs); ok {
+			s.HTTPIdleTimeoutMs = &timeoutMs
+		} else {
+			s.httpIdleTimeoutInvalid = w.HTTPIdleTimeoutMs
+		}
+	}
+	s.CacheWarming = w.CacheWarming
+	s.NpmCommand = w.NpmCommand
+	s.SelfUpdateCommand = w.SelfUpdateCommand
+	return nil
+}
+
+// decodeSettingsWire decodes the settings object into settingsWire. Upstream
+// reads settings with JSON.parse, which never rejects a file for one field's
+// type, so a field whose JSON type does not match is dropped and the rest of
+// the file still loads.
+// pig divergence (D158): a value of the wrong JSON type is dropped here instead of reaching code that throws, as Pi's does.
+func decodeSettingsWire(raw map[string]any) (settingsWire, []string, error) {
+	sanitized := false
+	var ignored []string
+	for {
+		normalized, err := json.Marshal(raw)
+		if err != nil {
+			return settingsWire{}, ignored, err
+		}
+		var w settingsWire
+		err = json.Unmarshal(normalized, &w)
+		if err == nil {
+			return w, ignored, nil
+		}
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && deleteJSONPath(raw, strings.Split(typeErr.Field, ".")) {
+			ignored = append(ignored, fmt.Sprintf("%q (expected %s)", typeErr.Field, expectedSettingType(typeErr.Field, typeErr.Type)))
+			continue
+		}
+		// The error does not name a removable path (for example, one inside
+		// a custom decoder such as a package entry): drop the undecodable
+		// array elements and top-level keys once, then retry.
+		if sanitized {
+			return w, ignored, err
+		}
+		removed := dropUndecodableSettings(raw)
+		if len(removed) == 0 {
+			return w, ignored, err
+		}
+		ignored = append(ignored, removed...)
+		sanitized = true
+	}
+}
+
+// expectedSettingType describes the JSON type of the setting at the dotted path, read from settingsWire's field types; fallback is the type the
+// decoder reported when the path names no field.
+func expectedSettingType(path string, fallback reflect.Type) string {
+	t := reflect.TypeFor[settingsWire]()
+	for name := range strings.SplitSeq(path, ".") {
+		for t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			t = nil
+			break
+		}
+		var next reflect.Type
+		for field := range t.Fields() {
+			if tag, _, _ := strings.Cut(field.Tag.Get("json"), ","); tag == name {
+				next = field.Type
+				break
+			}
+		}
+		if next == nil {
+			t = nil
+			break
+		}
+		t = next
+	}
+	if t == nil {
+		t = fallback
+	}
+	return describeSettingType(t)
+}
+
+func describeSettingType(t reflect.Type) string {
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == nil {
+		return "a valid value"
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "a boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Float32, reflect.Float64:
+		return "a number"
+	case reflect.Slice, reflect.Array:
+		if elem := t.Elem(); elem.Kind() == reflect.String {
+			return "an array of strings"
+		}
+		return "an array"
+	case reflect.Map, reflect.Struct:
+		return "an object"
+	}
+	return "a valid value"
+}
+
+// dropUndecodableSettings removes each top-level key whose value does not
+// decode into settingsWire; for an array, only the elements that do not
+// decode go. It returns a description of each removal, in key order.
+func dropUndecodableSettings(raw map[string]any) []string {
+	decodes := func(key string, value any) bool {
+		data, err := json.Marshal(map[string]any{key: value})
+		if err != nil {
+			return false
+		}
+		var w settingsWire
+		return json.Unmarshal(data, &w) == nil
+	}
+	var removed []string
+	for key, value := range raw {
+		if decodes(key, value) {
+			continue
+		}
+		items, isArray := value.([]any)
+		if !isArray {
+			removed = append(removed, fmt.Sprintf("%q (expected %s)", key, expectedSettingType(key, nil)))
+			delete(raw, key)
+			continue
+		}
+		removed = append(removed, fmt.Sprintf("%q (an element of the wrong type)", key))
+		kept := make([]any, 0, len(items))
+		for _, item := range items {
+			if decodes(key, []any{item}) {
+				kept = append(kept, item)
+			}
+		}
+		raw[key] = kept
+	}
+	slices.Sort(removed)
+	return removed
+}
+
+// deleteJSONPath removes the deepest object key along path that exists. It
+// reports whether it removed one.
+func deleteJSONPath(object map[string]any, path []string) bool {
+	if len(path) == 0 || path[0] == "" {
+		return false
+	}
+	value, ok := object[path[0]]
+	if !ok {
+		return false
+	}
+	if nested, isObject := value.(map[string]any); isObject && len(path) > 1 && deleteJSONPath(nested, path[1:]) {
+		return true
+	}
+	delete(object, path[0])
+	return true
+}
+
+// GetShellPath satisfies tools.SettingsView so the bash tool can resolve the
+// user's preferred shell without importing internal/codingagent (which would
+// create a cycle).
+func (s Settings) GetShellPath() (string, error) { return normalizeSettingsPath(s.ShellPath) }
+func (s Settings) GetCommandPrefix() string      { return s.CommandPrefix }
+
+// GetMaskSecretInput returns the login-input privacy setting, enabled by default.
+func (s Settings) GetMaskSecretInput() bool {
+	// pig divergence (D80): the user can restore Pi's plain-text input behavior with false.
+	return s.MaskSecretInput == nil || *s.MaskSecretInput
+}
+
+// GetShowImages returns whether inline images should be rendered. Default true.
+func (s Settings) GetShowImages() bool {
+	if s.ShowImages == nil {
+		return true
+	}
+	return *s.ShowImages
+}
+
+// GetImageWidthCells returns the max image width in columns. Default 60.
+func (s Settings) GetImageWidthCells() int {
+	if s.ImageWidthCells == 0 && !s.imageWidthCellsSet {
+		return 60
+	}
+	return max(1, s.ImageWidthCells)
+}
+
+// imageWidthCellsWire is the terminal.imageWidthCells to write: a value the file set, or a positive one, and nothing otherwise.
+func imageWidthCellsWire(s Settings) *int {
+	if s.ImageWidthCells == 0 && !s.imageWidthCellsSet {
+		return nil
+	}
+	return &s.ImageWidthCells
+}
+
+// GetImageAutoResize returns whether images should auto-resize. Default true.
+func (s Settings) GetImageAutoResize() bool {
+	if s.ImageAutoResize == nil {
+		return true
+	}
+	return *s.ImageAutoResize
+}
+
+var (
+	hardwareCursorEnv = newEnvVar("PI_HARDWARE_CURSOR")
+	clearOnShrinkEnv  = newEnvVar("PI_CLEAR_ON_SHRINK")
+	visualEnv         = newEnvVar("VISUAL")
+	editorEnv         = newEnvVar("EDITOR")
+)
+
+// GetShowHardwareCursor returns whether the hardware cursor is shown.
+// Default: false (or PI_HARDWARE_CURSOR=1 env).
+func (s Settings) GetShowHardwareCursor() bool {
+	if s.ShowHardwareCursor == nil {
+		return hardwareCursorEnv.isOne()
+	}
+	return *s.ShowHardwareCursor
+}
+
+// GetEditorPaddingX returns horizontal editor padding. Default: 0.
+func (s Settings) GetEditorPaddingX() int {
+	if s.EditorPaddingX == nil {
+		return 0
+	}
+	return *s.EditorPaddingX
+}
+
+// OutputPad is the horizontal chat output padding: upstream `0 | 1` (settings-manager.ts:1488).
+type OutputPad int
+
+// The OutputPad values.
+const (
+	OutputPadNone OutputPad = 0
+	OutputPadOne  OutputPad = 1
+)
+
+// GetOutputPad returns zero only for an explicit zero setting, and one otherwise.
+func (s Settings) GetOutputPad() OutputPad {
+	if s.OutputPad != nil && *s.OutputPad == 0 {
+		return OutputPadNone
+	}
+	return OutputPadOne
+}
+
+// GetAutocompleteMaxVisible returns max autocomplete items. Default: 5.
+func (s Settings) GetAutocompleteMaxVisible() int {
+	if s.AutocompleteMaxVisible == nil {
+		return 5
+	}
+	return *s.AutocompleteMaxVisible
+}
+
+// GetClearOnShrink returns whether screen clears on terminal shrink. Default: false.
+func (s Settings) GetClearOnShrink() bool {
+	if s.ClearOnShrink == nil {
+		return clearOnShrinkEnv.isOne()
+	}
+	return *s.ClearOnShrink
+}
+
+// GetTerminalCapabilityOverrides mirrors upstream
+// SettingsManager.getTerminalCapabilityOverrides: terminal.images "kitty" or
+// "iterm2" selects that protocol and false disables images; a boolean
+// terminal.trueColor or terminal.hyperlinks overrides detection. "auto" and
+// any other value leave detection alone.
+func (s Settings) GetTerminalCapabilityOverrides() tui.CapabilityOverrides {
+	var overrides tui.CapabilityOverrides
+	switch images := decodeSettingJSON(s.terminalImages).(type) {
+	case string:
+		if images == string(tui.ImageProtocolKitty) || images == string(tui.ImageProtocolITerm2) {
+			protocol := tui.ImageProtocol(images)
+			overrides.Images = &protocol
+		}
+	case bool:
+		if !images {
+			none := tui.ImageProtocol("")
+			overrides.Images = &none
+		}
+	}
+	if trueColor, ok := decodeSettingJSON(s.terminalTrueColor).(bool); ok {
+		overrides.TrueColor = &trueColor
+	}
+	if hyperlinks, ok := decodeSettingJSON(s.terminalHyperlinks).(bool); ok {
+		overrides.Hyperlinks = &hyperlinks
+	}
+	return overrides
+}
+
+// decodeSettingJSON decodes one authored settings value, or returns nil when it
+// is absent or malformed.
+func decodeSettingJSON(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil
+	}
+	return value
+}
+
+// The values of terminal.screenWriter.
+const (
+	TerminalScreenWriterWriter = "writer"
+	TerminalScreenWriterPi     = "pi"
+)
+
+// TerminalScreenWriterDefault is what terminal.screenWriter means when the key is unset or holds neither value: the one place
+// that says what a fullscreen terminal is sent when nobody chose (D624). Nothing else in the tree names the default. The screen
+// writer is opt-in in 0.8.0: the default is Pi's bytes until the writer is shown on the owner's terminals.
+const TerminalScreenWriterDefault = TerminalScreenWriterPi
+
+// GetTerminalScreenWriter returns the terminal.screenWriter setting, TerminalScreenWriterWriter or TerminalScreenWriterPi. The key unset, and any other value, is TerminalScreenWriterDefault.
+// pig divergence (D624): see Settings.TerminalScreenWriter.
+func (s Settings) GetTerminalScreenWriter() string {
+	return terminalScreenWriterOr(s.TerminalScreenWriter, TerminalScreenWriterDefault)
+}
+
+// terminalScreenWriterOr is value when it is one of the two values of terminal.screenWriter, byDefault otherwise.
+func terminalScreenWriterOr(value, byDefault string) string {
+	if value == TerminalScreenWriterWriter || value == TerminalScreenWriterPi {
+		return value
+	}
+	return byDefault
+}
+
+// The values of terminal.framePacing.
+const (
+	TerminalFramePacingAdaptive = "adaptive"
+	TerminalFramePacingPi       = "pi"
+)
+
+// terminalFramePacingDefault is the frame pacing of a run that selects none: the terminal.framePacing key unset or holding any other value, and PIG_FRAME_PACING naming no policy. It is Pi's interval: the adaptive policy's median and 95th percentile gap between visible changes are shorter, but it uses 4 to 7 % more CPU time, most of it for the frames it draws more, and its 99th percentile while a 200 KB file is written is half a millisecond over Pi's (D625). This constant is the only place the default is decided.
+// pig additive (D625): the adaptive policy is opt-in.
+const terminalFramePacingDefault = TerminalFramePacingPi
+
+// terminalFramePacingOr returns value when it names a frame pacing, else byDefault.
+func terminalFramePacingOr(value, byDefault string) string {
+	if value == TerminalFramePacingAdaptive || value == TerminalFramePacingPi {
+		return value
+	}
+	return byDefault
+}
+
+// GetTerminalFramePacing returns the terminal.framePacing setting, TerminalFramePacingAdaptive or TerminalFramePacingPi. The key unset, and any other value, is the default, terminalFramePacingDefault.
+// pig additive (D625): see Settings.TerminalFramePacing.
+func (s Settings) GetTerminalFramePacing() string {
+	return terminalFramePacingOr(s.TerminalFramePacing, terminalFramePacingDefault)
+}
+
+// GetShowTerminalProgress returns whether OSC 9;4 terminal progress indicators are enabled.
+func (s Settings) GetShowTerminalProgress() bool {
+	if s.ShowTerminalProgress == nil {
+		return false
+	}
+	return *s.ShowTerminalProgress
+}
+
+// GetCodeBlockIndent returns the markdown code block indent string. Default: "  ".
+func (s Settings) GetCodeBlockIndent() string {
+	if s.Markdown == nil || s.Markdown.CodeBlockIndent == nil {
+		return "  "
+	}
+	return *s.Markdown.CodeBlockIndent
+}
+
+// GetHideThinkingBlock returns whether thinking blocks should be hidden.
+func (s Settings) GetHideThinkingBlock() bool { return s.HideThinkingBlock }
+
+// GetShowCacheMissNotices returns whether transcript cache-miss notices are shown.
+func (s Settings) GetShowCacheMissNotices() bool { return s.ShowCacheMissNotices }
+
+// GetQuietStartup returns the quiet startup setting: true, "header" or false.
+func (s Settings) GetQuietStartup() QuietStartup { return s.QuietStartup }
+
+// GetCollapseChangelog returns whether changelog output is collapsed.
+func (s Settings) GetCollapseChangelog() bool { return s.CollapseChangelog }
+
+// GetBlockImages returns whether image rendering is blocked entirely.
+func (s Settings) GetBlockImages() bool { return s.BlockImages }
+
+// ─── SettingsManager ──────────────────────────────────────────────────────────
+
+// SettingsManager loads and merges settings from global and project scopes.
+// Merge order: global defaults → project → CLI flags.
+type SettingsManager struct {
+	// mu guards the settings layers: a cache-warming refresh reads the mode
+	// from its own goroutine while /settings writes it.
+	mu             sync.RWMutex
+	global         Settings
+	project        Settings
+	merged         Settings
+	agentDir       string
+	cwd            string
+	projectTrusted bool
+	globalLoadErr  error
+	projectLoadErr error
+	errors         []SettingsError
+	// writer performs the persisted writes of file and extension storage in the order the setters queued them (settings-manager.ts writeQueue).
+	writer settingsWriter
+	// unsavedGlobal and unsavedProject are the changes of a scope that no write has saved yet: Pi's modifiedFields and modifiedProjectFields, which a write clears only when it succeeds (settings-manager.ts:578-584). nil when there is none.
+	unsavedGlobal, unsavedProject *unsavedSettings
+	memory                        *memorySettingsStorage
+	// storage is the extension-owned backend of SettingsManager.fromStorage; nil for file and memory storage.
+	storage SettingsStorage
+	// generation counts the changes of merged (setMergedLocked); extensionEncoding is the extension encoding of one generation.
+	generation        uint64
+	extensionEncoding atomic.Pointer[extensionSettingsEncoding]
+	// changeObservers run after each change of merged, with sm.mu held for writing.
+	changeObservers changeobservers.Observers
+	// globalObject and projectObject are the settings layers as Pi's SettingsManager holds them: the migrated file object, which a setter
+	// changes in place. mergedObject is their deepMergeSettings with each applied override (settings-manager.ts:195-212). Only their member
+	// order is read: the extension settings encoding lists the members of merged in it, as Pi's getSettings() clone of this.settings does.
+	globalObject, projectObject, mergedObject *orderedjson.Object
+}
+
+// setMergedLocked makes merged the merged settings, a new generation, and object the merged object. The caller holds sm.mu for writing.
+func (sm *SettingsManager) setMergedLocked(merged Settings, object *orderedjson.Object) {
+	sm.merged = merged
+	sm.mergedObject = object
+	sm.generation++
+	sm.changeObservers.Notify()
+}
+
+// ObserveChange registers observe to run after every change of the effective settings: a setter, a reload, a trust change and an override. A change that leaves the merged settings equal still reports. observe runs on the goroutine that made the change, with the manager's lock held for writing, so it must return at once and must not call the manager. The returned function removes it and can be called repeatedly.
+func (sm *SettingsManager) ObserveChange(observe func()) func() {
+	return sm.changeObservers.Add(observe)
+}
+
+// remergeLocked makes deepMergeSettings(global, project) the merged settings, as Pi's setters and reload do. The caller holds sm.mu for writing.
+func (sm *SettingsManager) remergeLocked() {
+	sm.setMergedLocked(mergeSettings(sm.global, sm.project), mergeSettingsObjects(sm.globalObject, sm.projectObject))
+}
+
+// SettingsStorage is Pi's SettingsStorage (settings-manager.ts:166): the backend of SettingsManager.fromStorage. WithLock runs fn on the current text of the scope's settings ("global" or "project", nil when there is none); fn returns the text to store, nil to leave it, or an error that WithLock returns.
+type SettingsStorage interface {
+	WithLock(scope string, fn func(current *string) (*string, error)) error
+}
+
+// NewSettingsManagerFromStorage is upstream's SettingsManager.fromStorage(storage, options).
+// upstream: settings-manager.ts:325-327
+func NewSettingsManagerFromStorage(storage SettingsStorage, options SettingsManagerCreateOptions) *SettingsManager {
+	projectTrusted := options.ProjectTrusted == nil || *options.ProjectTrusted
+	sm := &SettingsManager{projectTrusted: projectTrusted, storage: storage}
+	sm.Load()
+	return sm
+}
+
+// errorPath is the file an error of a scope names: none for an extension's storage, as Pi's SettingsError.path is undefined there.
+func (sm *SettingsManager) errorPath(path string) string {
+	if sm.storage != nil {
+		return ""
+	}
+	return path
+}
+
+// loadScope reads one scope's settings from the file at path, or from the extension's storage.
+func (sm *SettingsManager) loadScope(scope, path string) (result Settings, object *orderedjson.Object, err error) {
+	if sm.storage == nil {
+		return loadSettingsFile(path)
+	}
+	result, object = Settings{}, orderedjson.New()
+	err = sm.storage.WithLock(scope, func(current *string) (*string, error) {
+		if current == nil || *current == "" {
+			return nil, nil
+		}
+		data := text.StripBomBytes([]byte(*current))
+		parsed, parseErr := parseSettingsJSON(data)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		result, object = parsed, settingsFileObject(data)
+		return nil, nil
+	})
+	if err != nil {
+		return Settings{}, orderedjson.New(), err
+	}
+	return result, object, nil
+}
+
+// saveScope writes one scope's settings change to the file at path, or to the extension's storage.
+func (sm *SettingsManager) saveScope(scope, path string, before, after Settings, order, replace []string) error {
+	if sm.storage == nil {
+		return saveSettingsPatchReplacing(path, before, after, order, replace)
+	}
+	return sm.storage.WithLock(scope, func(current *string) (*string, error) {
+		var data []byte
+		if current != nil {
+			data = []byte(*current)
+		}
+		patched, err := patchedSettingsBytes(data, current != nil, before, after, order, replace)
+		if err != nil {
+			return nil, err
+		}
+		out := string(patched)
+		return &out, nil
+	})
+}
+
+type memorySettingsStorage struct {
+	global  Settings
+	project Settings
+	// globalObject and projectObject are the stored layers' objects, for their member order (SettingsManager.globalObject).
+	globalObject, projectObject *orderedjson.Object
+}
+
+// NewInMemorySettingsManager creates an independent settings manager without file I/O.
+// Ports packages/coding-agent/src/core/settings-manager.ts:403-410.
+func NewInMemorySettingsManager(settings Settings) *SettingsManager {
+	initial := cloneSettings(settings)
+	global := settingsObject(initial)
+	return &SettingsManager{
+		global: cloneSettings(initial), merged: cloneSettings(initial), projectTrusted: true,
+		memory:       &memorySettingsStorage{global: initial, globalObject: global.Clone()},
+		globalObject: global, projectObject: orderedjson.New(), mergedObject: mergeSettingsObjects(global, nil),
+	}
+}
+
+// SettingsError mirrors upstream settings-manager.ts load/write diagnostics.
+type SettingsError struct {
+	Scope string
+	// Path is the settings file behind the error. Mirrors upstream
+	// SettingsError.path, which file-backed storage always sets.
+	Path  string
+	Error error
+}
+
+// SettingsManagerCreateOptions are the options of SettingsManager.create.
+// upstream: settings-manager.ts:292-294
+type SettingsManagerCreateOptions struct {
+	// ProjectTrusted is whether project settings are read; nil is true.
+	// upstream: settings-manager.ts:465 `options.projectTrusted ?? true`
+	ProjectTrusted *bool
+}
+
+// NewSettingsManager creates a SettingsManager for the given directories.
+func NewSettingsManager(cwd, agentDir string) *SettingsManager {
+	return NewSettingsManagerWithOptions(cwd, agentDir, SettingsManagerCreateOptions{})
+}
+
+// NewSettingsManagerWithProjectTrust creates a settings manager that reads
+// project settings only when projectTrusted is true.
+func NewSettingsManagerWithProjectTrust(cwd, agentDir string, projectTrusted bool) *SettingsManager {
+	return NewSettingsManagerWithOptions(cwd, agentDir, SettingsManagerCreateOptions{ProjectTrusted: &projectTrusted})
+}
+
+// NewSettingsManagerWithOptions is upstream's SettingsManager.create(cwd, agentDir, options).
+// upstream: settings-manager.ts:440-452
+func NewSettingsManagerWithOptions(cwd, agentDir string, options SettingsManagerCreateOptions) *SettingsManager {
+	projectTrusted := options.ProjectTrusted == nil || *options.ProjectTrusted
+	sm := &SettingsManager{cwd: cwd, agentDir: agentDir, projectTrusted: projectTrusted}
+	sm.Load()
+	return sm
+}
+
+// DefaultAgentDir is Pi's getAgentDir (config.ts): the directory named by the agent directory variable (PIG_CODING_AGENT_DIR, or PI_CODING_AGENT_DIR when
+// PIG_USE_PI_DIRS=1) with a leading tilde expanded, else Pi's ~/.pi/agent in shared mode, else <ConfigRoot>/agent. It panics with a [configroot.UnresolvedError]
+// when the home directory is needed and unavailable; [ResolveDefaultAgentDir] reports that as an error.
+func DefaultAgentDir() string {
+	dir, err := ResolveDefaultAgentDir()
+	if err != nil {
+		panic(&configroot.UnresolvedError{Err: err})
+	}
+	return dir
+}
+
+// ResolveDefaultAgentDir is [DefaultAgentDir] with an error, never a relative path, when the home directory is needed and unavailable.
+func ResolveDefaultAgentDir() (string, error) {
+	if UsePiDirs() {
+		if configured := os.Getenv("PI_CODING_AGENT_DIR"); configured != "" {
+			return ExpandTildePath(configured), nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("locate home directory: %w", err)
+		}
+		return filepath.Join(home, ".pi", "agent"), nil
+	}
+	if configured := os.Getenv(ENV_AGENT_DIR); configured != "" {
+		return ExpandTildePath(configured), nil
+	}
+	if configured := os.Getenv("PIG_CODING_AGENT_DIR"); configured != "" {
+		return ExpandTildePath(configured), nil
+	}
+	root, err := configroot.Resolve()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "agent"), nil
+}
+
+// AgentDir returns the global settings directory backing this manager.
+func (sm *SettingsManager) AgentDir() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.agentDir
+}
+
+// CWD returns the project directory backing this manager.
+func (sm *SettingsManager) CWD() string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.cwd
+}
+
+// Load reloads the backing settings layers and discards transient overrides, after the writes queued before the call (settings-manager.ts reload awaits writeQueue). Previously recorded errors remain until DrainErrors.
+func (sm *SettingsManager) Load() {
+	sm.writer.wait()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	// upstream: packages/coding-agent/src/core/settings-manager.ts:reload
+	sm.unsavedGlobal, sm.unsavedProject = nil, nil
+	if sm.memory != nil {
+		sm.global = cloneSettings(sm.memory.global)
+		sm.globalObject = cloneSettingsObject(sm.memory.globalObject)
+		sm.project = Settings{}
+		sm.projectObject = orderedjson.New()
+		if sm.projectTrusted {
+			sm.project = cloneSettings(sm.memory.project)
+			sm.projectObject = cloneSettingsObject(sm.memory.projectObject)
+		}
+	} else {
+		globalPath := filepath.Join(sm.agentDir, "settings.json")
+		if global, object, err := sm.loadScope("global", globalPath); err == nil {
+			sm.global = global
+			sm.globalObject = object
+			sm.globalLoadErr = nil
+			sm.noteIgnoredSettings("global", sm.errorPath(globalPath), global)
+		} else {
+			sm.globalLoadErr = err
+			if !errors.Is(err, os.ErrNotExist) {
+				sm.errors = append(sm.errors, SettingsError{Scope: "global", Path: sm.errorPath(globalPath), Error: err})
+			}
+		}
+		if !sm.projectTrusted {
+			sm.project = Settings{}
+			sm.projectObject = orderedjson.New()
+			sm.projectLoadErr = nil
+			sm.setMergedLocked(cloneSettings(sm.global), cloneSettingsObject(sm.globalObject))
+			return
+		}
+		projectPath := filepath.Join(ProjectConfigDir(sm.cwd), "settings.json")
+		if project, object, err := sm.loadScope("project", projectPath); err == nil {
+			sm.project = project
+			sm.projectObject = object
+			sm.projectLoadErr = nil
+			sm.noteIgnoredSettings("project", sm.errorPath(projectPath), project)
+		} else {
+			sm.projectLoadErr = err
+			if !errors.Is(err, os.ErrNotExist) {
+				sm.errors = append(sm.errors, SettingsError{Scope: "project", Path: sm.errorPath(projectPath), Error: err})
+			}
+		}
+	}
+	// settings-manager.ts reload ends in this.settings = deepMergeSettings(this.globalSettings, this.projectSettings): the reviewed Load→mergeSettings edge.
+	sm.setMergedLocked(mergeSettings(sm.global, sm.project), mergeSettingsObjects(sm.globalObject, sm.projectObject))
+}
+
+// Get returns the merged settings.
+func (sm *SettingsManager) Get() Settings {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return cloneSettings(sm.merged)
+}
+
+// readMerged returns read's result over the merged settings, under the read lock and without the copy Get makes; read copies any slice, map
+// or pointer it returns, so nothing the caller keeps reaches into the manager.
+func readMerged[T any](sm *SettingsManager, read func(*Settings) T) T {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return read(&sm.merged)
+}
+
+// readGlobal is readMerged over the global settings layer.
+func readGlobal[T any](sm *SettingsManager, read func(*Settings) T) T {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return read(&sm.global)
+}
+
+// Reload refreshes the merged view from file or memory storage after earlier writes finish.
+func (sm *SettingsManager) Reload() { sm.Load() }
+
+// noteIgnoredSettings records one warning for a settings file that held settings of the wrong JSON type, naming each and the type it expects.
+// pig divergence (D158): Pi 1.1.0 throws on these; PiG ignores them and says so once.
+func (sm *SettingsManager) noteIgnoredSettings(scope, path string, loaded Settings) {
+	if len(loaded.ignored) == 0 {
+		return
+	}
+	sm.errors = append(sm.errors, SettingsError{Scope: scope, Path: path, Error: fmt.Errorf("ignored settings of the wrong type: %s", strings.Join(loaded.ignored, ", "))})
+}
+
+// DrainErrors returns accumulated load/write diagnostics, or an empty list, and clears them.
+func (sm *SettingsManager) DrainErrors() []SettingsError {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.errors) == 0 {
+		return []SettingsError{}
+	}
+	out := append([]SettingsError(nil), sm.errors...)
+	sm.errors = nil
+	return out
+}
+
+// GetGlobalSettings returns the persisted global settings layer.
+func (sm *SettingsManager) GetGlobalSettings() Settings {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return cloneSettings(sm.global)
+}
+
+// GetProjectSettings returns the persisted project settings layer.
+func (sm *SettingsManager) GetProjectSettings() Settings {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return cloneSettings(sm.project)
+}
+
+// IsProjectTrusted reports whether project settings are readable and writable.
+func (sm *SettingsManager) IsProjectTrusted() bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.projectTrusted
+}
+
+// SetProjectTrusted changes project-settings access without reloading global settings. Unchanged trust preserves the current merged view.
+// Ports packages/coding-agent/src/core/settings-manager.ts:515-537.
+func (sm *SettingsManager) SetProjectTrusted(trusted bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.projectTrusted == trusted {
+		return
+	}
+	sm.projectTrusted = trusted
+	sm.unsavedProject = nil
+	sm.project = Settings{}
+	sm.projectObject = orderedjson.New()
+	sm.projectLoadErr = nil
+	if trusted {
+		if sm.memory != nil {
+			sm.project = cloneSettings(sm.memory.project)
+			sm.projectObject = cloneSettingsObject(sm.memory.projectObject)
+		} else {
+			path := filepath.Join(ProjectConfigDir(sm.cwd), "settings.json")
+			project, object, err := loadSettingsFile(path)
+			sm.project, sm.projectObject, sm.projectLoadErr = project, object, err
+			if err != nil {
+				sm.errors = append(sm.errors, SettingsError{Scope: "project", Path: path, Error: err})
+			} else {
+				sm.noteIgnoredSettings("project", path, project)
+			}
+		}
+	}
+	sm.remergeLocked()
+}
+
+// ApplyOverrides applies non-persistent overrides on top of the merged settings.
+// Mirrors upstream SettingsManager.applyOverrides.
+func (sm *SettingsManager) ApplyOverrides(overrides Settings) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.setMergedLocked(mergeSettings(sm.merged, overrides), mergeSettingsObjects(sm.mergedObject, settingsObject(overrides)))
+}
+
+// ThemeOverride returns ApplyOverrides input that selects theme, as Pi's applyOverrides({theme}). An empty name is a selection, not an omitted key.
+func ThemeOverride(theme string) Settings {
+	return Settings{Theme: theme, themeEmpty: theme == ""}
+}
+
+// Flush waits for the writes queued before the call (settings-manager.ts flush). A setter returns after its own write, so Flush waits only for the write of a setter that another goroutine is still in. A write that fails is recorded for DrainErrors, so Flush itself does not fail.
+func (sm *SettingsManager) Flush() error {
+	sm.writer.wait()
+	return nil
+}
+
+// unsavedSettings is the change of a settings scope that no write has saved yet.
+type unsavedSettings struct {
+	// before is the scope as it was before its oldest unsaved setter.
+	before Settings
+	// marked lists the top-level keys the unsaved setters before the latest one changed, in the order they first changed them: Pi's modifiedFields is a Set, which a write walks in insertion order (settings-manager.ts:278, :609).
+	marked []string
+	// latestBefore and latestOrder are the scope before the latest unsaved setter and the order that setter passed. Its keys are worked out only when a later setter carries it, which happens only after a write failed.
+	latestBefore Settings
+	latestOrder  []string
+	// replace is what the unsaved setters passed as replace.
+	replace []string
+}
+
+// settingsChange is what one write persists: the change of its scope from before to the setter's result, with the order and replace of saveScope.
+type settingsChange struct {
+	before         Settings
+	order, replace []string
+}
+
+// carryUnsaved returns the change the write of a setter persists and the scope's unsaved change after that setter. The setter changed the scope from before to after and passed order and replace. With an unsaved change the write starts from the scope before the oldest unsaved setter, so it also saves what an earlier, failed write of the scope did not, as Pi's does with the fields still marked modified, and it adds new keys to the file in the order the setters changed them. The caller holds sm.mu for writing.
+func carryUnsaved(unsaved *unsavedSettings, before, after Settings, order, replace []string) (settingsChange, *unsavedSettings) {
+	if unsaved == nil {
+		return settingsChange{before: before, order: order, replace: replace}, &unsavedSettings{before: before, latestBefore: before, latestOrder: order, replace: replace}
+	}
+	marked := appendMissing(unsaved.marked, setterKeys(unsaved.latestOrder, unsaved.latestBefore, before))
+	change := settingsChange{before: unsaved.before, order: appendMissing(marked, setterKeys(order, before, after)), replace: slices.Concat(unsaved.replace, replace)}
+	return change, &unsavedSettings{before: unsaved.before, marked: marked, latestBefore: before, latestOrder: order, replace: change.replace}
+}
+
+// setterKeys lists the top-level keys a setter changed, in the order it changed them: the order it passed, or the keys that differ between before and after, sorted as a write applies them.
+func setterKeys(order []string, before, after Settings) []string {
+	if order != nil {
+		return order
+	}
+	beforeMap, err := settingsJSONMap(before)
+	if err != nil {
+		return nil
+	}
+	afterMap, err := settingsJSONMap(after)
+	if err != nil {
+		return nil
+	}
+	var keys []string
+	for key, value := range afterMap {
+		if old, ok := beforeMap[key]; !ok || !bytes.Equal(old, value) {
+			keys = append(keys, key)
+		}
+	}
+	for key := range beforeMap {
+		if _, ok := afterMap[key]; !ok {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// appendMissing returns keys followed by the entries of more that keys does not hold, in a new slice.
+func appendMissing(keys, more []string) []string {
+	out := slices.Clone(keys)
+	for _, key := range more {
+		if !slices.Contains(out, key) {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// writeFailed records the failure of a queued write for DrainErrors (settings-manager.ts recordError); path is the file the write targeted.
+func (sm *SettingsManager) writeFailed(scope, path string, err error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.errors = append(sm.errors, SettingsError{Scope: scope, Path: sm.errorPath(path), Error: err})
+}
+
+// GetCompactionSettings resolves ordinary settings and rejects invalid authored token values. The optional model selects the compaction.modelOverrides entry for its provider and ID, as upstream getCompactionSettings(model?: Pick<Model, "provider" | "id">).
+func (sm *SettingsManager) GetCompactionSettings(model ...*ai.Model) (CompactionConfig, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	settings := sm.merged.Compaction
+	provider, modelID := compactionModelKey(model)
+	reserve, err := getCompactionTokenSetting(settings, "reserveTokens", provider, modelID)
+	if err != nil {
+		return CompactionConfig{}, err
+	}
+	recent, err := getCompactionTokenSetting(settings, "keepRecentTokens", provider, modelID)
+	if err != nil {
+		return CompactionConfig{}, err
+	}
+	return CompactionConfig{Enabled: compactionEnabled(settings), ReserveTokens: reserve, KeepRecentTokens: recent}, nil
+}
+
+// GetCompactionEnabled returns the global compaction toggle independently of model token validation.
+func (sm *SettingsManager) GetCompactionEnabled() bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return compactionEnabled(sm.merged.Compaction)
+}
+
+// compactionModelKey is the provider and ID of the optional model argument; without one no override applies.
+func compactionModelKey(model []*ai.Model) (provider, id string) {
+	if len(model) > 0 && model[0] != nil {
+		return model[0].ProviderID(), model[0].ID
+	}
+	return "", ""
+}
+
+func compactionEnabled(s *CompactionSettingsJSON) bool {
+	return s == nil || s.Enabled == nil || *s.Enabled
+}
+
+// GetCompactionReserveTokens resolves and validates the reserve token setting for the optional model (upstream getCompactionReserveTokens(model?)).
+func (sm *SettingsManager) GetCompactionReserveTokens(model ...*ai.Model) (int, error) {
+	provider, id := compactionModelKey(model)
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return getCompactionTokenSetting(sm.merged.Compaction, "reserveTokens", provider, id)
+}
+
+// GetCompactionKeepRecentTokens resolves and validates the retention setting for the optional model (upstream getCompactionKeepRecentTokens(model?)).
+func (sm *SettingsManager) GetCompactionKeepRecentTokens(model ...*ai.Model) (int, error) {
+	provider, id := compactionModelKey(model)
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return getCompactionTokenSetting(sm.merged.Compaction, "keepRecentTokens", provider, id)
+}
+
+// GetBranchSummarySettings returns branch summary settings, applying any
+// reserve-token override from the merged settings.
+// Mirrors upstream SettingsManager.getBranchSummarySettings (settings-manager.ts).
+func (sm *SettingsManager) GetBranchSummarySettings() BranchSummaryConfig {
+	return readMerged(sm, func(s *Settings) BranchSummaryConfig {
+		result := BranchSummaryConfig{ReserveTokens: 16384}
+		if s.BranchSummary != nil {
+			if s.BranchSummary.reserveTokensSet || s.BranchSummary.ReserveTokens != 0 {
+				result.ReserveTokens = s.BranchSummary.ReserveTokens
+			}
+			result.SkipPrompt = s.BranchSummary.SkipPrompt
+		}
+		return result
+	})
+}
+
+// GetBranchSummarySkipPrompt returns whether branch-summary prompt skipping is enabled.
+func (sm *SettingsManager) GetBranchSummarySkipPrompt() bool {
+	return sm.GetBranchSummarySettings().SkipPrompt
+}
+
+// GetDoubleEscapeAction returns the double-escape action setting.
+// Default: "tree". Mirrors upstream SettingsManager.getDoubleEscapeAction
+// (settings-manager.ts:944-946).
+func (sm *SettingsManager) GetDoubleEscapeAction() string {
+	a := readMerged(sm, func(s *Settings) string { return s.DoubleEscapeAction })
+	if a == "" {
+		return "tree"
+	}
+	return a
+}
+
+// DefaultProjectTrust is the fallback project-trust mode: upstream `"ask" | "always" | "never"` (settings-manager.ts:110).
+type DefaultProjectTrust string
+
+// The DefaultProjectTrust values.
+const (
+	DefaultProjectTrustAsk    DefaultProjectTrust = "ask"
+	DefaultProjectTrustAlways DefaultProjectTrust = "always"
+	DefaultProjectTrustNever  DefaultProjectTrust = "never"
+)
+
+// GetDefaultProjectTrust returns the fallback project-trust mode, "ask" unless the global setting is "always" or "never".
+// upstream: settings-manager.ts:1100 getDefaultProjectTrust
+func (sm *SettingsManager) GetDefaultProjectTrust() DefaultProjectTrust {
+	v := DefaultProjectTrust(readGlobal(sm, func(s *Settings) string { return s.DefaultProjectTrust }))
+	if v == DefaultProjectTrustAlways || v == DefaultProjectTrustNever {
+		return v
+	}
+	return DefaultProjectTrustAsk
+}
+
+// SetDefaultProjectTrust stores the fallback project-trust mode in the global settings and saves.
+// upstream: settings-manager.ts:1105 setDefaultProjectTrust
+func (sm *SettingsManager) SetDefaultProjectTrust(trust DefaultProjectTrust) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.DefaultProjectTrust = string(trust) })
+}
+
+// GetCacheWarmingMode returns the global cache-warming mode, or "idle"
+// when it is unset or invalid. Project settings are ignored because each
+// refresh costs money. Mirrors upstream getCacheWarmingMode.
+func (sm *SettingsManager) GetCacheWarmingMode() CacheWarmingMode {
+	mode := readGlobal(sm, func(s *Settings) CacheWarmingMode { return s.CacheWarming })
+	if slices.Contains(CacheWarmingModes, mode) {
+		return mode
+	}
+	return defaultCacheWarmingMode
+}
+
+// SetCacheWarmingMode persists the cache-warming mode to global settings.
+// Mirrors upstream setCacheWarmingMode.
+func (sm *SettingsManager) SetCacheWarmingMode(mode CacheWarmingMode) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.CacheWarming = mode })
+}
+
+// GetLastChangelogVersion returns the last seen changelog version string.
+// Mirrors upstream getLastChangelogVersion (settings-manager.ts:529).
+func (sm *SettingsManager) GetLastChangelogVersion() string {
+	return readMerged(sm, func(s *Settings) string { return s.LastChangelogVersion })
+}
+
+// SetLastChangelogVersion records that the user has seen changelog entries
+// up to and including version. Persists to global settings.
+// Mirrors upstream setLastChangelogVersion (settings-manager.ts:533-535).
+func (sm *SettingsManager) SetLastChangelogVersion(version string) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.LastChangelogVersion = version
+	})
+}
+
+// GetExtensionChangelogVersion returns the last changelog version seen for the extension package key (GetSourcePackageKey), if any.
+// Mirrors upstream getExtensionChangelogVersion (settings-manager.ts).
+func (sm *SettingsManager) GetExtensionChangelogVersion(key string) (string, bool) {
+	type seen struct {
+		version string
+		ok      bool
+	}
+	got := readMerged(sm, func(s *Settings) seen {
+		version, ok := s.ExtensionChangelogVersions[key]
+		return seen{version, ok}
+	})
+	return got.version, got.ok
+}
+
+// SetExtensionChangelogVersion records that the user has seen the changelog of the extension package key up to version. Persists to
+// global settings, changing only that key. Mirrors upstream setExtensionChangelogVersion.
+func (sm *SettingsManager) SetExtensionChangelogVersion(key, version string) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		if s.ExtensionChangelogVersions == nil {
+			s.ExtensionChangelogVersions = map[string]string{}
+		}
+		s.ExtensionChangelogVersions[key] = version
+	})
+}
+
+// GetSteeringMode returns the steering queue dispatch mode.
+// Default: "one-at-a-time". Mirrors upstream getSteeringMode (settings-manager.ts:581).
+func (sm *SettingsManager) GetSteeringMode() string {
+	m := readMerged(sm, func(s *Settings) string { return s.SteeringMode })
+	if m == "" {
+		return "one-at-a-time"
+	}
+	return m
+}
+
+// GetFollowUpMode returns the follow-up queue dispatch mode.
+// Default: "one-at-a-time". Mirrors upstream getFollowUpMode (settings-manager.ts:591).
+func (sm *SettingsManager) GetFollowUpMode() string {
+	m := readMerged(sm, func(s *Settings) string { return s.FollowUpMode })
+	if m == "" {
+		return "one-at-a-time"
+	}
+	return m
+}
+
+// GetTuiMode returns the terminal UI mode: "regular" only when the setting says so, otherwise "fullscreen" (settings-manager.ts:1348-1350).
+func (sm *SettingsManager) GetTuiMode() tui.TuiMode {
+	if readMerged(sm, func(s *Settings) string { return s.TuiMode }) == string(tui.TuiModeRegular) {
+		return tui.TuiModeRegular
+	}
+	return tui.TuiModeFullscreen
+}
+
+func (sm *SettingsManager) GetFullscreenExitOutput() FullscreenExitOutput {
+	if readMerged(sm, func(s *Settings) FullscreenExitOutput { return s.FullscreenExitOutput }) == "resume-hint" {
+		return "resume-hint"
+	}
+	return "transcript"
+}
+
+func (sm *SettingsManager) GetFullscreenCopyOnSelect() bool {
+	return readMerged(sm, func(s *Settings) bool { return s.FullscreenCopyOnSelect == nil || *s.FullscreenCopyOnSelect })
+}
+
+func (sm *SettingsManager) GetFullscreenScrollbar() string {
+	mode := readMerged(sm, func(s *Settings) string { return s.FullscreenScrollbar })
+	if mode == "always" || mode == "hidden" {
+		return mode
+	}
+	return "auto"
+}
+
+// GetFullscreenWheelScrollLines returns the wheel line setting: a finite number floored and clamped to 1-100, otherwise auto.
+// Mirrors upstream getFullscreenWheelScrollLines (settings-manager.ts:1386-1391).
+func (sm *SettingsManager) GetFullscreenWheelScrollLines() WheelScrollLines {
+	return readMerged(sm, func(s *Settings) WheelScrollLines {
+		raw := s.FullscreenWheelScrollLines
+		if len(raw) == 0 || string(raw) == "null" {
+			return WheelScrollLines{Auto: true}
+		}
+		var lines float64
+		if json.Unmarshal(raw, &lines) != nil || math.IsNaN(lines) || math.IsInf(lines, 0) {
+			return WheelScrollLines{Auto: true}
+		}
+		return WheelScrollLines{Lines: clampWheelScrollLines(lines)}
+	})
+}
+
+// clampWheelScrollLines is Math.max(1, Math.min(100, Math.floor(lines))).
+func clampWheelScrollLines(lines float64) float64 {
+	return math.Max(1, math.Min(100, math.Floor(lines)))
+}
+
+// SetFullscreenWheelScrollLines saves the wheel line setting to global settings: auto, or a count floored and clamped to 1-100.
+// Mirrors upstream setFullscreenWheelScrollLines (settings-manager.ts:1394-1399).
+func (sm *SettingsManager) SetFullscreenWheelScrollLines(lines WheelScrollLines) error {
+	value := []byte(`"auto"`)
+	if !lines.Auto {
+		clamped := clampWheelScrollLines(lines.Lines)
+		if math.IsNaN(clamped) {
+			// JSON.stringify writes NaN as null, which reads back as auto.
+			value = []byte("null")
+		} else {
+			value = strconv.AppendFloat(nil, clamped, 'f', -1, 64)
+		}
+	}
+	return sm.UpdateGlobal(func(s *Settings) { s.FullscreenWheelScrollLines = value })
+}
+
+// GetOrCreateDeviceID returns the stable ID of this installation, e.g. sent to OpenAI as its agent host ID, and creates it on first use.
+// Project settings are ignored so a committed project settings file cannot give every clone the same ID.
+// A global file that does not parse keeps the new ID in memory only, as upstream's save() returns before writing then.
+// Mirrors upstream getOrCreateDeviceId (settings-manager.ts:1172-1179).
+func (sm *SettingsManager) GetOrCreateDeviceID() string {
+	sm.mu.RLock()
+	id := sm.global.DeviceID
+	sm.mu.RUnlock()
+	if id != "" {
+		return id
+	}
+	id = uuid.NewString()
+	setID := func(s *Settings) {
+		if s.DeviceID == "" {
+			s.DeviceID = id
+		}
+	}
+	if err := sm.UpdateGlobal(setID); err != nil {
+		sm.mu.Lock()
+		setID(&sm.global)
+		sm.remergeLocked()
+		sm.mu.Unlock()
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.global.DeviceID
+}
+
+// GetSettings returns a copy of the effective settings: global and project settings merged, with overrides.
+// Mirrors upstream getSettings (settings-manager.ts:564-566).
+func (sm *SettingsManager) GetSettings() Settings { return sm.Get() }
+
+// ExtensionSettings is GetSettings as the JSON object extensions read: a copy that a change does not reach back into the manager through.
+//
+// upstream: settings-manager.ts:562-564 (getSettings), loader.ts:411-414
+func (sm *SettingsManager) ExtensionSettings() extension.Settings {
+	encoding := sm.extensionSettingsEncoding()
+	var settings extension.Settings
+	if encoding.settings == nil || json.Unmarshal(encoding.settings, &settings) != nil || settings == nil {
+		return extension.Settings{}
+	}
+	return settings
+}
+
+// ExtensionSettingsJSON is ExtensionSettings() as JSON with its members in the order Pi's getSettings() object lists them, the settings object
+// an extension state push carries. It is encoded once per settings generation and shared: the caller must not change it.
+func (sm *SettingsManager) ExtensionSettingsJSON() json.RawMessage {
+	return sm.extensionSettingsEncoding().wire
+}
+
+// extensionSettingsEncoding is the encoding of one settings generation: settings is json.Marshal of the merged Settings, nil when that
+// fails, and wire is ExtensionSettings() encoded in the member order of the merged object (SettingsManager.mergedObject).
+type extensionSettingsEncoding struct {
+	generation uint64
+	settings   []byte
+	wire       json.RawMessage
+}
+
+// extensionSettingsEncoding returns the encoding of the current settings generation, encoding it on the first call after a change.
+func (sm *SettingsManager) extensionSettingsEncoding() *extensionSettingsEncoding {
+	sm.mu.RLock()
+	generation := sm.generation
+	if cached := sm.extensionEncoding.Load(); cached != nil && cached.generation == generation {
+		sm.mu.RUnlock()
+		return cached
+	}
+	encoded, err := json.Marshal(sm.merged)
+	var order []byte
+	if sm.mergedObject != nil {
+		order, _ = sm.mergedObject.MarshalJSON()
+	}
+	sm.mu.RUnlock()
+	encoding := &extensionSettingsEncoding{generation: generation}
+	var settings extension.Settings
+	if err == nil {
+		encoding.settings = encoded
+		//portlint:allow jsonclone converts the typed Settings to the JSON object extensions receive (Pi's structuredClone of its plain settings object), once per settings generation
+		if json.Unmarshal(encoded, &settings) != nil { //perf:ok once per settings generation (a settings write), not per read
+			settings = nil
+		}
+	}
+	if settings == nil {
+		settings = extension.Settings{}
+	}
+	if encoding.wire, err = orderedjson.MarshalInSourceOrder(settings, order); err != nil {
+		encoding.wire = json.RawMessage("{}")
+	}
+	sm.extensionEncoding.Store(encoding)
+	return encoding
+}
+
+// MermaidRenderingMode is when Mermaid code blocks render as diagrams (settings-manager.ts:79).
+type MermaidRenderingMode string
+
+const (
+	MermaidRenderingOff       MermaidRenderingMode = "off"
+	MermaidRenderingFinal     MermaidRenderingMode = "final"
+	MermaidRenderingStreaming MermaidRenderingMode = "streaming"
+)
+
+// GetMermaidRenderingMode returns "off" or "final" when the markdown.mermaid setting says so, otherwise "streaming" (settings-manager.ts:1512-1515).
+func (sm *SettingsManager) GetMermaidRenderingMode() MermaidRenderingMode {
+	return readMerged(sm, func(s *Settings) MermaidRenderingMode {
+		if s.Markdown != nil && (s.Markdown.Mermaid == "off" || s.Markdown.Mermaid == "final") {
+			return MermaidRenderingMode(s.Markdown.Mermaid)
+		}
+		return MermaidRenderingStreaming
+	})
+}
+
+// GetEnableSkillCommands returns whether skill commands are shown in autocomplete.
+// Default: true. Mirrors upstream getEnableSkillCommands (settings-manager.ts:1264-1266).
+func (sm *SettingsManager) GetEnableSkillCommands() bool {
+	return readMerged(sm, func(s *Settings) bool { return s.EnableSkillCommands == nil || *s.EnableSkillCommands })
+}
+
+// GetCollapseChangelog returns whether to show a condensed changelog.
+// Default: false. Mirrors upstream getCollapseChangelog (settings-manager.ts:743).
+func (sm *SettingsManager) GetCollapseChangelog() bool {
+	return readMerged(sm, func(s *Settings) bool { return s.CollapseChangelog })
+}
+
+// GetTreeFilterMode returns the default /tree filter mode.
+// Default: "default". Mirrors upstream SettingsManager.getTreeFilterMode
+// (settings-manager.ts:954-955).
+func (sm *SettingsManager) GetTreeFilterMode() string {
+	m := readMerged(sm, func(s *Settings) string { return s.TreeFilterMode })
+	switch m {
+	case "default", "no-tools", "user-only", "labeled-only", "all":
+		return m
+	default:
+		return "default"
+	}
+}
+
+// RetryConfig holds resolved retry settings with defaults applied.
+type RetryConfig struct {
+	Enabled     bool
+	MaxRetries  int
+	BaseDelayMs int
+	// MaxAgentDelayMs is upstream's maxAgentDelayMs, the cap for exponential retry backoff.
+	MaxAgentDelayMs int
+}
+
+// ProviderRetryConfig holds resolved provider/SDK retry settings.
+type ProviderRetryConfig struct {
+	// TimeoutMs and MaxRetries are nil when unset, as upstream's `timeoutMs?` and `maxRetries?` are undefined; an explicit 0 is a pointer to 0.
+	TimeoutMs       *int
+	MaxRetries      *int
+	MaxRetryDelayMs int
+}
+
+// builtinRetryConfig is upstream's retry default: 3 retries (settings-manager.ts:21), 2000 ms base (:22), 60000 ms cap.
+var builtinRetryConfig = RetryConfig{Enabled: true, MaxRetries: 3, BaseDelayMs: 2000, MaxAgentDelayMs: 60000}
+
+var defaultRetryConfig atomic.Pointer[RetryConfig]
+
+// SetDefaultRetryConfig replaces the retry defaults GetRetrySettings starts from; a settings.json `retry` member still overrides each
+// field. A fused Piglet member sets it through its CLI hook (clihook.Result.Retry), before the Session starts.
+func SetDefaultRetryConfig(config RetryConfig) { defaultRetryConfig.Store(&config) }
+
+// DefaultRetryConfig is the retry configuration a Session uses when no settings file names one.
+func DefaultRetryConfig() RetryConfig {
+	if config := defaultRetryConfig.Load(); config != nil {
+		return *config
+	}
+	return builtinRetryConfig
+}
+
+var (
+	defaultRetryDecider       atomic.Pointer[ai.RetryDecider]
+	defaultRetrySilent        atomic.Bool
+	defaultHTTPIdleMsOverride atomic.Pointer[int]
+)
+
+// SetDefaultRetryDecider installs the retry classifier and delay hook a fused Piglet member supplies through
+// clihook.Result.Retry. Nil restores PiG's built-in classifier and exponential schedule.
+// pig additive (D654): inert unless a fused member installs a decider.
+func SetDefaultRetryDecider(decider ai.RetryDecider, silent bool) {
+	if decider == nil {
+		defaultRetryDecider.Store(nil)
+	} else {
+		defaultRetryDecider.Store(&decider)
+	}
+	defaultRetrySilent.Store(silent)
+}
+
+// DefaultRetryDecider returns the installed retry decider, or nil when PiG's built-in retry rules apply.
+func DefaultRetryDecider() ai.RetryDecider {
+	if p := defaultRetryDecider.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// DefaultRetrySilent reports whether PiG's built-in interactive retry status indicator and final "Retry failed after ..."
+// error line are suppressed because the piglet renders its own.
+func DefaultRetrySilent() bool { return defaultRetrySilent.Load() }
+
+// SetDefaultHTTPIdleTimeoutMs replaces the default HTTP idle timeout GetHttpIdleTimeoutMs uses when settings.json names
+// none; nil restores PiG's built-in 300000 ms default.
+func SetDefaultHTTPIdleTimeoutMs(timeoutMs *int) {
+	if timeoutMs == nil {
+		defaultHTTPIdleMsOverride.Store(nil)
+		return
+	}
+	v := *timeoutMs
+	defaultHTTPIdleMsOverride.Store(&v)
+}
+
+// DefaultHTTPIdleTimeoutMs is the HTTP idle timeout a Session uses when no settings file names one.
+func DefaultHTTPIdleTimeoutMs() int {
+	if p := defaultHTTPIdleMsOverride.Load(); p != nil {
+		return *p
+	}
+	return defaultHTTPIdleTimeoutMs
+}
+
+// GetRetrySettings returns retry settings with defaults applied.
+// Mirrors upstream SettingsManager.getRetrySettings (settings-manager.ts:683-690).
+func (sm *SettingsManager) GetRetrySettings() RetryConfig {
+	// pig additive (D653): a fused member's clihook Retry replaces the built-in defaults; with none set this is upstream's 3 / 2000 / 60000.
+	result := DefaultRetryConfig()
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	s := &sm.merged
+	if s.Retry != nil {
+		if s.Retry.Enabled != nil {
+			result.Enabled = *s.Retry.Enabled
+		}
+		if s.Retry.MaxRetries != nil {
+			result.MaxRetries = *s.Retry.MaxRetries
+		}
+		if s.Retry.BaseDelayMs != nil {
+			result.BaseDelayMs = *s.Retry.BaseDelayMs
+		}
+		if s.Retry.MaxAgentDelayMs != nil {
+			result.MaxAgentDelayMs = *s.Retry.MaxAgentDelayMs
+		}
+	}
+	return result
+}
+
+// GetProviderRetrySettings returns provider retry settings with defaults
+// applied. timeoutMs is the request timeoutMs (GetProviderRequestTimeoutMs),
+// not the dispatcher's idle timeout; maxRetries/maxRetryDelayMs drive the provider
+// retry transport (ai.ConfigureProviderRetry), mirroring the values upstream
+// sdk.ts passes into retryProviderRequest.
+func (sm *SettingsManager) GetProviderRetrySettings() ProviderRetryConfig {
+	result := ProviderRetryConfig{MaxRetryDelayMs: 60000}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	s := &sm.merged
+	if s.Retry != nil && s.Retry.Provider != nil {
+		// Copy the values: a caller must not reach the settings through the returned pointers.
+		if s.Retry.Provider.TimeoutMs != nil {
+			result.TimeoutMs = new(*s.Retry.Provider.TimeoutMs)
+		}
+		if s.Retry.Provider.MaxRetries != nil {
+			result.MaxRetries = new(*s.Retry.Provider.MaxRetries)
+		}
+		// nil means unset (keep the 60s default); an explicit value passes
+		// through, including 0 which disables the cap, mirroring upstream's
+		// maxRetryDelayMs ?? 60000.
+		if s.Retry.Provider.MaxRetryDelayMs != nil {
+			result.MaxRetryDelayMs = *s.Retry.Provider.MaxRetryDelayMs
+		}
+	}
+	return result
+}
+
+// GetRetryEnabled returns whether automatic retries are enabled.
+func (sm *SettingsManager) GetRetryEnabled() bool { return sm.GetRetrySettings().Enabled }
+
+// GetWebSocketConnectTimeoutMs returns the optional opening-handshake timeout; zero disables it.
+func (sm *SettingsManager) GetWebSocketConnectTimeoutMs() (*int, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	s := &sm.merged
+	if s.webSocketConnectTimeoutNull {
+		return nil, fmt.Errorf("Invalid websocketConnectTimeoutMs setting: null")
+	}
+	if s.webSocketConnectTimeoutInvalid != nil {
+		return nil, fmt.Errorf("Invalid websocketConnectTimeoutMs setting: %v", s.webSocketConnectTimeoutInvalid)
+	}
+	if s.WebSocketConnectTimeoutMs == nil {
+		return nil, nil
+	}
+	if *s.WebSocketConnectTimeoutMs < 0 {
+		return nil, fmt.Errorf("Invalid websocketConnectTimeoutMs setting: %v", *s.WebSocketConnectTimeoutMs)
+	}
+	return cloneIntPtr(s.WebSocketConnectTimeoutMs), nil
+}
+
+func webSocketConnectTimeoutWire(s Settings) any {
+	if s.webSocketConnectTimeoutNull {
+		return json.RawMessage("null")
+	}
+	if s.WebSocketConnectTimeoutMs != nil {
+		return *s.WebSocketConnectTimeoutMs
+	}
+	return s.webSocketConnectTimeoutInvalid
+}
+
+// GetHttpIdleTimeoutMs returns the HTTP header/body idle timeout in milliseconds.
+// Default: 300000 (5 minutes). Zero disables the timeout.
+// An unparseable value is an error, as upstream parseTimeoutSetting throws.
+func (sm *SettingsManager) GetHttpIdleTimeoutMs() (int, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.merged.httpIdleTimeoutMs()
+}
+
+// httpIdleTimeoutMs is GetHttpIdleTimeoutMs over s.
+func (s *Settings) httpIdleTimeoutMs() (int, error) {
+	if s.httpIdleTimeoutNull {
+		return 0, fmt.Errorf("Invalid httpIdleTimeoutMs setting: null")
+	}
+	if s.httpIdleTimeoutInvalid != nil {
+		return 0, fmt.Errorf("Invalid httpIdleTimeoutMs setting: %v", s.httpIdleTimeoutInvalid)
+	}
+	if s.HTTPIdleTimeoutMs == nil {
+		return DefaultHTTPIdleTimeoutMs(), nil
+	}
+	timeoutMs, ok := parseHTTPIdleTimeoutMs(*s.HTTPIdleTimeoutMs)
+	if !ok {
+		return 0, fmt.Errorf("Invalid httpIdleTimeoutMs setting: %v", *s.HTTPIdleTimeoutMs)
+	}
+	return timeoutMs, nil
+}
+
+// httpIdleTimeoutWire returns the httpIdleTimeoutMs value to serialize: the
+// parsed value, else the unparseable raw value unchanged.
+func httpIdleTimeoutWire(s Settings) any {
+	if s.httpIdleTimeoutNull {
+		return json.RawMessage("null")
+	}
+	if s.HTTPIdleTimeoutMs != nil {
+		return *s.HTTPIdleTimeoutMs
+	}
+	return s.httpIdleTimeoutInvalid
+}
+
+// GetProviderRequestTimeoutMs returns the effective per-request stream/read
+// timeout: retry.provider.timeoutMs when set, otherwise the httpIdleTimeoutMs.
+// Mirrors upstream sdk.ts:311 (timeoutMs = providerRetrySettings.timeoutMs ??
+// effectiveTimeoutMs, where effectiveTimeoutMs is the httpIdleTimeoutMs). The
+// sibling maxRetries/maxRetryDelayMs are consumed separately by the provider
+// retry transport (ai.ConfigureProviderRetry).
+func (sm *SettingsManager) GetProviderRequestTimeoutMs() (int, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s := &sm.merged; s.Retry != nil && s.Retry.Provider != nil && s.Retry.Provider.TimeoutMs != nil {
+		return *s.Retry.Provider.TimeoutMs, nil
+	}
+	return sm.merged.httpIdleTimeoutMs()
+}
+
+// GetSessionDir returns the configured session directory, expanding ~ forms
+// and converting a file:// URL. An invalid file URL is an error, as upstream
+// getSessionDir throws Node's fileURLToPath error.
+func (sm *SettingsManager) GetSessionDir() (string, error) {
+	return normalizeSettingsPath(readMerged(sm, func(s *Settings) string { return s.SessionDir }))
+}
+
+// normalizeSettingsPath mirrors upstream utils/paths.ts normalizePath with
+// default options: a leading "~" or "~/" expands to the home directory and a
+// file:// URL becomes its path through Node's fileURLToPath, whose errors it
+// returns. An empty path stays empty.
+func normalizeSettingsPath(path string) (string, error) {
+	return resolvepath.Normalize(path)
+}
+
+// GetDefaultProvider returns the configured default provider, or "".
+func (sm *SettingsManager) GetDefaultProvider() string {
+	return readMerged(sm, func(s *Settings) string { return s.DefaultProvider })
+}
+
+// GetDefaultModel returns the configured default model, or "".
+func (sm *SettingsManager) GetDefaultModel() string {
+	return readMerged(sm, func(s *Settings) string { return s.DefaultModel })
+}
+
+// GetThemeSetting returns the selected setting, preserving an omitted value separately from an explicitly empty name.
+func (sm *SettingsManager) GetThemeSetting() *string { return readMerged(sm, (*Settings).themeSetting) }
+
+// GetTheme returns the configured fixed theme name, or "" for an automatic slash-separated theme setting.
+func (sm *SettingsManager) GetTheme() string {
+	return readMerged(sm, func(s *Settings) string {
+		if strings.Contains(s.Theme, "/") {
+			return ""
+		}
+		return s.Theme
+	})
+}
+
+// GetDefaultThinkingLevel returns the configured thinking level, or "".
+func (sm *SettingsManager) GetDefaultThinkingLevel() ai.ThinkingLevel {
+	return ai.ThinkingLevel(readMerged(sm, func(s *Settings) string { return s.DefaultThinkingLevel }))
+}
+
+// GetTransport returns the configured transport. Default: "auto".
+func (sm *SettingsManager) GetTransport() string {
+	t := readMerged(sm, func(s *Settings) string { return s.Transport })
+	if t == "" {
+		return "auto"
+	}
+	return t
+}
+
+// GetSessionShareDestination returns the configured /share destination. Values other than "gist" and "radius" read as "auto" (settings-manager.ts getSessionShareDestination).
+// pig divergence (D64): /share uploads to the PiG gateway for every value; the setting is kept for shared settings files and the SDK.
+func (sm *SettingsManager) GetSessionShareDestination() SessionShareDestination {
+	switch destination := sm.Get().SessionShareDestination; destination {
+	case SessionShareDestinationGist, SessionShareDestinationRadius:
+		return destination
+	}
+	return SessionShareDestinationAuto
+}
+
+// GetHideThinkingBlock returns whether thinking blocks should be hidden.
+func (sm *SettingsManager) GetHideThinkingBlock() bool {
+	return readMerged(sm, func(s *Settings) bool { return s.HideThinkingBlock })
+}
+
+// GetShowCacheMissNotices returns whether transcript cache-miss notices are shown.
+func (sm *SettingsManager) GetShowCacheMissNotices() bool {
+	return readMerged(sm, func(s *Settings) bool { return s.ShowCacheMissNotices })
+}
+
+// GetShellPath returns the configured shell path (for bash tool). An invalid
+// file URL is an error, as upstream getShellPath throws.
+func (sm *SettingsManager) GetShellPath() (string, error) {
+	return normalizeSettingsPath(readMerged(sm, func(s *Settings) string { return s.ShellPath }))
+}
+
+// GetQuietStartup returns the quiet startup setting: true, "header" or false (settings-manager.ts:1089-1092).
+func (sm *SettingsManager) GetQuietStartup() QuietStartup {
+	return readMerged(sm, func(s *Settings) QuietStartup { return s.QuietStartup })
+}
+
+// GetShellCommandPrefix returns the command prefix (e.g. "set -e; ").
+func (sm *SettingsManager) GetShellCommandPrefix() string {
+	return readMerged(sm, func(s *Settings) string { return s.CommandPrefix })
+}
+
+// GetNpmCommand returns the npm command override. Default: nil (use "npm").
+func (sm *SettingsManager) GetNpmCommand() []string {
+	return readMerged(sm, func(s *Settings) []string { return slices.Clone(s.NpmCommand) })
+}
+
+// GetEnableAnalytics reports the opt-in analytics setting (default false).
+// Mirrors upstream SettingsManager.getEnableAnalytics.
+func (sm *SettingsManager) GetEnableAnalytics() bool {
+	return readMerged(sm, func(s *Settings) bool { return s.EnableAnalytics != nil && *s.EnableAnalytics })
+}
+
+// GetTrackingID returns the analytics tracking identifier, or "". Mirrors
+// upstream getTrackingId.
+func (sm *SettingsManager) GetTrackingID() string {
+	return readMerged(sm, func(s *Settings) string { return s.TrackingID })
+}
+
+// SetEnableAnalytics saves the analytics opt-in. The first opt-in generates a
+// random UUID tracking identifier, which later toggles keep. Mirrors upstream
+// setEnableAnalytics.
+func (sm *SettingsManager) SetEnableAnalytics(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.EnableAnalytics = &enabled
+		if enabled && s.TrackingID == "" {
+			s.TrackingID = uuid.NewString()
+		}
+	})
+}
+
+// GetEnableInstallTelemetry returns whether package-install telemetry is enabled.
+// Default: true. This only answers the setting/env gate; it does not imply a
+// transport is configured or that telemetry will actually be delivered.
+func (sm *SettingsManager) GetEnableInstallTelemetry() bool {
+	return readMerged(sm, func(s *Settings) bool { return s.EnableInstallTelemetry == nil || *s.EnableInstallTelemetry })
+}
+
+// IsInstallTelemetryEnabled reports whether install/attribution telemetry is
+// enabled, honoring the PIG_TELEMETRY / PI_TELEMETRY env override first and otherwise the
+// enableInstallTelemetry setting (default true). Mirrors upstream
+// isInstallTelemetryEnabled (telemetry.ts:8): when PI_TELEMETRY is set its
+// truthiness wins; otherwise the setting decides. Gates provider attribution
+// headers (provider-attribution.ts) in addition to package-install telemetry.
+// pig divergence (D26): gates the OpenRouter/NVIDIA/Cloudflare attribution headers in coding/model.go.
+func (sm *SettingsManager) IsInstallTelemetryEnabled() bool {
+	if value, ok := InstallTelemetryEnvOverride(); ok {
+		return isTruthyTelemetryEnvFlag(value)
+	}
+	return sm.GetEnableInstallTelemetry()
+}
+
+// InstallTelemetryEnvOverride is the one place that resolves the telemetry environment override: PIG_TELEMETRY, PiG's name, when it is
+// set, otherwise Pi's PI_TELEMETRY. ok is false when neither is set and the enableInstallTelemetry setting decides. The value is returned
+// as written; both names share one grammar (Pi's isTruthyEnvFlag). The reader of the setting and `pig`'s export to the Node extension
+// runtime both call it.
+// pig divergence (D2): PIG_TELEMETRY wins over PI_TELEMETRY when both are set (owner decision 2026-11-17).
+func InstallTelemetryEnvOverride() (value string, ok bool) {
+	//perf:ok one environment lookup per provider request or start-up; read on each call as Pi's default parameter reads process.env.PI_TELEMETRY (telemetry.ts:8, called from sdk.ts:352 per request), so a changed variable applies at once; a cached value would not
+	if value, ok = os.LookupEnv("PIG_TELEMETRY"); ok {
+		return value, true
+	}
+	//perf:ok the same per-call read (telemetry.ts:8), reached only when PIG_TELEMETRY is unset
+	return os.LookupEnv("PI_TELEMETRY")
+}
+
+// isTruthyTelemetryEnvFlag mirrors upstream isTruthyEnvFlag (telemetry.ts:3):
+// "1", "true", or "yes" (case-insensitive) are truthy; everything else, including
+// empty, is falsy.
+// pig divergence (D26): telemetry gate feeding the attribution-header decision.
+func isTruthyTelemetryEnvFlag(value string) bool {
+	if value == "" {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// GetPackages returns the configured package sources, or an empty list.
+func (sm *SettingsManager) GetPackages() []PackageSource {
+	return readMerged(sm, func(s *Settings) []PackageSource {
+		if s.Packages == nil {
+			return []PackageSource{}
+		}
+		return clonePackageSources(s.Packages)
+	})
+}
+
+// GetExtensionPaths returns the configured extension paths, or an empty list.
+func (sm *SettingsManager) GetExtensionPaths() []string {
+	return readMerged(sm, func(s *Settings) []string { return listCopy(s.Extensions) })
+}
+
+// listCopy is a copy of list, or an empty list for nil.
+func listCopy[T any](list []T) []T {
+	if list == nil {
+		return []T{}
+	}
+	return slices.Clone(list)
+}
+
+// GetSkillPaths returns the configured skill paths, or an empty list.
+func (sm *SettingsManager) GetSkillPaths() []string {
+	return readMerged(sm, func(s *Settings) []string { return listCopy(s.Skills) })
+}
+
+// GetPromptTemplatePaths returns the configured prompt template paths, or an empty list.
+func (sm *SettingsManager) GetPromptTemplatePaths() []string {
+	return readMerged(sm, func(s *Settings) []string { return listCopy(s.Prompts) })
+}
+
+// GetThemePaths returns the configured theme paths, or an empty list.
+func (sm *SettingsManager) GetThemePaths() []string {
+	return readMerged(sm, func(s *Settings) []string { return listCopy(s.Themes) })
+}
+
+// GetThinkingBudgets returns custom thinking budgets, or nil.
+func (sm *SettingsManager) GetThinkingBudgets() *ThinkingBudgetsSettings {
+	return readMerged(sm, func(s *Settings) *ThinkingBudgetsSettings { return cloneThinkingBudgets(s.ThinkingBudgets) })
+}
+
+// GetShowImages returns whether inline images should be rendered.
+func (sm *SettingsManager) GetShowImages() bool { return readMerged(sm, (*Settings).GetShowImages) }
+
+// GetImageWidthCells returns the max image width in columns.
+func (sm *SettingsManager) GetImageWidthCells() int {
+	return readMerged(sm, (*Settings).GetImageWidthCells)
+}
+
+// GetClearOnShrink returns whether screen clears on terminal shrink.
+func (sm *SettingsManager) GetClearOnShrink() bool {
+	return readMerged(sm, (*Settings).GetClearOnShrink)
+}
+
+// GetShowTerminalProgress returns whether OSC 9;4 terminal progress indicators are enabled.
+func (sm *SettingsManager) GetShowTerminalProgress() bool {
+	return readMerged(sm, (*Settings).GetShowTerminalProgress)
+}
+
+// GetTerminalCapabilityOverrides mirrors upstream
+// SettingsManager.getTerminalCapabilityOverrides over the merged settings.
+func (sm *SettingsManager) GetTerminalCapabilityOverrides() tui.CapabilityOverrides {
+	return readMerged(sm, (*Settings).GetTerminalCapabilityOverrides)
+}
+
+// GetImageAutoResize returns whether images auto-resize.
+func (sm *SettingsManager) GetImageAutoResize() bool {
+	return readMerged(sm, (*Settings).GetImageAutoResize)
+}
+
+// GetBlockImages returns whether image rendering is blocked entirely.
+func (sm *SettingsManager) GetBlockImages() bool {
+	return readMerged(sm, func(s *Settings) bool { return s.BlockImages })
+}
+
+// GetDefaultTools returns the configured initial built-in tool selection, or
+// nil. Mirrors upstream SettingsManager.getDefaultTools.
+func (sm *SettingsManager) GetDefaultTools() []string {
+	return readMerged(sm, (*Settings).GetDefaultTools)
+}
+
+// ResolvedDefaultTools returns the tools enabled at startup: the `defaultTools` setting, or the built-in defaults when no settings layer sets it.
+// Mirrors upstream `getDefaultTools() ?? DEFAULT_TOOL_NAMES` (agent-session.ts:3593).
+func (sm *SettingsManager) ResolvedDefaultTools() []string {
+	if tools := sm.GetDefaultTools(); tools != nil {
+		return tools
+	}
+	return slices.Clone(defaultToolNames)
+}
+
+// GetDefaultTools returns the resolved `defaultTools` selection, or nil when no settings layer sets it: plain names replace the built-in defaults, then `+name` and `-name` entries apply in order.
+// Mirrors upstream getDefaultTools (settings-manager.ts:1430-1434).
+func (s Settings) GetDefaultTools() []string {
+	if s.DefaultTools == nil {
+		return nil
+	}
+	return resolveDefaultTools(s.DefaultTools)
+}
+
+// GetModelThinkingLevel returns the per-model default thinking level for
+// provider/modelID, or "". Mirrors upstream getModelThinkingLevel.
+func (sm *SettingsManager) GetModelThinkingLevel(provider, modelID string) ai.ThinkingLevel {
+	key := provider + "/" + modelID
+	return ai.ThinkingLevel(readMerged(sm, func(s *Settings) string { return s.ModelThinkingLevels[key] }))
+}
+
+// GetAllModelThinkingLevels returns a copy of the merged per-model default thinking levels keyed by provider/modelID. Mirrors upstream getAllModelThinkingLevels.
+func (sm *SettingsManager) GetAllModelThinkingLevels() map[string]ai.ThinkingLevel {
+	return readMerged(sm, func(s *Settings) map[string]ai.ThinkingLevel {
+		levels := make(map[string]ai.ThinkingLevel, len(s.ModelThinkingLevels))
+		for key, level := range s.ModelThinkingLevels {
+			levels[key] = ai.ThinkingLevel(level)
+		}
+		return levels
+	})
+}
+
+// SetModelThinkingLevel sets a per-model default thinking level override,
+// keyed by "provider/modelID". Mirrors upstream setModelThinkingLevel.
+func (sm *SettingsManager) SetModelThinkingLevel(provider, modelID string, level ai.ThinkingLevel) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		if s.ModelThinkingLevels == nil {
+			s.ModelThinkingLevels = map[string]string{}
+		}
+		s.ModelThinkingLevels[provider+"/"+modelID] = string(level)
+	})
+}
+
+// RemoveModelThinkingLevel clears a per-model default thinking level
+// override. Mirrors upstream removeModelThinkingLevel.
+func (sm *SettingsManager) RemoveModelThinkingLevel(provider, modelID string) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		if s.ModelThinkingLevels == nil {
+			return
+		}
+		delete(s.ModelThinkingLevels, provider+"/"+modelID)
+		if len(s.ModelThinkingLevels) == 0 {
+			s.ModelThinkingLevels = nil
+		}
+	})
+}
+
+// GetEnabledModels returns the list of enabled models for Ctrl+P cycling, or nil.
+func (sm *SettingsManager) GetEnabledModels() []string {
+	return readMerged(sm, func(s *Settings) []string { return slices.Clone(s.EnabledModels) })
+}
+
+// GetShowHardwareCursor returns whether the hardware cursor is shown.
+func (sm *SettingsManager) GetShowHardwareCursor() bool {
+	return readMerged(sm, (*Settings).GetShowHardwareCursor)
+}
+
+// GetEditorPaddingX returns horizontal editor padding.
+func (sm *SettingsManager) GetEditorPaddingX() int {
+	return readMerged(sm, (*Settings).GetEditorPaddingX)
+}
+
+// GetOutputPad returns horizontal chat output padding.
+func (sm *SettingsManager) GetOutputPad() OutputPad { return readMerged(sm, (*Settings).GetOutputPad) }
+
+// GetExternalEditorCommand resolves a nonblank configured command, VISUAL, EDITOR, then the platform default, without trimming the selected command.
+func (sm *SettingsManager) GetExternalEditorCommand() string {
+	configured := readMerged(sm, func(s *Settings) string { return s.ExternalEditor })
+	return resolveExternalEditorCommand(configured, visualEnv.get(), editorEnv.get(), runtime.GOOS)
+}
+
+// upstream: packages/coding-agent/src/core/settings-manager.ts:getExternalEditorCommand
+func resolveExternalEditorCommand(configured, visual, editor, goos string) string {
+	if jsTrim(configured) != "" {
+		return configured
+	}
+	if visual != "" {
+		return visual
+	}
+	if editor != "" {
+		return editor
+	}
+	if goos == "windows" {
+		return "notepad"
+	}
+	return "nano"
+}
+
+// GetAutocompleteMaxVisible returns max autocomplete items visible.
+func (sm *SettingsManager) GetAutocompleteMaxVisible() int {
+	return readMerged(sm, (*Settings).GetAutocompleteMaxVisible)
+}
+
+// GetCodeBlockIndent returns the markdown code block indent string.
+func (sm *SettingsManager) GetCodeBlockIndent() string {
+	return readMerged(sm, (*Settings).GetCodeBlockIndent)
+}
+
+// GetWarnings returns warning settings.
+func (sm *SettingsManager) GetWarnings() WarningSettings {
+	return readMerged(sm, func(s *Settings) WarningSettings {
+		if s.Warnings == nil || !s.Warnings.anthropicExtraUsageSet {
+			return WarningSettings{AnthropicExtraUsage: true, anthropicExtraUsageSet: true}
+		}
+		return *s.Warnings
+	})
+}
+
+// ─── Setters (all persist to global settings) ─────────────────────────────────
+
+// SetDefaultProvider sets the default provider.
+func (sm *SettingsManager) SetDefaultProvider(p string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.DefaultProvider, s.emptyStrings.defaultProvider = p, p == "" })
+}
+
+// SetDefaultModel sets the default model.
+func (sm *SettingsManager) SetDefaultModel(m string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.DefaultModel, s.emptyStrings.defaultModel = m, m == "" })
+}
+
+// SetDefaultModelAndProvider sets both default model and provider atomically.
+func (sm *SettingsManager) SetDefaultModelAndProvider(provider, model string) error {
+	return sm.updateGlobalOrdered([]string{"defaultProvider", "defaultModel"}, func(s *Settings) {
+		s.DefaultProvider, s.emptyStrings.defaultProvider = provider, provider == ""
+		s.DefaultModel, s.emptyStrings.defaultModel = model, model == ""
+	})
+}
+
+// SetSteeringMode sets the steering queue dispatch mode.
+func (sm *SettingsManager) SetSteeringMode(mode string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.SteeringMode = mode })
+}
+
+// SetFollowUpMode sets the follow-up queue dispatch mode.
+func (sm *SettingsManager) SetFollowUpMode(mode string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.FollowUpMode = mode })
+}
+
+// SetTuiMode sets the terminal UI mode.
+func (sm *SettingsManager) SetTuiMode(mode tui.TuiMode) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.TuiMode = string(mode) })
+}
+
+func (sm *SettingsManager) SetFullscreenExitOutput(output FullscreenExitOutput) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.FullscreenExitOutput = output })
+}
+
+func (sm *SettingsManager) SetFullscreenCopyOnSelect(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.FullscreenCopyOnSelect = &enabled })
+}
+
+func (sm *SettingsManager) SetFullscreenScrollbar(mode string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.FullscreenScrollbar = mode })
+}
+
+func (sm *SettingsManager) SetMermaidRenderingMode(mode MermaidRenderingMode) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		if s.Markdown == nil {
+			s.Markdown = &MarkdownSettings{}
+		}
+		s.Markdown.Mermaid = string(mode)
+	})
+}
+
+// SetTheme stores an explicit default theme; an empty name is not an omitted setting.
+func (sm *SettingsManager) SetTheme(theme string) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.Theme = theme
+		s.themeEmpty = theme == ""
+		s.themeNonString = false
+	})
+}
+
+// SetDefaultThinkingLevel sets the default thinking level.
+func (sm *SettingsManager) SetDefaultThinkingLevel(level ai.ThinkingLevel) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.DefaultThinkingLevel = string(level) })
+}
+
+// SetTransport sets the HTTP transport mode.
+func (sm *SettingsManager) SetTransport(transport string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.Transport = transport })
+}
+
+// SetSessionShareDestination sets the /share destination in the global settings.
+func (sm *SettingsManager) SetSessionShareDestination(destination SessionShareDestination) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.SessionShareDestination = destination })
+}
+
+// SetCompactionEnabled enables or disables auto-compaction.
+func (sm *SettingsManager) SetCompactionEnabled(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		if s.Compaction == nil {
+			s.Compaction = &CompactionSettingsJSON{}
+		}
+		s.Compaction.Enabled = &enabled
+	})
+}
+
+// SetRetryEnabled enables or disables auto-retry.
+func (sm *SettingsManager) SetRetryEnabled(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		if s.Retry == nil {
+			s.Retry = &RetrySettingsJSON{}
+		}
+		s.Retry.Enabled = &enabled
+	})
+}
+
+// SetHttpIdleTimeoutMs sets the HTTP header/body idle timeout in milliseconds.
+// Zero disables the timeout.
+func (sm *SettingsManager) SetHttpIdleTimeoutMs(timeoutMs float64) error {
+	normalized, ok := parseHTTPIdleTimeoutMs(timeoutMs)
+	if !ok {
+		return fmt.Errorf("invalid httpIdleTimeoutMs setting: %v", timeoutMs)
+	}
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.HTTPIdleTimeoutMs = &normalized
+		s.httpIdleTimeoutInvalid = nil
+		s.httpIdleTimeoutNull = false
+	})
+}
+
+// SetHideThinkingBlock sets whether to hide thinking blocks.
+func (sm *SettingsManager) SetHideThinkingBlock(hide bool) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.HideThinkingBlock = hide
+		s.hideThinkingBlockSet = true
+	})
+}
+
+// SetShowCacheMissNotices sets whether transcript cache-miss notices are shown.
+func (sm *SettingsManager) SetShowCacheMissNotices(show bool) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.ShowCacheMissNotices = show
+		s.showCacheMissNoticesSet = true
+	})
+}
+
+// SetShellPath sets the shell path for the bash tool.
+func (sm *SettingsManager) SetShellPath(path string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.ShellPath, s.emptyStrings.shellPath = path, path == "" })
+}
+
+// SetQuietStartup sets the global quiet startup setting.
+func (sm *SettingsManager) SetQuietStartup(quiet QuietStartup) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.QuietStartup = quiet
+		s.quietStartupSet = true
+	})
+}
+
+// SetShellCommandPrefix sets the command prefix for bash commands.
+func (sm *SettingsManager) SetShellCommandPrefix(prefix string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.CommandPrefix, s.emptyStrings.commandPrefix = prefix, prefix == "" })
+}
+
+// SetNpmCommand sets the npm command override.
+func (sm *SettingsManager) SetNpmCommand(cmd []string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.NpmCommand = cmd })
+}
+
+// SetCollapseChangelog sets whether changelog is collapsed.
+func (sm *SettingsManager) SetCollapseChangelog(collapse bool) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.CollapseChangelog = collapse
+		s.collapseChangelogSet = true
+	})
+}
+
+// SetEnableInstallTelemetry sets whether package-install telemetry is enabled.
+// This toggles the gate only; delivery depends on the configured sender.
+func (sm *SettingsManager) SetEnableInstallTelemetry(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.EnableInstallTelemetry = &enabled })
+}
+
+// SetEnableSkillCommands sets whether skill commands are enabled.
+func (sm *SettingsManager) SetEnableSkillCommands(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.EnableSkillCommands = &enabled })
+}
+
+// SetShowImages sets whether inline images are shown.
+func (sm *SettingsManager) SetShowImages(show bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.ShowImages = &show })
+}
+
+// SetImageWidthCells sets the max image width in columns.
+func (sm *SettingsManager) SetImageWidthCells(width int) error {
+	width = max(1, width)
+	return sm.UpdateGlobal(func(s *Settings) { s.ImageWidthCells = width })
+}
+
+// SetClearOnShrink sets whether screen clears on terminal shrink.
+func (sm *SettingsManager) SetClearOnShrink(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.ClearOnShrink = &enabled })
+}
+
+// SetShowTerminalProgress sets whether OSC 9;4 terminal progress indicators are enabled.
+func (sm *SettingsManager) SetShowTerminalProgress(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.ShowTerminalProgress = &enabled })
+}
+
+// SetImageAutoResize sets whether images auto-resize.
+func (sm *SettingsManager) SetImageAutoResize(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.ImageAutoResize = &enabled })
+}
+
+// SetBlockImages sets whether image rendering is blocked.
+func (sm *SettingsManager) SetBlockImages(blocked bool) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.BlockImages = blocked
+		s.blockImagesSet = true
+	})
+}
+
+// SetEnabledModels sets the list of enabled models for Ctrl+P cycling.
+func (sm *SettingsManager) SetEnabledModels(patterns []string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.EnabledModels = patterns })
+}
+
+// GetExtensionsTypescriptRuntime returns the global extensionsTypescriptRuntime setting, or "" when it is unset. A project file cannot set it.
+// pig additive (D19): see Settings.ExtensionsTypescriptRuntime.
+func (sm *SettingsManager) GetExtensionsTypescriptRuntime() string {
+	if runtime := sm.GetGlobalSettings().ExtensionsTypescriptRuntime; runtime != nil {
+		return *runtime
+	}
+	return ""
+}
+
+// GetTerminalScreenWriter returns the global terminal.screenWriter setting, normalized as Settings.GetTerminalScreenWriter does. A project file cannot set it.
+// pig divergence (D624): see Settings.TerminalScreenWriter.
+func (sm *SettingsManager) GetTerminalScreenWriter() string {
+	return sm.GetGlobalSettings().GetTerminalScreenWriter()
+}
+
+// GetTerminalFramePacing returns the global terminal.framePacing setting, normalized as Settings.GetTerminalFramePacing does. A project file cannot set it.
+// pig additive (D625): see Settings.TerminalFramePacing.
+func (sm *SettingsManager) GetTerminalFramePacing() string {
+	return sm.GetGlobalSettings().GetTerminalFramePacing()
+}
+
+// GetExtensionsAutoUpgrade reports whether the global settings turn on the automatic Go extension upgrade. It is off unless set, and a project file cannot turn it on.
+// pig additive (D109): see Settings.ExtensionsAutoUpgrade.
+func (sm *SettingsManager) GetExtensionsAutoUpgrade() bool {
+	enabled := sm.GetGlobalSettings().ExtensionsAutoUpgrade
+	return enabled != nil && *enabled
+}
+
+// SetMaskSecretInput sets the PiG-only login-input privacy setting.
+// pig divergence (D80): configurable input privacy leaves the upstream setting order intact.
+func (sm *SettingsManager) SetMaskSecretInput(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.MaskSecretInput = &enabled })
+}
+
+// SetDoubleEscapeAction sets the double-escape action.
+func (sm *SettingsManager) SetDoubleEscapeAction(action string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.DoubleEscapeAction = action })
+}
+
+// SetTreeFilterMode sets the tree filter mode.
+func (sm *SettingsManager) SetTreeFilterMode(mode string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.TreeFilterMode = mode })
+}
+
+// SetShowHardwareCursor sets whether the hardware cursor is shown.
+func (sm *SettingsManager) SetShowHardwareCursor(enabled bool) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.ShowHardwareCursor = &enabled })
+}
+
+// SetEditorPaddingX sets horizontal editor padding. Clamped to 0-3.
+func (sm *SettingsManager) SetEditorPaddingX(padding int) error {
+	p := max(0, min(3, padding))
+	return sm.UpdateGlobal(func(s *Settings) { s.EditorPaddingX = &p })
+}
+
+// SetOutputPad sets horizontal chat output padding. Clamped to 0-1.
+func (sm *SettingsManager) SetOutputPad(padding OutputPad) error {
+	p := max(0, min(1, int(padding)))
+	return sm.UpdateGlobal(func(s *Settings) { s.OutputPad = &p })
+}
+
+// SetAutocompleteMaxVisible sets max autocomplete items. Clamped to 3-20.
+func (sm *SettingsManager) SetAutocompleteMaxVisible(n int) error {
+	v := max(3, min(20, n))
+	return sm.UpdateGlobal(func(s *Settings) { s.AutocompleteMaxVisible = &v })
+}
+
+// SetWarnings sets warning settings.
+func (sm *SettingsManager) SetWarnings(warnings WarningSettings) error {
+	warnings.anthropicExtraUsageSet = true
+	return sm.updateGlobalReplacing(nil, []string{"warnings"}, func(s *Settings) { s.Warnings = &warnings })
+}
+
+// GlobalPath returns the global settings file path, or empty for memory storage.
+func (sm *SettingsManager) GlobalPath() string {
+	if sm.memory != nil {
+		return ""
+	}
+	return filepath.Join(sm.agentDir, "settings.json")
+}
+
+// UpdateGlobal applies fn and refreshes the merged view, then saves to the selected backing storage. Like Pi's setters (settings-manager.ts save), the change is in effect in memory at once and its write goes through the manager's write queue, which has performed it when UpdateGlobal returns (settingsWriter). A write that fails is recorded for DrainErrors, as Pi's is, and the change stays in effect in memory; UpdateGlobal also returns the failure, which Pi's setter cannot, or the skipped save of a global file that had parse errors.
+func (sm *SettingsManager) UpdateGlobal(fn func(*Settings)) error {
+	return sm.updateGlobalOrdered(nil, fn)
+}
+
+// updateGlobalOrdered is UpdateGlobal for a setter that marks several fields modified: a field new to the file is appended in the order the
+// setter marks it (settings-manager.ts markModified), which the diff of before and after cannot tell.
+func (sm *SettingsManager) updateGlobalOrdered(order []string, fn func(*Settings)) error {
+	return sm.updateGlobalReplacing(order, nil, fn)
+}
+
+// updateGlobalReplacing is updateGlobalOrdered for a setter that assigns whole top-level objects: the keys in replace are written as the setter left
+// them, dropping members the file holds that PiG does not model (setWarnings assigns `{ ...warnings }`), where other setters patch their nested objects.
+func (sm *SettingsManager) updateGlobalReplacing(order, replace []string, fn func(*Settings)) error {
+	write, err := sm.changeGlobal(order, replace, fn)
+	if err != nil {
+		return err
+	}
+	// pig divergence (D633): the setter returns the failure of its write, which Pi's cannot throw; both record it for the settings diagnostics.
+	return sm.writer.settle(write)
+}
+
+// changeGlobal applies fn to the global layer and queues the write of the change, which the caller settles after the lock is released.
+func (sm *SettingsManager) changeGlobal(order, replace []string, fn func(*Settings)) (*settingsWrite, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	before := cloneSettings(sm.global)
+	fn(&sm.global)
+	sm.globalObject = patchLayerObject(sm.globalObject, before, sm.global, order, replace)
+	sm.remergeLocked()
+	if sm.memory != nil {
+		sm.memory.global = cloneSettings(sm.global)
+		sm.memory.globalObject = sm.globalObject.Clone()
+		return nil, nil
+	}
+	if sm.globalLoadErr != nil {
+		return nil, fmt.Errorf("global settings file has parse errors: %w", sm.globalLoadErr)
+	}
+	path := filepath.Join(sm.agentDir, "settings.json")
+	after := cloneSettings(sm.global)
+	var change settingsChange
+	change, sm.unsavedGlobal = carryUnsaved(sm.unsavedGlobal, before, after, order, replace)
+	return sm.writer.enqueue(func() error {
+		if err := sm.saveScope("global", path, change.before, after, change.order, change.replace); err != nil {
+			return err
+		}
+		sm.mu.Lock()
+		sm.unsavedGlobal = nil
+		sm.mu.Unlock()
+		return nil
+	}, func(err error) { sm.writeFailed("global", path, err) }), nil
+}
+
+// errProjectUntrustedWrite is the error of Pi's assertProjectTrustedForWrite (settings-manager.ts:555-559).
+var errProjectUntrustedWrite = errors.New("Project is not trusted; refusing to write project settings")
+
+// UpdateProject applies fn to trusted project settings and refreshes the merged view, then saves to the selected storage. Like Pi's saveProjectSettings (settings-manager.ts), an untrusted project refuses the change, and otherwise the change is in effect in memory at once and its write goes through the manager's write queue, which has performed it when UpdateProject returns (settingsWriter) and which checks the trust again when it performs it. A write that fails is recorded for DrainErrors, as Pi's is, and the change stays in effect in memory; UpdateProject also returns the failure, which Pi's setter cannot, or the refusal, or the skipped save of a project file that had parse errors.
+func (sm *SettingsManager) UpdateProject(fn func(*Settings)) error {
+	write, err := sm.changeProject(fn)
+	if err != nil {
+		return err
+	}
+	// pig divergence (D633): the setter returns the failure of its write, which Pi's cannot throw; both record it for the settings diagnostics.
+	return sm.writer.settle(write)
+}
+
+// changeProject is changeGlobal for the project layer.
+func (sm *SettingsManager) changeProject(fn func(*Settings)) (*settingsWrite, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if !sm.projectTrusted {
+		return nil, errProjectUntrustedWrite
+	}
+	before := cloneSettings(sm.project)
+	fn(&sm.project)
+	sm.projectObject = patchLayerObject(sm.projectObject, before, sm.project, nil, nil)
+	sm.remergeLocked()
+	if sm.memory != nil {
+		sm.memory.project = cloneSettings(sm.project)
+		sm.memory.projectObject = sm.projectObject.Clone()
+		return nil, nil
+	}
+	if sm.projectLoadErr != nil {
+		return nil, fmt.Errorf("project settings file has parse errors: %w", sm.projectLoadErr)
+	}
+	path := filepath.Join(ProjectConfigDir(sm.cwd), "settings.json")
+	after := cloneSettings(sm.project)
+	var change settingsChange
+	change, sm.unsavedProject = carryUnsaved(sm.unsavedProject, before, after, nil, nil)
+	return sm.writer.enqueue(func() error {
+		// The trust is checked again when the write is performed (settings-manager.ts:579-581): a project that lost it since the setter is not written.
+		if !sm.IsProjectTrusted() {
+			return errProjectUntrustedWrite
+		}
+		if err := sm.saveScope("project", path, change.before, after, change.order, change.replace); err != nil {
+			return err
+		}
+		sm.mu.Lock()
+		sm.unsavedProject = nil
+		sm.mu.Unlock()
+		return nil
+	}, func(err error) { sm.writeFailed("project", path, err) }), nil
+}
+
+// SetPackages persists the global package source list, including an explicitly empty array.
+func (sm *SettingsManager) SetPackages(pkgs []PackageSource) error {
+	return sm.UpdateGlobal(func(s *Settings) {
+		s.Packages = pkgs
+	})
+}
+
+// SetProjectPackages persists the project package source list, including an explicitly empty array.
+func (sm *SettingsManager) SetProjectPackages(pkgs []PackageSource) error {
+	return sm.UpdateProject(func(s *Settings) {
+		s.Packages = pkgs
+	})
+}
+
+func (sm *SettingsManager) SetExtensionPaths(paths []string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.Extensions = paths })
+}
+
+func (sm *SettingsManager) SetProjectExtensionPaths(paths []string) error {
+	return sm.UpdateProject(func(s *Settings) { s.Extensions = paths })
+}
+
+func (sm *SettingsManager) SetSkillPaths(paths []string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.Skills = paths })
+}
+
+func (sm *SettingsManager) SetProjectSkillPaths(paths []string) error {
+	return sm.UpdateProject(func(s *Settings) { s.Skills = paths })
+}
+
+func (sm *SettingsManager) SetPromptTemplatePaths(paths []string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.Prompts = paths })
+}
+
+func (sm *SettingsManager) SetProjectPromptTemplatePaths(paths []string) error {
+	return sm.UpdateProject(func(s *Settings) { s.Prompts = paths })
+}
+
+func (sm *SettingsManager) SetThemePaths(paths []string) error {
+	return sm.UpdateGlobal(func(s *Settings) { s.Themes = paths })
+}
+
+func (sm *SettingsManager) SetProjectThemePaths(paths []string) error {
+	return sm.UpdateProject(func(s *Settings) { s.Themes = paths })
+}
+
+// GlobalSettingsPath returns the global settings file path, or empty for memory storage.
+func (sm *SettingsManager) GlobalSettingsPath() string { return sm.GlobalPath() }
+
+// loadSettingsFile reads a settings file as Pi's tryLoadFromStorage does, returning the settings and the object Pi holds for them (settingsFileObject). FileSettingsStorage.withLock tests existsSync(path) (settings-manager.ts:231), which is false for every stat error: a file that cannot be reached because a parent is a regular file or cannot be searched is no settings file, not a load error.
+func loadSettingsFile(path string) (result Settings, object *orderedjson.Object, err error) {
+	if !pathExists(path) {
+		return Settings{}, orderedjson.New(), nil
+	}
+	release, err := acquireSyncLockWithRetry(path)
+	if err != nil {
+		return Settings{}, orderedjson.New(), err
+	}
+	defer releaseSyncLock(release, &err)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Settings{}, orderedjson.New(), nil
+		}
+		return Settings{}, orderedjson.New(), err
+	}
+	if len(data) == 0 {
+		return Settings{}, orderedjson.New(), nil
+	}
+	data = text.StripBomBytes(data)
+	settings, err := parseSettingsJSON(data)
+	if err != nil {
+		return Settings{}, orderedjson.New(), err
+	}
+	return settings, settingsFileObject(data), nil
+}
+
+// settingsFileObject is the object Pi's SettingsManager holds for settings file content parseSettingsJSON accepted: JSON.parse then
+// migrateSettings, which keep the file's member order. Content that is not an object reads as no settings, an empty object.
+func settingsFileObject(data []byte) *orderedjson.Object {
+	object, err := orderedjson.Parse(data)
+	if err != nil || migrateSettingsObject(object) != nil {
+		return orderedjson.New()
+	}
+	return object
+}
+
+// settingsObject is the object Pi holds for settings it did not read from a file (an in-memory manager's initial settings, applyOverrides'
+// argument): their JSON, in the member order Settings.MarshalJSON writes.
+func settingsObject(s Settings) *orderedjson.Object {
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		return orderedjson.New()
+	}
+	object, err := orderedjson.Parse(encoded)
+	if err != nil {
+		return orderedjson.New()
+	}
+	return object
+}
+
+// cloneSettingsObject returns a copy of object, an empty object for nil.
+func cloneSettingsObject(object *orderedjson.Object) *orderedjson.Object {
+	if object == nil {
+		return orderedjson.New()
+	}
+	return object.Clone()
+}
+
+// mergeSettingsObjects is deepMergeObjects (settings-manager.ts:195-212) for the settings layer objects: base's members keep their order,
+// each member of override replaces or deep-merges into its own, and members new to base follow in override's order. Nil reads as {}.
+func mergeSettingsObjects(base, override *orderedjson.Object) *orderedjson.Object {
+	merged := cloneSettingsObject(base)
+	if override == nil {
+		return merged
+	}
+	for _, key := range override.Keys() {
+		value, _ := override.Get(key)
+		existing, _ := merged.Get(key)
+		merged.Set(key, deepMergeJSONObjects(existing, value))
+	}
+	return merged
+}
+
+// patchLayerObject returns a settings layer's object after a setter changed the layer from before to after: Pi's setters assign the modified
+// fields on this.globalSettings or this.projectSettings, so a member already present keeps its place and a new one follows (patchSettingsObject).
+// A nil object starts as before's; an object the change cannot patch is replaced by after's.
+func patchLayerObject(object *orderedjson.Object, before, after Settings, order, replace []string) *orderedjson.Object {
+	if object == nil {
+		object = settingsObject(before)
+	}
+	if patchSettingsObject(object, before, after, order, replace) != nil {
+		return settingsObject(after)
+	}
+	return object
+}
+
+// parseSettingsJSON applies JSON.parse and migrateSettings to settings file content: a syntax error carries V8's
+// JSON.parse message, an array reads as no settings, and any other non-object value fails migrateSettings' first
+// `in` test.
+func parseSettingsJSON(data []byte) (Settings, error) {
+	if err := jsonparse.Validate(data); err != nil {
+		return Settings{}, err
+	}
+	switch trimmed := bytes.TrimLeft(data, " \t\r\n"); {
+	case len(trimmed) > 0 && trimmed[0] == '[':
+		return Settings{}, nil
+	case len(trimmed) > 0 && trimmed[0] != '{':
+		var value any
+		if err := json.Unmarshal(data, &value); err != nil {
+			return Settings{}, err
+		}
+		operand := "null"
+		switch v := value.(type) {
+		case float64:
+			if v == 0 {
+				operand = "0"
+			} else {
+				operand = tools.FormatJSNumber(v)
+			}
+		case string, bool:
+			operand = jsStringValue(v)
+		}
+		return Settings{}, fmt.Errorf("Cannot use 'in' operator to search for 'queueMode' in %s", operand)
+	}
+	var s Settings
+	if err := json.Unmarshal(data, &s); err != nil {
+		return Settings{}, err
+	}
+	return s, nil
+}
+
+// saveSettingsPatch is FileSettingsStorage.withLock with persistScopedSettings (settings-manager.ts:268-296,643-665): it creates the directory when existsSync does not find it, and returns Node's fs errors and JSON.parse's message for the current file unchanged.
+func saveSettingsPatch(path string, before, after Settings, order ...string) (err error) {
+	return saveSettingsPatchReplacing(path, before, after, order, nil)
+}
+
+func saveSettingsPatchReplacing(path string, before, after Settings, order, replace []string) (err error) {
+	if dir := filepath.Dir(path); !pathExists(dir) {
+		if err := nodeerrno.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	release, err := acquireSyncLockWithRetry(path)
+	if err != nil {
+		return err
+	}
+	defer releaseSyncLock(release, &err)
+
+	data, readErr := os.ReadFile(path)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return nodeerrno.FromPathError(readErr)
+	}
+	encoded, err := patchedSettingsBytes(data, readErr == nil, before, after, order, replace)
+	if err != nil {
+		return err
+	}
+	// pig divergence (D651): replaced through a private temporary file and a rename, in place where that is refused; Pi writes the file in place.
+	// upstream: coding-agent/src/core/settings-manager.ts:245 writeFileSync(path, next, "utf-8"): no mode, so a new file is 0666 with the umask taken out.
+	if err := atomicfile.WriteFile(path, encoded, 0o666); err != nil {
+		return nodeerrno.FromPathError(err)
+	}
+	return nil
+}
+
+// patchedSettingsBytes is the settings text that results from applying a setter's change (before to after) to the stored text data, which exists when exists. It is the part of FileSettingsStorage.withLock's callback that persistScopedSettings runs.
+func patchedSettingsBytes(data []byte, exists bool, before, after Settings, order, replace []string) ([]byte, error) {
+	current := orderedjson.New()
+	if exists {
+		data = text.StripBomBytes(data)
+		if _, err := parseSettingsJSON(data); err != nil {
+			return nil, err
+		}
+		var members map[string]json.RawMessage
+		if json.Unmarshal(data, &members) == nil {
+			if members != nil {
+				// settings-manager.ts:715 spreads the file's own object, so its keys keep their order.
+				var err error
+				if current, err = orderedjson.Parse(data); err != nil {
+					return nil, err
+				}
+				if err := migrateSettingsObject(current); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			var err error
+			if current, err = spreadNonObjectRoot(data); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := patchSettingsObject(current, before, after, order, replace); err != nil {
+		return nil, err
+	}
+	// JSON.stringify(mergedSettings, null, 2) (settings-manager.ts:731) re-serializes the whole parsed file: no HTML escaping, JS number and string forms, array-index keys first.
+	return stringifyIndented(rawObject(current))
+}
+
+// patchSettingsObject applies a setter's change of a settings layer from before to after to current, the layer's object, as persistScopedSettings
+// assigns the modified fields (patchJSONObject); the keys in replace take after's value whole.
+func patchSettingsObject(current *orderedjson.Object, before, after Settings, order, replace []string) error {
+	beforeMap, err := settingsJSONMap(before)
+	if err != nil {
+		return err
+	}
+	afterMap, err := settingsJSONMap(after)
+	if err != nil {
+		return err
+	}
+	if err := patchJSONObject(current, beforeMap, afterMap, order...); err != nil {
+		return err
+	}
+	for _, key := range replace {
+		if value, ok := afterMap[key]; ok {
+			current.Set(key, slices.Clone(value))
+		}
+	}
+	return nil
+}
+
+// migrateSettingsObject is SettingsManager.migrateSettings (settings-manager.ts:395-452) on the file's own object: persistScopedSettings migrates the
+// current file before it merges the modified fields, so a legacy key is rewritten in the saved file. Keys keep JavaScript's property order: a migrated
+// value is appended unless its key exists, and a deleted key leaves the others in place.
+func migrateSettingsObject(o *orderedjson.Object) error {
+	isObject := func(raw json.RawMessage) bool { return orderedjson.IsObject(raw) }
+	if queueMode, ok := o.Get("queueMode"); ok && !o.Has("steeringMode") {
+		o.Set("steeringMode", queueMode)
+		o.Delete("queueMode")
+	}
+	if !o.Has("transport") {
+		if websockets, ok := o.Get("websockets"); ok {
+			switch string(bytes.TrimSpace(websockets)) {
+			case "true":
+				o.Set("transport", json.RawMessage(`"websocket"`))
+				o.Delete("websockets")
+			case "false":
+				o.Set("transport", json.RawMessage(`"sse"`))
+				o.Delete("websockets")
+			}
+		}
+	}
+	if raw, ok := o.Get("skills"); ok && isObject(raw) {
+		skills, err := orderedjson.Parse(raw)
+		if err != nil {
+			return err
+		}
+		if enable, ok := skills.Get("enableSkillCommands"); ok && !o.Has("enableSkillCommands") {
+			o.Set("enableSkillCommands", enable)
+		}
+		var directories []json.RawMessage
+		if raw, ok := skills.Get("customDirectories"); ok && json.Unmarshal(raw, &directories) == nil && len(directories) > 0 && bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) {
+			o.Set("skills", slices.Clone(raw))
+		} else {
+			o.Delete("skills")
+		}
+	}
+	if raw, ok := o.Get("retry"); ok && isObject(raw) {
+		retry, err := orderedjson.Parse(raw)
+		if err != nil {
+			return err
+		}
+		maxDelay, hasMaxDelay := retry.Get("maxDelayMs")
+		if trimmed := bytes.TrimSpace(maxDelay); hasMaxDelay && len(trimmed) > 0 && (trimmed[0] == '-' || trimmed[0] >= '0' && trimmed[0] <= '9') {
+			provider := orderedjson.New()
+			var existing json.RawMessage
+			if value, ok := retry.Get("provider"); ok {
+				existing = bytes.TrimSpace(value)
+			}
+			switch {
+			case isObject(existing):
+				if provider, err = orderedjson.Parse(existing); err != nil {
+					return err
+				}
+			case len(existing) > 0 && existing[0] == '[':
+				if provider, err = spreadNonObjectRoot(existing); err != nil {
+					return err
+				}
+			}
+			if current, ok := provider.Get("maxRetryDelayMs"); !ok || bytes.Equal(bytes.TrimSpace(current), []byte("null")) {
+				provider.Set("maxRetryDelayMs", slices.Clone(maxDelay))
+				encoded, err := json.Marshal(provider)
+				if err != nil {
+					return err
+				}
+				retry.Set("provider", encoded)
+			}
+		}
+		retry.Delete("maxDelayMs")
+		encoded, err := json.Marshal(retry)
+		if err != nil {
+			return err
+		}
+		o.Set("retry", encoded)
+	}
+	return nil
+}
+
+// spreadNonObjectRoot is `{ ...parsed }` for a settings.json whose root is an array: its elements under their indexes (settings-manager.ts:738). Every
+// other non-object root fails earlier, in parseSettingsJSON, with migrateSettings' TypeError, so Pi never writes it.
+func spreadNonObjectRoot(data []byte) (*orderedjson.Object, error) {
+	object := orderedjson.New()
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err != nil {
+		return nil, err
+	}
+	for i, item := range items {
+		object.Set(strconv.Itoa(i), slices.Clone(item))
+	}
+	return object, nil
+}
+
+func settingsJSONMap(settings Settings) (map[string]json.RawMessage, error) {
+	encoded, err := json.Marshal(settings)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]json.RawMessage{}
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// patchJSONObject applies the difference between before and after to current. Keys already in current keep their
+// position, a changed value is replaced in place and a new key is appended, as the spread-and-assign merge at
+// settings-manager.ts:715-732 orders them. Keys new to the file are appended in the order given, then in sorted order.
+func patchJSONObject(current *orderedjson.Object, before, after map[string]json.RawMessage, order ...string) error {
+	keys := make(map[string]struct{}, len(after))
+	for key := range before {
+		keys[key] = struct{}{}
+	}
+	for key := range after {
+		keys[key] = struct{}{}
+	}
+	ordered := slices.Sorted(maps.Keys(keys))
+	for _, o := range slices.Backward(order) {
+		if at := slices.Index(ordered, o); at >= 0 {
+			ordered = slices.Insert(slices.Delete(ordered, at, at+1), 0, o)
+		}
+	}
+	for _, key := range ordered {
+		oldValue, hadOld := before[key]
+		newValue, hasNew := after[key]
+		if hadOld == hasNew && bytes.Equal(oldValue, newValue) {
+			continue
+		}
+		if !hasNew {
+			current.Delete(key)
+			continue
+		}
+		newObject, newIsObject := rawJSONObject(newValue)
+		if !newIsObject {
+			current.Set(key, slices.Clone(newValue))
+			continue
+		}
+		oldObject, _ := rawJSONObject(oldValue)
+		currentObject := orderedjson.New()
+		if existing, ok := current.Get(key); ok && orderedjson.IsObject(existing) {
+			parsed, err := orderedjson.Parse(existing)
+			if err != nil {
+				return err
+			}
+			currentObject = parsed
+		}
+		if err := patchJSONObject(currentObject, oldObject, newObject); err != nil {
+			return err
+		}
+		encoded, err := json.Marshal(currentObject)
+		if err != nil {
+			return err
+		}
+		current.Set(key, encoded)
+	}
+	return nil
+}
+
+func rawJSONObject(value json.RawMessage) (map[string]json.RawMessage, bool) {
+	value = bytes.TrimSpace(value)
+	if len(value) == 0 || value[0] != '{' {
+		return map[string]json.RawMessage{}, false
+	}
+	result := map[string]json.RawMessage{}
+	if err := json.Unmarshal(value, &result); err != nil {
+		return map[string]json.RawMessage{}, false
+	}
+	return result, true
+}
+
+// settingsWireMembers are the top-level settings members settingsWire decodes.
+var settingsWireMembers = sync.OnceValue(func() map[string]struct{} { return orderedjson.JSONNames(reflect.TypeFor[settingsWire]()) })
+
+// unmodeledSettings returns the members of the migrated settings object that settingsWire does not decode, with their values as data holds
+// them; nil when there are none. migrateSettings deletes only members it rewrote, so every member left in migrated is in data unchanged.
+func unmodeledSettings(data []byte, migrated map[string]any) (map[string]json.RawMessage, error) {
+	known := settingsWireMembers()
+	var members, extra map[string]json.RawMessage
+	for name := range migrated {
+		if _, ok := known[name]; ok {
+			continue
+		}
+		if members == nil {
+			if err := json.Unmarshal(data, &members); err != nil {
+				return nil, err
+			}
+			extra = make(map[string]json.RawMessage)
+		}
+		extra[name] = members[name]
+	}
+	return extra, nil
+}
+
+// mergeSettingsExtra is deepMergeObjects (settings-manager.ts:63-80) on the members PiG does not model: a project member replaces the global
+// one unless both are objects, which merge member by member.
+func mergeSettingsExtra(global, project map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(project) == 0 {
+		return global
+	}
+	merged := make(map[string]json.RawMessage, allocsize.Add(len(global), len(project)))
+	maps.Copy(merged, global)
+	for name, value := range project {
+		merged[name] = deepMergeJSONObjects(merged[name], value)
+	}
+	return merged
+}
+
+// deepMergeJSONObjects returns override, or, when base and override are both objects (isMergeableObject), base with each member of
+// override merged in the same way: base's members keep their order and new members follow.
+func deepMergeJSONObjects(base, override json.RawMessage) json.RawMessage {
+	if !orderedjson.IsObject(base) || !orderedjson.IsObject(override) {
+		return override
+	}
+	merged, err := orderedjson.Parse(base)
+	if err != nil {
+		return override
+	}
+	overrides, err := orderedjson.Parse(override)
+	if err != nil {
+		return override
+	}
+	for _, name := range overrides.Keys() {
+		value, _ := overrides.Get(name)
+		existing, _ := merged.Get(name)
+		merged.Set(name, deepMergeJSONObjects(existing, value))
+	}
+	encoded, err := merged.MarshalJSON()
+	if err != nil {
+		return override
+	}
+	return encoded
+}
+
+// mergeSettings merges project settings over global settings.
+// Mirrors upstream deepMergeSettings: primitives/arrays fully override, nested
+// objects merge field-by-field, and presence-tracked booleans may override to
+// either true or false.
+func mergeSettings(global, project Settings) Settings {
+	m := cloneSettings(global)
+	// pig divergence (D645): the unknown keys of the project file are merged as own entries, so a settings key `__proto__` is one more unknown key and nothing under it is a setting; Pi's `result[key] = ...` on a plain object sets the merged object's prototype with it and reads its members as settings.
+	m.extra = mergeSettingsExtra(m.extra, project.extra)
+	if project.DefaultProvider != "" || project.emptyStrings.defaultProvider {
+		m.DefaultProvider, m.emptyStrings.defaultProvider = project.DefaultProvider, project.emptyStrings.defaultProvider
+	}
+	if project.DefaultModel != "" || project.emptyStrings.defaultModel {
+		m.DefaultModel, m.emptyStrings.defaultModel = project.DefaultModel, project.emptyStrings.defaultModel
+	}
+	if project.DefaultThinkingLevel != "" {
+		m.DefaultThinkingLevel = project.DefaultThinkingLevel
+	}
+	if project.Theme != "" || project.themeEmpty || project.themeNonString {
+		m.Theme = project.Theme
+		m.themeEmpty = project.themeEmpty
+		m.themeNonString = project.themeNonString
+	}
+	if project.ShellPath != "" || project.emptyStrings.shellPath {
+		m.ShellPath, m.emptyStrings.shellPath = project.ShellPath, project.emptyStrings.shellPath
+	}
+	// deepMergeSettings lets every project key override, lastChangelogVersion included (settings-manager.ts getLastChangelogVersion reads the merged view).
+	if project.LastChangelogVersion != "" {
+		m.LastChangelogVersion = project.LastChangelogVersion
+	}
+	if project.CommandPrefix != "" || project.emptyStrings.commandPrefix {
+		m.CommandPrefix, m.emptyStrings.commandPrefix = project.CommandPrefix, project.emptyStrings.commandPrefix
+	}
+	if project.Transport != "" {
+		m.Transport = project.Transport
+	}
+	if project.SessionShareDestination != "" {
+		m.SessionShareDestination = project.SessionShareDestination
+	}
+	if project.SessionDir != "" {
+		m.SessionDir = project.SessionDir
+	}
+	if project.WebSocketConnectTimeoutMs != nil || project.webSocketConnectTimeoutInvalid != nil || project.webSocketConnectTimeoutNull {
+		m.webSocketConnectTimeoutNull = project.webSocketConnectTimeoutNull
+		m.WebSocketConnectTimeoutMs = cloneIntPtr(project.WebSocketConnectTimeoutMs)
+		m.webSocketConnectTimeoutInvalid = project.webSocketConnectTimeoutInvalid
+	}
+	if project.HTTPIdleTimeoutMs != nil || project.httpIdleTimeoutInvalid != nil || project.httpIdleTimeoutNull {
+		m.httpIdleTimeoutNull = project.httpIdleTimeoutNull
+		m.httpIdleTimeoutInvalid = project.httpIdleTimeoutInvalid
+		m.HTTPIdleTimeoutMs = cloneIntPtr(project.HTTPIdleTimeoutMs)
+	}
+	if project.Packages != nil {
+		m.Packages = clonePackageSources(project.Packages)
+	}
+	if project.Extensions != nil {
+		m.Extensions = append([]string{}, project.Extensions...)
+	}
+	if project.Skills != nil {
+		m.Skills = append([]string{}, project.Skills...)
+	}
+	if project.Prompts != nil {
+		m.Prompts = append([]string{}, project.Prompts...)
+	}
+	if project.Themes != nil {
+		m.Themes = append([]string{}, project.Themes...)
+	}
+	if project.DefaultTools != nil {
+		m.DefaultTools = mergeDefaultTools(m.DefaultTools, project.DefaultTools)
+	}
+	if project.ModelThinkingLevels != nil {
+		// Upstream deep-merges nested objects: project keys override global.
+		merged := maps.Clone(m.ModelThinkingLevels)
+		if merged == nil {
+			merged = map[string]string{}
+		}
+		maps.Copy(merged, project.ModelThinkingLevels)
+		m.ModelThinkingLevels = merged
+	}
+	if project.ExtensionChangelogVersions != nil {
+		// Upstream deep-merges nested objects: project keys override global.
+		merged := maps.Clone(m.ExtensionChangelogVersions)
+		if merged == nil {
+			merged = map[string]string{}
+		}
+		maps.Copy(merged, project.ExtensionChangelogVersions)
+		m.ExtensionChangelogVersions = merged
+	}
+	if project.EnabledModels != nil {
+		m.EnabledModels = append([]string{}, project.EnabledModels...)
+	}
+	if project.NpmCommand != nil {
+		m.NpmCommand = append([]string{}, project.NpmCommand...)
+	}
+	if project.SelfUpdateCommand != nil {
+		m.SelfUpdateCommand = append([]string{}, project.SelfUpdateCommand...)
+	}
+	if project.BranchSummary != nil {
+		if m.BranchSummary == nil {
+			m.BranchSummary = &BranchSummaryConfig{}
+		}
+		if project.BranchSummary.reserveTokensSet || project.BranchSummary.ReserveTokens != 0 {
+			m.BranchSummary.ReserveTokens = project.BranchSummary.ReserveTokens
+			m.BranchSummary.reserveTokensSet = true
+		}
+		if project.BranchSummary.skipPromptSet {
+			m.BranchSummary.SkipPrompt = project.BranchSummary.SkipPrompt
+			m.BranchSummary.skipPromptSet = true
+		}
+	}
+	if project.Compaction != nil {
+		if m.Compaction == nil {
+			m.Compaction = &CompactionSettingsJSON{}
+		}
+		if project.Compaction.Enabled != nil {
+			m.Compaction.Enabled = cloneBoolPtr(project.Compaction.Enabled)
+		}
+		if m.Compaction.extra == nil {
+			m.Compaction.extra = make(map[string]json.RawMessage)
+		}
+		maps.Copy(m.Compaction.extra, project.Compaction.extra)
+		mergeCompactionNumber(&m.Compaction.ReserveTokens, m.Compaction.extra, "reserveTokens", project.Compaction.ReserveTokens, project.Compaction.extra)
+		mergeCompactionNumber(&m.Compaction.KeepRecentTokens, m.Compaction.extra, "keepRecentTokens", project.Compaction.KeepRecentTokens, project.Compaction.extra)
+		mergeCompactionNumber(&m.Compaction.MaxContextTokens, m.Compaction.extra, "maxContextTokens", project.Compaction.MaxContextTokens, project.Compaction.extra)
+		mergeCompactionModelOverrides(m.Compaction, project.Compaction.ModelOverrides)
+	}
+	if project.Retry != nil {
+		if m.Retry == nil {
+			m.Retry = &RetrySettingsJSON{}
+		}
+		if project.Retry.Enabled != nil {
+			m.Retry.Enabled = cloneBoolPtr(project.Retry.Enabled)
+		}
+		if project.Retry.MaxRetries != nil {
+			m.Retry.MaxRetries = cloneIntPtr(project.Retry.MaxRetries)
+		}
+		if project.Retry.BaseDelayMs != nil {
+			m.Retry.BaseDelayMs = cloneIntPtr(project.Retry.BaseDelayMs)
+		}
+		if project.Retry.MaxAgentDelayMs != nil {
+			m.Retry.MaxAgentDelayMs = cloneIntPtr(project.Retry.MaxAgentDelayMs)
+		}
+		if project.Retry.Provider != nil {
+			if m.Retry.Provider == nil {
+				m.Retry.Provider = &ProviderRetrySettings{}
+			}
+			if project.Retry.Provider.TimeoutMs != nil {
+				m.Retry.Provider.TimeoutMs = cloneIntPtr(project.Retry.Provider.TimeoutMs)
+			}
+			if project.Retry.Provider.MaxRetries != nil {
+				m.Retry.Provider.MaxRetries = cloneIntPtr(project.Retry.Provider.MaxRetries)
+			}
+			if project.Retry.Provider.MaxRetryDelayMs != nil {
+				d := *project.Retry.Provider.MaxRetryDelayMs
+				m.Retry.Provider.MaxRetryDelayMs = &d
+			}
+		}
+	}
+	if project.DoubleEscapeAction != "" {
+		m.DoubleEscapeAction = project.DoubleEscapeAction
+	}
+	if project.TreeFilterMode != "" {
+		m.TreeFilterMode = project.TreeFilterMode
+	}
+	if project.SteeringMode != "" {
+		m.SteeringMode = project.SteeringMode
+	}
+	if project.FollowUpMode != "" {
+		m.FollowUpMode = project.FollowUpMode
+	}
+	if project.TuiMode != "" {
+		m.TuiMode = project.TuiMode
+	}
+	if project.FullscreenExitOutput != "" {
+		m.FullscreenExitOutput = project.FullscreenExitOutput
+	}
+	if project.FullscreenScrollbar != "" {
+		m.FullscreenScrollbar = project.FullscreenScrollbar
+	}
+	if project.MaskSecretInput != nil {
+		m.MaskSecretInput = cloneBoolPtr(project.MaskSecretInput)
+	}
+	if project.FullscreenWheelScrollLines != nil {
+		m.FullscreenWheelScrollLines = slices.Clone(project.FullscreenWheelScrollLines)
+	}
+	if project.DeviceID != "" {
+		m.DeviceID = project.DeviceID
+	}
+	m.Codemode = mergeCodemodeSettings(m.Codemode, project.Codemode)
+	if project.FullscreenCopyOnSelect != nil {
+		m.FullscreenCopyOnSelect = cloneBoolPtr(project.FullscreenCopyOnSelect)
+	}
+	if project.collapseChangelogSet {
+		m.CollapseChangelog = project.CollapseChangelog
+		m.collapseChangelogSet = true
+	}
+	if project.showCacheMissNoticesSet {
+		m.ShowCacheMissNotices = project.ShowCacheMissNotices
+		m.showCacheMissNoticesSet = true
+	}
+	if project.EnableSkillCommands != nil {
+		m.EnableSkillCommands = cloneBoolPtr(project.EnableSkillCommands)
+	}
+	if project.EnableInstallTelemetry != nil {
+		m.EnableInstallTelemetry = cloneBoolPtr(project.EnableInstallTelemetry)
+	}
+	// deepMergeSettings lets a project file override enableAnalytics and trackingId too (getEnableAnalytics and getTrackingId read the merged view).
+	if project.EnableAnalytics != nil {
+		m.EnableAnalytics = cloneBoolPtr(project.EnableAnalytics)
+	}
+	if project.TrackingID != "" {
+		m.TrackingID = project.TrackingID
+	}
+	if project.hideThinkingBlockSet {
+		m.HideThinkingBlock = project.HideThinkingBlock
+		m.hideThinkingBlockSet = true
+	}
+	if project.quietStartupSet {
+		m.QuietStartup = project.QuietStartup
+		m.quietStartupSet = true
+	}
+	if project.ShowImages != nil {
+		m.ShowImages = cloneBoolPtr(project.ShowImages)
+	}
+	if project.ImageWidthCells > 0 || project.imageWidthCellsSet {
+		m.ImageWidthCells, m.imageWidthCellsSet = project.ImageWidthCells, true
+	}
+	if project.ClearOnShrink != nil {
+		m.ClearOnShrink = cloneBoolPtr(project.ClearOnShrink)
+	}
+	if project.ShowTerminalProgress != nil {
+		m.ShowTerminalProgress = cloneBoolPtr(project.ShowTerminalProgress)
+	}
+	if project.terminalHyperlinks != nil {
+		m.terminalHyperlinks = slices.Clone(project.terminalHyperlinks)
+	}
+	if project.terminalImages != nil {
+		m.terminalImages = slices.Clone(project.terminalImages)
+	}
+	if project.terminalTrueColor != nil {
+		m.terminalTrueColor = slices.Clone(project.terminalTrueColor)
+	}
+	if project.ImageAutoResize != nil {
+		m.ImageAutoResize = cloneBoolPtr(project.ImageAutoResize)
+	}
+	if project.blockImagesSet {
+		m.BlockImages = project.BlockImages
+		m.blockImagesSet = true
+	}
+	if project.ThinkingBudgets != nil {
+		if m.ThinkingBudgets == nil {
+			m.ThinkingBudgets = &ThinkingBudgetsSettings{}
+		}
+		if project.ThinkingBudgets.Minimal != nil {
+			m.ThinkingBudgets.Minimal = cloneIntPtr(project.ThinkingBudgets.Minimal)
+		}
+		if project.ThinkingBudgets.Low != nil {
+			m.ThinkingBudgets.Low = cloneIntPtr(project.ThinkingBudgets.Low)
+		}
+		if project.ThinkingBudgets.Medium != nil {
+			m.ThinkingBudgets.Medium = cloneIntPtr(project.ThinkingBudgets.Medium)
+		}
+		if project.ThinkingBudgets.High != nil {
+			m.ThinkingBudgets.High = cloneIntPtr(project.ThinkingBudgets.High)
+		}
+	}
+	if project.Markdown != nil {
+		if m.Markdown == nil {
+			m.Markdown = &MarkdownSettings{}
+		}
+		if project.Markdown.CodeBlockIndent != nil || project.Markdown.codeBlockIndentNull {
+			m.Markdown.CodeBlockIndent = cloneStringPtr(project.Markdown.CodeBlockIndent)
+			m.Markdown.codeBlockIndentNull = project.Markdown.codeBlockIndentNull
+		}
+		if project.Markdown.Mermaid != "" {
+			m.Markdown.Mermaid = project.Markdown.Mermaid
+		}
+	}
+	if project.Warnings != nil {
+		if m.Warnings == nil {
+			m.Warnings = &WarningSettings{}
+		}
+		if project.Warnings.anthropicExtraUsageSet {
+			m.Warnings.AnthropicExtraUsage = project.Warnings.AnthropicExtraUsage
+			m.Warnings.anthropicExtraUsageSet = true
+		}
+	}
+	if project.ShowHardwareCursor != nil {
+		m.ShowHardwareCursor = cloneBoolPtr(project.ShowHardwareCursor)
+	}
+	if project.EditorPaddingX != nil {
+		m.EditorPaddingX = cloneIntPtr(project.EditorPaddingX)
+	}
+	if project.OutputPad != nil {
+		m.OutputPad = cloneIntPtr(project.OutputPad)
+	}
+	if project.ExternalEditor != "" || project.emptyStrings.externalEditor {
+		m.ExternalEditor, m.emptyStrings.externalEditor = project.ExternalEditor, project.emptyStrings.externalEditor
+	}
+	if project.AutocompleteMaxVisible != nil {
+		m.AutocompleteMaxVisible = cloneIntPtr(project.AutocompleteMaxVisible)
+	}
+	return m
+}
+
+// FullscreenExitOutput selects what a fullscreen exit prints (settings-manager.ts:55).
+type FullscreenExitOutput string
+
+const (
+	FullscreenExitOutputTranscript FullscreenExitOutput = "transcript"
+	FullscreenExitOutputResumeHint FullscreenExitOutput = "resume-hint"
+)
+
+// SessionShareDestination selects where /share uploads (settings-schema.ts SessionShareDestination).
+type SessionShareDestination string
+
+const (
+	SessionShareDestinationAuto   SessionShareDestination = "auto"
+	SessionShareDestinationGist   SessionShareDestination = "gist"
+	SessionShareDestinationRadius SessionShareDestination = "radius"
+)

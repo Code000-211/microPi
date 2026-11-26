@@ -1,0 +1,81 @@
+# Behavior family: interactive-rendering
+# Surface: the byte stream of a fresh start, after the frame that carries the footer. Pi loads the remaining highlight.js grammars once its first frame is
+# out and then invalidates and requests a render (interactive-mode.ts init: loadAllHighlightLanguages().then(...)); the tui writes a frame for every render
+# request even when no row changed (tui-alt-screen.ts doRender has no early return for unchanged lines), so Pi writes one more frame: a cursor-only
+# CSI ? 2026 h, CSI <row>;1 H, CSI ? 25 l, CSI ? 2026 l (29 bytes) that repaints nothing.
+# PiG does the same: after the grammar load it invalidates and requests a render on the owner loop (loadRemainingHighlightLanguages), so each binary's renderer
+# writes that cursor-only frame once.
+# Upstream evidence (pi v1.5.2, npm @earendil-works/pi-coding-agent, 2026-11-11, pty capture on xd670): one 29-byte cursor-only frame about 97 ms after the
+# startup frames.
+# Both binaries also write frames after the footer's text while the terminal answers their start-up queries (OSC 10/11/4 and DA1, which tmux answers):
+# the colors apply, the logo row is rewritten (a frame that is not cursor-only), and further renders find no changed row. The number and order of
+# those frames follow the replies' timing, and Pi coalesces some of them, so the stream after the text is not pinned. What is stable is the count of
+# cursor-only frames after the text: exactly one in each binary. So the scenario pins that count, per binary, independent of the reply timing; a
+# load that requests no render makes PiG's count 0 and fails. The scenario cannot show which of the frames comes from the grammar load (the harness has
+# no direct pty driver and the cursor-only frames are byte-identical); that attribution is the pty capture in the evidence above and the direct test of
+# the load's two calls in internal/codingagent (TestLoadRemainingHighlightLanguagesRepaintsOnTheOwnerLoop).
+
+# Re-measured 2026-11-12 on xd670 (Ubuntu 26.04, tmux 3.6a, Pi 1.5.2 source oracle b4afdddf, with and without the post-release backports; the counts did not differ).
+# The earlier red came from the runner, not from either binary: the transcript was read through cat, which on that host is uutils coreutils 0.8.0 and stops copying
+# tmux pipe-pane's socket after the first chunk, so the last frame was missing (Pi: 0 cursor-only frames in 20 of 20 runs, loaded and on quiet cores; PiG: wrong in 10 and
+# 12 of 20). With the runner's own complete transcript reader (transcript.go) Pi and PiG had one cursor-only frame after "(auto)" in 70 of 70 runs each (50 loaded, 20
+# pinned to cores 56-63). Shapes (8 runs of each): Pi writes the first frame with the footer's "(auto)", sometimes a header frame, then the cursor-only frame; PiG writes
+# the first frame, one 4.7 kB frame, then the cursor-only frame. The cursor-only frame is the render coding-agent loadAllHighlightLanguages() requests when the grammar
+# import resolves (interactive-mode.ts), and Pi writes it for every request, so the count is exact unless a later frame rewrites the footer; none was seen.
+
+# Read above PiG's screen writer since 2026-11-12 (container tern-ci:v10, tmux 3.4, this scenario alone, 10 runs in each of PiG's modes). With the screen
+# writer on (D624) the terminal got no cursor-only frame from PiG after the text, 10 runs of 10: the writer does not send a frame that changes nothing. Its
+# record log of the same runs (PIG_TUI_SCREEN_WRITER_LOG) shows that the renderer wrote exactly one such frame after the text (29 bytes in, none out) in 10
+# of 10. With PIG_TUI_SCREEN_WRITER=pi the transcript held one, 10 of 10. The scenario is about the frame the renderer is asked for, so the frames of both binaries
+# are read from PI_TUI_WRITE_LOG, the log of what the renderers wrote (Pi's ProcessTerminal.write and PiG's port of it; PiG's screen writer sits under it):
+# read that way, this scenario alone, Pi wrote one cursor-only frame after the text and PiG one in 30 pairs of 30 with the screen writer and in 30 of 30 with
+# PIG_TUI_SCREEN_WRITER=pi. A write log that is missing or lacks the text fails the run ("the text is not in the raw transcript").
+# What the counts assert now: what each binary's renderer WROTE, read from PI_TUI_WRITE_LOG on both sides: exactly one cursor-only frame after the footer's
+# text. For Pi, and for PiG with PIG_TUI_SCREEN_WRITER=pi, those are the bytes on the wire; for PiG with the screen writer they are the bytes above the
+# writer. What they no longer assert: that the frame reaches the terminal; from PiG with the screen writer it does not. What the terminal keeps of the
+# writer's bytes is compared by fullscreen/19-alt-screen-row-grows-in-place.
+
+# lint-known-gap: no equality comparator. The start screen carries each product's own banner (PiG's logo and "PiG can explain..." hint against Pi's
+# name), which no recorded normalization covers; this scenario asserts the byte stream after the footer's text, and the settled screens are compared
+# by the family's scenarios that follow a start with a prompt (68-no-frame-after-reply and the others).
+
+name = "69-startup-frames-after-grammar-load"
+description = "A fresh start writes the same number of cursor-only frames after the footer's text as Pi: the render both binaries request when the remaining highlight grammars have loaded."
+covers = [
+  "packages/coding-agent/src/modes/interactive/interactive-mode.ts",
+  "packages/tui/src/tui-alt-screen.ts",
+]
+tags = ["hermetic", "tui"]
+driver = "interactive-tmux"
+model = "test-faux/faux-1"
+
+[env]
+pig = ["PIG_TEST_FAUX=1", "PIG_CODING_AGENT_DIR=testdata/pig-agent", "PI_TUI_WRITE_LOG={{TEMP}}/renderer-writes.log"]
+pi = ["PI_CODING_AGENT_DIR=testdata/pi-agent", "PI_SKIP_VERSION_CHECK=1", "PI_TUI_WRITE_LOG={{TEMP}}/renderer-writes.log"]
+pi_extensions = ["../../testdata/test-faux-provider.ts"]
+pig_args = ["--no-extensions", "--session-dir", "{{TEMP}}/sessions"]
+pi_args = ["--session-dir", "{{TEMP}}/sessions"]
+
+[tmux]
+width = 100
+height = 35
+ready_pattern_pig = "(auto)"
+ready_pattern_pi = "(auto)"
+ready_timeout_seconds = 30
+
+[[tmux.steps]]
+keys = []
+settle_seconds = 1
+wait_visible_contains = ["(auto)"]
+wait_timeout_seconds = 10
+[tmux.steps.final_frame]
+text = "(auto)"
+quiet_milliseconds = 2000
+write_log = "{{TEMP}}/renderer-writes.log"
+
+[assert]
+both_reach_ready = true
+both_not_contain = ["unknown command", "panic:", "goroutine "]
+final_frame_cursor_only_pig = 1
+final_frame_cursor_only_pi = 1
+runs = 3

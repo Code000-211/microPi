@@ -1,0 +1,893 @@
+package pigletbuild
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/linkerexec"
+	"github.com/MichaelKinsy/PiG/internal/sortx"
+
+	"golang.org/x/mod/modfile"
+
+	"github.com/MichaelKinsy/PiG/coding"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/runtimecell"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
+	piglet "github.com/MichaelKinsy/PiG/coding/piglet"
+	pigletartifact "github.com/MichaelKinsy/PiG/coding/piglet/artifact"
+	"github.com/MichaelKinsy/PiG/coding/piglet/signature"
+	sourceref "github.com/MichaelKinsy/PiG/coding/source"
+	"github.com/MichaelKinsy/PiG/internal/buildprogress"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/fspublish"
+	"github.com/MichaelKinsy/PiG/internal/toolchain"
+)
+
+var artifactNamePattern = lazyregexp.New(`^[A-Za-z0-9][A-Za-z0-9._+\-]*$`)
+
+type buildLock struct {
+	Piglet            string
+	ReleaseVersion    string
+	ComponentPlan     pigletartifact.Plan
+	ResolutionRecord  pigletartifact.Record
+	PigVersion        string
+	PigSourceRevision string
+	PigSourceDigest   string
+	Builder           string
+	BuilderIdentity   string
+	Target            string
+	Toolchains        map[string]string
+}
+
+type buildInput struct {
+	Kind    string
+	Name    string
+	Source  string
+	Version string
+	Package string
+	Digest  string
+}
+
+type binaryBuildRecords struct {
+	Resolution pigletartifact.Record
+	Binary     pigletartifact.Record
+}
+
+func validateNativeTargets(targets []Target) error {
+	host := Target{OS: runtime.GOOS, Arch: runtime.GOARCH}
+	if len(targets) != 1 || targets[0] != host {
+		return fmt.Errorf("native builder supports only host target %s; requested %v. Configure a container or remote builder for other targets", host, targets)
+	}
+	return nil
+}
+
+// nativeArtifactPath returns the absolute path a native build writes. The
+// default name is pig-<name>, with .exe for a Windows target as go build names
+// its default output. Windows runs only files with an executable extension,
+// so an explicit Windows output without one fails before the build instead
+// of producing a binary that cannot start.
+func nativeArtifactPath(outPath, name string, target Target) (string, error) {
+	if outPath == "" {
+		outPath = "pig-" + name
+		if target.OS == "windows" {
+			outPath += ".exe"
+		}
+	}
+	artifactPath, err := filepath.Abs(outPath)
+	if err != nil {
+		return "", err
+	}
+	if target.OS == "windows" && filepath.Ext(artifactPath) == "" {
+		return "", fmt.Errorf("a Windows Piglet Binary needs an executable extension so Windows can start it; name the output %s.exe", filepath.Base(artifactPath))
+	}
+	return artifactPath, nil
+}
+
+func buildNativeWithRecords(ctx context.Context, resolveSource func(context.Context) (pigSource, error), p *piglet.Piglet, cells []subprocess.CellSpec, opts Options, outPath string, stdout, stderr io.Writer) (string, string, error) {
+	if err := validateNativeTargets(opts.Targets); err != nil {
+		return "", "", err
+	}
+	artifactPath, err := nativeArtifactPath(outPath, p.Name, opts.Targets[0])
+	if err != nil {
+		return "", "", err
+	}
+	if !artifactNamePattern.MatchString(filepath.Base(artifactPath)) {
+		return "", "", fmt.Errorf("artifact basename %q contains unsupported characters", filepath.Base(artifactPath))
+	}
+	if _, err := os.Stat(artifactPath); err == nil {
+		return "", "", fmt.Errorf("artifact %s already exists; choose a different --out path or remove it explicitly", artifactPath)
+	} else if !os.IsNotExist(err) {
+		return "", "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o755); err != nil {
+		return "", "", err
+	}
+	source, err := resolveSource(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	buildprogress.Phase(ctx, "Locking build inputs", "Hashing source, extensions, and toolchain identities")
+	lock, err := buildNativeLock(p, cells, opts, source)
+	if err != nil {
+		return "", "", err
+	}
+	embedded, err := buildNativeArtifact(ctx, source, p, cells, lock.ComponentPlan, &lock.ResolutionRecord, opts, artifactPath, stdout, stderr)
+	if err != nil {
+		return "", "", err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(artifactPath)
+		}
+	}()
+	if opts.SignKey != nil {
+		buildprogress.Phase(ctx, "Signing binary", artifactPath)
+		// pig additive (D18): sign before the record so its artifact digest
+		// covers the signature block.
+		signed, err := signature.Sign(artifactPath, signingManifest(lock, embedded), opts.SignKey)
+		if err != nil {
+			return "", "", fmt.Errorf("sign Piglet Binary: %w", err)
+		}
+		if !buildprogress.Enabled(ctx) {
+			_, _ = fmt.Fprintf(stdout, "Piglet Binary signed by %s\n", signed.Signer.KeyID)
+		}
+	}
+	buildprogress.Phase(ctx, "Checksumming and verifying binary", artifactPath)
+	records, err := buildBinaryRecords(lock, p, artifactPath)
+	if err != nil {
+		return "", "", err
+	}
+	buildprogress.Phase(ctx, "Writing binary and records", "Publishing verified artifact to the managed store")
+	recordPath, err := writeBinaryRecords(records, artifactPath)
+	if err != nil {
+		return "", "", err
+	}
+	cleanup = false
+	if !buildprogress.Enabled(ctx) {
+		_, _ = fmt.Fprintf(stdout, "Piglet Binary record: %s\n", recordPath)
+	}
+	return artifactPath, recordPath, nil
+}
+
+// signingManifest states what a Piglet Binary signature vouches for.
+func signingManifest(lock buildLock, embedded []signature.EmbeddedFile) signature.Manifest {
+	resolution := lock.ResolutionRecord.Resolution
+	components := make([]signature.Component, 0, len(lock.ComponentPlan.Components))
+	for _, component := range lock.ComponentPlan.Components {
+		components = append(components, signature.Component{
+			Kind: string(component.Kind), Name: component.Name, Realization: string(component.Realization),
+			Materialization: string(component.Materialization), Digest: component.Origin.Digest,
+		})
+	}
+	return signature.Manifest{
+		Piglet: lock.Piglet, ReleaseVersion: lock.ReleaseVersion, Target: lock.Target, PigVersion: lock.PigVersion,
+		PigletDigest: resolution.EffectiveDigest, SourceDigest: resolution.SourceDigest,
+		ResolutionDigest: lock.ResolutionRecord.Digest, ComponentPlanDigest: lock.ComponentPlan.Digest,
+		Components: components, Embedded: embedded,
+	}
+}
+
+func buildBinaryRecords(lock buildLock, p *piglet.Piglet, artifactPath string) (binaryBuildRecords, error) {
+	artifactDigest, size, err := hashFile(artifactPath)
+	if err != nil {
+		return binaryBuildRecords{}, fmt.Errorf("hash artifact: %w", err)
+	}
+	if err := smokeArtifact(artifactPath); err != nil {
+		return binaryBuildRecords{}, err
+	}
+	// The managed copy is stored and later started under this name, so a
+	// Windows artifact keeps the .exe its default output has.
+	fileName := "pig-" + p.Name
+	if p.Build != nil && p.Build.OutputName != "" {
+		fileName = p.Build.OutputName
+	} else if strings.HasPrefix(lock.Target, "windows/") {
+		fileName += ".exe"
+	}
+	binaryRecord, err := pigletartifact.NewBinaryRecord(lock.Piglet, lock.ReleaseVersion, time.Now(), lock.ResolutionRecord, pigletartifact.BinaryInput{
+		Target: lock.Target, PigVersion: lock.PigVersion,
+		PigSourceRevision: lock.PigSourceRevision, PigSourceDigest: lock.PigSourceDigest,
+		Builder: lock.Builder, BuilderIdentity: lock.BuilderIdentity, Toolchains: lock.Toolchains,
+		Artifact: pigletartifact.Artifact{Digest: artifactDigest, Size: size, FileName: fileName},
+		Verification: pigletartifact.Verification{
+			Policy: "basic", Passed: true,
+			Checks: []string{"artifact-sha256", "artifact-version-smoke", "extension-plan", "piglet-and-origins"},
+		},
+		Strip: binaryStripEntries(p), StripKeep: binaryStripIDs(p.Strip.KeepLists()), StripTable: binaryStripIDs(piglet.StripTable()),
+	})
+	if err != nil {
+		return binaryBuildRecords{}, fmt.Errorf("build Piglet Binary record: %w", err)
+	}
+	return binaryBuildRecords{Resolution: lock.ResolutionRecord, Binary: binaryRecord}, nil
+}
+
+// binaryStripEntries lists the Piglet's stripped built-ins for the Binary record.
+// pig additive (D92): the strip list is part of the Binary identity and digest.
+func binaryStripEntries(p *piglet.Piglet) []pigletartifact.StripEntry {
+	ids := p.Strip.StrippedIDs()
+	if len(ids) == 0 {
+		return nil
+	}
+	entries := make([]pigletartifact.StripEntry, len(ids))
+	for i, id := range ids {
+		entries[i] = pigletartifact.StripEntry{Kind: id.Kind, ID: id.ID, Disposition: id.Disposition}
+	}
+	return entries
+}
+
+// binaryStripIDs converts strip ID lists for the Binary record: the keep-mode
+// lists (stripKeep) or the building core's strip table (stripTable).
+// pig additive (D92): keep mode states its intent in the record, and the
+// table lets a later core report the built-ins it adds.
+func binaryStripIDs(lists []piglet.StripIDList) []pigletartifact.StripIDs {
+	if len(lists) == 0 {
+		return nil
+	}
+	out := make([]pigletartifact.StripIDs, len(lists))
+	for i, list := range lists {
+		out[i] = pigletartifact.StripIDs{Kind: list.Kind, IDs: list.IDs}
+	}
+	return out
+}
+
+func buildNativeLock(p *piglet.Piglet, cells []subprocess.CellSpec, opts Options, source pigSource) (buildLock, error) {
+	lock, err := buildPortableLock(p, cells, opts)
+	if err != nil {
+		return buildLock{}, err
+	}
+	toolchains, err := toolchainVersions(cells)
+	if err != nil {
+		return buildLock{}, err
+	}
+	revision, sourceDigest, err := pigSourceIdentity(source)
+	if err != nil {
+		return buildLock{}, err
+	}
+	lock.PigVersion = coding.PigVersion
+	lock.PigSourceRevision = revision
+	lock.PigSourceDigest = sourceDigest
+	lock.Builder = "native"
+	lock.BuilderIdentity = "native:" + revision
+	lock.Target = runtime.GOOS + "/" + runtime.GOARCH
+	lock.Toolchains = toolchains
+	return lock, nil
+}
+
+func buildPortableLock(p *piglet.Piglet, cells []subprocess.CellSpec, opts Options) (buildLock, error) {
+	pigletPath := p.SourcePath()
+	if pigletPath == "" {
+		return buildLock{}, fmt.Errorf("Piglet source path is unavailable; build from a parsed Piglet file")
+	}
+	pigletDigest, _, err := hashFile(pigletPath)
+	if err != nil {
+		return buildLock{}, fmt.Errorf("hash Piglet source: %w", err)
+	}
+	if len(opts.BakedSettings) == 0 {
+		return buildLock{}, fmt.Errorf("baked runtime Piglet is empty")
+	}
+	runtimeDigest := digestBytes(opts.BakedSettings)
+	inputs, err := buildInputs(p, cells)
+	if err != nil {
+		return buildLock{}, err
+	}
+	deliveryPlan := BuildPlan(extensionInputsFromCells(cells), opts)
+	componentPlan, err := buildPigletComponentPlan(cells, deliveryPlan, inputs)
+	if err != nil {
+		return buildLock{}, fmt.Errorf("build Piglet component plan: %w", err)
+	}
+	resolutionRecord, err := pigletartifact.NewResolutionRecord(p.Name, opts.Version, time.Now(), pigletartifact.ResolutionInput{
+		SourceDigest: pigletDigest, EffectiveDigest: runtimeDigest,
+		Inputs: resolutionInputs(inputs), ComponentPlan: componentPlan,
+	})
+	if err != nil {
+		return buildLock{}, fmt.Errorf("build Piglet resolution record: %w", err)
+	}
+	return buildLock{
+		Piglet: p.Name, ReleaseVersion: opts.Version,
+		ComponentPlan: componentPlan, ResolutionRecord: resolutionRecord,
+	}, nil
+}
+
+func buildInputs(p *piglet.Piglet, cells []subprocess.CellSpec) ([]buildInput, error) {
+	lineage, _, _ := p.ResolutionIdentity()
+	inputs := make([]buildInput, 0, max(0, len(lineage)-1))
+	for i, entry := range lineage[:max(0, len(lineage)-1)] {
+		inputs = append(inputs, buildInput{
+			Kind: "piglet-base", Name: fmt.Sprintf("%02d-%s", i, filepath.Base(entry.Source)),
+			Source: entry.Source, Version: entry.Version, Digest: entry.Digest,
+		})
+	}
+	packages, err := piglet.ResolvePackages(p)
+	if err != nil {
+		return nil, err
+	}
+	for _, resolved := range packages {
+		digest, err := packageManifestDigest(resolved.Root)
+		if err != nil {
+			return nil, fmt.Errorf("lock package %q: %w", resolved.Alias, err)
+		}
+		source, version, err := recordSource(resolved.Source, sourceref.BareReject, filepath.Dir(p.SourcePath()))
+		if err != nil {
+			return nil, fmt.Errorf("lock package %q source: %w", resolved.Alias, err)
+		}
+		inputs = append(inputs, buildInput{Kind: "package", Name: resolved.Alias, Source: source, Version: version, Digest: digest})
+	}
+	resolvedExtensions, extensionErrors := piglet.ResolveExtensions(p)
+	if len(extensionErrors) > 0 {
+		return nil, extensionErrors[0]
+	}
+	originByName := make(map[string]string, len(resolvedExtensions))
+	for _, resolved := range resolvedExtensions {
+		originByName[resolved.Entry.Name] = resolved.Origin
+	}
+	for _, cell := range cells {
+		for _, config := range cell.Extensions {
+			origin, ok := originByName[config.Name]
+			if !ok {
+				return nil, fmt.Errorf("lock extension %q: selected origin is unavailable", config.Name)
+			}
+			source, version, packageAlias, err := recordExtensionOrigin(origin, filepath.Dir(p.SourcePath()))
+			if err != nil {
+				return nil, fmt.Errorf("lock extension %q origin: %w", config.Name, err)
+			}
+			digest := strings.TrimSpace(config.ContentHash)
+			if digest == "" {
+				digest, err = hashTree(config.Source)
+				if err != nil {
+					return nil, fmt.Errorf("lock extension %q: %w", config.Name, err)
+				}
+			} else if !strings.HasPrefix(digest, "sha256:") {
+				digest = "sha256:" + digest
+			}
+			inputs = append(inputs, buildInput{Kind: "extension", Name: config.Name, Source: source, Version: version, Package: packageAlias, Digest: digest})
+			replacements, err := localGoReplacementDirs(config.Source)
+			if err != nil {
+				return nil, fmt.Errorf("lock extension %q local Go replacements: %w", config.Name, err)
+			}
+			for i, replacement := range replacements {
+				replacementDigest, err := goModuleDigest(replacement)
+				if err != nil {
+					return nil, fmt.Errorf("lock extension %q local Go replacement %s: %w", config.Name, replacement, err)
+				}
+				inputs = append(inputs, buildInput{
+					Kind: "extension-dependency", Name: fmt.Sprintf("%s:go-replace:%d", config.Name, i),
+					Source: "local:" + filepath.ToSlash(replacement), Digest: replacementDigest,
+				})
+			}
+		}
+	}
+	resolvedSkills, skillErrors := piglet.ResolveSkills(p)
+	if len(skillErrors) > 0 {
+		return nil, skillErrors[0]
+	}
+	for _, skill := range resolvedSkills {
+		digest, err := hashTree(skill.Path)
+		if err != nil {
+			return nil, fmt.Errorf("lock skill %q: %w", skill.Entry.Name, err)
+		}
+		source := "content-addressed"
+		packageAlias := ""
+		if alias, ok := strings.CutPrefix(skill.Origin, "package:"); ok {
+			source = skill.Origin
+			packageAlias = alias
+		}
+		inputs = append(inputs, buildInput{Kind: "skill", Name: skill.Entry.Name, Source: source, Package: packageAlias, Digest: digest})
+	}
+	// pig additive (D91): the frontend member's source is part of the
+	// Binary's identity.
+	frontendDir, err := p.FrontendDir()
+	if err != nil {
+		return nil, err
+	}
+	if frontendDir != "" {
+		digest, err := hashTree(frontendDir)
+		if err != nil {
+			return nil, fmt.Errorf("lock frontend: %w", err)
+		}
+		inputs = append(inputs, buildInput{Kind: "frontend", Name: "frontend", Source: "content-addressed", Digest: digest})
+		// The member's go.mod and go.sum pin its external modules; a local
+		// replacement, which the fused build promotes, is pinned by its source.
+		replacements, err := localGoReplacementDirs(frontendDir)
+		if err != nil {
+			return nil, fmt.Errorf("lock frontend local Go replacements: %w", err)
+		}
+		for i, replacement := range replacements {
+			replacementDigest, err := goModuleDigest(replacement)
+			if err != nil {
+				return nil, fmt.Errorf("lock frontend local Go replacement %s: %w", replacement, err)
+			}
+			inputs = append(inputs, buildInput{
+				Kind: "frontend-dependency", Name: fmt.Sprintf("frontend:go-replace:%d", i),
+				Source: "local:" + filepath.ToSlash(replacement), Digest: replacementDigest,
+			})
+		}
+	}
+	sortx.Func(inputs, func(a, b buildInput) int {
+		if value := strings.Compare(a.Kind, b.Kind); value != 0 {
+			return value
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+	return inputs, nil
+}
+
+func resolutionInputs(inputs []buildInput) []pigletartifact.InputPin {
+	pins := make([]pigletartifact.InputPin, 0, len(inputs))
+	for _, input := range inputs {
+		pins = append(pins, pigletartifact.InputPin{
+			Kind: input.Kind, Name: input.Name, Source: input.Source,
+			Version: input.Version, Digest: input.Digest, Package: input.Package,
+		})
+	}
+	return pins
+}
+
+func recordExtensionOrigin(origin string, baseDir string) (string, string, string, error) {
+	if alias, ok := strings.CutPrefix(origin, "package:"); ok {
+		return origin, "", alias, nil
+	}
+	source, version, err := recordSource(origin, sourceref.BareReject, baseDir)
+	return source, version, "", err
+}
+
+func recordSource(raw string, bare sourceref.BarePolicy, baseDir string) (string, string, error) {
+	ref, err := sourceref.Parse(raw, sourceref.Options{Bare: bare, AllowContributed: true})
+	if err != nil {
+		return "", "", err
+	}
+	switch ref.Kind {
+	case sourceref.KindNPM:
+		identity, err := ref.Identity(baseDir)
+		return identity, ref.NPMVer, err
+	case sourceref.KindGit:
+		identity, err := ref.Identity(baseDir)
+		return identity, ref.GitRef, err
+	case sourceref.KindLocal:
+		identity, err := ref.Identity(baseDir)
+		return identity, "", err
+	case sourceref.KindContributed:
+		return ref.Scheme + ":sha256:" + hex.EncodeToString(sha256Sum([]byte(ref.Locator))), "", nil
+	default:
+		return "", "", fmt.Errorf("unsupported source kind %q", ref.Kind)
+	}
+}
+
+func packageManifestDigest(root string) (string, error) {
+	paths := []string{"package.json", "plugin.json", ".plugin/plugin.json", ".claude-plugin/plugin.json", ".cursor-plugin/plugin.json", ".pig-plugin/plugin.json"}
+	hash := sha256.New()
+	found := false
+	for _, relative := range paths {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relative)))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		found = true
+		_, _ = hash.Write([]byte(relative))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write(data)
+		_, _ = hash.Write([]byte{0})
+	}
+	if !found {
+		return "", fmt.Errorf("no Package or Plugin manifest found")
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func localGoReplacementDirs(root string) ([]string, error) {
+	if root == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	// A single-file extension (a lone .ts or .js file) has no go.mod beside it: reading "<file>/go.mod" fails with ENOTDIR on
+	// Unix and with a not-found error on Windows.
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := modfile.Parse(filepath.Join(root, "go.mod"), data, nil)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	var paths []string
+	for _, replacement := range parsed.Replace {
+		target := replacement.New.Path
+		if target == "" || replacement.New.Version != "" || (!filepath.IsAbs(target) && !strings.HasPrefix(target, ".")) {
+			continue
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(root, target)
+		}
+		target, err = filepath.Abs(target)
+		if err != nil {
+			return nil, err
+		}
+		target, err = filepath.EvalSymlinks(target)
+		if err != nil {
+			return nil, fmt.Errorf("resolve local Go replacement %s: %w", replacement.New.Path, err)
+		}
+		if _, exists := seen[target]; exists {
+			continue
+		}
+		seen[target] = struct{}{}
+		paths = append(paths, target)
+	}
+	slices.Sort(paths)
+	return paths, nil
+}
+
+// goModuleDigest is the lock digest of a local Go replacement: the module's Go source set, which excludes build output and documentation another process may create or delete under a checkout.
+func goModuleDigest(root string) (string, error) {
+	digest, err := runtimecell.GoModuleSourceDigest(root)
+	if err != nil {
+		return "", err
+	}
+	return "sha256:" + digest, nil
+}
+
+func hashTree(root string) (string, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		hash := sha256.New()
+		_, _ = hash.Write([]byte(filepath.Base(root)))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(info.Mode().String()))
+		_, _ = hash.Write([]byte{0})
+		if err := copyFileInto(hash, root, make([]byte, hashBufferSize)); err != nil {
+			return "", err
+		}
+		return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+	}
+	hash := sha256.New()
+	buffer := make([]byte, hashBufferSize)
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
+				return nil
+			}
+			return fmt.Errorf("symlink %s is not supported in build locks", path)
+		}
+		if entry.IsDir() {
+			name := entry.Name()
+			if path != root && (name == ".git" || name == "node_modules" || name == "target" || name == "dist" || name == "build" || name == "__pycache__" || name == ".venv" || name == "venv") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		_, _ = hash.Write([]byte(filepath.ToSlash(relative)))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(info.Mode().String()))
+		_, _ = hash.Write([]byte{0})
+		if err := copyFileInto(hash, path, buffer); err != nil {
+			return err
+		}
+		_, _ = hash.Write([]byte{0})
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// hashFile returns the sha256 digest and size of the file at path, streaming it
+// so a Piglet Binary is never held in memory.
+func hashFile(path string) (string, int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = file.Close() }()
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
+	if err != nil {
+		return "", 0, err
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), size, nil
+}
+
+// hashBufferSize is the copy buffer a tree digest reuses for every file.
+const hashBufferSize = 64 << 10
+
+// copyFileInto streams the file at path into w through buffer. The reader is wrapped so io.CopyBuffer uses buffer:
+// *os.File implements WriterTo, which would ignore it and allocate a 32 KiB buffer for every file.
+func copyFileInto(w io.Writer, path string, buffer []byte) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	_, err = io.CopyBuffer(w, struct{ io.Reader }{file}, buffer)
+	return err
+}
+
+func digestBytes(data []byte) string {
+	return "sha256:" + hex.EncodeToString(sha256Sum(data))
+}
+
+func sha256Sum(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
+}
+
+// smokeArtifactTimeout bounds the artifact's `--version` run. A freshly linked, unsigned binary's first start can wait on
+// the operating system's on-access malware scan (Windows Defender scans a new executable before it runs), which on a busy
+// machine takes well over ten seconds; a hung artifact still fails.
+var smokeArtifactTimeout = 60 * time.Second // pig additive (D18): Piglet binary builds are PiG's own; Pi has no artifact check.
+
+func smokeArtifact(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), smokeArtifactTimeout)
+	defer cancel()
+	output, err := linkerexec.CommandContext(ctx, path, "--version").CombinedOutput()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// A killed process reports only its exit status (1 on Windows), so name the deadline instead.
+		return fmt.Errorf("basic artifact verification timed out after %s running %s --version", smokeArtifactTimeout, path)
+	}
+	if err != nil {
+		return fmt.Errorf("basic artifact verification failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	if strings.TrimSpace(string(output)) == "" {
+		return fmt.Errorf("basic artifact verification failed: --version returned empty output")
+	}
+	return nil
+}
+
+func pigSourceIdentity(source pigSource) (string, string, error) {
+	root := source.Root
+	revision, err := source.revision()
+	if err != nil {
+		return "", "", err
+	}
+	paths, err := source.sourceFiles()
+	if err != nil {
+		return "", "", err
+	}
+	slices.Sort(paths)
+	hash := sha256.New()
+	buffer := make([]byte, hashBufferSize)
+	for _, relative := range paths {
+		if relative == "" {
+			continue
+		}
+		path := filepath.Join(root, filepath.FromSlash(relative))
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", "", fmt.Errorf("lock PiG source %s: %w", relative, err)
+		}
+		if info.IsDir() {
+			continue
+		}
+		_, _ = hash.Write([]byte(filepath.ToSlash(relative)))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(info.Mode().String()))
+		_, _ = hash.Write([]byte{0})
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return "", "", fmt.Errorf("read PiG source symlink %s: %w", relative, err)
+			}
+			_, _ = hash.Write([]byte(target))
+		} else if err := copyFileInto(hash, path, buffer); err != nil {
+			return "", "", fmt.Errorf("read PiG source %s: %w", relative, err)
+		}
+		_, _ = hash.Write([]byte{0})
+	}
+	return revision, "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func toolchainVersions(cells []subprocess.CellSpec) (map[string]string, error) {
+	goCommand, err := toolchain.Go()
+	if err != nil {
+		return nil, fmt.Errorf("resolve go toolchain identity: %w", err)
+	}
+	commands := map[string][]string{"go": {goCommand, "version"}}
+	for _, cell := range cells {
+		switch cell.Language {
+		case "rust":
+			commands["rust"] = []string{"cargo", "--version"}
+		case "python":
+			// The interpreter the cell runs with: python or python3 on Windows (python3.exe there is often the Store alias).
+			commands["python"] = []string{toolchain.PythonExecutable(runtime.GOOS, exec.LookPath), "--version"}
+		case "node":
+			commands["node"] = []string{"node", "--version"}
+		}
+	}
+	versions := make(map[string]string, len(commands))
+	for name, command := range commands {
+		output, err := linkerexec.Command(command[0], command[1:]...).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s toolchain identity: %w: %s", name, err, strings.TrimSpace(string(output)))
+		}
+		version := strings.TrimSpace(string(output))
+		if version == "" {
+			return nil, fmt.Errorf("resolve %s toolchain identity: command returned empty output", name)
+		}
+		versions[name] = version
+	}
+	return versions, nil
+}
+
+func writeBinaryRecords(records binaryBuildRecords, artifactPath string) (string, error) {
+	if err := pigletartifact.ValidateBinaryLink(records.Resolution, records.Binary); err != nil {
+		return "", err
+	}
+	resolution := records.Resolution.Resolution
+	binary := records.Binary.Binary
+	if resolution == nil || binary == nil {
+		return "", fmt.Errorf("Piglet Binary records have invalid kinds")
+	}
+	artifactDigest, artifactSize, err := hashFile(artifactPath)
+	if err != nil {
+		return "", err
+	}
+	if artifactDigest != binary.Artifact.Digest || artifactSize != binary.Artifact.Size {
+		return "", fmt.Errorf("Piglet Binary artifact does not match its record")
+	}
+	version := records.Binary.ReleaseVersion
+	if version == "" {
+		version = "unversioned"
+	}
+	root := filepath.Join(
+		codingagent.PigletRecordsDir(), records.Binary.Piglet,
+		strings.TrimPrefix(resolution.SourceDigest, "sha256:"), version,
+	)
+	resolutionPath := filepath.Join(root, string(pigletartifact.RecordKindResolution), strings.TrimPrefix(records.Resolution.Digest, "sha256:")+".json")
+	binaryPath := filepath.Join(
+		root, string(pigletartifact.RecordKindBinary), strings.ReplaceAll(binary.Target, "/", "-"),
+		strings.TrimPrefix(records.Binary.Digest, "sha256:")+".json",
+	)
+	managedArtifact := filepath.Join(
+		codingagent.PigletArtifactsDir(), records.Binary.Piglet,
+		strings.TrimPrefix(resolution.SourceDigest, "sha256:"), version,
+		strings.ReplaceAll(binary.Target, "/", "-"),
+		strings.TrimPrefix(binary.Artifact.Digest, "sha256:"), binary.Artifact.FileName,
+	)
+	artifactCreated, err := writeManagedArtifact(artifactPath, managedArtifact, binary.Artifact.Digest)
+	if err != nil {
+		return "", err
+	}
+	resolutionCreated, err := writeRecordFile(resolutionPath, records.Resolution)
+	if err != nil {
+		if artifactCreated {
+			_ = os.Remove(managedArtifact)
+		}
+		return "", err
+	}
+	if _, err := writeRecordFile(binaryPath, records.Binary); err != nil {
+		if resolutionCreated {
+			_ = os.Remove(resolutionPath)
+		}
+		if artifactCreated {
+			_ = os.Remove(managedArtifact)
+		}
+		return "", err
+	}
+	return binaryPath, nil
+}
+
+func writeRecordFile(path string, record pigletartifact.Record) (bool, error) {
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	data = append(data, '\n')
+	if existing, err := os.ReadFile(path); err == nil {
+		if slices.Equal(existing, data) {
+			return false, nil
+		}
+		return false, fmt.Errorf("Piglet record %s already exists with different content", path)
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	stage, err := os.CreateTemp(filepath.Dir(path), ".record-*.stage")
+	if err != nil {
+		return false, err
+	}
+	stagePath := stage.Name()
+	defer func() { _ = os.Remove(stagePath) }()
+	if _, err := stage.Write(data); err != nil {
+		_ = stage.Close()
+		return false, err
+	}
+	if err := stage.Chmod(0o644); err != nil {
+		_ = stage.Close()
+		return false, err
+	}
+	if err := stage.Close(); err != nil {
+		return false, err
+	}
+	if err := fspublish.Publish(stagePath, path); err != nil {
+		return false, fmt.Errorf("commit Piglet record %s: %w", path, err)
+	}
+	return true, nil
+}
+
+func writeManagedArtifact(source, target, expectedDigest string) (bool, error) {
+	if _, err := os.Stat(target); err == nil {
+		digest, _, err := hashFile(target)
+		if err != nil {
+			return false, err
+		}
+		if digest != expectedDigest {
+			return false, fmt.Errorf("managed artifact %s exists with digest %s, expected %s", target, digest, expectedDigest)
+		}
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return false, err
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = input.Close() }()
+	stage, err := os.CreateTemp(filepath.Dir(target), ".artifact-*.stage")
+	if err != nil {
+		return false, err
+	}
+	stagePath := stage.Name()
+	defer func() { _ = os.Remove(stagePath) }()
+	if _, err := io.Copy(stage, input); err != nil {
+		_ = stage.Close()
+		return false, err
+	}
+	if err := stage.Chmod(0o755); err != nil {
+		_ = stage.Close()
+		return false, err
+	}
+	if err := stage.Close(); err != nil {
+		return false, err
+	}
+	digest, _, err := hashFile(stagePath)
+	if err != nil {
+		return false, err
+	}
+	if digest != expectedDigest {
+		return false, fmt.Errorf("staged artifact digest %s does not match expected %s", digest, expectedDigest)
+	}
+	if err := fspublish.Publish(stagePath, target); err != nil {
+		return false, fmt.Errorf("commit managed artifact %s: %w", target, err)
+	}
+	return true, nil
+}

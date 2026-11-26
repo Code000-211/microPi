@@ -1,0 +1,1159 @@
+// SPDX-License-Identifier: MIT
+
+package ciimages
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"go.yaml.in/yaml/v3"
+
+	"github.com/MichaelKinsy/PiG/internal/testenv"
+)
+
+// linuxShardBudgetSeconds is the 60-minute shard budget that Linux shard plans must fit inside.
+// The linux job's timeout-minutes in ci.yml is the GitHub kill limit and is set from three times
+// the worst measured Linux matrix job by the rule in ci.yml, separate from this shard budget.
+const (
+	linuxShardBudgetSeconds = 3600
+	linuxKillLimitMinutes   = 125
+)
+
+type verificationJob struct {
+	Name     string
+	Needs    []string
+	If       string
+	Timeout  int `yaml:"timeout-minutes"`
+	Strategy struct {
+		FailFast *bool `yaml:"fail-fast"`
+		// Include is the expression that expands to the job's matrix; planFor derives the shards it holds.
+		Matrix struct{ Include any }
+	}
+	Steps []struct {
+		If   string
+		Uses string
+		With map[string]string
+		Run  string
+		Env  map[string]string
+	}
+}
+
+func verificationJobs(t *testing.T) map[string]verificationJob {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), ".github/workflows/ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct{ Jobs map[string]verificationJob }
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	return workflow.Jobs
+}
+
+// gateLeaves expands a make target into the leaf gates it runs. The independent denominator is make check, not a snapshot
+// count of jobs: every ci-* target expands through its prerequisites, and the targets CI runs in halves expand to their halves.
+func gateLeaves(t *testing.T) func(string) []string {
+	t.Helper()
+	rules := map[string][]string{}
+	for line := range strings.SplitSeq(readMakeSources(t, repoRoot(t)), "\n") {
+		if strings.HasPrefix(line, "\t") {
+			continue
+		}
+		line, _, _ = strings.Cut(line, "#")
+		name, deps, ok := strings.Cut(line, ":")
+		if ok && !strings.ContainsAny(name, " =$()") {
+			rules[name] = strings.Fields(deps)
+		}
+	}
+	var leaves func(string) []string
+	leaves = func(name string) []string {
+		switch name {
+		case "check", "check-core", "check-contracts-fast", "vet":
+		case "test":
+			// CI runs test-fast and test-cli in halves (fast-parallel and fast-sharded; two cmd/pig shard ranges) and conformance in four shard ranges, which together are make test.
+			return []string{"test-fast-parallel", "test-fast-sharded-1", "test-fast-sharded-2", "test-cli-1", "test-cli-2", "test-subprocess", "test-conformance-1", "test-conformance-2", "test-conformance-3", "test-conformance-4"}
+		case "portmap-check":
+			// CI runs the PORT_MAP evidence check as PORTMAP_SHARDS shards (PORTMAP_SHARD=N/M), which together are portmap-check.
+			var halves []string
+			for n := 1; n <= portmapShards(t); n++ {
+				halves = append(halves, fmt.Sprintf("portmap-check-%d", n))
+			}
+			return halves
+		case "parity-fast":
+			// CI runs the hermetic parity scenarios as two hash shards (PARITY_SHARD), which together are parity-fast.
+			return []string{"parity-fast-1", "parity-fast-2"}
+		default:
+			if !strings.HasPrefix(name, "ci-") {
+				return []string{name}
+			}
+		}
+		deps, ok := rules[name]
+		if !ok {
+			t.Fatalf("missing Make rule %s", name)
+		}
+		var result []string
+		for _, dep := range deps {
+			result = append(result, leaves(dep)...)
+		}
+		return result
+	}
+	return leaves
+}
+
+func TestLinuxShardsRetainEveryCheck(t *testing.T) {
+	jobs := verificationJobs(t)
+	linux := jobs["linux"]
+	// The full run is every event that can land a change; its matrix is the denominator of the partition below.
+	full := planFor(t, "merge_group", "")
+	if len(full.Matrix["linux"]) < 2 {
+		t.Fatal("Linux verification is not sharded")
+	}
+	if linux.Timeout*60 < linuxShardBudgetSeconds || linux.Timeout > linuxKillLimitMinutes || linux.Strategy.FailFast == nil || *linux.Strategy.FailFast {
+		t.Fatalf("Linux shards must keep timeout-minutes in %d..%d (got %d) and run every shard on failure", linuxShardBudgetSeconds/60, linuxKillLimitMinutes, linux.Timeout)
+	}
+	if linux.Strategy.Matrix.Include != "${{ fromJSON(needs.changes.outputs.linux) }}" {
+		t.Fatalf("the Linux matrix is %v, want the changes job's plan", linux.Strategy.Matrix.Include)
+	}
+	invokesShard := false
+	for _, step := range linux.Steps {
+		if step.Env["SHARD"] == "${{ matrix.shard }}" && step.Env["TARGET"] == "${{ matrix.target }}" && strings.Contains(step.Run, `make "$TARGET"`) {
+			invokesShard = true
+		}
+	}
+	if !invokesShard {
+		t.Fatal("matrix does not invoke the checked Make targets")
+	}
+
+	leaves := gateLeaves(t)
+	want := leaves("check")
+	var got []string
+	for _, entry := range full.Matrix["linux"] {
+		if entry.Target != "ci-"+entry.Shard {
+			t.Errorf("the full run's shard %s runs %s, want ci-%s", entry.Shard, entry.Target, entry.Shard)
+		}
+		got = append(got, leaves(entry.Target)...)
+	}
+	// The preflight job runs the compile gates the Windows, macOS and Node loader jobs wait for; they count once, there.
+	preflight, ok := jobs["preflight"]
+	if !ok {
+		t.Fatal("ci.yml has no preflight job")
+	}
+	runsPreflight := false
+	for _, step := range preflight.Steps {
+		if strings.TrimSpace(step.Run) == "make ci-preflight" {
+			runsPreflight = true
+		}
+	}
+	if !runsPreflight {
+		t.Fatal("the preflight job does not run make ci-preflight")
+	}
+	got = append(got, leaves("ci-preflight")...)
+	preflightPlatforms, ok := jobs["preflight-platforms"]
+	if !ok {
+		t.Fatal("ci.yml has no preflight-platforms job")
+	}
+	runsPreflightPlatforms := false
+	for _, step := range preflightPlatforms.Steps {
+		if strings.TrimSpace(step.Run) == "make ci-preflight-platforms" {
+			runsPreflightPlatforms = true
+		}
+	}
+	if !runsPreflightPlatforms {
+		t.Fatal("the preflight-platforms job does not run make ci-preflight-platforms")
+	}
+	got = append(got, leaves("ci-preflight-platforms")...)
+	// The bookkeeping job runs the fail-fast gates every spending job waits for; they count once, there.
+	bookkeeping, ok := jobs["bookkeeping"]
+	if !ok {
+		t.Fatal("ci.yml has no bookkeeping job")
+	}
+	runsBookkeeping := false
+	for _, step := range bookkeeping.Steps {
+		if strings.Contains(step.Run, "ci-bookkeeping") {
+			runsBookkeeping = true
+		}
+	}
+	if !runsBookkeeping {
+		t.Fatal("the bookkeeping job does not run make ci-bookkeeping")
+	}
+	got = append(got, leaves("ci-bookkeeping")...)
+	for _, waiting := range []string{"preflight", "linux", "node-runtime", "chord", "durable-cf-host", "durable-contract", "android"} {
+		if !slices.Contains(jobs[waiting].Needs, "bookkeeping") {
+			t.Errorf("%s does not wait for the bookkeeping job, so a bookkeeping failure would not stop it", waiting)
+		}
+	}
+	if !slices.Contains(jobs["preflight-platforms"].Needs, "verdict") {
+		t.Errorf("preflight-platforms does not wait for the verdict job")
+	}
+	for _, gated := range []string{"windows", "macos", "node-loader"} {
+		if !slices.Contains(jobs[gated].Needs, "preflight") {
+			t.Errorf("%s does not wait for the preflight job", gated)
+		}
+		if !slices.Contains(jobs[gated].Needs, "preflight-platforms") {
+			t.Errorf("%s does not wait for the preflight-platforms job", gated)
+		}
+	}
+	slices.Sort(want)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("shards must partition all make check gates exactly once\ngot  %v\nwant %v", got, want)
+	}
+	// The two test-cli halves run the cmd/pig shard ranges that together are every shard, each once.
+	shards, _ := cliShards(t)
+	runs := make([]int, shards+1)
+	cliRange := regexp.MustCompile(`(?m)^(test-cli-[12]):[^\n]*\n\t@\./automation/ci/test-grouped\.sh cli ([0-9]+) ([0-9]+)$`)
+	halves := cliRange.FindAllStringSubmatch(readMakeSources(t, repoRoot(t)), -1)
+	if len(halves) != 2 {
+		t.Fatalf("found %d test-cli halves with a shard range, want test-cli-1 and test-cli-2", len(halves))
+	}
+	for _, half := range halves {
+		first, _ := strconv.Atoi(half[2])
+		last, _ := strconv.Atoi(half[3])
+		for shard := first; shard <= last; shard++ {
+			if shard < 1 || shard > shards {
+				t.Fatalf("%s runs cmd/pig shard %d of %d", half[1], shard, shards)
+			}
+			runs[shard]++
+		}
+	}
+	for shard := 1; shard <= shards; shard++ {
+		if runs[shard] != 1 {
+			t.Errorf("cmd/pig shard %d runs in %d test-cli halves, want exactly one", shard, runs[shard])
+		}
+	}
+}
+
+// portmapShards is the number of PORT_MAP evidence shards the Makefile plans for (PORTMAP_SHARDS).
+func portmapShards(t *testing.T) int {
+	t.Helper()
+	m := regexp.MustCompile(`(?m)^PORTMAP_SHARDS\s*:?=\s*([0-9]+)\s*$`).FindStringSubmatch(readMakeSources(t, repoRoot(t)))
+	if m == nil {
+		t.Fatal("the Makefile does not define PORTMAP_SHARDS")
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// TestPortmapShardsAreWiredEndToEnd: every shard the portmapcheck plan splits the rows into is a matrix job that runs its own
+// PORTMAP_SHARD=N/M slice, so no slice of the PORT_MAP rows goes unchecked and none is checked under another shard's number.
+func TestPortmapShardsAreWiredEndToEnd(t *testing.T) {
+	total := portmapShards(t)
+	if total < 2 {
+		t.Fatalf("PORTMAP_SHARDS = %d, want the evidence run split", total)
+	}
+	var matrix []string
+	for _, shard := range planFor(t, "merge_group", "").shards("linux") {
+		if strings.HasPrefix(shard, "portmap") {
+			matrix = append(matrix, shard)
+		}
+	}
+	var want []string
+	for n := 1; n <= total; n++ {
+		want = append(want, fmt.Sprintf("portmap-%d", n))
+	}
+	if !slices.Equal(matrix, want) {
+		t.Fatalf("matrix portmap shards %v, want %v (PORTMAP_SHARDS = %d)", matrix, want, total)
+	}
+	sources := readMakeSources(t, repoRoot(t))
+	for n := 1; n <= total; n++ {
+		recipe := fmt.Sprintf("portmap-check-%d:\n\t@$(MAKE) -s portmap-check PORTMAP_SHARD=%d/$(PORTMAP_SHARDS)\n", n, n)
+		if !strings.Contains(sources, recipe) {
+			t.Errorf("no recipe %q", recipe)
+		}
+		if !strings.Contains(sources, fmt.Sprintf("ci-portmap-%d: portmap-check-%d\n", n, n)) {
+			t.Errorf("ci-portmap-%d does not run portmap-check-%d", n, n)
+		}
+	}
+}
+
+// TestPortmapShardsFitTheirBudget guards against regressions like runs 44870314130 and 44880357753 where
+// Linux / portmap-1 (55.5 m, 92.5% of 60 m on southcentralus) and Linux / portmap-3 (51.8 m, 86.4% on westus)
+// exceeded the 70% slow-pool budget at PORTMAP_SHARDS=8. Scaling the worst observed 8-shard work linearly to
+// PORTMAP_SHARDS must keep every shard <= 60% of the 60-minute shard budget on the fast pool and <= 85% on the slow pool.
+func TestPortmapShardsFitTheirBudget(t *testing.T) {
+	killLimit := verificationJobs(t)["linux"].Timeout * 60
+	if killLimit < linuxShardBudgetSeconds || killLimit > linuxKillLimitMinutes*60 {
+		t.Fatalf("linux timeout = %d s, want %d..%d", killLimit, linuxShardBudgetSeconds, linuxKillLimitMinutes*60)
+	}
+	budget := linuxShardBudgetSeconds
+	total := portmapShards(t)
+	// Measured on run 44880357753 (portmap-1 at 8 shards): 3113 s shard work + 218 s setup on southcentralus (slow pool),
+	// and run 44870314130 (portmap-1 at 8 shards): 2430 s shard work + 216 s setup on us-west-2 (fast pool).
+	const (
+		baseShards      = 8
+		fastSetupSec    = 220
+		fastWork8Sec    = 2430
+		slowSetupSec    = 240
+		slowWork8Sec    = 3113
+		slowMarginRatio = 85 // <= 85% of shard budget (at least 15% margin)
+	)
+	fastProjected := fastSetupSec + (fastWork8Sec*baseShards+total-1)/total
+	slowProjected := slowSetupSec + (slowWork8Sec*baseShards+total-1)/total
+	if fastProjected*5 > budget*3 {
+		t.Errorf("PORTMAP_SHARDS=%d projects %d s fast-pool wall (> 60%% of %d s shard budget)", total, fastProjected, budget)
+	}
+	if slowProjected*100 > budget*slowMarginRatio {
+		t.Errorf("PORTMAP_SHARDS=%d projects %d s slow-pool wall (> %d%% of %d s shard budget)", total, slowProjected, slowMarginRatio, budget)
+	}
+}
+
+// TestBookkeepingKeepsAutofixGatesAndMovesHeavyNonAutofixToBuild guards against Bookkeeping (timeout-minutes: 15)
+// hitting 96.4% of its limit (14.5 m on westus3 in run 44880357753) while preserving every autofix gate in Bookkeeping
+// and pinning every one of the 25 pre-move ci-bookkeeping targets in exactly one job in both the full and light plans.
+func TestBookkeepingKeepsAutofixGatesAndMovesHeavyNonAutofixToBuild(t *testing.T) {
+	leaves := gateLeaves(t)
+	preMove := []string{
+		"autofix-check",
+		"divergences-drift",
+		"piglet-strip-ids-drift",
+		"sdk-bundles-drift",
+		"node-runtime-drift",
+		"vendor-pi-dist-drift",
+		"known-gaps-drift",
+		"custom-factory-ledger-drift",
+		"lint-scenarios",
+		"port-map-drift",
+		"coverage-drift",
+		"divergence-consistency",
+		"divergence-quality",
+		"divergence-guard",
+		"gui-import-guard",
+		"source-hygiene",
+		"fixture-guard",
+		"module-pins",
+		"test-provenance",
+		"docs-drift",
+		"bug-ledger-check",
+		"model-data-check",
+		"race-coverage",
+		"perf-scoreboard-check",
+		"go-fix-clean",
+	}
+	if len(preMove) != 25 {
+		t.Fatalf("preMove has %d targets, want 25", len(preMove))
+	}
+	moved := []string{
+		"go-fix-clean",
+		"race-coverage",
+		"model-data-check",
+		"fixture-guard",
+		"source-hygiene",
+		"node-runtime-drift",
+		"vendor-pi-dist-drift",
+	}
+	bk := leaves("ci-bookkeeping")
+	buildFull := leaves("ci-build")
+	buildPR := leaves("ci-build-pr")
+	for _, gate := range moved {
+		if slices.Contains(bk, gate) {
+			t.Errorf("ci-bookkeeping still contains heavy non-autofix gate %s; keep it in ci-build and ci-build-pr", gate)
+		}
+		if !slices.Contains(buildFull, gate) {
+			t.Errorf("ci-build is missing moved gate %s", gate)
+		}
+		if !slices.Contains(buildPR, gate) {
+			t.Errorf("ci-build-pr is missing moved gate %s (would disappear from the light PR run)", gate)
+		}
+	}
+	checkPlan := func(planName string, p ciPlan) {
+		jobTargets := map[string][]string{
+			"bookkeeping":         leaves("ci-bookkeeping"),
+			"preflight":           leaves("ci-preflight"),
+			"preflight-platforms": leaves("ci-preflight-platforms"),
+		}
+		for _, entry := range p.Matrix["linux"] {
+			jobTargets["linux/"+entry.Shard] = leaves(entry.Target)
+		}
+		for _, gate := range preMove {
+			var owners []string
+			for job, targets := range jobTargets {
+				for _, target := range targets {
+					if target == gate {
+						owners = append(owners, job)
+					}
+				}
+			}
+			slices.Sort(owners)
+			wantOwner := "bookkeeping"
+			if slices.Contains(moved, gate) {
+				wantOwner = "linux/build"
+			}
+			if len(owners) != 1 || owners[0] != wantOwner {
+				t.Errorf("%s plan: pre-move bookkeeping gate %s runs in %v (count %d), want exactly [%s]", planName, gate, owners, len(owners), wantOwner)
+			}
+		}
+	}
+	checkPlan("full", planFor(t, "merge_group", ""))
+	checkPlan("light", planFor(t, "pull_request", "queue"))
+}
+
+func TestLinuxAggregateRejectsUnsuccessfulShards(t *testing.T) {
+	job := verificationJobs(t)["verify"]
+	if !slices.Contains(job.Needs, "linux") || !strings.Contains(job.If, "always()") {
+		t.Fatal("Linux aggregate must run even when matrix jobs fail or are skipped")
+	}
+	var script string
+	for _, step := range job.Steps {
+		if step.Env["RESULT"] == "${{ needs.linux.result }}" {
+			script = step.Run
+		}
+	}
+	if script == "" {
+		t.Fatal("Linux aggregate does not consume matrix result")
+	}
+	for _, result := range []string{"success", "failure", "cancelled", "skipped", ""} {
+		t.Run(result, func(t *testing.T) {
+			t.Setenv("RESULT", result)
+			cmd := exec.CommandContext(t.Context(), testenv.Bash(t), "-euo", "pipefail", "-c", script)
+			output, err := cmd.CombinedOutput()
+			if (err == nil) != (result == "success") {
+				t.Fatalf("aggregate for %q: %v\n%s", result, err, output)
+			}
+		})
+	}
+}
+
+// fakeTests are the top-level tests the fixture's fake go test -list prints for every package; it also prints a benchmark, which -run does not select. Twenty conformance shards need enough names for the hash to place a test in every one: 64 does.
+var fakeTests = func() []string {
+	var names []string
+	for i := range 64 {
+		names = append(names, fmt.Sprintf("TestFixture%02d", i))
+	}
+	return append(names, "ExampleFixture", "FuzzFixture")
+}()
+
+// groupedTestFixture copies test-grouped.sh and the scripts it runs into a fresh root whose fake go lists five packages, lists fakeTests for go test -list, and appends the packages each go test receives to $TEST_LOG and each -run pattern, after its package, to $RUN_LOG. LIST_FAIL fails the listing, LIST_EXTRA adds a name to it, FAIL_TEST fails each go test whose -run pattern names that test, and FAIL_PACKAGE fails each go test that receives that package. When LEAK_TMP is set, the fake go test leaves a file in the TMPDIR it runs under, as a leaking test package would; when LEAK_PROCESS is set it leaves a sleep of that many seconds running, as a test that leaks a child process would. ARGS_LOG receives each go test command line, and FD_LOG the targets of the file descriptors each go test holds (Linux). When WIPE_AGENT_AUTH is set it rewrites auth.json in the agent directory its environment names, as the 2026-10-06 lane wipe did, and RECORD_AGENT_ENV names a file that receives the agent environment each go test sees.
+func groupedTestFixture(t *testing.T) string {
+	t.Helper()
+	// A CI shard exports these for the run it keeps events and a summary of; the fake go below must see the plain run.
+	for _, name := range []string{"PIG_TEST_JSON_DIR", "GITHUB_STEP_SUMMARY", "TEST_CHANGED_FOR"} {
+		t.Setenv(name, "")
+	}
+	root := t.TempDir()
+	copyCIFixture(t, root, "automation/ci/test-grouped.sh")
+	copyCIFixture(t, root, "automation/ci/test-shard-pattern.sh")
+	copyCIFixture(t, root, "automation/ci/check-shard-union.sh")
+	copyCIFixture(t, root, "automation/ci/assert-clean-tmp.sh")
+	copyCIFixture(t, root, "automation/ci/agent-dir-guard.sh")
+	copyCIFixture(t, root, "automation/ci/reap-test-processes.sh")
+	for _, rel := range groupedSourcedScripts(t) {
+		copyCIFixture(t, root, rel)
+	}
+	// test-grouped.sh enters the in-repo Porter extension module to warm its dependency-module build cache.
+	writeCIFixture(t, root, "piglets/porter/extensions/pig-porter/.keep", "")
+	// The core-fault group runs exactly the tests that the pigfault-tagged test files of durable/core/driver declare; an untagged file's tests belong to the normal run.
+	writeCIFixture(t, root, "durable/core/driver/fault_core_test.go", "//go:build pigfault\n\npackage driver\n\nfunc TestCoreFaultHeld(t *testing.T) {}\n\nfunc TestCoreFaultReleased(t *testing.T) {}\n")
+	writeCIFixture(t, root, "durable/core/driver/core_test.go", "package driver\n\nfunc TestCoreUntagged(t *testing.T) {}\n")
+	writeCIFixture(t, root, "automation/ci/test-fixtures.sh", "#!/bin/sh\nprintf 'export CI_TEST_FIXTURES=ready\\n'\n")
+	writeCIFixture(t, root, "bin/go", `#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  list)
+    shift
+    if [[ "$*" == ./... ]]; then
+      printf '%s\n' ./alpha ./beta ./coding/cli ./coding/extension/host/subprocess ./test/extension-conformance
+    else
+      printf '%s\n' "$@"
+    fi
+    ;;
+  build) ;;
+  test)
+    if [[ "$2" == -list ]]; then
+      if [[ -n "${LIST_FAIL:-}" ]]; then echo TestPartial; exit 1; fi
+      printf '%s\n' `+strings.Join(fakeTests, " ")+` BenchmarkFixture ${LIST_EXTRA:-}
+      printf 'ok  \t%s\t0.01s\n' "$4"
+      exit 0
+    fi
+    test "$CI_TEST_FIXTURES" = ready
+    saved_args="$*"
+    shift 3
+    packages=() run=
+    while (($#)); do
+      case "$1" in
+        -run) run=$2; shift 2 ;;
+        -timeout) shift 2 ;;
+        -*) shift ;;
+        *) packages+=("$1"); shift ;;
+      esac
+    done
+    printf '%s\n' "${packages[@]}" >> "$TEST_LOG"
+    if [[ -n "${ARGS_LOG:-}" ]]; then printf '%s\n' "$saved_args" >> "$ARGS_LOG"; fi
+    if [[ -n "${FD_LOG:-}" ]]; then for fd in /proc/$$/fd/*; do readlink "$fd" || true; done >> "$FD_LOG"; fi
+    if [[ -n "$run" ]]; then printf '%s %s\n' "${packages[*]}" "$run" >> "${RUN_LOG:-/dev/null}"; fi
+    if [[ -n "${FAIL_TEST:-}" && "$run" == *"$FAIL_TEST"* ]]; then exit 1; fi
+    if [[ -n "${FAIL_PACKAGE:-}" ]]; then for package in "${packages[@]}"; do if [[ "$package" == "$FAIL_PACKAGE" ]]; then exit 1; fi; done; fi
+    if [[ -n "${LEAK_TMP:-}" ]]; then : > "$TMPDIR/pig-leak"; fi
+    if [[ -n "${LEAK_PROCESS:-}" ]]; then sleep "$LEAK_PROCESS" </dev/null >/dev/null 2>&1 & fi
+    if [[ -n "${WIPE_AGENT_AUTH:-}" ]]; then printf '{}' > "$PIG_CODING_AGENT_DIR/auth.json"; fi
+    # Under Git Bash this script sees POSIX paths (/tmp/... for the Windows temporary directory) where the Go test, and a real go.exe, see Windows paths. Record each directory in the host's own form: pwd -W prints it there, and is rejected on every other bash.
+    native() { (cd "$1" 2>/dev/null && { pwd -W 2>/dev/null || pwd; }) || printf '%s\n' "$1"; }
+    if [[ -n "${RECORD_AGENT_ENV:-}" ]]; then printf '%s\n' "$(native "$PIG_CODING_AGENT_DIR")" "$(native "$PI_CODING_AGENT_DIR")" "$(native "$PIG_HOME")" "$(native "$PI_HOME")" "${PIG_CODING_AGENT_SESSION_DIR-unset}" >> "$RECORD_AGENT_ENV"; fi
+    ;;
+  *) exit 99 ;;
+esac
+`)
+	t.Setenv("PATH", filepath.Join(root, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return root
+}
+
+func TestLinuxTestShardsPartitionPackages(t *testing.T) {
+	root := groupedTestFixture(t)
+	log := filepath.Join(root, "packages")
+	t.Setenv("TEST_LOG", log)
+	t.Setenv("RUN_LOG", filepath.Join(root, "runs"))
+	var defaultPackages []string
+	for _, modes := range [][]string{{"default"}, {"fast", "cli", "subprocess", "conformance"}} {
+		writeCIFixture(t, root, "packages", "")
+		for _, mode := range modes {
+			cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), mode)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("test mode %s: %v\n%s", mode, err, output)
+			}
+		}
+		data, err := os.ReadFile(log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packages := strings.Fields(string(data))
+		slices.Sort(packages)
+		if defaultPackages == nil {
+			defaultPackages = packages
+		} else if !slices.Equal(packages, defaultPackages) {
+			t.Fatalf("shards must partition default tests exactly once: got %v, want %v", packages, defaultPackages)
+		}
+	}
+	// Each shard must retain make test's preparation rather than invoking go test bare.
+	makefile := readMakeSources(t, repoRoot(t))
+	for _, mode := range []string{"fast", "cli", "subprocess", "conformance"} {
+		pattern := `(?m)^test-` + mode + `: test-prereqs interface-deps parity-deps[^\n]*\n\t@\./automation/ci/test-grouped.sh ` + mode + `$`
+		if !regexp.MustCompile(pattern).MatchString(makefile) {
+			t.Errorf("test-%s does not preserve test preparation and package selection", mode)
+		}
+	}
+}
+
+// cliShards reads the cmd/pig shard count and package that test-grouped.sh runs.
+func cliShards(t *testing.T) (int, string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "automation", "ci", "test-grouped.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := regexp.MustCompile(`(?m)^CLI_SHARDS=([0-9]+)$`).FindSubmatch(data)
+	pkg := regexp.MustCompile(`(?m)^CLI_PKG=(\S+)$`).FindSubmatch(data)
+	if count == nil || pkg == nil {
+		t.Fatal("test-grouped.sh does not declare CLI_SHARDS and CLI_PKG")
+	}
+	shards, err := strconv.Atoi(string(count[1]))
+	if err != nil || shards < 2 {
+		t.Fatalf("CLI_SHARDS=%s: want two or more shards", count[1])
+	}
+	return shards, string(pkg[1])
+}
+
+// hostShards reads the shard count SHARDED_SPEC of test-grouped.sh declares for the extension host package, the one count that make test-subprocess, the Windows extension-host jobs, the macOS extension-host units and the package's pins in test-shard-weights.txt share, and the package.
+func hostShards(t *testing.T) (int, string) {
+	t.Helper()
+	const pkg = "./coding/extension/host/subprocess"
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "automation", "ci", "test-grouped.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := regexp.MustCompile(`(?m)^SHARDED_SPEC=\(\n((?:  \S+\n)+)\)$`).FindSubmatch(data)
+	if spec == nil {
+		t.Fatal("test-grouped.sh does not declare SHARDED_SPEC")
+	}
+	count := regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(pkg) + `:([0-9]+)$`).FindSubmatch(spec[1])
+	if count == nil {
+		t.Fatalf("SHARDED_SPEC of test-grouped.sh does not shard %s", pkg)
+	}
+	shards, err := strconv.Atoi(string(count[1]))
+	if err != nil || shards < 2 {
+		t.Fatalf("SHARDED_SPEC runs %s in %s shards: want two or more", pkg, count[1])
+	}
+	return shards, pkg
+}
+
+// hostUnits names the extension-host units of a Windows or macOS matrix, one for each shard of the extension host package.
+func hostUnits(t *testing.T) []string {
+	t.Helper()
+	shards, _ := hostShards(t)
+	units := make([]string, 0, shards)
+	for shard := 1; shard <= shards; shard++ {
+		units = append(units, "extension-host-"+strconv.Itoa(shard))
+	}
+	return units
+}
+
+// The pins of the extension host package in test-shard-weights.txt apply only to the shard count their section declares, so the section must declare the count the package runs under: pins packed for another count place nothing, and every test falls back to its name hash.
+func TestExtensionHostPinsAreForTheShardCountItRuns(t *testing.T) {
+	shards, pkg := hostShards(t)
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "automation", "ci", "test-shard-weights.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections := regexp.MustCompile(`(?m)^package `+regexp.QuoteMeta(pkg)+`\nshards ([0-9]+)\n((?:[0-9]+ \S+\n)*)`).FindAllSubmatch(data, -1)
+	if len(sections) != 1 {
+		t.Fatalf("test-shard-weights.txt has %d sections for %s, want one", len(sections), pkg)
+	}
+	if got := string(sections[0][1]); got != strconv.Itoa(shards) {
+		t.Fatalf("test-shard-weights.txt packs %s for %s shards, SHARDED_SPEC runs it in %d", pkg, got, shards)
+	}
+	pinned := map[string]bool{}
+	for line := range strings.Lines(string(sections[0][2])) {
+		shard, _, _ := strings.Cut(line, " ")
+		pinned[shard] = true
+	}
+	if len(pinned) != shards {
+		t.Errorf("test-shard-weights.txt pins tests of %s to %d of its %d shards", pkg, len(pinned), shards)
+	}
+}
+
+// requireShardPartition fails unless the -run patterns select every runnable fake test exactly once.
+func requireShardPartition(t *testing.T, patterns []string) {
+	t.Helper()
+	for _, name := range fakeTests {
+		matches := 0
+		for _, pattern := range patterns {
+			if regexp.MustCompile(pattern).MatchString(name) {
+				matches++
+			}
+		}
+		if matches != 1 {
+			t.Errorf("%s is selected by %d shards, want exactly one", name, matches)
+		}
+	}
+}
+
+// make test-cli runs cmd/pig as CLI_SHARDS go test processes, each under its own package timeout, whose -run patterns partition the package's tests. A failing shard does not stop the later ones.
+func TestCLIShardsPartitionTheCLIPackage(t *testing.T) {
+	shards, pkg := cliShards(t)
+	root := groupedTestFixture(t)
+	runs := filepath.Join(root, "runs")
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	t.Setenv("RUN_LOG", runs)
+	run := func() ([]string, error) {
+		t.Helper()
+		writeCIFixture(t, root, "runs", "")
+		cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "cli")
+		output, err := cmd.CombinedOutput()
+		data, readErr := os.ReadFile(runs)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		var patterns []string
+		for line := range strings.Lines(string(data)) {
+			gotPkg, pattern, ok := strings.Cut(strings.TrimSpace(line), " ")
+			if !ok || gotPkg != pkg {
+				t.Fatalf("shard ran %q, want package %s with a -run pattern\n%s", line, pkg, output)
+			}
+			patterns = append(patterns, pattern)
+		}
+		if err != nil {
+			err = fmt.Errorf("%w\n%s", err, output)
+		}
+		return patterns, err
+	}
+	patterns, err := run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(patterns) != shards {
+		t.Fatalf("cli ran %d go test processes, want %d shards", len(patterns), shards)
+	}
+	requireShardPartition(t, patterns)
+
+	// Fail a test of the first shard, so every later shard must still run.
+	first, _, _ := strings.Cut(strings.TrimSuffix(strings.TrimPrefix(patterns[0], "^("), ")$"), "|")
+	if !slices.Contains(fakeTests, first) {
+		t.Fatalf("first shard pattern %q does not start with a fixture test", patterns[0])
+	}
+	t.Setenv("FAIL_TEST", first)
+	patterns, err = run()
+	if err == nil {
+		t.Fatal("cli passed with a failing shard")
+	}
+	if len(patterns) != shards {
+		t.Fatalf("cli ran %d of %d shards after a failing shard", len(patterns), shards)
+	}
+	requireShardPartition(t, patterns)
+}
+
+// test-shard-pattern.sh fails instead of printing a pattern when the listing fails, the listing names a test it cannot select, a shard is empty, or the arguments are not a shard of a shard count.
+func TestShardPatternFailsClosed(t *testing.T) {
+	root := groupedTestFixture(t)
+	script := filepath.Join(root, "automation/ci/test-shard-pattern.sh")
+	shards, _ := cliShards(t)
+	for i := 1; i <= shards; i++ {
+		output, err := exec.CommandContext(t.Context(), testenv.Bash(t), script, strconv.Itoa(i), strconv.Itoa(shards), "./pkg").Output()
+		if err != nil || !regexp.MustCompile(`^\^\((\w+\|)*\w+\)\$\n$`).Match(output) {
+			t.Fatalf("shard %d of %d: %v, %q", i, shards, err, output)
+		}
+	}
+	for name, tc := range map[string]struct {
+		args []string
+		env  string
+	}{
+		"listing fails":       {[]string{"1", "2", "./pkg"}, "LIST_FAIL=1"},
+		"non-ASCII test name": {[]string{"1", "2", "./pkg"}, "LIST_EXTRA=Test\u00dcber"},
+		"empty shard":         {[]string{"1", "1000", "./pkg"}, ""},
+		"shard beyond count":  {[]string{"3", "2", "./pkg"}, ""},
+		"shard zero":          {[]string{"0", "2", "./pkg"}, ""},
+		"missing package":     {[]string{"1", "2"}, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.CommandContext(t.Context(), testenv.Bash(t), append([]string{script}, tc.args...)...)
+			cmd.Env = append(os.Environ(), tc.env)
+			output, err := cmd.Output()
+			if err == nil || len(output) != 0 {
+				t.Fatalf("err=%v output=%q, want a failure with no pattern", err, output)
+			}
+		})
+	}
+}
+
+// Each group runs go test under a private temporary directory, fails when the run leaves anything in it, and removes it either way, so a leaking package fails make test instead of filling the shared temporary directory.
+func TestGroupedTestsFailOnTemporaryLeakAndRemoveScratch(t *testing.T) {
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	outer := t.TempDir()
+	t.Setenv("TMPDIR", outer)
+	run := func() (string, error) {
+		cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast")
+		output, err := cmd.CombinedOutput()
+		return string(output), err
+	}
+	requireScratchRemoved := func() {
+		t.Helper()
+		if left, err := os.ReadDir(outer); err != nil || len(left) != 0 {
+			t.Fatalf("group scratch directory left in TMPDIR: %v, %v", left, err)
+		}
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("clean run failed: %v\n%s", err, output)
+	}
+	requireScratchRemoved()
+	t.Setenv("LEAK_TMP", "1")
+	output, err := run()
+	if err == nil || !strings.Contains(output, "[assert-clean-tmp]") || !strings.Contains(output, "pig-leak") {
+		t.Fatalf("leaking run: err=%v, want the leak reported\n%s", err, output)
+	}
+	requireScratchRemoved()
+}
+
+// A process a test started and left running fails its group and is killed when go test returns, so leaked tmux servers, Node oracles and helper processes cannot outlive the run. Linux only: this end-to-end run reads environments from /proc; TestReapTestProcessesReadsTheEnvironmentFromPsWithoutProc covers the `ps -E` path that hosts without /proc use.
+func TestGroupedTestsFailOnLeakedProcessAndKillIt(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("reap-test-processes.sh reads /proc")
+	}
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	// A distinctive duration names the leaked sleep among every process on the host.
+	duration := strconv.Itoa(86400 + os.Getpid()%10000)
+	t.Setenv("LEAK_PROCESS", duration)
+	cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast")
+	output, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "[reap-test-processes]") || !strings.Contains(string(output), "sleep "+duration) {
+		t.Fatalf("leaking run: err=%v, want the leaked process reported\n%s", err, output)
+	}
+	survivors, _ := exec.CommandContext(t.Context(), "pgrep", "-f", "^sleep "+duration+"$").Output()
+	if len(strings.TrimSpace(string(survivors))) != 0 {
+		t.Fatalf("leaked process still running: %s", survivors)
+	}
+}
+
+// CI restores test results from earlier commits with the build cache, and the cache key misses what child processes read, so under CI every go test runs with -count=1; elsewhere unchanged packages replay their cached results, and stress keeps its own count.
+func TestGroupedTestsRunEveryTestUnderCI(t *testing.T) {
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	t.Setenv("RUN_LOG", filepath.Join(root, "runs"))
+	argsLog := filepath.Join(root, "args")
+	t.Setenv("ARGS_LOG", argsLog)
+	for _, tc := range []struct {
+		mode, ci string
+		want     []string
+		reject   string
+	}{
+		{"fast", "true", []string{"-count=1"}, ""},
+		{"cli", "1", []string{"-count=1"}, ""},
+		{"fast", "", nil, "-count"},
+		{"stress", "true", []string{"-count=3"}, "-count=1"},
+	} {
+		writeCIFixture(t, root, "args", "")
+		t.Setenv("CI", tc.ci)
+		cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), tc.mode)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("mode %s CI=%q: %v\n%s", tc.mode, tc.ci, err, output)
+		}
+		data, err := os.ReadFile(argsLog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) == 0 || lines[0] == "" {
+			t.Fatalf("mode %s CI=%q ran no go test", tc.mode, tc.ci)
+		}
+		for _, line := range lines {
+			args := strings.Fields(line)
+			for _, want := range tc.want {
+				if !slices.Contains(args, want) {
+					t.Errorf("mode %s CI=%q: go %s lacks %s", tc.mode, tc.ci, line, want)
+				}
+			}
+			if tc.reject != "" && strings.Contains(line, tc.reject) {
+				t.Errorf("mode %s CI=%q: go %s has %s", tc.mode, tc.ci, line, tc.reject)
+			}
+		}
+	}
+}
+
+// The checkout lock is held by test-grouped.sh alone. A go test that inherited it would pass it to every process a test starts, and one such process left running would block every later run in the checkout.
+func TestGroupedTestsKeepTheCheckoutLockFromTests(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the fake go test reads its descriptors from /proc")
+	}
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	fdLog := filepath.Join(root, "fds")
+	t.Setenv("FD_LOG", fdLog)
+	cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fast: %v\n%s", err, output)
+	}
+	data, err := os.ReadFile(fdLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "/dev/") && !strings.Contains(string(data), "pipe:") {
+		t.Fatalf("descriptor log holds no standard streams; the probe did not run:\n%s", data)
+	}
+	if strings.Contains(string(data), "test-grouped.lock") {
+		t.Fatalf("go test holds the checkout lock:\n%s", data)
+	}
+}
+
+// The fast run keeps going after a failed group, so one run reports every failing group: test/perfgate runs in the serial-exclusive group after the parallel one, and a failure in the parallel group must not hide its own. The serial group runs with its own arguments, not the fault group's -tags and -run that ran before it. The run is in the fixture's root, not the checkout: test-grouped.sh holds the lock of its checkout for the whole run, and CI runs this test under test-grouped.sh in that checkout, so a script run in the checkout waits for the run that started it, forever.
+func TestGroupedFastRunReportsTheSerialGroupAfterAFailedParallelGroup(t *testing.T) {
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	argsLog := filepath.Join(root, "args")
+	t.Setenv("ARGS_LOG", argsLog)
+	t.Setenv("FAIL_PACKAGE", "./alpha")
+	// CI sets TEST_FAST_PARALLEL for its 4-CPU runners; this test is about the script's own default.
+	t.Setenv("TEST_FAST_PARALLEL", "")
+	cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast-parallel")
+	output, err := cmd.CombinedOutput()
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("fast-parallel with a failing parallel group: %v, want exit status 1\n%s", err, output)
+	}
+	data, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("no go test ran: %v\n%s", err, output)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("go test ran %d times, want the parallel, fault and serial groups:\n%s", len(lines), data)
+	}
+	parallel, fault, serial := lines[0], lines[1], lines[2]
+	if !strings.Contains(parallel, "-p 12 ") || !strings.HasSuffix(parallel, " ./alpha ./beta") {
+		t.Errorf("first group = %q, want the 12-way pool of the fast packages alone", parallel)
+	}
+	if !strings.Contains(fault, "-tags pigfault") || !strings.HasSuffix(fault, " ./durable/core/driver") {
+		t.Errorf("second group = %q, want the pigfault group of ./durable/core/driver", fault)
+	}
+	if !strings.Contains(serial, "-p 1 ") || !strings.HasSuffix(serial, " ./test/perfgate") || strings.Contains(serial, "-tags") || strings.Contains(serial, "-run") {
+		t.Errorf("third group = %q, want ./test/perfgate alone at -p 1 without the fault group's -tags and -run", serial)
+	}
+}
+
+// isUnderDir reports whether path is dir or lies beneath it. It compares file identity, not spelling: Git Bash names the Windows temporary directory /tmp/... while Go names it C:\\..., and a path may use forward slashes or 8.3 short names, so no string prefix test holds on every host.
+func isUnderDir(t testing.TB, path, dir string) bool {
+	t.Helper()
+	want, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat %q: %v", dir, err)
+	}
+	for p := filepath.Clean(path); ; {
+		if info, err := os.Stat(p); err == nil && os.SameFile(info, want) {
+			return true
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return false
+		}
+		p = parent
+	}
+}
+
+// A directory is under another by identity, whatever path spells it: through a symlink, with a trailing slash or dot elements, as a Windows host spells the same directory differently from Git Bash.
+func TestIsUnderDirComparesFileIdentity(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "a", "b")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	other := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	testenv.RequireDirectoryLink(t, outer, alias)
+	for name, tc := range map[string]struct {
+		path string
+		dir  string
+		want bool
+	}{
+		"same directory":         {outer, outer, true},
+		"nested":                 {inner, outer, true},
+		"alias of the root":      {filepath.Join(alias, "a", "b"), outer, true},
+		"dot elements":           {inner + string(filepath.Separator) + ".", outer, true},
+		"forward slashes":        {filepath.ToSlash(inner), outer, true},
+		"sibling directory":      {other, outer, false},
+		"missing path":           {filepath.Join(other, "missing"), outer, false},
+		"prefix sibling by name": {outer + "-sibling", outer, false},
+	} {
+		if got := isUnderDir(t, tc.path, tc.dir); got != tc.want {
+			t.Errorf("%s: isUnderDir(%q, %q) = %v, want %v", name, tc.path, tc.dir, got, tc.want)
+		}
+	}
+}
+
+// Each group runs go test with PIG_CODING_AGENT_DIR, PI_CODING_AGENT_DIR, PIG_HOME and PI_HOME pointing at seeded throwaway directories, whatever the caller exported, and fails when a test run changes them. A lane exports the real agent directory for its own pig, and a test that wrote it emptied the lane's credentials.
+func TestGroupedTestsIsolateAndGuardTheAgentDirectories(t *testing.T) {
+	t.Run("temporary directory as the host spells it", func(t *testing.T) {
+		outer := t.TempDir()
+		testGroupedAgentDirectoryIsolation(t, outer, outer)
+	})
+	// Git Bash on Windows spells the temporary directory /tmp/... to the scripts and C:\... to Go. A symlink reproduces that mismatch on every host: the scripts and the fake go see the alias, the test sees the real directory.
+	t.Run("temporary directory reached through an alias", func(t *testing.T) {
+		outer := t.TempDir()
+		alias := filepath.Join(t.TempDir(), "alias")
+		testenv.RequireDirectoryLink(t, outer, alias)
+		testGroupedAgentDirectoryIsolation(t, outer, alias)
+	})
+}
+
+// testGroupedAgentDirectoryIsolation runs test-grouped.sh with TMPDIR set to tmpdir, a spelling of the directory outer.
+func testGroupedAgentDirectoryIsolation(t *testing.T, outer, tmpdir string) {
+	t.Helper()
+	root := groupedTestFixture(t)
+	t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+	t.Setenv("TMPDIR", tmpdir)
+	realAgent := t.TempDir()
+	t.Setenv("PIG_CODING_AGENT_DIR", realAgent)
+	t.Setenv("PIG_CODING_AGENT_SESSION_DIR", realAgent)
+	record := filepath.Join(root, "agent-env")
+	t.Setenv("RECORD_AGENT_ENV", record)
+	run := func() (string, error) {
+		cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast")
+		output, err := cmd.CombinedOutput()
+		return string(output), err
+	}
+	if output, err := run(); err != nil {
+		t.Fatalf("clean run failed: %v\n%s", err, output)
+	}
+	seen, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(seen)), "\n") {
+		if line == "unset" {
+			continue
+		}
+		if isUnderDir(t, line, realAgent) || !isUnderDir(t, line, outer) {
+			t.Fatalf("go test saw %q, want a directory under the group's private root, not the caller's %q", line, realAgent)
+		}
+	}
+	if !strings.Contains(string(seen), "unset") {
+		t.Fatalf("PIG_CODING_AGENT_SESSION_DIR reached go test: %q", seen)
+	}
+	if left, err := os.ReadDir(outer); err != nil || len(left) != 0 {
+		t.Fatalf("agent guard directories left in TMPDIR: %v, %v", left, err)
+	}
+	t.Setenv("WIPE_AGENT_AUTH", "1")
+	output, err := run()
+	if err == nil || !strings.Contains(output, "[agent-dir-guard]") || !strings.Contains(output, "agent/auth.json") {
+		t.Fatalf("wiping run: err=%v, want the agent-dir guard to report auth.json\n%s", err, output)
+	}
+	if left, err := os.ReadDir(outer); err != nil || len(left) != 0 {
+		t.Fatalf("agent guard directories left in TMPDIR after a failure: %v, %v", left, err)
+	}
+	if info, err := os.Stat(realAgent); err != nil || !info.IsDir() {
+		t.Fatalf("caller's agent directory: %v", err)
+	}
+}
+
+// A group whose agent directories cannot be seeded must fail without running go test: the caller's real agent directory is still exported, and the guard could not detect a write to it.
+func TestGroupedTestsDoNotRunWhenTheAgentDirectoriesCannotBeSeeded(t *testing.T) {
+	root := groupedTestFixture(t)
+	writeCIFixture(t, root, "automation/ci/agent-dir-guard.sh", "#!/bin/sh\nif [ \"$1\" = seed ]; then exit 3; fi\nexit 0\n")
+	if err := os.Chmod(filepath.Join(root, "automation/ci/agent-dir-guard.sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testLog := filepath.Join(root, "packages")
+	t.Setenv("TEST_LOG", testLog)
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("PIG_CODING_AGENT_DIR", t.TempDir())
+	cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), "fast")
+	output, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "could not seed isolated agent directories") {
+		t.Fatalf("seed failure: err=%v, want the group to fail and say why\n%s", err, output)
+	}
+	if ran, readErr := os.ReadFile(testLog); readErr == nil && len(ran) > 0 {
+		t.Fatalf("go test ran with the caller's agent directory exported: %q", ran)
+	}
+}
+
+func TestHostedJobsInstallPinnedNpmBeforeOracle(t *testing.T) {
+	for name, job := range verificationJobs(t) {
+		if name != "linux" && name != "windows" && name != "macos" {
+			continue
+		}
+		installed := false
+		verified := false
+		oracle := false
+		for _, step := range job.Steps {
+			for line := range strings.SplitSeq(step.Run, "\n") {
+				if strings.Contains(line, "automation/ci/install-npm-toolchain.sh") {
+					installed = true
+				}
+				if strings.Contains(line, `test "$(npm --version)" = "$NPM_VERSION"`) {
+					verified = installed
+				}
+				if strings.Contains(line, "make upstream-mirror") || strings.Contains(line, "automation/pin/pin.py install-oracle") {
+					oracle = true
+					if !verified {
+						t.Errorf("%s prepares dependencies before installing and checking pinned npm", name)
+					}
+				}
+			}
+		}
+		if !oracle {
+			t.Errorf("%s has no pinned oracle preparation", name)
+		}
+	}
+}
+
+// The Pi tests that need ControlledStorage run only in the pigfault build of durable/core/driver, which the normal run of
+// the package skips. Every mode that runs the fast packages must therefore run that group once, with the tag and the
+// pattern that names exactly the tagged files' tests, or those tests run nowhere (or the untagged ones run twice).
+func TestFastAndDefaultModesRunTheFaultGroupWithItsTag(t *testing.T) {
+	for _, mode := range []string{"fast", "default"} {
+		t.Run(mode, func(t *testing.T) {
+			root := groupedTestFixture(t)
+			args, runs := filepath.Join(root, "args"), filepath.Join(root, "runs")
+			t.Setenv("TEST_LOG", filepath.Join(root, "packages"))
+			t.Setenv("ARGS_LOG", args)
+			t.Setenv("RUN_LOG", runs)
+			writeCIFixture(t, root, "runs", "")
+			cmd := exec.CommandContext(t.Context(), testenv.Bash(t), filepath.Join(root, "automation/ci/test-grouped.sh"), mode)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v\n%s", err, output)
+			}
+			runData, err := os.ReadFile(runs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(string(runData), "./durable/core/driver ^(TestCoreFaultHeld|TestCoreFaultReleased)$\n"); got != 1 {
+				t.Fatalf("%s ran the fault group %d times, want once:\n%s", mode, got, runData)
+			}
+			argData, err := os.ReadFile(args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tagged := 0
+			for line := range strings.Lines(string(argData)) {
+				if strings.Contains(line, "-tags pigfault") {
+					tagged++
+					if !strings.Contains(line, "-run ^(TestCoreFaultHeld|TestCoreFaultReleased)$ ") || !strings.Contains(line, "./durable/core/driver") {
+						t.Errorf("a pigfault run is not the fault group: %s", line)
+					}
+				}
+			}
+			if tagged != 1 {
+				t.Fatalf("%s ran %d pigfault processes, want 1:\n%s", mode, tagged, argData)
+			}
+		})
+	}
+}
+
+// TestOSParallelJobsKeepTheCheapFirstOrderOnMain guards the job order of CI-QUALITY-PLAN item 2. The jobs that wait for Bookkeeping
+// or the compile gate run when it failed only where changes.os-parallel (release and integration branches) says so, so a main
+// pull request keeps the fail-fast order. They use !cancelled(), never always(): GitHub keeps running a job whose condition is
+// still true when concurrency cancels the run, so always() would let a superseded run spend its Windows and macOS minutes.
+func TestOSParallelJobsKeepTheCheapFirstOrderOnMain(t *testing.T) {
+	jobs := verificationJobs(t)
+	gate := map[string]string{
+		"preflight":        "bookkeeping",
+		"linux":            "bookkeeping",
+		"node-runtime":     "bookkeeping",
+		"chord":            "bookkeeping",
+		"durable-cf-host":  "bookkeeping",
+		"durable-contract": "bookkeeping",
+		"android":          "bookkeeping",
+		"windows":          "preflight",
+		"macos":            "preflight",
+		"node-loader":      "preflight",
+	}
+	for name, need := range gate {
+		job, ok := jobs[name]
+		if !ok {
+			t.Errorf("ci.yml has no job %s", name)
+			continue
+		}
+		if strings.Contains(job.If, "always()") {
+			t.Errorf("%s: if %q uses always(), which keeps a superseded run's job running; use !cancelled()", name, job.If)
+		}
+		// The Bookkeeping job publishes shards-blocked (automation/ci/bookkeeping_shards.py): a known-gaps-drift failure alone does not stop the shards, so its jobs wait on that output and not on the job's result.
+		passed := "needs." + need + ".result == 'success'"
+		if need == "bookkeeping" {
+			passed = "needs.bookkeeping.outputs.shards-blocked == 'false'"
+		}
+		for _, want := range []string{
+			"!cancelled()",
+			"needs.changes.result == 'success'",
+			passed,
+			"needs.changes.outputs.os-parallel == 'true'",
+		} {
+			if !strings.Contains(job.If, want) {
+				t.Errorf("%s: if %q lacks %q", name, job.If, want)
+			}
+		}
+	}
+}
+
+var groupedSourcedScriptPattern = regexp.MustCompile(`(?m)^\s*source\s+"\$ROOT/([^"]+)"`)
+
+// groupedSourcedScripts reads automation/ci/test-grouped.sh from the repository and returns every relative path it sources under $ROOT.
+func groupedSourcedScripts(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "automation", "ci", "test-grouped.sh"))
+	if err != nil {
+		t.Fatalf("read automation/ci/test-grouped.sh: %v", err)
+	}
+	matches := groupedSourcedScriptPattern.FindAllStringSubmatch(string(data), -1)
+	if len(matches) == 0 {
+		t.Fatal("automation/ci/test-grouped.sh sources no scripts under $ROOT")
+	}
+	var scripts []string
+	for _, m := range matches {
+		scripts = append(scripts, m[1])
+	}
+	return scripts
+}
+
+func TestGroupedTestFixtureCopiesEverySourcedScript(t *testing.T) {
+	root := groupedTestFixture(t)
+	for _, rel := range groupedSourcedScripts(t) {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+			t.Errorf("groupedTestFixture missing sourced script %s: %v", rel, err)
+		}
+	}
+}

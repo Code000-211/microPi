@@ -1,0 +1,46 @@
+// Package goroutineid identifies the calling goroutine for synchronous reentry checks. Upstream JavaScript is
+// single-threaded, so "reentrant" means "on the current call stack"; Go code compares the goroutine that owns a running
+// callback with the caller's, keeping upstream's nested synchronous semantics for reentrant calls while calls from
+// other goroutines serialize. The ID is never a wire, persisted or application identity.
+package goroutineid
+
+import (
+	"bytes"
+	"runtime"
+	"strconv"
+)
+
+// Current returns the calling goroutine's runtime ID, which is never zero.
+//
+// Where the runtime's goroutine record can be read (fast_gc.go), a call loads the ID from it once the offset is proved. The first
+// calls prove where the ID lives in the record on the goroutines that make them, and return the stack header's ID meanwhile. The
+// proof stands only if exactly one word equals the stack header's ID on 17 distinct goroutines (the runtime never reuses an ID): a
+// runtime that moved, renamed or stopped storing the field leaves no such word, or none that stays equal across goroutines, and
+// Current then formats the header, as it does on every other platform. A changed layout therefore costs speed and never returns
+// another goroutine's or a wrong ID. The header's cost grows with the depth of the stack.
+func Current() uint64 { return current() }
+
+// Proving reports whether Current is still proving where the goroutine ID lives: until the proof has seen its distinct goroutines
+// every call formats the stack header, whose cost grows with the depth of the stack. A caller that reuses a few goroutines keeps
+// it there, so such a caller waits for Proving to end before it reuses them. It is false where Current always formats the header.
+func Proving() bool { return proving() }
+
+// Token identifies the calling goroutine among the goroutines alive at the same time, for a caller that compares the token of a
+// goroutine it recorded with the caller's on every call of a hot path. Where the runtime's goroutine record can be read it is the
+// record's address, which costs a load and needs no proof; elsewhere it is Current. A token is valid while the goroutine it
+// identifies runs: the runtime reuses a goroutine's record once the goroutine has ended, so a token outlives its goroutine only
+// as a name for whichever goroutine next holds the record. It is never zero and is not a wire, persisted or application identity.
+func Token() uintptr { return token() }
+
+// stackID parses the ID from the header line runtime.Stack writes for the calling goroutine.
+func stackID() uint64 {
+	var buf [64]byte
+	header := buf[:runtime.Stack(buf[:], false)]
+	header, _ = bytes.CutPrefix(header, []byte("goroutine "))
+	digits, _, _ := bytes.Cut(header, []byte(" "))
+	id, err := strconv.ParseUint(string(digits), 10, 64)
+	if err != nil {
+		panic("goroutineid: unrecognized goroutine header " + strconv.Quote(string(header)))
+	}
+	return id
+}

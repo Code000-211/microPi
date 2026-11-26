@@ -1,0 +1,39 @@
+// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
+// SPDX-License-Identifier: MIT
+
+package core
+
+import (
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/durable/core/abi"
+	"github.com/MichaelKinsy/PiG/durable/core/session"
+	"github.com/MichaelKinsy/PiG/durable/core/session/sessiontest"
+)
+
+func TestASessionModeCorePublishesTheDocumentCacheSizesWhenTheyChange(t *testing.T) {
+	store := sessiontest.New()
+	h := &handler{b: abi.NewBuilder(), mode: "session"}
+	h.sess = session.New(store, store.NextID(), func() float64 { return 0 })
+	notices := func() []abi.Notice { return append([]abi.Notice(nil), h.b.Step().Notices...) }
+	h.publishDocCache()
+	got := notices()
+	if len(got) != 1 || got[0].Kind != abi.NoticeDocCache || string(got[0].Payload) != `{"cached":0,"idle":0,"attached":0,"sweeps":0,"held":0,"taskDocuments":0,"tails":0}` {
+		t.Fatalf("first notice %+v", got)
+	}
+	h.publishDocCache()
+	if len(notices()) != 1 {
+		t.Fatalf("an unchanged size was published again")
+	}
+	h.sess.SweepJobs = 2
+	h.publishDocCache()
+	got = notices()
+	if len(got) != 2 || string(got[1].Payload) != `{"cached":0,"idle":0,"attached":0,"sweeps":2,"held":0,"taskDocuments":0,"tails":0}` {
+		t.Fatalf("after a sweep job: %+v", got)
+	}
+	harness := &handler{b: abi.NewBuilder(), mode: "harness", sess: h.sess}
+	harness.publishDocCache()
+	if len(harness.b.Step().Notices) != 1 {
+		t.Fatal("a Harness-mode core did not publish the document cache sizes: Harness.documentCacheSizes needs them")
+	}
+}

@@ -1,0 +1,12 @@
+module example.com/provider-object-go
+
+go 1.27.0
+
+require (
+	github.com/MichaelKinsy/PiG v0.8.0
+	github.com/MichaelKinsy/PiG/extensions/sdk v0.8.0
+)
+
+replace github.com/MichaelKinsy/PiG => ../../../..
+
+replace github.com/MichaelKinsy/PiG/extensions/sdk => ../../../../extensions/sdk

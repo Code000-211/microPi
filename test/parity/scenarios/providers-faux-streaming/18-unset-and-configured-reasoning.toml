@@ -1,0 +1,24 @@
+# Pi packages/ai/test/openrouter-reasoning-options.test.ts:89-110 requires omission for unrequested mandatory reasoning, selected low effort, and explicit none for optional models.
+# Probe both OpenAI-compatible APIs and every raw-vendor helper case against the pinned TypeScript catalog modules. Node's native TypeScript type stripping executes them directly.
+name = "18-unset-and-configured-reasoning"
+description = "Unrequested reasoning remains unset and configured model effort maps reach both OpenAI request paths."
+covers = ["packages/ai/src/api/openai-completions.ts", "packages/ai/src/api/openai-responses.ts", "packages/ai/catalog/reasoning.ts", "packages/ai/catalog/sources/openrouter.ts"]
+tags = ["fast", "hermetic"]
+driver = "cli-mode"
+
+[env]
+override_base_args = true
+pig_bin = "/usr/bin/env"
+pi_bin = "/usr/bin/env"
+pig_args = ["go", "run", "./test/parity/testdata/reasoning-options/pig"]
+pi_args = ["node", "./test/parity/testdata/reasoning-options/pi.mjs"]
+
+[cli]
+cwd = "../../../.."
+timeout_seconds = 60
+
+[assert]
+exit_code = 0
+output_equal = true
+both_contain = ['"openai-completions/mandatory-unset":null', '"openai-responses/mandatory-unset":null']
+runs = 3

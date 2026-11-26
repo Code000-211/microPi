@@ -1,0 +1,262 @@
+package imageprocessing
+
+import (
+	"bytes"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
+	"math"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/ai"
+)
+
+// Fixtures are the unchanged base64-decoded constants from packages/coding-agent/test/image-processing.test.ts:10-24.
+func upstreamImageFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "upstream-image-processing", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestResizeImageUpstream(t *testing.T) {
+	// packages/coding-agent/test/image-processing.test.ts:99,116
+	t.Run("caller input remains intact and image within limits is unchanged", func(t *testing.T) {
+		input := upstreamImageFixture(t, "TINY_PNG.png")
+		original := bytes.Clone(input)
+		result, err := resizeDetected(input, &ai.ModelImageResizeOptions{MaxWidth: 100, MaxHeight: 100, MaxBytes: 1024 * 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(input, original) {
+			t.Fatal("caller bytes changed")
+		}
+		if result.WasResized || !bytes.Equal(result.Bytes(), original) || result.OriginalWidth != 2 || result.OriginalHeight != 2 || result.Width != 2 || result.Height != 2 {
+			t.Fatalf("result=%+v", result)
+		}
+	})
+	// packages/coding-agent/test/image-processing.test.ts:133
+	t.Run("resizes image exceeding dimension limits", func(t *testing.T) {
+		result, err := resizeDetected(upstreamImageFixture(t, "MEDIUM_PNG_100x100.png"), &ai.ModelImageResizeOptions{MaxWidth: 50, MaxHeight: 50, MaxBytes: 1024 * 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.WasResized || result.OriginalWidth != 100 || result.OriginalHeight != 100 || result.Width > 50 || result.Height > 50 {
+			t.Fatalf("result=%+v", result)
+		}
+	})
+	// packages/coding-agent/test/image-processing.test.ts:148
+	t.Run("resizes image exceeding byte limit", func(t *testing.T) {
+		input := upstreamImageFixture(t, "LARGE_PNG_200x200.png")
+		// Pi measures the fixture's base64 length and floors its 90% limit.
+		result, err := resizeDetected(input, &ai.ModelImageResizeOptions{MaxWidth: 2000, MaxHeight: 2000, MaxBytes: encodedSizeBase64(input) * 9 / 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Bytes()) >= len(input) || len(result.Data) >= encodedSizeBase64(input) {
+			t.Fatalf("size=%d, original=%d", len(result.Bytes()), len(input))
+		}
+	})
+	// packages/coding-agent/test/image-processing.test.ts:168. Go returns an error/zero result for Pi's null, never oversized image bytes.
+	t.Run("returns no image when maxBytes cannot be satisfied", func(t *testing.T) {
+		result, err := resizeDetected(upstreamImageFixture(t, "LARGE_PNG_200x200.png"), &ai.ModelImageResizeOptions{MaxWidth: 2000, MaxHeight: 2000, MaxBytes: 1})
+		if err == nil || result.Data != "" {
+			t.Fatalf("result=%+v err=%v, want no image", result, err)
+		}
+	})
+	// packages/coding-agent/test/image-processing.test.ts:178
+	t.Run("handles JPEG input", func(t *testing.T) {
+		result, err := resizeDetected(upstreamImageFixture(t, "TINY_JPEG.jpg"), &ai.ModelImageResizeOptions{MaxWidth: 100, MaxHeight: 100, MaxBytes: 1024 * 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.WasResized || result.OriginalWidth != 2 || result.OriginalHeight != 2 {
+			t.Fatalf("result=%+v", result)
+		}
+	})
+}
+
+// Ports packages/coding-agent/test/image-processing.test.ts:193,206.
+func TestFormatDimensionNoteUpstream(t *testing.T) {
+	if note := formatDimensionNote(ResizedImage{MimeType: "image/png", OriginalWidth: 100, OriginalHeight: 100, Width: 100, Height: 100}); note != "" {
+		t.Fatalf("non-resized note=%q", note)
+	}
+	note := formatDimensionNote(ResizedImage{MimeType: "image/png", OriginalWidth: 2000, OriginalHeight: 1000, Width: 1000, Height: 500, WasResized: true})
+	for _, want := range []string{"original 2000x1000", "displayed at 1000x500", "2.00"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note=%q, lacks %q", note, want)
+		}
+	}
+}
+
+// image-resize.ts:121 formatDimensionNote: the scale is toFixed(2), which rounds an exactly representable tie up (2250/2000 = 1.125 ->
+// "1.13"; Go's %.2f gives "1.12").
+func TestFormatDimensionNoteScaleUsesJavaScriptToFixed(t *testing.T) {
+	for _, tc := range []struct {
+		originalWidth, width int
+		want                 string
+	}{{2250, 2000, "Multiply coordinates by 1.13 to map"}, {2750, 2000, "Multiply coordinates by 1.38 to map"}, {2000, 1000, "Multiply coordinates by 2.00 to map"}} {
+		note := formatDimensionNote(ResizedImage{MimeType: "image/png", OriginalWidth: tc.originalWidth, OriginalHeight: 100, Width: tc.width, Height: 100, WasResized: true})
+		if !strings.Contains(note, tc.want) {
+			t.Errorf("%dx -> %dx: %q lacks %q", tc.originalWidth, tc.width, note, tc.want)
+		}
+	}
+}
+
+// image-resize-core.ts resizeImage options: maxHeight limits the height on its own (maxWidth left wide), and jpegQuality is the first JPEG quality tried. Pi keeps the first candidate under
+// maxBytes in the order PNG, then JPEG at [jpegQuality, 85, 70, 55, 40] (image-resize-core.ts:132-148); a noisy image's PNG exceeds half its size, so a JPEG wins, and a lower quality
+// gives a much smaller file. The upstream fixtures only ever set both dimension limits together and only reach the PNG candidate.
+func TestResizeImageHonoursMaxHeightAndJPEGQualityOnTheirOwn(t *testing.T) {
+	t.Run("maxHeight alone limits the height", func(t *testing.T) {
+		result, err := resizeDetected(upstreamImageFixture(t, "MEDIUM_PNG_100x100.png"), &ai.ModelImageResizeOptions{MaxWidth: 100, MaxHeight: 50, MaxBytes: 1024 * 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.WasResized || result.Height > 50 || result.Width > 50 {
+			t.Fatalf("result=%+v, want the 100x100 image fitted to a height of 50", result)
+		}
+	})
+
+	t.Run("jpegQuality sets the quality of the JPEG candidate", func(t *testing.T) {
+		rng := rand.New(rand.NewPCG(1, 2))
+		img := image.NewRGBA(image.Rect(0, 0, 256, 256))
+		for y := range 256 {
+			for x := range 256 {
+				img.Set(x, y, color.RGBA{uint8(x + rng.IntN(40)), uint8(y + rng.IntN(40)), uint8((x+y)/2 + rng.IntN(40)), 255})
+			}
+		}
+		var encoded bytes.Buffer
+		if err := png.Encode(&encoded, img); err != nil {
+			t.Fatal(err)
+		}
+		input := encoded.Bytes()
+		sizeAt := func(quality int) (string, int) {
+			result, err := resizeDetected(input, &ai.ModelImageResizeOptions{MaxWidth: 2000, MaxHeight: 2000, MaxBytes: encodedSizeBase64(input) / 2, JPEGQuality: quality})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return result.MimeType, len(result.Data)
+		}
+		lowMime, low := sizeAt(5)
+		highMime, high := sizeAt(95)
+		if lowMime != "image/jpeg" || highMime != "image/jpeg" {
+			t.Fatalf("mime types %s and %s, want the smaller JPEG candidate for a noisy image", lowMime, highMime)
+		}
+		if low*4 > high {
+			t.Fatalf("quality 5 gave %d bytes and quality 95 gave %d, want the low quality far smaller", low, high)
+		}
+	})
+}
+
+// photoLikeJPEG ports photoLikeJpeg of packages/coding-agent/test/image-processing.test.ts: smooth gradients with light deterministic noise, so PNG compresses it poorly.
+func photoLikeJPEG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	seed := 1
+	for y := range height {
+		for x := range width {
+			seed = (seed*1103515245 + 12345) & 0x7fffffff
+			noise := seed % 6
+			i := img.PixOffset(x, y)
+			img.Pix[i] = uint8(int(float64(x)/float64(width)*200) + noise)
+			img.Pix[i+1] = uint8(int(float64(y)/float64(height)*200) + noise)
+			img.Pix[i+2] = uint8(int(128+math.Sin(float64(x)/30)*60) + noise)
+			img.Pix[i+3] = 255
+		}
+	}
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: 85}); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+// Ports packages/coding-agent/test/image-processing.test.ts:196-206 (Pi e7a0df27, #11551): PNG was returned whenever it fit, even when JPEG was much smaller.
+func TestResizeImagePicksJPEGOverLargerPNGForPhotos(t *testing.T) {
+	input := photoLikeJPEG(t, 1200, 800)
+	result, err := resizeDetected(input, &ai.ModelImageResizeOptions{MaxWidth: 1000, MaxHeight: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.WasResized || result.MimeType != "image/jpeg" || result.Width != 1000 {
+		t.Fatalf("result = %s resized=%v width=%d, want a resized image/jpeg of width 1000", result.MimeType, result.WasResized, result.Width)
+	}
+	if limit := encodedSizeBase64(input) * 2; len(result.Data) >= limit {
+		t.Fatalf("len(Data) = %d, want below %d", len(result.Data), limit)
+	}
+}
+
+// Pi e7a0df27 image-resize-core.ts: the smaller of the PNG and the JPEG at the configured quality goes first, the other format next, and
+// the lower JPEG qualities only when neither fits.
+func TestFirstFittingCandidatePrefersTheSmallerOfPNGAndJPEG(t *testing.T) {
+	// Blocks with sharp edges: the PNG is far smaller than the JPEG, which rings around every edge.
+	flat := image.NewRGBA(image.Rect(0, 0, 200, 200))
+	for y := range 200 {
+		for x := range 200 {
+			v := uint8(0)
+			if (x/10+y/10)%2 == 0 {
+				v = 255
+			}
+			flat.Set(x, y, color.RGBA{v, v, v, 255})
+		}
+	}
+	noisy := image.NewRGBA(image.Rect(0, 0, 200, 200))
+	rng := rand.New(rand.NewPCG(3, 4))
+	for y := range 200 {
+		for x := range 200 {
+			noisy.Set(x, y, color.RGBA{uint8(x + rng.IntN(6)), uint8(y + rng.IntN(6)), uint8(128 + rng.IntN(6)), 255})
+		}
+	}
+	qualities := []int{80, 85, 70, 55, 40}
+	pngSize := func(img image.Image) int {
+		data, err := encodePNG(img)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encodedSizeBase64(data)
+	}
+	jpegSize := func(img image.Image, quality int) int {
+		data, err := encodeJPEG(img, quality)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encodedSizeBase64(data)
+	}
+	if png, jpegAt80 := pngSize(flat), jpegSize(flat, 80); png >= jpegAt80 {
+		t.Fatalf("fixture: blocks PNG %d must be smaller than JPEG %d", png, jpegAt80)
+	}
+	if png, jpegAt80 := pngSize(noisy), jpegSize(noisy, 80); jpegAt80 >= png {
+		t.Fatalf("fixture: noisy JPEG %d must be smaller than PNG %d", jpegAt80, png)
+	}
+	for _, tc := range []struct {
+		name     string
+		img      image.Image
+		maxBytes int
+		wantMIME string
+	}{
+		{"blocks, both fit: PNG is smaller", flat, 1 << 30, "image/png"},
+		{"noisy image, both fit: JPEG is smaller", noisy, 1 << 30, "image/jpeg"},
+		// The PNG fits as well, but the smaller JPEG goes first.
+		{"noisy image, maxBytes above the PNG: the JPEG still wins", noisy, pngSize(noisy) + 1, "image/jpeg"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate, fits, err := firstFittingCandidate(tc.img, qualities, tc.maxBytes)
+			if err != nil || !fits || candidate.MIME != tc.wantMIME {
+				t.Fatalf("candidate = %s fits=%v err=%v, want %s", candidate.MIME, fits, err, tc.wantMIME)
+			}
+		})
+	}
+	// Neither format at the configured quality fits: a lower JPEG quality is tried.
+	between := jpegSize(noisy, 80) - 1
+	candidate, fits, err := firstFittingCandidate(noisy, qualities, between)
+	if err != nil || !fits || candidate.MIME != "image/jpeg" || candidate.EncodedSize >= jpegSize(noisy, 80) {
+		t.Fatalf("lower quality: %s size=%d fits=%v err=%v", candidate.MIME, candidate.EncodedSize, fits, err)
+	}
+}

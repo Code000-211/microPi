@@ -1,0 +1,100 @@
+//go:build parity
+
+package runner
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestTokenContext_ExpandsTempPlaceholder(t *testing.T) {
+	tc := newTokenContext(t, "test")
+
+	got := tc.expand("{{TEMP}}/sessions")
+	if want := filepath.Join(tc.tempRoot, "sessions"); filepath.Clean(got) != want {
+		t.Errorf("expand: got %q, want the path %q", got, want)
+	}
+	// Scenarios place {{TEMP}} inside JSON and TOML strings, where a Windows
+	// path's backslashes would be escape sequences.
+	if strings.Contains(got, `\`) {
+		t.Errorf("expand: got %q, want forward slashes", got)
+	}
+
+	// No-op when no token present.
+	if tc.expand("/tmp/literal") != "/tmp/literal" {
+		t.Errorf("expand should return input unchanged when no token")
+	}
+}
+
+func TestTokenContext_PerCallFreshTempdir(t *testing.T) {
+	a := newTokenContext(t, "a")
+	b := newTokenContext(t, "b")
+	if a.tempRoot == b.tempRoot {
+		t.Fatalf("two contexts must allocate distinct tempdirs; both got %q", a.tempRoot)
+	}
+	// Both must exist on disk.
+	for _, p := range []string{a.tempRoot, b.tempRoot} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("tempdir %q does not exist: %v", p, err)
+		}
+	}
+}
+
+// macOS spells its temporary directory through a symlink. The per-run root, the "temp" identity root and every {{TEMP}} expansion must name the canonical directory, as a binary's Path.resolve, pwd or process.cwd does, or a path alias cannot match what the binaries print.
+func TestTokenContext_TempRootIsCanonicalUnderSymlinkedTMPDIR(t *testing.T) {
+	real, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("cannot create a symlink: %v", err)
+	}
+	t.Setenv(tempDirVar, link)
+	tc := newTokenContext(t, "symlinked")
+	if got := filepath.Dir(tc.tempRoot); got != real {
+		t.Fatalf("tempRoot = %q, want a directory of the canonical %q, not of the symlink %q", tc.tempRoot, real, link)
+	}
+	if got := tc.expand("{{TEMP}}/x"); strings.Contains(got, filepath.ToSlash(link)) {
+		t.Fatalf("expand = %q still spells the symlink %q", got, link)
+	}
+}
+
+func TestTokenContext_ExpandSliceIsIndependent(t *testing.T) {
+	tc := newTokenContext(t, "slice")
+	in := []string{"--session-dir", "{{TEMP}}/s", "--log", "{{TEMP}}/l"}
+	out := tc.expandSlice(in)
+	if &in[0] == &out[0] {
+		t.Fatalf("expandSlice must return a new slice, not modify in-place")
+	}
+	if root := filepath.ToSlash(tc.tempRoot); !strings.Contains(out[1], root) || !strings.Contains(out[3], root) {
+		t.Errorf("expandSlice did not expand all entries: %v", out)
+	}
+	if in[1] != "{{TEMP}}/s" {
+		t.Errorf("expandSlice mutated input: %v", in)
+	}
+}
+
+func TestContainsLiteralTmpPath_DetectsBypass(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want bool
+	}{
+		{"clean tokens", []string{"--session-dir", "{{TEMP}}/s"}, false},
+		{"literal /tmp", []string{"--session-dir", "/tmp/x"}, true},
+		{"embedded =/tmp/", []string{"--log=/tmp/y.log"}, true},
+		{"deep /tmp path", []string{"/tmp/nested/path"}, true},
+		{"relative is fine", []string{"sessions"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, got := containsLiteralTmpPath(c.in)
+			if got != c.want {
+				t.Errorf("want %v, got %v for %v", c.want, got, c.in)
+			}
+		})
+	}
+}

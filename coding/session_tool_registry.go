@@ -1,0 +1,756 @@
+package coding
+
+// Ports packages/coding-agent/src/core/agent-session.ts.
+// Ports packages/coding-agent/src/core/sdk.ts.
+// Ports packages/coding-agent/src/core/extensions/wrapper.ts.
+// Ports packages/coding-agent/src/core/tools/tool-definition-wrapper.ts.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+)
+
+type sessionBoundTool struct {
+	agent.AgentTool
+	session *Session
+	// description replaces the tool's declared description when set, as a prepareLoadout hook does.
+	description *string
+}
+
+// Schema is the wrapped tool's schema with the description a prepareLoadout hook set.
+//
+// upstream: agent-session.ts:1551-1557 (declared = { ...tool, description })
+func (tool *sessionBoundTool) Schema() ai.ToolSchema {
+	return tool.withDescription(tool.AgentTool.Schema())
+}
+
+// BorrowedSchema is Schema with the wrapped tool's parameters shared where it can share them; see agent.schemaBorrower.
+func (tool *sessionBoundTool) BorrowedSchema() ai.ToolSchema {
+	if borrower, ok := tool.AgentTool.(interface{ BorrowedSchema() ai.ToolSchema }); ok {
+		return tool.withDescription(borrower.BorrowedSchema())
+	}
+	return tool.Schema()
+}
+
+func (tool *sessionBoundTool) withDescription(schema ai.ToolSchema) ai.ToolSchema {
+	if tool.description != nil {
+		schema.Description = *tool.description
+	}
+	return schema
+}
+
+type sessionArgumentSchema interface {
+	ArgumentSchema() json.RawMessage
+}
+
+type sessionBoundArgumentTool struct {
+	sessionBoundTool
+	schema sessionArgumentSchema
+}
+
+func (tool *sessionBoundArgumentTool) ArgumentSchema() json.RawMessage {
+	return tool.schema.ArgumentSchema()
+}
+
+// bindTool preserves optional validation metadata without manufacturing the capability on ordinary tools.
+func (s *Session) bindTool(tool agent.AgentTool, description ...string) agent.AgentTool {
+	bound := sessionBoundTool{AgentTool: tool, session: s}
+	if len(description) > 0 {
+		bound.description = &description[0]
+	}
+	if schema, ok := tool.(sessionArgumentSchema); ok {
+		return &sessionBoundArgumentTool{sessionBoundTool: bound, schema: schema}
+	}
+	return &bound
+}
+
+func (tool *sessionBoundTool) Execute(ctx context.Context, id string, args json.RawMessage, update agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
+	if _, bound := agent.ToolEnvironmentFrom(ctx); !bound {
+		session := tool.session
+		env := agent.ToolEnvironment{SessionID: session.ID(), SessionFile: session.Path(), ThinkingLevel: string(session.ThinkingLevel())}
+		if model := session.Model(); model != nil {
+			env.Model = model.ID
+			env.Provider = providerID(model)
+			env.InputLimits = model.InputLimits.Clone()
+			supports := model.Capabilities.SupportsImages
+			if model.Input != nil {
+				supports = slices.Contains(model.Input, "image")
+			}
+			env.SupportsImages = &supports
+		}
+		ctx = agent.WithToolEnvironment(ctx, env)
+	}
+	// Every call gets its own tool context, including a nested call an extension made, as upstream's wrapToolDefinition creates one per call.
+	//
+	// upstream: wrapper.ts:14-19, tool-definition-wrapper.ts:7-30
+	// A registered extension tool wrapped with its runner (WrapRegisteredTool) creates its own.
+	if wrapped, ok := tool.AgentTool.(*bridgeTool); !ok || wrapped.runner == nil {
+		if runner := tool.session.currentRunner(); runner != nil {
+			ctx = runner.ToolCallContext(ctx, id)
+		}
+	}
+	return tool.AgentTool.Execute(ctx, id, args, update)
+}
+
+// RunsInExtension reports whether the wrapped tool runs in an extension (agent.ExtensionTool).
+func (tool *sessionBoundTool) RunsInExtension() bool {
+	wrapped, ok := tool.AgentTool.(agent.ExtensionTool)
+	return ok && wrapped.RunsInExtension()
+}
+
+func (tool *sessionBoundTool) PrepareArguments(args json.RawMessage) (json.RawMessage, error) {
+	if prepare, ok := tool.AgentTool.(agent.ArgumentPreparer); ok {
+		return prepare.PrepareArguments(args)
+	}
+	return args, nil
+}
+
+func (tool *sessionBoundTool) ReserveMutationOrder(args json.RawMessage) (*agent.MutationTicket, bool) {
+	if ordered, ok := tool.AgentTool.(agent.QueueOrderable); ok {
+		return ordered.ReserveMutationOrder(args)
+	}
+	return nil, false
+}
+
+// MayTakeFileMutationQueue and RegistersInFileMutationQueue pass the tool's own answers on: the parallel dispatcher orders an extension tool's registration in
+// the file mutation queue against the edit and write calls of its batch through the tool it was given, which is this one.
+func (tool *sessionBoundTool) MayTakeFileMutationQueue() bool {
+	mayTake, ok := tool.AgentTool.(agent.MayTakeFileMutationQueue)
+	return ok && mayTake.MayTakeFileMutationQueue()
+}
+
+func (tool *sessionBoundTool) RegistersInFileMutationQueue() bool {
+	registers, ok := tool.AgentTool.(agent.RegistersInFileMutationQueue)
+	return ok && registers.RegistersInFileMutationQueue()
+}
+
+type sessionToolEntry struct {
+	tool         agent.AgentTool
+	registration extension.RegisteredTool
+}
+
+// wrappedTool is the agent tool built for one registration of a runner's extension tool, kept while that registration stays the one the runner lists.
+type wrappedTool struct {
+	revision uint64
+	runner   *inproc.Runner
+	tool     agent.AgentTool
+}
+
+type sessionToolRegistry struct {
+	base, custom []sessionToolEntry
+	entries      []sessionToolEntry
+	// index maps each name in entries to its position.
+	index map[string]int
+	// wrapped holds the tool of each registered extension tool by name, so a refresh builds a tool, which decodes the definition's schema, only for a registration it has not wrapped.
+	wrapped           map[string]wrappedTool
+	allowed, excluded map[string]struct{}
+	// filter is the compiled `--tools` and `--exclude-tools` entries, names or `*` patterns, intersected with scope.
+	filter extension.ToolFilter
+	// scope is the Piglet tool scope (SessionOptions.ToolScope); nil places no restriction.
+	scope          *extension.ToolScope
+	skipExtensions bool
+	// usesDefaultTools reports that the initial tools come from the defaultTools setting, so a reload activates tools newly added to it.
+	// upstream: agent-session.ts:263-267 (usesDefaultTools), sdk.ts:448
+	usesDefaultTools bool
+	// defaultToolModifiers are applied to the defaultTools setting wherever the registry reads it (agent-session.ts:3667-3670).
+	defaultToolModifiers []string
+	// addedDefaultTools are the tools a settings reload newly added to defaultTools; the next RefreshTools activates them.
+	addedDefaultTools []string
+}
+
+// syntheticToolSource is createSyntheticSourceInfo for a tool of a session: `builtin:<name>` for a built-in tool and `<sdk:name>` for an SDK tool.
+// Ports .upstream/v0.99.1/packages/coding-agent/src/core/agent-session.ts:3425-3440,3470-3474.
+func syntheticToolSource(name, source string) icodingagent.PiSourceInfo {
+	path := "<" + source + ":" + name + ">"
+	if source == "builtin" {
+		path = icodingagent.BuiltinPathPrefix + name
+	}
+	return icodingagent.CreateSyntheticSourceInfo(path, icodingagent.SyntheticSourceInfoOptions{Source: source})
+}
+
+func toolDefinition(tool agent.AgentTool) (extension.ToolDefinition, error) {
+	if bridged, ok := tool.(*bridgeTool); ok {
+		return bridged.def, nil
+	}
+	schema := tool.Schema()
+	parameters, err := schema.ParametersJSON()
+	if err != nil {
+		return extension.ToolDefinition{}, err
+	}
+	var sampling json.RawMessage
+	if schema.ConstrainedSampling != nil {
+		sampling, err = json.Marshal(schema.ConstrainedSampling)
+		if err != nil {
+			return extension.ToolDefinition{}, err
+		}
+	}
+	label := tool.Label()
+	if label == "" {
+		label = tool.Name()
+	}
+	definition := extension.ToolDefinition{Name: tool.Name(), Label: label, Description: schema.Description, Parameters: parameters, ConstrainedSampling: sampling, PromptSnippet: prompts.DefaultToolSnippets()[tool.Name()], PromptGuidelines: schema.PromptGuidelines, ExecutionMode: extension.ToolExecutionMode(tool.ExecutionMode()), Execute: func(ctx context.Context, id string, args json.RawMessage, onUpdate extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+		return tool.Execute(ctx, id, args, onUpdate)
+	}}
+	if preparer, ok := tool.(agent.ArgumentPreparer); ok {
+		definition.PrepareArguments = preparer.PrepareArguments
+	}
+	// upstream: tool-definition-wrapper.ts:52 (createToolDefinitionFromAgentTool copies outputSchema)
+	// upstream: bash.ts:262 (outputSchema: bashOutputSchema); codemode resolves a nested call of such a tool to its structuredContent, also for a returned isError (codemode/execute.ts:201-209).
+	if provider, ok := tool.(agent.OutputSchemaProvider); ok {
+		definition.OutputSchema = provider.OutputSchema()
+	}
+	return definition, nil
+}
+
+func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptions) (sessionToolRegistry, []agent.AgentTool, error) {
+	registry := sessionToolRegistry{allowed: maps.Clone(opts.AllowedTools), excluded: maps.Clone(opts.ExcludedTools), scope: opts.ToolScope, skipExtensions: opts.skipExtensionTools,
+		usesDefaultTools: usesDefaultTools(opts), defaultToolModifiers: slices.Clone(opts.DefaultToolModifiers)}
+	if opts.toolRegistry != nil {
+		registry = *opts.toolRegistry
+		registry.base = slices.Clone(registry.base)
+		registry.custom = slices.Clone(registry.custom)
+		registry.entries = slices.Clone(registry.entries)
+		registry.index = maps.Clone(registry.index)
+		registry.wrapped = maps.Clone(registry.wrapped)
+		registry.allowed = maps.Clone(registry.allowed)
+		registry.excluded = maps.Clone(registry.excluded)
+		registry.filter = registry.compileFilter()
+		if opts.InitialActiveToolNames != nil {
+			return registry, registry.selectTools(opts.InitialActiveToolNames), nil
+		}
+		return registry, registry.tools(), nil
+	}
+	// upstream: sdk.ts:280-281; the tools option that changes the default selection is DefaultToolModifiers here.
+	if problem := icodingagent.GetToolListError(opts.DefaultToolModifiers); problem != "" {
+		return registry, nil, fmt.Errorf("Invalid tools option: %s", problem)
+	}
+	// Pi's one tools list holds names and +name/-name entries together; here the names are AllowedTools, so both at once is the mixed list getToolListError rejects (settings-manager.ts:230).
+	if opts.AllowedTools != nil && opts.NoTools == "" && len(opts.DefaultToolModifiers) > 0 {
+		return registry, nil, errors.New("Invalid tools option: tool names cannot be mixed with +name or -name entries")
+	}
+	if opts.NoTools != "" && opts.NoTools != "all" && opts.NoTools != "builtin" {
+		return registry, nil, fmt.Errorf("invalid noTools selection %q", opts.NoTools)
+	}
+	// A `tools` list of only `+name` and `-name` entries changes the default selection instead of replacing it (none under NoTools); a list that mixes plain names or patterns in is rejected.
+	// upstream: sdk.ts:279-295 (getToolListError, toolModifiers, selectedToolNames, allowedToolNames)
+	if problem := icodingagent.GetToolListError(opts.DefaultToolModifiers); problem != "" {
+		return registry, nil, fmt.Errorf("Invalid tools option: %s", problem)
+	}
+	var modifiedSelection []string
+	if slices.ContainsFunc(opts.DefaultToolModifiers, icodingagent.IsToolModifier) {
+		var defaultToolNames []string
+		if opts.NoTools == "" {
+			defaultToolNames = services.SettingsManager().ResolvedDefaultTools()
+		}
+		modifiedSelection = icodingagent.ApplyToolModifiers(defaultToolNames, opts.DefaultToolModifiers)
+	}
+	if opts.NoTools == "all" && opts.AllowedTools == nil {
+		registry.allowed = map[string]struct{}{}
+		for _, name := range modifiedSelection {
+			registry.allowed[name] = struct{}{}
+		}
+	}
+	registry.filter = registry.compileFilter()
+	var activeNames []string
+	if !opts.SkipBuiltinTools {
+		var baseTools []agent.AgentTool
+		var overrideKeys []string
+		if opts.BaseToolsOverride == nil {
+			toolsOpts := tools.ToolsOptionsFromSettings(services.Settings(), filepath.Join(services.AgentDir(), "bin"))
+			toolsOpts.BackgroundJobs = opts.BackgroundJobs
+			toolsOpts.Remote = opts.Remote
+			if (opts.Remote == nil || !opts.Remote.Active()) && opts.RemoteTarget == "" && os.Getenv("PI_REMOTE") == "" {
+				toolsOpts.Checks = opts.BackgroundChecks
+			}
+			baseTools = tools.CreateAllTools(services.CWD(), toolsOpts)
+		} else {
+			// upstream: agent-session.ts:3614-3620: an override is the minimal definition createToolDefinitionFromAgentTool synthesizes, with no built-in prompt snippet.
+			for _, entry := range opts.BaseToolsOverride {
+				definition, err := tools.ToolDefinitionFromAgentTool(entry.Tool)
+				if err != nil {
+					return registry, nil, err
+				}
+				overrideKeys = append(overrideKeys, entry.Name)
+				registry.base = append(registry.base, sessionToolEntry{tool: entry.Tool, registration: extension.RegisteredTool{Definition: definition, SourceInfo: syntheticToolSource(entry.Tool.Name(), "builtin")}})
+			}
+		}
+		for _, tool := range baseTools {
+			definition := builtinToolDefinition(tool)
+			registry.base = append(registry.base, sessionToolEntry{tool: tool, registration: extension.RegisteredTool{Definition: definition, SourceInfo: syntheticToolSource(tool.Name(), "builtin")}})
+		}
+		switch {
+		case modifiedSelection != nil && opts.AllowedTools == nil && opts.InitialActiveToolNames == nil:
+			activeNames = slices.Clone(modifiedSelection)
+		case opts.AllowedTools != nil:
+			// upstream: agent-session.ts:3552-3562: the initial names keep the caller's order; the registered tools the allowlist names or matches follow in registry order.
+			activeNames = append(activeNames, opts.InitialActiveToolNames...)
+			for _, entry := range registry.base {
+				// Naming or matching a built-in tool activates it (agent-session.ts _refreshToolRegistry).
+				if registry.filter.Names(entry.tool.Name()) {
+					activeNames = append(activeNames, entry.tool.Name())
+				}
+			}
+		case opts.InitialActiveToolNames != nil:
+			// upstream: sdk.ts:274-276, agent-session.ts:3552-3554: the initial names, which may also name extension tools, stay in the caller's order; selectTools keeps the names the registry admits. An explicit list outranks NoTools (initialActiveToolNames = tools ?? (noTools ? [] : defaults)).
+			activeNames = slices.Clone(opts.InitialActiveToolNames)
+		case opts.NoTools != "":
+		case opts.BaseToolsOverride != nil:
+			// upstream: agent-session.ts:3650-3652
+			activeNames = append(activeNames, overrideKeys...)
+		default:
+			activeNames = icodingagent.ApplyToolModifiers(services.SettingsManager().ResolvedDefaultTools(), opts.DefaultToolModifiers)
+		}
+	}
+	var customActiveNames []string
+	for _, tool := range opts.Tools {
+		definition, err := toolDefinition(tool)
+		if err != nil {
+			return registry, nil, err
+		}
+		if _, defined := tool.(*bridgeTool); !defined {
+			definition.PromptSnippet = ""
+			definition.PromptGuidelines = nil
+		}
+		registry.custom = append(registry.custom, sessionToolEntry{tool: tool, registration: extension.RegisteredTool{Definition: definition, SourceInfo: syntheticToolSource(tool.Name(), "sdk")}})
+		customActiveNames = append(customActiveNames, tool.Name())
+	}
+	for _, definition := range opts.CustomTools {
+		registration := extension.RegisteredTool{Definition: definition, SourceInfo: syntheticToolSource(definition.Name, "sdk")}
+		tool, err := newBridgeTool(registration)
+		if err != nil {
+			return registry, nil, err
+		}
+		registry.custom = append(registry.custom, sessionToolEntry{tool: tool, registration: registration})
+		customActiveNames = append(customActiveNames, definition.Name)
+	}
+	if err := registry.refresh(opts.Runner); err != nil {
+		return registry, nil, err
+	}
+	// upstream: agent-session.ts:3660-3666, 3702, 3733-3736: extension-registered tools precede caller custom tools.
+	if opts.Runner != nil && !registry.skipExtensions {
+		for _, tool := range opts.Runner.Tools() {
+			if ExtensionToolStartsActive(tool.Definition, registry.allowed) {
+				activeNames = append(activeNames, tool.Definition.Name)
+			}
+		}
+	}
+	activeNames = append(activeNames, customActiveNames...)
+	if (opts.Remote != nil && opts.Remote.Active()) || opts.RemoteTarget != "" || os.Getenv("PI_REMOTE") != "" {
+		filtered := activeNames[:0]
+		for _, name := range activeNames {
+			switch name {
+			case "grep", "find", "ls", "project_search":
+				continue
+			}
+			filtered = append(filtered, name)
+		}
+		activeNames = filtered
+	} else if opts.AllowedTools == nil && services.CWD() != "" && slices.Contains(activeNames, "project_search") && countProjectFilesUpTo(services.CWD(), 151) <= 150 {
+		filtered := activeNames[:0]
+		for _, name := range activeNames {
+			if name == "project_search" {
+				continue
+			}
+			filtered = append(filtered, name)
+		}
+		activeNames = filtered
+	}
+	return registry, registry.selectTools(activeNames), nil
+}
+
+func countProjectFilesUpTo(root string, limit int) int {
+	count := 0
+	stop := errors.New("limit reached")
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".git" || name == "node_modules" || name == ".micropi" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		count++
+		if count >= limit {
+			return stop
+		}
+		return nil
+	})
+	return count
+}
+
+// compileFilter compiles `--tools` and `--exclude-tools` with the Piglet tool scope.
+func (r *sessionToolRegistry) compileFilter() extension.ToolFilter {
+	return extension.NewToolFilter(r.allowed, r.excluded).WithScope(r.scope)
+}
+
+// scopeInfo is the part of a tool's info the registry scope reads.
+func scopeInfo(entry sessionToolEntry) extension.ToolInfo {
+	definition := entry.registration.Definition
+	info := extension.ToolInfo{Name: entry.tool.Name(), SourceInfo: entry.registration.SourceInfo, Exposure: toolExposureOf(definition)}
+	if definition.Namespace != nil {
+		info.Namespace = definition.Namespace
+	}
+	return info
+}
+
+func (r *sessionToolRegistry) refresh(runner *inproc.Runner) error {
+	entries := slices.Clone(r.base)
+	var wrapped map[string]wrappedTool
+	if runner != nil && !r.skipExtensions {
+		registrations := runner.Tools()
+		wrapped = make(map[string]wrappedTool, len(registrations))
+		for _, registration := range registrations {
+			name := registration.Definition.Name
+			source, _ := runner.ToolSourceInfo(name)
+			registration.SourceInfo = source
+			cached, hit := r.wrapped[name]
+			if !hit || registration.Revision == 0 || cached.revision != registration.Revision || cached.runner != runner {
+				tool, err := WrapRegisteredTool(registration, runner)
+				if err != nil {
+					return err
+				}
+				cached = wrappedTool{revision: registration.Revision, runner: runner, tool: tool}
+			}
+			wrapped[name] = cached
+			entries = append(entries, sessionToolEntry{tool: cached.tool, registration: registration})
+		}
+	}
+	entries = append(entries, r.custom...)
+	indexes := make(map[string]int)
+	var admitted []sessionToolEntry
+	var hidden []extension.HiddenTool
+	for _, entry := range entries {
+		name := entry.tool.Name()
+		info := scopeInfo(entry)
+		if !r.filter.AllowsTool(info) {
+			// The scope's own removals are the startup notice's subject; `--tools` and `--exclude-tools` removals are not.
+			if r.scope != nil && r.filter.Allows(name) {
+				if tool, ok := r.scope.HiddenInfo(info); ok {
+					hidden = append(hidden, tool)
+				}
+			}
+			continue
+		}
+		if index, exists := indexes[name]; exists {
+			admitted[index] = entry
+		} else {
+			indexes[name] = len(admitted)
+			admitted = append(admitted, entry)
+		}
+	}
+	if r.scope != nil {
+		r.scope.SetHidden(hidden)
+	}
+	r.entries = admitted
+	r.index = make(map[string]int, len(admitted))
+	for i, entry := range admitted {
+		r.index[entry.tool.Name()] = i
+	}
+	r.wrapped = wrapped
+	return nil
+}
+
+// entry is the admitted entry of name.
+func (r *sessionToolRegistry) entry(name string) (sessionToolEntry, bool) {
+	index, ok := r.index[name]
+	if !ok {
+		return sessionToolEntry{}, false
+	}
+	return r.entries[index], true
+}
+
+// extensionToolNames names the tools of runner and the SDK custom tools, the registrations upstream's _refreshToolRegistry wraps as extension tools (agent-session.ts:3434-3441).
+func (r *sessionToolRegistry) extensionToolNames(runner *inproc.Runner) map[string]struct{} {
+	names := make(map[string]struct{})
+	if runner != nil && !r.skipExtensions {
+		for _, registration := range runner.Tools() {
+			names[registration.Definition.Name] = struct{}{}
+		}
+	}
+	for _, entry := range r.custom {
+		names[entry.tool.Name()] = struct{}{}
+	}
+	return names
+}
+
+func (r *sessionToolRegistry) selectTools(names []string) []agent.AgentTool {
+	result := make([]agent.AgentTool, 0, len(names))
+	seen := make(map[string]struct{})
+	registry := make(map[string]agent.AgentTool, len(r.entries))
+	for _, entry := range r.entries {
+		registry[entry.tool.Name()] = entry.tool
+	}
+	for _, name := range names {
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		if tool := registry[name]; tool != nil {
+			result = append(result, tool)
+			seen[name] = struct{}{}
+		}
+	}
+	return result
+}
+func (r *sessionToolRegistry) tools() []agent.AgentTool {
+	result := make([]agent.AgentTool, len(r.entries))
+	for i, entry := range r.entries {
+		result[i] = entry.tool
+	}
+	return result
+}
+
+// GetAllTools returns every admitted definition, including inactive builtins, with its registration metadata.
+func (s *Session) GetAllTools() []extension.ToolInfo {
+	s.toolRegistryMu.RLock()
+	defer s.toolRegistryMu.RUnlock()
+	result := make([]extension.ToolInfo, 0, len(s.toolRegistry.entries))
+	for _, entry := range s.toolRegistry.entries {
+		definition := entry.registration.Definition
+		info := extension.ToolInfo{Name: definition.Name, Description: definition.Description, Parameters: slices.Clone(definition.Parameters), PromptGuidelines: slices.Clone(definition.PromptGuidelines), SourceInfo: entry.registration.SourceInfo, Exposure: toolExposureOf(definition)}
+		if definition.Namespace != nil {
+			info.Namespace = new(*definition.Namespace)
+		}
+		if definition.Annotations != nil {
+			info.Annotations = new(*definition.Annotations)
+		}
+		info.ReachesTools = definition.ReachesTools
+		result = append(result, info)
+	}
+	return result
+}
+
+// ToolScope is the Piglet tool scope the Session was created with (SessionOptions.ToolScope), nil without one.
+func (s *Session) ToolScope() *extension.ToolScope {
+	s.toolRegistryMu.RLock()
+	defer s.toolRegistryMu.RUnlock()
+	return s.toolRegistry.scope
+}
+
+// GetToolDefinition returns the admitted definition for name.
+func (s *Session) GetToolDefinition(name string) (extension.ToolDefinition, bool) {
+	s.toolRegistryMu.RLock()
+	defer s.toolRegistryMu.RUnlock()
+	return s.toolDefinitionLocked(name)
+}
+
+// BindExtensions stores the mode bindings the argument defines, always applies the stored bindings to the runner, awaits the configured session_start event and admits tools registered by its handlers before returning (upstream bindExtensions, agent-session.ts:3258-3282). A host that binds with empty bindings still marks the extensions bound: Reload then restarts them (Pi e03dca7a3843 _extensionsBound). Attach an event consumer before binding when handlers can send messages.
+func (s *Session) BindExtensions(ctx context.Context, bindings ExtensionBindings) error {
+	merged := s.mergeExtensionBindings(bindings)
+	s.extensionsBound.Store(true)
+	runner := s.currentRunner()
+	if runner == nil {
+		return nil
+	}
+	s.bindSessionExtensions(runner, merged)
+	event := s.sessionStartEvent
+	if event.Type == "" {
+		event = extension.SessionStartEvent{Type: "session_start", Reason: "startup"}
+	}
+	if _, err := runner.Emit(ctx, event); err != nil {
+		return err
+	}
+	// upstream: agent-session.ts:3207 (bindExtensions)
+	runner.ReportUnhandledMcpServers()
+	if err := s.extendResourcesFromExtensions(ctx, event.Reason); err != nil {
+		return err
+	}
+	return s.RefreshTools()
+}
+
+// RefreshTools rebuilds registered definitions and their prompt contributions, preserves active selection, and activates newly admitted names.
+func (s *Session) RefreshTools() error {
+	return s.refreshTools(false)
+}
+
+// RefreshToolsAfterReload is the tool registry rebuild of upstream's reload(): RefreshTools, except that without a tool allowlist every extension or SDK tool that activates on registration is active again, including one disabled during the session.
+//
+// upstream: agent-session.ts:3604-3609 (_buildRuntime with includeAllExtensionTools), 3507-3510
+//
+// Active tools that the reloaded extensions register later, such as MCP tools, are pending until then (upstream: agent-session.ts reload).
+func (s *Session) RefreshToolsAfterReload() error {
+	return s.refreshTools(true)
+}
+
+// refreshTools rebuilds the registry. Only a reload passes includeAllExtensionTools.
+func (s *Session) refreshTools(includeAllExtensionTools bool) error {
+	s.loadout.applyMu.Lock()
+	defer s.loadout.applyMu.Unlock()
+	s.toolRegistryMu.Lock()
+	defer s.toolRegistryMu.Unlock()
+	if includeAllExtensionTools {
+		// The active tools become pending under the same locks as the rebuild, as reload() marks them and calls _buildRuntime without yielding, so no loadout change or registry refresh runs in between.
+		s.addPendingTools(s.ActiveToolNames())
+		s.restoredToolNames = s.ActiveToolNames()
+	}
+	// upstream: agent-session.ts:3457-3459: only tools that were already activated on registration count as known, so a tool whose exposure changes to `direct` or `model-only` is activated like a new tool.
+	previous := make(map[string]struct{}, len(s.tools))
+	for _, tool := range s.tools {
+		if definition, ok := s.toolDefinitionLocked(tool.Name()); ok && toolActivatesOnRegistration(definition) || !ok {
+			previous[tool.Name()] = struct{}{}
+		}
+	}
+	// upstream: agent-session.ts:3598-3609: a reload activates the tools it newly added to defaultTools.
+	active := append(s.ActiveToolNames(), s.toolRegistry.addedDefaultTools...)
+	s.toolRegistry.addedDefaultTools = nil
+	if err := s.toolRegistry.refresh(s.currentRunner()); err != nil {
+		return err
+	}
+	s.tools = s.toolRegistry.tools()
+	// upstream: agent-session.ts:3507-3510: a reload without an allowlist activates every extension or SDK tool that activates on registration.
+	var reactivated map[string]struct{}
+	if includeAllExtensionTools && !s.toolRegistry.filter.HasAllowlist() {
+		reactivated = s.toolRegistry.extensionToolNames(s.currentRunner())
+	}
+	for _, tool := range s.tools {
+		_, known := previous[tool.Name()]
+		_, reactivate := reactivated[tool.Name()]
+		definition, _ := s.toolDefinitionLocked(tool.Name())
+		// upstream: agent-session.ts:3553-3572: with an allowlist, naming or matching a tool activates it when it is declarable (MCP tools the allowlist keeps without matching them stay inactive); without one, a new tool activates only when it activates on registration.
+		if s.toolRegistry.filter.HasAllowlist() {
+			if s.toolRegistry.filter.Names(tool.Name()) && toolIsDeclarable(definition) {
+				active = append(active, tool.Name())
+			}
+		} else if (!known || reactivate) && toolActivatesOnRegistration(definition) {
+			active = append(active, tool.Name())
+		}
+	}
+	// upstream: agent-session.ts _buildRuntime: pending tools that are registered now become active.
+	active = append(active, s.pendingToolNames...)
+	var names []string
+	for _, tool := range s.toolRegistry.selectTools(active) {
+		names = append(names, tool.Name())
+	}
+	s.setActiveToolsByName(names)
+	return nil
+}
+
+// ReloadOption configures Session.Reload (agent-session.ts reload(options)).
+type ReloadOption func(*reloadOptions)
+
+type reloadOptions struct {
+	beforeSessionStart func(context.Context) error
+}
+
+// WithBeforeSessionStart runs fn after the new runner is bound and before it receives session_start, only when the mode bound its UI or command
+// actions (reload's options.beforeSessionStart, agent-session.ts:3676-3678). An error from fn fails the reload.
+func WithBeforeSessionStart(fn func(context.Context) error) ReloadOption {
+	return func(o *reloadOptions) { o.beforeSessionStart = fn }
+}
+
+// Reload is AgentSession.reload (agent-session.ts:3640-3685): a session that is running or compacting rejects it first; otherwise the old extensions receive session_shutdown with reason reload and go stale;
+// the settings and the resource loader are read again; the loader's extensions build a new runner that keeps the previous flag values; the
+// tools a settings reload newly added to defaultTools activate; and, when the host bound the extensions (BindExtensions, also with empty bindings), the new runner gets the stored bindings
+// and session_start with reason reload, then the resources its resources_discover handlers contribute. A failure before the new runner exists
+// leaves the old one stale, as Pi does.
+func (s *Session) Reload(ctx context.Context, options ...ReloadOption) error {
+	// Pi c3b938e3e rejects a reload while the session is running or compacting, before session_shutdown or any
+	// runner invalidation, so a running extension tool keeps its context (Pi 1.5.0 reloads and the tool fails with a stale-context error).
+	if s.IsStreaming() {
+		return errors.New("Wait for the current response to finish before reloading.")
+	}
+	if s.IsCompacting() {
+		return errors.New("Wait for compaction to finish before reloading.")
+	}
+	var reload reloadOptions
+	for _, option := range options {
+		option(&reload)
+	}
+	previous := s.currentRunner()
+	var flagValues map[string]any
+	// keepsRuntime is set when the rebuilt runner binds the previous runner's runtime.
+	keepsRuntime := false
+	if previous != nil {
+		flagValues = previous.GetFlagValues()
+		if previous.HasHandlers(icodingagent.EventSessionShutdown) {
+			if _, err := previous.Emit(ctx, extension.SessionShutdownEvent{Type: icodingagent.EventSessionShutdown, Reason: "reload"}); err != nil {
+				return err
+			}
+		}
+		// upstream: agent-session.ts:3663-3664 marks the old runner stale right after session_shutdown. Its runtime stays active until the reload knows whether the rebuilt runner keeps it: a loader whose extensions registered against the same runtime hands it to the new runner, and invalidating it would make the new runner stale too. A runtime an earlier failed reload invalidated is made active again here, for the loader that registers against it.
+		if previous.Runtime() != nil {
+			previous.Runtime().Reactivate()
+		}
+		previous.InvalidateForReload("")
+		defer func() {
+			if !keepsRuntime && previous.Runtime() != nil {
+				previous.Runtime().Invalidate(previous.StaleMessage())
+			}
+		}()
+	}
+	s.ReloadSettings()
+	// The tools the settings reload staged activate in the runtime rebuild below; any other exit drops them (agent-session.ts:3598-3609).
+	defer s.DiscardAddedDefaultTools()
+	// The API provider registry returns to the built-in providers before the extensions load again, so a provider a removed extension registered is gone (agent-session.ts:3656 resetApiProviders).
+	ai.ResetAPIProviders()
+	loader := s.ResourceLoader()
+	if err := reloadResourceLoader(ctx, loader); err != nil {
+		return err
+	}
+	loaded := loader.GetExtensions()
+	keepsRuntime = previous != nil && loaded.Runtime != nil && loaded.Runtime == previous.Runtime()
+	runner, err := s.ReloadExtensions(loaded.Extensions, loaded.Runtime)
+	if err != nil {
+		return err
+	}
+	for name, value := range flagValues {
+		runner.SetFlagValue(name, value)
+	}
+	bindings := s.extensionBindings.Load()
+	if bindings == nil {
+		return nil
+	}
+	s.bindSessionExtensions(runner, *bindings)
+	// upstream: agent-session.ts:3865-3870 (Pi e03dca7a3843): only a session whose host called bindExtensions, even with empty bindings, replays session_start on reload.
+	if !s.extensionsBound.Load() {
+		return nil
+	}
+	if reload.beforeSessionStart != nil {
+		if err := reload.beforeSessionStart(ctx); err != nil {
+			return err
+		}
+	}
+	if _, err := runner.Emit(ctx, extension.SessionStartEvent{Type: "session_start", Reason: "reload"}); err != nil {
+		return err
+	}
+	runner.ReportUnhandledMcpServers()
+	return s.extendResourcesFromExtensions(ctx, "reload")
+}
+
+// contextResourceLoader is a resource loader whose reload runs under the context of the call that asked for it, as Pi's reload runs for the awaiting caller.
+type contextResourceLoader interface {
+	ReloadWith(ctx context.Context, options ...ResourceLoaderReloadOptions) error
+}
+
+// reloadResourceLoader reloads loader under ctx when it can take one.
+func reloadResourceLoader(ctx context.Context, loader ResourceLoader) error {
+	if withContext, ok := loader.(contextResourceLoader); ok {
+		return withContext.ReloadWith(ctx)
+	}
+	return loader.Reload()
+}
+
+// usesDefaultTools reports whether the session's initial tools come from the defaultTools setting.
+// upstream: sdk.ts:472 `(options.tools === undefined || toolModifiers !== undefined) && !options.noTools`; agent-session.ts:500 `config.usesDefaultTools ?? false`, so a session built on a base tool override does not use them unless it says so.
+func usesDefaultTools(opts SessionOptions) bool {
+	if opts.UsesDefaultTools != nil {
+		return *opts.UsesDefaultTools
+	}
+	return opts.BaseToolsOverride == nil && opts.AllowedTools == nil && opts.NoTools == "" && !opts.SkipBuiltinTools
+}

@@ -1,0 +1,195 @@
+package documents
+
+import (
+	"context"
+
+	"github.com/MichaelKinsy/PiG/chord"
+	"github.com/MichaelKinsy/PiG/chord/delta"
+)
+
+// Ports packages/chord/src/documents/handles.ts
+//
+// Document handles (slice 6a §1.2): what `self.state` returns, one per attempt and definition, a thin view of its
+// object's slot bound to the attempt's seal token and the definition's version.
+//
+// Go forced differences: `HandleOf<D>` and the generic parameters `T` and `Key` are designed out (documents are
+// *JsonObject, a draft is *delta.Object, a keyed handle's keys are `any`: a string, or for a host-keyed definition an
+// address of its kind, checked by the slot's KeyOf); a callback that throws returns an error; `keys` is a
+// HandleKeyIterator (Pi's AsyncIterable).
+
+// SingletonHandle is a singleton document: a watchable that always has a value (`initial()` until written, and after
+// a retire).
+type SingletonHandle interface {
+	// Value is the current value.
+	Value() (*JsonObject, error)
+	// Watch is a watch holding the current value, then one frame per change.
+	Watch(ctx context.Context) (chord.WatchHandle[delta.JsonValue], error)
+	// Change is one transaction that drafts this document and passes the draft to fn.
+	Change(ctx context.Context, fn func(draft *delta.Object) (any, error)) (any, error)
+	// Retire is one transaction that retires this document: back to `initial()`.
+	Retire(ctx context.Context) error
+}
+
+// KeyedHandle is keyed documents: many per object, by key: a string, or an address of the host kind the definition is
+// keyed by (a contracts.Address of that kind, stored by its key; anything else is invalid/args). Not a watchable
+// itself: each key is, through Watch and At; a live collection is a singleton holding it.
+type KeyedHandle interface {
+	// Get is the document's value, nil when absent (persisted and not in memory: loaded on the object's line).
+	Get(ctx context.Context, key any) (*JsonObject, error)
+	// Keys is the keys of the present documents, in code point order of their stored keys; a host-keyed handle's are
+	// addresses.
+	Keys(ctx context.Context) *HandleKeyIterator
+	// Watch is a watch of the document at key, nil when absent. It follows the address: a retirement is one frame with
+	// `retired: true` and `initial()`, a later creation a root replacement; it ends with the object.
+	Watch(ctx context.Context, key any) (chord.WatchHandle[delta.JsonValue], error)
+	// At is, in the factory only, the document at key as a watchable (a state member, a derive source, an `on`
+	// source), `initial()` while absent, loaded before the object goes live and pinned while this attempt lives.
+	At(key any) (*KeySource, error)
+	// Change is one transaction that drafts the document at key and passes the draft to fn.
+	Change(ctx context.Context, key any, fn func(draft *delta.Object) (any, error)) (any, error)
+	// Retire is one transaction that retires the document at key (a no-op when absent).
+	Retire(ctx context.Context, key any) error
+}
+
+// Singleton is a singleton's handle. Reads go to the slot (allowed after the seal); Change and Retire take the line
+// under the attempt's token. Exposed as a member or read by a derive, it resolves to the slot itself.
+type Singleton struct {
+	Slot  *SingletonSlot
+	Token *SealToken
+	// Version is the version of the definition it was declared with: the slot refuses it once its values are newer (R15).
+	Version int
+}
+
+// NewSingleton is the handle of slot for an attempt sealed by token, declared at version.
+func NewSingleton(slot *SingletonSlot, token *SealToken, version int) *Singleton {
+	return &Singleton{Slot: slot, Token: token, Version: version}
+}
+
+// Value is the current value, after the handle's version fence. It is read in a section of the owner (inline in one): the
+// slot is the section's state, and Go code reads it from the goroutines of its jobs, which race the commits of the object's
+// other changes and its seal otherwise (Watch takes its section the same way).
+func (handle *Singleton) Value() (*JsonObject, error) {
+	if handle.Slot.owner.InSection() {
+		return handle.read()
+	}
+	return handle.readFromOutside()
+}
+
+// read is Value inside a section of the owner.
+func (handle *Singleton) read() (*JsonObject, error) {
+	if err := handle.Slot.definition.AssertVersion(handle.Version); err != nil {
+		return nil, err
+	}
+	return handle.Slot.Object()
+}
+
+// readFromOutside is Value for a caller outside the host's loop (the closure is made here only).
+func (handle *Singleton) readFromOutside() (value *JsonObject, err error) {
+	handle.Slot.owner.Do(func() { value, err = handle.read() })
+	return value, err
+}
+
+// Watch is a watch of the document.
+func (handle *Singleton) Watch(ctx context.Context) (chord.WatchHandle[delta.JsonValue], error) {
+	var err error
+	handle.Slot.owner.Do(func() { err = handle.Slot.definition.AssertVersion(handle.Version) })
+	if err != nil {
+		return nil, err
+	}
+	var watch *chord.Watch[delta.JsonValue]
+	handle.Slot.owner.Do(func() { watch, err = handle.Slot.OpenWatch(ctx) })
+	if err != nil {
+		return nil, err
+	}
+	return watch, nil
+}
+
+// Change is one transaction that drafts this document and passes the draft to fn.
+func (handle *Singleton) Change(ctx context.Context, fn func(draft *delta.Object) (any, error)) (any, error) {
+	return handle.Slot.owner.Tx(func(tx *Transaction) (any, error) {
+		draft, err := tx.Draft(handle)
+		if err != nil {
+			return nil, err
+		}
+		return fn(draft)
+	}, handle.Token, ctx)
+}
+
+// Retire is one transaction that retires this document: back to `initial()`.
+func (handle *Singleton) Retire(ctx context.Context) error {
+	_, err := handle.Slot.owner.Tx(func(tx *Transaction) (any, error) { return nil, tx.Retire(handle) }, handle.Token, ctx)
+	return err
+}
+
+// KeyDeclarer is who declares an attempt's `at(key)` pins: its factory, which alone may (the attempt).
+type KeyDeclarer interface {
+	// At pins key of slot for the attempt and returns its source; fails outside the factory.
+	At(slot *KeyedSlot, key string) (*KeySource, error)
+}
+
+// Keyed is a keyed handle: reads go to the slot; Change, Retire and cold reads take the line under the attempt's token.
+// A host-keyed one takes addresses (the slot's KeyOf checks them) and yields them from Keys.
+type Keyed struct {
+	Slot  *KeyedSlot
+	Token *SealToken
+	// Version is as Singleton.Version.
+	Version  int
+	declarer KeyDeclarer
+}
+
+// NewKeyed is the handle of slot for an attempt sealed by token, declared at version, whose At pins declarer takes.
+func NewKeyed(slot *KeyedSlot, token *SealToken, version int, declarer KeyDeclarer) *Keyed {
+	return &Keyed{Slot: slot, Token: token, Version: version, declarer: declarer}
+}
+
+func (handle *Keyed) access() Access { return Access{Token: handle.Token, Version: handle.Version} }
+
+// Get is the value at key, nil when absent.
+func (handle *Keyed) Get(ctx context.Context, key any) (*JsonObject, error) {
+	return handle.Slot.getHandle(key, handle.access(), ctx)
+}
+
+// Keys is the keys of the present documents, in code point order of their stored keys.
+func (handle *Keyed) Keys(ctx context.Context) *HandleKeyIterator {
+	return handle.Slot.HandleKeys(handle.access(), ctx)
+}
+
+// Watch is a watch of the document at key, nil when absent.
+func (handle *Keyed) Watch(ctx context.Context, key any) (chord.WatchHandle[delta.JsonValue], error) {
+	watch, err := handle.Slot.watchHandle(key, handle.access(), ctx)
+	if err != nil || watch == nil {
+		return nil, err
+	}
+	return watch, nil
+}
+
+// At is the document at key as a source, pinned by the attempt's factory.
+func (handle *Keyed) At(key any) (*KeySource, error) {
+	stored, err := handle.Slot.KeyOf(key)
+	if err != nil {
+		return nil, err
+	}
+	return handle.declarer.At(handle.Slot, stored)
+}
+
+// Change is one transaction that drafts the document at key and passes the draft to fn.
+func (handle *Keyed) Change(ctx context.Context, key any, fn func(draft *delta.Object) (any, error)) (any, error) {
+	return handle.Slot.owner.Tx(func(tx *Transaction) (any, error) {
+		draft, err := tx.Draft(handle, key)
+		if err != nil {
+			return nil, err
+		}
+		return fn(draft)
+	}, handle.Token, ctx)
+}
+
+// Retire is one transaction that retires the document at key.
+func (handle *Keyed) Retire(ctx context.Context, key any) error {
+	_, err := handle.Slot.owner.Tx(func(tx *Transaction) (any, error) { return nil, tx.Retire(handle, key) }, handle.Token, ctx)
+	return err
+}
+
+var (
+	_ SingletonHandle = (*Singleton)(nil)
+	_ KeyedHandle     = (*Keyed)(nil)
+)

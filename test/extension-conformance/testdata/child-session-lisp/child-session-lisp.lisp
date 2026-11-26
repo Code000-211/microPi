@@ -1,0 +1,437 @@
+(defpackage "child-session-lisp" (:use "COMMON-LISP"))
+(in-package "child-session-lisp")
+
+(defun text-of (message)
+  (let ((content (pig:jget message "content")))
+    (if (and (vectorp content) (not (stringp content)) (plusp (length content)))
+        (let ((text (pig:jget (aref content 0) "text"))) (if (stringp text) text ""))
+        "")))
+
+(defun sorted-keys (table)
+  (let ((keys '()))
+    (when (hash-table-p table) (maphash (lambda (key value) (declare (ignore value)) (push key keys)) table))
+    (coerce (sort keys #'string<) 'simple-vector)))
+
+(defun event-name (event)
+  (let ((type (pig:jget event "type")))
+    (if (and (>= (length type) 8) (string= "message_" type :end2 8))
+        (concatenate 'string type ":" (pig:jget (pig:jget event "message") "role"))
+        type)))
+
+(defun quiet-resources (&rest more)
+  (apply #'pig:make-resource-options :no-extensions t :no-skills t :no-prompt-templates t :no-themes t :no-context-files t more))
+
+(defun sentinel-tool (name description handler)
+  (pig:child-tool name description (pig:from-json "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}},\"required\":[\"x\"]}") handler :label "sentinel"))
+
+(defun no-compaction () (pig:obj "compaction" (pig:obj "enabled" :false)))
+
+(defun string-or-empty (value) (if (stringp value) value ""))
+
+(defun split-lines (text)
+  (loop with start = 0
+        for end = (position #\Newline text :start start)
+        collect (subseq text start end)
+        while end do (setf start (1+ end))))
+
+(defun norm (message)
+  (if (or (null message) (equal message ""))
+      :null
+      (let ((lines (split-lines message)))
+        (pig:obj "first" (first lines)
+                 "docs" (coerce (loop for line in lines
+                                      for trimmed = (string-trim (list #\Space #\Tab) line)
+                                      when (and (>= (length trimmed) 3) (string= ".md" trimmed :start2 (- (length trimmed) 3)))
+                                        collect (subseq trimmed (1+ (or (position-if (lambda (c) (member c '(#\/ #\\))) trimmed :from-end t) -1))))
+                                'simple-vector)))))
+
+(defun child-run (ctx params)
+  (let ((events '()) (updates 0) (streamed "") (partial ""))
+    (let ((session (pig:ctx-create-agent-session
+                    ctx :model (pig:obj "provider" "sentinel" "id" "echo") :tools '("sentinel_tool") :in-memory t :settings (no-compaction)
+                        :resources (quiet-resources :append-system-prompt '("Child appendix"))
+                        :custom-tools (list (sentinel-tool "sentinel_tool" "uppercases x"
+                                                           (lambda (c args) (declare (ignore c)) (concatenate 'string (string-upcase (pig:jget args "x")) "!")))))))
+      (unwind-protect
+           (progn
+             (pig:agent-session-subscribe session
+                                          (lambda (event)
+                                            (push (event-name event) events)
+                                            (when (equal (pig:jget event "type") "message_update")
+                                              (incf updates)
+                                              (setf streamed (text-of (pig:jget event "message"))
+                                                    partial (text-of (pig:jref event "assistantMessageEvent" "partial"))))))
+             (pig:agent-session-prompt session (pig:jget params "prompt"))
+             (let* ((messages (pig:agent-session-messages session))
+                    (first (if (plusp (length messages)) (aref messages 0) (pig:obj)))
+                    (state (pig:agent-session-state session)))
+               (pig:to-json
+                (pig:obj "events" (coerce (reverse events) 'simple-vector) "updates" updates "streamed" streamed "partial" partial
+                         "roles" (map 'simple-vector (lambda (m) (pig:jget m "role")) messages)
+                         "system" (pig:obj "keys" (sorted-keys first) "role" (or (pig:jget first "role") :null) "content" (or (pig:jget first "content") :null)
+                                           "sections" (sorted-keys (pig:jget first "sections")) "toolsAdded" (or (pig:jget first "toolsAdded") :null))
+                         "final" (string-or-empty (pig:jget state "lastAssistantText")) "model" (pig:jref state "model" "id")
+                         "activeTools" (pig:jget state "activeTools") "file" (string-or-empty (pig:jget state "sessionFile"))
+                         "appendix" (if (search "Child appendix" (pig:jget state "systemPrompt")) t :false)))))
+        (pig:agent-session-dispose session)))))
+
+(defun hanging-tool (started saw)
+  (sentinel-tool "sentinel_tool" "waits for its abort"
+                 (lambda (c args)
+                   (declare (ignore args))
+                   (sb-thread:signal-semaphore started)
+                   (loop until (pig:ctx-cancelled-p c) do (sleep 0.005))
+                   (when saw (setf (car saw) t))
+                   (error "aborted"))))
+
+(defun prompt-error (session text)
+  (handler-case (progn (pig:agent-session-prompt session text) "resolved")
+    (error (e) (princ-to-string e))))
+
+(defun child-lifecycle (ctx params)
+  (declare (ignore params))
+  (let* ((started (sb-thread:make-semaphore)) (saw (list nil))
+         (session (pig:ctx-create-agent-session
+                   ctx :model (pig:obj "provider" "sentinel" "id" "echo") :tools '("sentinel_tool") :in-memory t :settings (no-compaction)
+                       :resources (quiet-resources) :custom-tools (list (hanging-tool started saw))))
+         (events '()))
+    (unwind-protect
+         (progn
+           (pig:agent-session-subscribe session
+                                        (lambda (e)
+                                          (push (concatenate 'string (pig:jget e "type")
+                                                             (if (equal (pig:jget e "type") "agent_settled")
+                                                                 (format nil ":aborted=~A" (if (eq (pig:jget e "aborted") t) "true" "false"))
+                                                                 ""))
+                                                events)))
+           (let* ((running (sb-thread:make-thread (lambda () (pig:agent-session-prompt session "tool:hang")) :name "child-prompt"))
+                  (concurrent (progn (sb-thread:wait-on-semaphore started :timeout 10) (prompt-error session "again"))))
+             (pig:agent-session-abort session)
+             (sb-thread:join-thread running :default nil :timeout 10)
+             (let* ((messages (pig:agent-session-messages session))
+                    (out (pig:obj "concurrentPrompt" concurrent "toolSawAbort" (if (car saw) t :false)
+                                  "idleAfterAbort" (if (eq (pig:jget (pig:agent-session-state session) "isStreaming") t) :false t)
+                                  "tail" (coerce (reverse (subseq events 0 (min 4 (length events)))) 'simple-vector)
+                                  "lastRole" (pig:jget (aref messages (1- (length messages))) "role"))))
+               (pig:agent-session-dispose session)
+               (setf (gethash "afterDispose" out) (prompt-error session "after dispose"))
+               (pig:to-json out))))
+      (pig:agent-session-dispose session))))
+
+(defun child-hold (ctx params)
+  (declare (ignore params))
+  (let* ((started (sb-thread:make-semaphore))
+         (session (pig:ctx-create-agent-session
+                   ctx :model (pig:obj "provider" "sentinel" "id" "echo") :tools '("sentinel_tool") :in-memory t
+                       :resources (quiet-resources) :custom-tools (list (hanging-tool started nil)))))
+    (sb-thread:make-thread (lambda () (ignore-errors (pig:agent-session-prompt session "tool:hang"))) :name "child-hold")
+    (sb-thread:wait-on-semaphore started :timeout 10)
+    (pig:to-json (pig:obj "held" t))))
+
+(defun child-errors (ctx params)
+  (declare (ignore params))
+  (let ((out (pig:obj)))
+    (loop for (name model) in (list (list "no-key" (pig:obj "provider" "nokey" "id" "locked")) (list "no-model" nil))
+          do (let* ((session (pig:ctx-create-agent-session ctx :model model :in-memory t :settings (no-compaction) :resources (quiet-resources)))
+                    (error-text (let ((text (prompt-error session "hi"))) (if (equal text "resolved") "" text)))
+                    (state (pig:agent-session-state session)))
+               (pig:agent-session-dispose session)
+               (setf (gethash name out)
+                     (pig:obj "fallback" (norm (pig:agent-session-model-fallback-message session))
+                              "model" (or (pig:jref state "model" "id") :null) "promptError" (norm error-text)))))
+    (pig:to-json out)))
+
+(defun child-events (ctx params)
+  (let* ((scope (list (pig:obj "model" (pig:obj "provider" "sentinel" "id" "echo") "thinkingLevel" "high")
+                      (pig:obj "model" (pig:obj "provider" "nokey" "id" "locked") "thinkingLevel" "low")))
+         (probe (pig:jget params "probe"))
+         (loader (when (equal (pig:jget params "via") "loader")
+                   (let ((loader (pig:make-resource-loader ctx :cwd (pig:jget params "cwd") :agent-dir (pig:jget params "agentDir")
+                                                               :additional-extension-paths (list probe) :no-extensions t :no-skills t
+                                                               :no-prompt-templates t :no-themes t :no-context-files t)))
+                     (pig:loader-reload loader)
+                     loader)))
+         (session (apply #'pig:ctx-create-agent-session
+                         ctx :model (pig:obj "provider" "sentinel" "id" "echo") :in-memory t :settings (no-compaction) :scoped-models scope
+                             (if loader
+                                 (list :resource-loader loader)
+                                 (list :resources (quiet-resources :additional-extension-paths (list probe))))))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (pig:agent-session-subscribe session
+                                        (lambda (event)
+                                          (let ((name (event-name event)))
+                                            (when (equal name "entry_appended")
+                                              (setf name (concatenate 'string name ":" (pig:jref event "entry" "customType"))))
+                                            (push name seen))))
+           (pig:agent-session-bind-extensions session)
+           (pig:agent-session-prompt session "stream:3")
+           (pig:to-json (coerce (reverse seen) 'simple-vector)))
+      (pig:agent-session-dispose session))))
+
+(defun flag (value) (if value t :false))
+
+(defun error-text (thunk)
+  (handler-case (progn (funcall thunk) "") (error (e) (princ-to-string e))))
+
+(defun same-path-p (a b)
+  "Whether A and B name one path whatever their separators: the host answers as Node's path.resolve does, with backslashes on Windows, for a path built here with a slash."
+  (equal (substitute #\/ #\\ a) (substitute #\/ #\\ b)))
+
+(defun file-text (path)
+  (with-open-file (in path :external-format :utf-8)
+    (let ((text (make-string (file-length in))))
+      (subseq text 0 (read-sequence text in)))))
+
+(defun names-of (tools) (map 'simple-vector (lambda (tool) (pig:jget tool "name")) tools))
+
+(defun child-members (ctx params)
+  "The AgentSession members beyond prompt, steer and abort, each read or changed on the host's session and observed back (the Go fixture's child_members)."
+  (let* ((dir (pig:jget params "dir")) (out (pig:obj))
+         (sentinel (pig:obj "provider" "sentinel" "id" "echo"))
+         (session (pig:ctx-create-agent-session
+                   ctx :model sentinel :tools '("sentinel_tool") :in-memory t :settings (no-compaction) :resources (quiet-resources)
+                       :custom-tools (list (sentinel-tool "sentinel_tool" "uppercases x"
+                                                          (lambda (c args) (declare (ignore c)) (concatenate 'string (string-upcase (pig:jget args "x")) "!")))))))
+    (flet ((put (key value) (setf (gethash key out) value)))
+      (unwind-protect
+           (let ((id (pig:agent-session-current-session-id session)))
+             ;; reads of a fresh session
+             (put "sessionId" (flag (plusp (length id))))
+             (put "sessionFile" (or (pig:agent-session-current-session-file session) ""))
+             (put "model" (pig:jget (pig:agent-session-current-model session) "id"))
+             (put "isIdle" (flag (pig:agent-session-idle-p session)))
+             (put "isStreaming" (flag (pig:agent-session-streaming-p session)))
+             (put "isCompacting" (flag (pig:agent-session-compacting-p session)))
+             (put "isRetrying" (flag (pig:agent-session-retrying-p session)))
+             (put "retryAttempt" (pig:agent-session-retry-attempt session))
+             (put "pendingMessageCount" (pig:agent-session-pending-message-count session))
+             (put "steeringMode" (pig:agent-session-steering-mode session))
+             (put "followUpMode" (pig:agent-session-follow-up-mode session))
+             (put "autoCompactionEnabled" (flag (pig:agent-session-auto-compaction-enabled-p session)))
+             (put "autoRetryEnabled" (flag (pig:agent-session-auto-retry-enabled-p session)))
+             (put "sessionName" (or (pig:agent-session-session-name session) ""))
+             (put "scopedModelsStart" (length (pig:agent-session-scoped-models session)))
+             (put "promptTemplates" (length (pig:agent-session-prompt-templates session)))
+             (put "hasHandlers" (flag (pig:agent-session-has-extension-handlers-p session "agent_start")))
+             (put "lastTextStart" (flag (null (pig:agent-session-get-last-assistant-text session))))
+             (put "systemPromptLen" (flag (plusp (length (pig:agent-session-current-system-prompt session)))))
+             ;; changes read back: each value is one no default holds
+             (pig:agent-session-set-steering-mode session "all")
+             (pig:agent-session-set-follow-up-mode session "all")
+             (pig:agent-session-set-auto-compaction-enabled session t)
+             (pig:agent-session-set-auto-retry-enabled session nil)
+             (pig:agent-session-set-session-name session "named-by-members")
+             (pig:agent-session-set-scoped-models session (list (pig:obj "model" sentinel "thinkingLevel" "medium")))
+             (put "steeringModeSet" (pig:agent-session-steering-mode session))
+             (put "followUpModeSet" (pig:agent-session-follow-up-mode session))
+             (put "autoCompactionSet" (flag (pig:agent-session-auto-compaction-enabled-p session)))
+             (put "autoRetrySet" (flag (pig:agent-session-auto-retry-enabled-p session)))
+             (put "sessionNameSet" (pig:agent-session-session-name session))
+             (let ((scoped (pig:agent-session-scoped-models session)))
+               (when (= (length scoped) 1)
+                 (put "scopedModelsSet" (format nil "~A:~A" (pig:jref (aref scoped 0) "model" "id") (pig:jget (aref scoped 0) "thinkingLevel")))))
+             (put "cycleOnlyModel" (flag (null (pig:agent-session-cycle-model session :direction "forward"))))
+             (pig:agent-session-set-active-tools-by-name session '())
+             (put "activeToolsEmpty" (pig:agent-session-get-active-tool-names session))
+             (pig:agent-session-set-active-tools-by-name session '("sentinel_tool"))
+             (put "activeTools" (pig:agent-session-get-active-tool-names session))
+             (put "allTools" (names-of (pig:agent-session-get-all-tools session)))
+             (let ((definition (pig:agent-session-get-tool-definition session "sentinel_tool")))
+               (when definition (put "toolDefinition" (pig:jget definition "description"))))
+             (put "toolDefinitionMissing" (flag (null (pig:agent-session-get-tool-definition session "no_such_tool"))))
+             (put "setModelRefused" (error-text (lambda () (pig:agent-session-set-model session (pig:obj "provider" "nokey" "id" "locked")))))
+             (pig:agent-session-set-model session sentinel)
+             (pig:agent-session-set-thinking-level session "off")
+             (put "thinkingLevel" (pig:agent-session-current-thinking-level session))
+             (put "availableThinkingLevels" (pig:agent-session-get-available-thinking-levels session))
+             (pig:agent-session-set-cache-warming-mode session "off")
+             ;; a run, observed through the members
+             (pig:agent-session-prompt session "hello")
+             (let ((text (pig:agent-session-get-last-assistant-text session))) (when text (put "lastText" text)))
+             (let ((stats (pig:agent-session-get-session-stats session)))
+               (put "stats" (pig:obj "user" (pig:jget stats "userMessages") "assistant" (pig:jget stats "assistantMessages")
+                                     "total" (pig:jget stats "totalMessages") "idMatches" (flag (equal (pig:jget stats "sessionId") id)))))
+             (let ((forks (pig:agent-session-get-user-messages-for-forking session)))
+               (when (= (length forks) 1) (put "fork" (pig:jget (aref forks 0) "text")))
+               ;; awaited members: a user message that starts a run, the wait for it, a custom message, bash, compaction, tree navigation, exports, the bug report
+               (pig:agent-session-send-user-message session "via-send")
+               (pig:agent-session-wait-for-idle session)
+               (let ((text (pig:agent-session-get-last-assistant-text session))) (when text (put "sentText" text)))
+               (pig:agent-session-send-custom-message session "member-note" "noted" :display t)
+               (let ((bash (pig:agent-session-execute-bash session "echo member-bash")))
+                 (put "bash" (pig:obj "output" (pig:jget bash "output") "exit" (flag (eql (pig:jget bash "exitCode") 0)))))
+               (pig:agent-session-record-bash-result session "recorded-cmd"
+                                                     (pig:obj "output" "recorded-out" "exitCode" 0 "cancelled" :false "truncated" :false))
+               (put "bashRunning" (flag (pig:agent-session-bash-running-p session)))
+               (put "roles" (map 'simple-vector (lambda (m) (pig:jget m "role")) (pig:agent-session-messages session)))
+               (put "compactRefused" (error-text (lambda () (pig:agent-session-compact session))))
+               (when (= (length forks) 1)
+                 (let ((nav (pig:agent-session-navigate-tree session (pig:jget (aref forks 0) "entryId"))))
+                   (put "navigate" (pig:obj "cancelled" (flag (eq (pig:jget nav "cancelled") t)) "editorText" (or (pig:jget nav "editorText") ""))))))
+             (let* ((jsonl (concatenate 'string dir "/export.jsonl"))
+                    (path (pig:agent-session-export-to-jsonl session jsonl)))
+               (put "exportedJsonl" (flag (same-path-p path jsonl)))
+               (put "jsonlHasSession" (flag (search id (file-text jsonl)))))
+             (put "bugReport" (flag (let ((report (pig:agent-session-summarize-for-bug-report session :hint "member-hint")))
+                                      (and (>= (length report) 20) (string= "sentinel-model:echo:" report :end2 20)))))
+             (let ((cleared (pig:agent-session-clear-queue session)))
+               (put "cleared" (vector (length (pig:jget cleared "steering")) (length (pig:jget cleared "followUp")))))
+             (put "callableTools" (pig:agent-session-get-callable-tool-names session))
+             (put "steeringMessages" (length (pig:agent-session-get-steering-messages session)))
+             (put "followUpMessages" (length (pig:agent-session-get-follow-up-messages session)))
+             (put "routedModel" (flag (null (pig:agent-session-routed-model session))))
+             (put "pendingBash" (flag (pig:agent-session-has-pending-bash-messages-p session)))
+             (put "supportsThinking" (flag (pig:agent-session-supports-thinking-p session)))
+             (put "cycledThinking" (or (pig:agent-session-cycle-thinking-level session) ""))
+             (let ((status (pig:agent-session-cache-warming-status session))) (when status (put "cacheWarming" (pig:jget status "state"))))
+             (put "exportHtmlInMemory"
+                  (error-text (lambda () (pig:agent-session-export-to-html session :output-path (concatenate 'string dir "/export.html")))))
+             (pig:agent-session-reload session)
+             (put "afterReload" (flag (equal (pig:agent-session-current-session-id session) id)))
+             ;; A file-backed session: its sessionFile is a real path (the in-memory one above is empty, so a reader that returned the fallback would still pass there).
+             (let* ((persisted (pig:ctx-create-agent-session
+                                ctx :cwd dir :agent-dir (concatenate 'string dir "/agent") :model sentinel
+                                    :settings (no-compaction) :resources (quiet-resources)))
+                    (persisted-id (pig:agent-session-current-session-id persisted))
+                    (persisted-file (or (pig:agent-session-current-session-file persisted) "")))
+               (pig:agent-session-dispose persisted)
+               (put "fileBackedSessionFile"
+                    (flag (and (eql 0 (search dir persisted-file))
+                               (>= (length persisted-file) 6) (string= ".jsonl" persisted-file :start2 (- (length persisted-file) 6))
+                               (plusp (length persisted-id)) (search persisted-id persisted-file)))))
+             (pig:agent-session-abort-bash session)
+             (pig:agent-session-abort-branch-summary session)
+             (pig:agent-session-abort-compaction session)
+             (pig:agent-session-abort-retry session)
+             (pig:to-json out))
+        (pig:agent-session-dispose session)))))
+
+(defun child-snapshot (ctx params)
+  "The deprecated creation-time readers beside the live ones (the Go fixture's child_snapshot): a file-backed session with one active tool, then its active tools are emptied."
+  (let* ((dir (pig:jget params "dir"))
+         (session (pig:ctx-create-agent-session
+                   ctx :cwd dir :agent-dir (concatenate 'string dir "/agent") :model (pig:obj "provider" "sentinel" "id" "echo") :tools '("sentinel_tool")
+                       :settings (no-compaction) :resources (quiet-resources)
+                       :custom-tools (list (pig:child-tool "sentinel_tool" "uppercases x" (pig:obj "type" "object") (lambda (c args) (declare (ignore c args)) "") :prompt-snippet "sentinel-snippet")))))
+    (unwind-protect
+         (let* ((id (pig:agent-session-session-id session)) (file (or (pig:agent-session-session-file session) ""))
+                (prompt (pig:agent-session-system-prompt session))
+                (start (pig:obj "model" (pig:jget (pig:agent-session-current-model session) "id")
+                                "thinking" (pig:agent-session-current-thinking-level session)
+                                "prompt" (flag (equal (pig:agent-session-current-system-prompt session) prompt))
+                                "tools" (pig:agent-session-get-active-tool-names session)))
+                (out (pig:obj "snapshotId" (flag (and (plusp (length id)) (equal id (pig:agent-session-current-session-id session))))
+                              "snapshotFile" (flag (and (eql 0 (search dir file)) (>= (length file) 6) (string= ".jsonl" file :start2 (- (length file) 6))
+                                                        (search id file) (equal file (or (pig:agent-session-current-session-file session) ""))))
+                              "snapshotModel" (pig:jget (pig:agent-session-model session) "id")
+                              "snapshotThinking" (pig:agent-session-thinking-level session)
+                              "snapshotTools" (pig:agent-session-active-tools session)
+                              "snapshotPromptListsTool" (flag (search "sentinel-snippet" prompt))
+                              "liveStart" start)))
+           (pig:agent-session-set-model session (pig:obj "provider" "sentinel-think" "id" "echo-think"))
+           (pig:agent-session-set-thinking-level session "high")
+           (pig:agent-session-set-active-tools-by-name session '())
+           (let ((changed (pig:agent-session-current-system-prompt session)))
+             (setf (gethash "afterChange" out)
+                   (pig:obj "liveTools" (pig:agent-session-get-active-tool-names session)
+                            "snapshotTools" (pig:agent-session-active-tools session)
+                            "livePromptDropsTool" (flag (and (not (equal changed prompt)) (not (search "sentinel-snippet" changed))))
+                            "snapshotPrompt" (flag (equal (pig:agent-session-system-prompt session) prompt))
+                            "liveModel" (pig:jget (pig:agent-session-current-model session) "id")
+                            "liveThinking" (pig:agent-session-current-thinking-level session)
+                            "snapshotModel" (pig:jget (pig:agent-session-model session) "id")
+                            "snapshotThinking" (pig:agent-session-thinking-level session))))
+           (pig:to-json out))
+      (pig:agent-session-dispose session))))
+
+(defun child-queue (ctx params)
+  "steer, follow-up and getContextUsage on an idle sentinel session, observed back."
+  (declare (ignore params))
+  (let ((session (pig:ctx-create-agent-session ctx :model (pig:obj "provider" "sentinel" "id" "echo") :in-memory t
+                                                   :settings (no-compaction) :resources (quiet-resources))))
+    (unwind-protect
+         (let* ((steer (let ((text (error-text (lambda () (pig:agent-session-steer session "nothing is running"))))) (if (equal text "") "resolved" text)))
+                (follow (let ((text (error-text (lambda () (pig:agent-session-follow-up session "nothing is running"))))) (if (equal text "") "resolved" text)))
+                (usage (pig:agent-session-get-context-usage session)))
+           (pig:to-json (pig:obj "steer" steer "followUp" follow "usage" (or usage :null)
+                                 "isAgentSession" (flag (typep session 'pig:agent-session))
+                                 "queued" (pig:agent-session-pending-message-count session))))
+      (pig:agent-session-dispose session))))
+
+(defun seconds-since (start) (/ (float (- (get-internal-real-time) start)) internal-time-units-per-second))
+
+(defun make-child-session (ctx &optional (model (pig:obj "provider" "sentinel" "id" "echo")))
+  (pig:ctx-create-agent-session ctx :model model :in-memory t :settings (no-compaction) :resources (quiet-resources)))
+
+(defun child-abort-bash (ctx params)
+  "child_abort_probe: execute-bash \"sleep 25\" blocks in one thread and abort-bash, sent 0.7 s later from this one, ends it long before the command would."
+  (declare (ignore params))
+  (let ((session (make-child-session ctx)) (result nil) (err ""))
+    (unwind-protect
+         (let* ((start (get-internal-real-time))
+                (runner (sb-thread:make-thread (lambda ()
+                                                 (handler-case (setf result (pig:agent-session-execute-bash session "sleep 25"))
+                                                   (error (e) (setf err (princ-to-string e)))))
+                                               :name "child-bash")))
+           (sleep 0.7)
+           (pig:agent-session-abort-bash session)
+           (sb-thread:join-thread runner :default nil :timeout 12)
+           (if (sb-thread:thread-alive-p runner)
+               (pig:to-json (pig:obj "returned" :false))
+               (pig:to-json (pig:obj "returned" t "cancelled" (flag (and result (eq (pig:jget result "cancelled") t)))
+                                     "err" err "seconds" (seconds-since start)))))
+      (pig:agent-session-dispose session))))
+
+(defun child-order-probe (ctx params)
+  "child_order_probe: one member is held by the host; abort-bash sent 0.4 s later from this thread must not wait behind it."
+  (let* ((first (pig:jget params "first")) (session (make-child-session ctx)))
+    (unwind-protect
+         (let ((runner (sb-thread:make-thread
+                        (lambda ()
+                          (ignore-errors
+                           (cond ((equal first "cycleModel") (pig:agent-session-cycle-model session :direction "forward"))
+                                 ((equal first "executeBash") (pig:agent-session-execute-bash session "echo x"))
+                                 ((equal first "setModel") (pig:agent-session-set-model session (pig:obj "provider" "sentinel" "id" "echo"))))))
+                        :name "child-held")))
+           (sleep 0.4)
+           (let ((start (get-internal-real-time)))
+             (pig:agent-session-abort-bash session)
+             (let ((took (seconds-since start)))
+               (sb-thread:join-thread runner :default nil :timeout 15)
+               (pig:to-json (pig:obj "abortTook" took)))))
+      (pig:agent-session-dispose session))))
+
+(defun child-usage (ctx params)
+  "getContextUsage of an idle session on the model params.provider/params.model."
+  (let ((session (make-child-session ctx (pig:obj "provider" (pig:jget params "provider") "id" (pig:jget params "model")))))
+    (unwind-protect (pig:to-json (pig:obj "usage" (or (pig:agent-session-get-context-usage session) :null)))
+      (pig:agent-session-dispose session))))
+
+(defun child-ctx-cancel (ctx params)
+  "The :ctx of execute-bash, compact and navigate-tree: this tool's context is cancelled by the host while execute-bash runs; the observation is written to params.out."
+  (let ((session (make-child-session ctx)) (out (pig:obj)) (start (get-internal-real-time)))
+    (unwind-protect
+         (progn
+           (setf (gethash "bash" out)
+                 (let ((result (handler-case (pig:agent-session-execute-bash session "sleep 20" :ctx ctx)
+                                 (error (e) (pig:obj "error" (princ-to-string e))))))
+                   (pig:obj "cancelled" (flag (eq (pig:jget result "cancelled") t)) "error" (or (pig:jget result "error") ""))))
+           (setf (gethash "seconds" out) (seconds-since start))
+           (setf (gethash "compact" out) (error-text (lambda () (pig:agent-session-compact session :ctx ctx))))
+           (setf (gethash "navigate" out) (error-text (lambda () (pig:agent-session-navigate-tree session "none" :ctx ctx)))))
+      (pig:agent-session-dispose session))
+    (with-open-file (stream (pig:jget params "out") :direction :output :if-exists :supersede :external-format :utf-8)
+      (write-string (pig:to-json out) stream))
+    "done"))
+
+(defun new-extension ()
+  (let ((ext (pig:make-extension "child-session")))
+    (loop for (name function) in (list (list "child_run" #'child-run) (list "child_lifecycle" #'child-lifecycle) (list "child_hold" #'child-hold)
+                                       (list "child_errors" #'child-errors) (list "child_events" #'child-events)
+                                       (list "child_members" #'child-members) (list "child_snapshot" #'child-snapshot) (list "child_queue" #'child-queue)
+                                       (list "child_abort_probe" #'child-abort-bash) (list "child_order_probe" #'child-order-probe)
+                                       (list "child_usage" #'child-usage) (list "child_ctx_cancel" #'child-ctx-cancel))
+          do (pig:tool ext name name (pig:obj "type" "object") function))
+    ext))

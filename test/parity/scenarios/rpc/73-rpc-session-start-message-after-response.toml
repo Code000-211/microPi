@@ -1,0 +1,53 @@
+# Behavior family: rpc
+# Surface: a message a session_start listener sends while an extension command starts a new Session (a prompt of "/fresh"), against the prompt's response.
+#
+# Pi's rpc-mode.ts rebindSession (Pi 1.5.2 + beffcde92dea, #12230) subscribes its writer to the new Session BEFORE `await session.bindExtensions()`, which emits session_start, so a message the listener sends at once is written: its message_start and message_end come ahead of the command's response. A toast it defers with a zero-delay timer runs after the command (agent-session.ts prompt writes the response once `await command.handler()` returned) and is written after the response.
+# Before the commit (Pi 1.3.0+1402973a to 1.5.2) the writer was subscribed after the bind, so the message sent at once was not written.
+# PiG held its writer back until the first session_start returned (the old `writing` flag), so it wrote neither event; it now subscribes before the bind, as Pi does.
+
+name = "73-rpc-session-start-message-after-response"
+description = "A message a session_start listener sends at once during a command's new Session is written ahead of the command's response, and a toast it defers follows the response"
+covers = [
+  "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+  "packages/coding-agent/src/core/agent-session.ts",
+  "packages/coding-agent/src/core/agent-session-runtime.ts",
+]
+tags = ["hermetic", "fast"]
+driver = "rpc-mode"
+
+[rpc]
+canonical_json = true
+timeout_seconds = 20
+settle_seconds = 1
+
+[[rpc.steps]]
+line = '{"id":"fresh","type":"prompt","message":"/fresh"}'
+wait_contains = ['"id":"fresh","type":"response","command":"prompt"', '"message":"session-start-later"']
+wait_timeout_seconds = 10
+
+[env]
+pig = ["PIG_HOME=testdata/multi-model"]
+pi = ["PI_CODING_AGENT_DIR=testdata/multi-model/agent"]
+pig_extensions = ["testdata/session-start-message.ts"]
+pi_extensions = ["testdata/session-start-message.ts"]
+pig_args = ["--offline", "--no-session", "--model", "fixture/model-one"]
+pi_args = ["--offline", "--no-session", "--model", "fixture/model-one"]
+
+[assert]
+exit_code = 0
+json_output_ordered_equal = true
+stderr_equal = true
+both_contain = ['"type":"message_start"', '"customType":"session-start-now"', '"message":"session-start-later"']
+both_not_contain = ['"success":false']
+runs = 3
+[[assert.json_aliases]]
+paths = ["/*/message/timestamp"]
+kind = "timestamp"
+reason = "The custom message's wall clock varies per run; retain presence, type and valid syntax."
+
+[[assert.json_aliases]]
+paths = ["/*/id"]
+kind = "id"
+group = "ui"
+pattern = '^[0-9a-f-]{36}$'
+reason = "Notify request UUIDs vary per process. The comparator preserves one-to-one identity correspondence."

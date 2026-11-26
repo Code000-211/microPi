@@ -1,0 +1,280 @@
+package coding
+
+// Ports the extension half of packages/coding-agent/src/core/resource-loader.ts reload (:513-600): the extension paths of the Packages and
+// settings, and the additional extension paths, load as one set.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
+	"github.com/MichaelKinsy/PiG/coding/extensionset"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/packagemanager"
+)
+
+// loadExtensionFiles is the default [DefaultResourceLoaderOptions.LoadExtensions]. The paths are the additional extension paths, then, unless
+// NoExtensions, the enabled extensions of the Packages and settings, merged without duplicates (resource-loader.ts:566-575). A `builtin:` path of a
+// disabled built-in extension is dropped (:576-579). A `builtin:<name>` path names a built-in extension (`-e builtin:<name>`), which the loader
+// reports as an error when it has none of that name (:722-727); pig additive (D31): it also names a member fused into this Piglet Binary
+// ([subprocess.RunsFused]), which loads through the fused resolver into the load's Host like a file extension, so a child session built with
+// the path gets the Binary's member that its parent has. A Pi built-in of the same name wins. A Package whose package.json lists host-provided packages under dependencies adds a warning (:581, :66-93). A local additional
+// path that does not exist is an error of the result (resource-loader.ts:545-551). The loader keeps the Extension Host of the load until the next load or Close.
+func (l *DefaultResourceLoader) loadExtensionFiles(ctx context.Context, request ExtensionLoadRequest) (LoadExtensionsResult, error) {
+	manager := l.newPackageManager()
+	cli, err := manager.ResolveExtensionSources(l.options.AdditionalExtensionPaths, false, true)
+	if err != nil {
+		return LoadExtensionsResult{}, fmt.Errorf("coding: %w", err)
+	}
+	enabled := enabledExtensionPaths(cli.Extensions)
+	l.cliExtensionPaths = map[string]bool{}
+	for _, path := range enabled {
+		l.cliExtensionPaths[icodingagent.CanonicalizePath(path)] = true
+	}
+	packageRoots := map[string]string{}
+	installFailures := [][]packagemanager.PackageInstallFailure{cli.InstallFailures}
+	if !l.options.NoExtensions {
+		resolved, err := manager.Resolve(nil)
+		if err != nil {
+			return LoadExtensionsResult{}, fmt.Errorf("coding: %w", err)
+		}
+		// pig additive (D216): a configured local Package whose directory does not exist warns after the failed installs; Pi skips it silently.
+		installFailures = append([][]packagemanager.PackageInstallFailure{resolved.InstallFailures, packagemanager.MissingLocalPackages(l.cwd, l.agentDir, l.settings)}, installFailures...)
+		enabled = append(append([]string{}, enabled...), enabledExtensionPaths(resolved.Extensions)...)
+		for _, resource := range resolved.Extensions {
+			packageRoots[resource.Path] = resource.Metadata.PackageRoot
+		}
+	}
+	for _, resource := range cli.Extensions {
+		if _, seen := packageRoots[resource.Path]; !seen {
+			packageRoots[resource.Path] = resource.Metadata.PackageRoot
+		}
+	}
+	paths, err := l.mergePaths(nil, enabled)
+	if err != nil {
+		return LoadExtensionsResult{}, err
+	}
+	paths = slices.DeleteFunc(paths, func(path string) bool {
+		name, builtin := strings.CutPrefix(path, icodingagent.BuiltinPathPrefix)
+		return builtin && slices.Contains(l.options.DisabledBuiltinExtensions, name)
+	})
+	var roots []string
+	for _, path := range paths {
+		roots = append(roots, packageRoots[path])
+	}
+	packageWarnings, err := icodingagent.ExtensionPackageWarnings(roots)
+	if err != nil {
+		return LoadExtensionsResult{}, fmt.Errorf("coding: %w", err)
+	}
+	var filePaths, builtinPaths []string
+	fusedPaths := map[string]bool{}
+	piBuiltins := extensionset.BuiltinNames(l.options.ExtensionFactories)
+	for _, path := range paths {
+		fused := false
+		if config, ok := fusedMemberConfig(path); ok {
+			fused = !slices.Contains(piBuiltins, config.Name)
+		}
+		switch {
+		case fused:
+			filePaths = append(filePaths, path)
+			fusedPaths[path] = true
+		case strings.HasPrefix(path, icodingagent.BuiltinPathPrefix):
+			builtinPaths = append(builtinPaths, path)
+		default:
+			filePaths = append(filePaths, path)
+		}
+	}
+	configs := make([]subprocess.ExtConfig, 0, len(filePaths))
+	for _, path := range filePaths {
+		configs = append(configs, extensionPathConfigs(path)...)
+	}
+	// One runtime serves every extension of a reload: the Host adopts it and the factories register against it (resource-loader.ts passes
+	// preTrustExtensions.runtime on). A pass with no PreTrust starts a new reload.
+	if request.PreTrust == nil || l.factoryRuntime == nil {
+		l.factoryRuntime = l.options.Runtime
+		if l.factoryRuntime == nil {
+			l.factoryRuntime = extension.CreateExtensionRuntime()
+		}
+	}
+	if l.eventBus == nil {
+		l.eventBus = l.options.EventBus
+	}
+	if l.eventBus == nil {
+		l.eventBus = extension.CreateEventBus()
+	}
+	factories := &extensionset.Loader{CWD: l.cwd, Inline: l.options.ExtensionFactories, Runtime: l.factoryRuntime, EventBus: l.eventBus}
+	// ctx ends the load; the extensions it loads belong to the loader, which stops them at its next load or Close. Pi's reload() has no caller whose end would stop them.
+	loadCtx, release := context.WithCancel(context.WithoutCancel(ctx))
+	stopWatching := context.AfterFunc(ctx, release)
+	defer stopWatching()
+	var result LoadExtensionsResult
+	if request.PreTrust != nil && l.files.host != nil {
+		// resource-loader.ts:747-790 loadFinalExtensionSet: the extensions the bootstrap pass loaded stay loaded, and a path it attempted, loaded or failed, is
+		// not attempted again; only the other paths load, in the same Host so the extensions share one runtime.
+		host := l.files.host
+		loaded, errs := host.LoadFinalExtensionSet(loadCtx, configs, l.filesConfigs)
+		bootstrapRelease := l.files.release
+		result = LoadExtensionsResult{
+			Extensions: append([]extension.Extension{}, loaded...),
+			Errors:     slices.Concat(request.PreTrust.Errors, extensionLoadErrors(errs)),
+			Warnings:   slices.Clone(request.PreTrust.Warnings),
+			Runtime:    host.Runtime(),
+			host:       host,
+			bridge:     l.files.bridge,
+			release: func() {
+				release()
+				if bootstrapRelease != nil {
+					bootstrapRelease()
+				}
+			},
+		}
+	} else {
+		l.closeExtensionFiles()
+		result = loadExtensionPathsIn(loadCtx, filePaths, l.cwd, l.factoryRuntime)
+		result.release = release
+		if request.PreTrust != nil {
+			result.Errors = slices.Concat(request.PreTrust.Errors, result.Errors)
+			result.Warnings = slices.Concat(request.PreTrust.Warnings, result.Warnings)
+		}
+	}
+	// The built-in and inline extensions the bootstrap pass loaded stay loaded and its attempted paths are not tried again (resource-loader.ts:747-790).
+	preloaded := map[string]extension.Extension{}
+	attempted := map[string]bool{}
+	var preInline []extension.Extension
+	if request.PreTrust != nil {
+		for _, ext := range request.PreTrust.Extensions {
+			switch {
+			case strings.HasPrefix(ext.Path, "<inline:"):
+				preInline = append(preInline, ext)
+			case strings.HasPrefix(ext.Path, icodingagent.BuiltinPathPrefix) && !fusedPaths[ext.Path]:
+				preloaded[ext.Path] = ext
+			}
+		}
+		for _, loadErr := range request.PreTrust.Errors {
+			attempted[loadErr.Path] = true
+		}
+	}
+	// The built-in paths load in path order, an unknown name and a failing factory each ending as its own error entry at its place (:722-742).
+	var builtinsToLoad []string
+	for _, path := range builtinPaths {
+		if _, have := preloaded[path]; !have && !attempted[path] {
+			builtinsToLoad = append(builtinsToLoad, path)
+		}
+	}
+	builtins, builtinErrs := factories.LoadBuiltin(builtinsToLoad)
+	for _, ext := range builtins {
+		preloaded[ext.Path] = ext
+	}
+	for _, loadErr := range builtinErrs {
+		result.Errors = append(result.Errors, ExtensionLoadError{Path: loadErr.Path, Error: loadErr.Error})
+	}
+	inline := preInline
+	if request.PreTrust == nil {
+		var inlineErrs []extensionset.LoadError
+		inline, inlineErrs = factories.LoadInline()
+		for _, loadErr := range inlineErrs {
+			result.Errors = append(result.Errors, ExtensionLoadError{Path: loadErr.Path, Error: loadErr.Error})
+		}
+	}
+	// Extensions follow the order of the paths, built-ins in place, then the inline ones (:765-775).
+	files := map[string]extension.Extension{}
+	for _, ext := range result.Extensions {
+		files[icodingagent.ResourcePathKey(ext.ResolvedPath)] = ext
+	}
+	ordered := make([]extension.Extension, 0, len(result.Extensions)+len(preloaded)+len(inline))
+	used := map[string]bool{}
+	for _, path := range paths {
+		if ext, ok := preloaded[path]; ok {
+			ordered = append(ordered, ext)
+		} else if ext, ok := files[icodingagent.ResourcePathKey(path)]; ok {
+			ordered = append(ordered, ext)
+			used[icodingagent.ResourcePathKey(path)] = true
+		}
+	}
+	for _, ext := range result.Extensions {
+		if !used[icodingagent.ResourcePathKey(ext.ResolvedPath)] {
+			ordered = append(ordered, ext)
+		}
+	}
+	var replacementWarnings []icodingagent.ExtensionWarning
+	result.Extensions = extensionset.OmitReplaced(append(ordered, inline...), &replacementWarnings)
+	result.Runtime = l.factoryRuntime
+	// loader.ts registerFlag sets a flag's default into the runtime's flagValues as the extension registers it.
+	for _, ext := range result.Extensions {
+		for _, flag := range ext.RegisteredFlags() {
+			if flag.Default != nil {
+				result.Runtime.SetFlagDefault(flag.Name, flag.Default)
+			}
+		}
+	}
+	var existing []icodingagent.ExtensionWarning
+	for _, warning := range result.Warnings {
+		existing = append(existing, icodingagent.ExtensionWarning{Path: warning.Path, Warning: warning.Warning})
+	}
+	result.Warnings = nil
+	// A Package that could not be installed warns before the package warnings (resource-loader.ts: [...installWarnings, ...packageWarnings], Pi 6dfb54678).
+	installWarnings := packagemanager.PackageInstallWarnings(installFailures...)
+	for _, warning := range icodingagent.MergeExtensionWarnings(icodingagent.MergeExtensionWarnings(existing, replacementWarnings), slices.Concat(installWarnings, packageWarnings)) {
+		result.Warnings = append(result.Warnings, ExtensionLoadWarning{Path: warning.Path, Warning: warning.Warning})
+	}
+	l.files, l.filesConfigs = result, configs
+	for _, path := range l.options.AdditionalExtensionPaths {
+		if request.Bootstrap || !icodingagent.IsLocalPath(path) {
+			continue
+		}
+		resolved, err := l.resolveResourcePath(path)
+		if err != nil {
+			return LoadExtensionsResult{}, err
+		}
+		if _, statErr := os.Stat(resolved); statErr != nil {
+			result.Errors = append(result.Errors, ExtensionLoadError{Path: resolved, Error: "Extension path does not exist: " + resolved})
+		}
+	}
+	// resource-loader.ts addExtensionConflictDiagnostics: the final set lists a tool or flag two extensions register as an error of the result; both extensions stay loaded.
+	if !request.Bootstrap {
+		for _, conflict := range icodingagent.DetectExtensionConflicts(result.Extensions) {
+			result.Errors = append(result.Errors, ExtensionLoadError{Path: conflict.Path, Error: conflict.Message})
+		}
+	}
+	return result, nil
+}
+
+// extensionLoadErrors maps the errors of a Host load to the {path, error} entries of LoadExtensionsResult.
+func extensionLoadErrors(errs []error) []ExtensionLoadError {
+	var entries []ExtensionLoadError
+	for _, err := range errs {
+		if loadErr, ok := errors.AsType[*subprocess.ExtensionLoadError](err); ok && loadErr.Path != "" {
+			entries = append(entries, ExtensionLoadError{Path: loadErr.Path, Error: loadErr.Err.Error()})
+			continue
+		}
+		entries = append(entries, ExtensionLoadError{Error: err.Error()})
+	}
+	return entries
+}
+
+func enabledExtensionPaths(resources []icodingagent.ResolvedResource) []string {
+	var paths []string
+	for _, resource := range resources {
+		if resource.Enabled {
+			paths = append(paths, resource.Path)
+		}
+	}
+	return paths
+}
+
+func (l *DefaultResourceLoader) closeExtensionFiles() {
+	l.files.Close()
+	l.files, l.filesConfigs = LoadExtensionsResult{}, nil
+}
+
+// Close shuts down the Extension Host the default extension load started. The loaded extensions stop.
+func (l *DefaultResourceLoader) Close() {
+	_, leave := l.takeOperation(nil)
+	defer leave()
+	l.closeExtensionFiles()
+}

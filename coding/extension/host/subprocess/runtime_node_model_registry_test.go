@@ -1,0 +1,48 @@
+//go:build !pig_strip_node_extensions
+
+package subprocess
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestNodeModelRegistryPreservesModelIdentityAndDoesNotFabricateModels(t *testing.T) {
+	shortSockDir(t)
+
+	h := newTestHost(t)
+	bridge := NewUIBridge(func() {})
+	model := map[string]any{
+		"id":       "openrouter/org/model/name",
+		"modelId":  "org/model/name",
+		"provider": map[string]any{"id": "openrouter"},
+		"name":     "Model Name",
+		"api":      "openai-responses",
+	}
+	bridge.SetHostAction("getModelInfo", func() json.RawMessage { return modelJSON(model) })
+	h.SetUIBridge(bridge)
+	defer h.Shutdown("test done")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	ext, err := h.Load(ctx, ExtConfig{
+		Name:    "node-model-registry",
+		Source:  filepath.Join("testdata", "node-model-registry.mjs"),
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.SetHostAction("getModels", func() []json.RawMessage { return modelJSONs(model) })
+
+	command, ok := ext.Commands["model_registry_identity"]
+	if !ok {
+		t.Fatal("model_registry_identity command not registered")
+	}
+	if err := command.Handler(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+}

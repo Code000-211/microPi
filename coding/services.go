@@ -1,0 +1,791 @@
+// Services, Runtime, and Session form the public embedding API. Services owns
+// shared configuration and credentials. Runtime creates and owns sessions. A
+// Session owns one mutable conversation and its JSONL transcript.
+//
+// This follows upstream Pi's AgentSessionServices, AgentSessionRuntime, and
+// AgentSession responsibilities while using Go ownership and error semantics.
+package coding
+
+// Ports packages/coding-agent/src/core/sdk.ts (createAgentSession's default settingsManager).
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/stackprime"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
+)
+
+// Settings is the merged user-settings view. Global settings are overlaid by
+// project settings. The alias keeps the embedding API identical to the runtime
+// representation.
+type Settings = icodingagent.Settings
+
+// QuietStartup is the quiet startup setting (re-exported alias): true hides all startup output, "header" keeps only the startup header.
+type QuietStartup = icodingagent.QuietStartup
+
+// Quiet startup values.
+const (
+	QuietStartupFalse  = icodingagent.QuietStartupFalse
+	QuietStartupTrue   = icodingagent.QuietStartupTrue
+	QuietStartupHeader = icodingagent.QuietStartupHeader
+)
+
+// SettingsManager is the live settings reader (re-exported alias). Use
+// Services.Settings() to obtain the merged Settings; use
+// Services.SettingsManager() if you need to call Reload() or watch for
+// project-level changes.
+type SettingsManager = icodingagent.SettingsManager
+
+// ModelRegistry is the extension-facing synchronous facade over model lookup
+// and the one Services-owned ModelRuntime.
+type ModelRegistry struct {
+	*icodingagent.ModelRegistry
+	runtime *ModelRuntime
+}
+
+// Services is the lowest-level dependency container: auth storage,
+// settings manager, and model registry. One Services instance is
+// typically constructed per-process and shared by every Runtime/Session.
+//
+// Services is intentionally narrow. Anything that needs the auth file
+// path, the merged settings, or model lookup goes through this type.
+// Anything specific to a single conversation (history, tools, hooks)
+// belongs on Session, not Services.
+type AgentSessionServices struct {
+	cwd          string
+	agentDir     string
+	auth         *ai.AuthStorage
+	credentials  ai.CredentialStore
+	settings     *icodingagent.SettingsManager
+	settingsOnce sync.Once
+	registry     *ModelRegistry
+	modelRuntime *ModelRuntime
+
+	// Keep the deterministic provider's counters across request-level model reconstruction.
+	testFauxProvider func() (ai.Provider, error)
+
+	// sharedRuntime marks a ModelRuntime owned by the caller: Close leaves it running.
+	sharedRuntime       bool
+	resourceLoader      *DefaultResourceLoader
+	sharedLoader        bool
+	extensionFlagValues []ExtensionFlagValue
+	// appliedExtensionFlagValues are the values ApplyExtensionFlagValues accepted, which extensions read with getFlag.
+	appliedExtensionFlagValues map[string]any
+	diagnostics                []AgentSessionRuntimeDiagnostic
+}
+
+// ExtensionFlagValue is one entry of [CreateAgentSessionServicesOptions.ExtensionFlagValues]: the value of --Name, a bool or a string.
+type ExtensionFlagValue struct {
+	Name  string
+	Value any
+}
+
+// AgentSessionRuntimeDiagnostic is a startup problem found while creating Services (upstream AgentSessionRuntimeDiagnostic).
+type AgentSessionRuntimeDiagnostic = icodingagent.AgentSessionRuntimeDiagnostic
+
+// CreateAgentSessionServicesOptions configures CreateAgentSessionServices. All fields are optional;
+// empty values resolve to sensible defaults (current working directory,
+// $PIG_HOME/agent or ~/.pig/agent).
+type CreateAgentSessionServicesOptions struct {
+	// CWD is the project directory used to discover per-project
+	// settings (.pig/settings.json) and to anchor session storage.
+	// Empty uses SessionManager.GetCwd when supplied, otherwise os.Getwd().
+	CWD string
+
+	// SessionManager supplies the CWD default when CWD is empty. It remains caller-owned; SessionOptions selects the log used by a Session.
+	SessionManager *SessionManager
+
+	// AgentDir is the global pig config directory (typically
+	// ~/.pig/agent). Empty → DefaultAgentDir().
+	AgentDir string
+
+	// ProjectTrusted controls whether project-local settings are loaded. nil
+	// preserves the SDK default of trusted project settings.
+	ProjectTrusted *bool
+
+	// SettingsManager supplies caller-owned file or memory settings instead of loading settings files.
+	SettingsManager *SettingsManager
+
+	// ModelRuntime shares a caller-owned runtime instead of creating one over AgentDir; the Services then use its
+	// registry and credentials and never close it. Upstream CreateAgentSessionServicesOptions.modelRuntime.
+	ModelRuntime *ModelRuntime
+
+	// ModelRuntimeSignal bounds the model catalog restore and the first availability refresh of the runtime the Services
+	// create; nil never cancels. It bounds neither the resource reload nor the refresh that follows it. Upstream
+	// CreateAgentSessionServicesOptions.modelRuntimeSignal (an AbortSignal).
+	ModelRuntimeSignal context.Context
+
+	// ExtensionFlagValues are the CLI values for extension flags in command-line order (a JavaScript Map keeps insertion order,
+	// and the order shows in diagnostics): true for a boolean flag, a string for a string flag.
+	// [Services.ApplyExtensionFlagValues] validates them against the loaded extensions.
+	// Upstream CreateAgentSessionServicesOptions.extensionFlagValues (Map<string, boolean | string>).
+	ExtensionFlagValues []ExtensionFlagValue
+
+	// ResourceLoaderOptions configure the Services' resource loader; its CWD, AgentDir and SettingsManager are the
+	// Services' own. Upstream CreateAgentSessionServicesOptions.resourceLoaderOptions
+	// (Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">). Nil leaves the resource loader to
+	// the Session, which builds a default one.
+	ResourceLoaderOptions *DefaultResourceLoaderOptions
+
+	// ResourceLoader is a caller-owned, already reloaded resource loader the Services use as their own instead of building one; Close does not close it. Upstream createAgentSession's `resourceLoader` option. It takes precedence over ResourceLoaderOptions.
+	ResourceLoader *DefaultResourceLoader
+
+	// ResourceLoaderReloadOptions are the options of the Services' first resource reload. Upstream
+	// CreateAgentSessionServicesOptions.resourceLoaderReloadOptions. Nil or empty reloads without resolving trust.
+	ResourceLoaderReloadOptions *ResourceLoaderReloadOptions
+}
+
+// CreateAgentSessionServices constructs a Services container. Failure modes:
+//
+//   - cannot resolve CWD when none provided → wrapped os.Getwd error
+//   - auth.json directory cannot be created/read → wrapped error
+//
+// Settings and registry constructors never fail; they fall back to
+// defaults if their backing files are missing or malformed. The caller owns
+// Services.Close; a Runtime or Session supplied with these Services does not close them.
+func CreateAgentSessionServices(opts CreateAgentSessionServicesOptions) (*AgentSessionServices, error) {
+	cwd := opts.CWD
+	if cwd == "" && opts.SessionManager != nil {
+		cwd = opts.SessionManager.GetCwd()
+	}
+	// agent-session-services.ts:138-139: `resolvePath(options.cwd)` and `options.agentDir ? resolvePath(options.agentDir) : getAgentDir()`. An empty cwd resolves to the process directory.
+	cwd, err := resolvepath.Resolve(cwd, "")
+	if err != nil {
+		return nil, fmt.Errorf("coding.CreateAgentSessionServices: resolve cwd: %w", err)
+	}
+
+	agentDir := opts.AgentDir
+	if agentDir == "" && opts.ModelRuntime != nil {
+		agentDir = opts.ModelRuntime.services.agentDir
+	}
+	if agentDir == "" {
+		agentDir = icodingagent.AgentDir()
+	} else if agentDir, err = resolvepath.Resolve(agentDir, ""); err != nil {
+		return nil, fmt.Errorf("coding.CreateAgentSessionServices: resolve agent directory: %w", err)
+	}
+	signal := opts.ModelRuntimeSignal
+	if signal == nil {
+		signal = context.Background()
+	}
+	// agent-session-services.ts:140-146 passes modelRuntimeSignal to ModelRuntime.create alone: the resource reload (:154) and the refresh after the
+	// extension registrations (:194) take no signal.
+	afterCreate := context.WithoutCancel(signal)
+
+	projectTrusted := true
+	if opts.ProjectTrusted != nil {
+		projectTrusted = *opts.ProjectTrusted
+	}
+	// Ports packages/coding-agent/src/core/agent-session-services.ts:147.
+	sm := opts.SettingsManager
+	if sm == nil {
+		sm = icodingagent.NewSettingsManagerWithOptions(cwd, agentDir, icodingagent.SettingsManagerCreateOptions{ProjectTrusted: opts.ProjectTrusted})
+	} else if opts.ProjectTrusted != nil {
+		sm.SetProjectTrusted(projectTrusted)
+	}
+
+	var services *AgentSessionServices
+	if shared := opts.ModelRuntime; shared != nil {
+		// agent-session-services.ts:140: `options.modelRuntime ?? ModelRuntime.create(...)`.
+		services = &AgentSessionServices{
+			cwd: cwd, agentDir: agentDir,
+			auth: shared.services.auth, credentials: shared.services.credentials,
+			settings: sm, registry: shared.services.registry, modelRuntime: shared,
+			testFauxProvider: shared.services.testFauxProvider, sharedRuntime: true,
+		}
+	} else {
+		authPath := filepath.Join(agentDir, "auth.json")
+		auth, err := ai.NewAuthStorage(authPath)
+		if err != nil {
+			return nil, fmt.Errorf("coding.CreateAgentSessionServices: open auth storage at %s: %w", authPath, err)
+		}
+		reg := icodingagent.NewModelRegistry(agentDir)
+		reg.SetAuthStorage(auth)
+		// Mirrors ModelRuntime.create: restore stored dynamic catalogs (Radius)
+		// without network access. Network refreshes run from the modes.
+		reg.RefreshCatalogs(signal, icodingagent.CatalogRefreshOptions{})
+		services, err = newConfiguredServices(cwd, agentDir, auth, auth, sm, reg)
+		if err != nil {
+			return nil, err
+		}
+		_ = services.ModelRuntime().queueAvailabilityRefresh(signal)
+	}
+	services.extensionFlagValues = opts.ExtensionFlagValues
+	if opts.ResourceLoader != nil {
+		services.resourceLoader, services.sharedLoader = opts.ResourceLoader, true
+		services.applyLoadedExtensions(afterCreate)
+		return services, nil
+	}
+	if opts.ResourceLoaderOptions != nil || opts.ResourceLoaderReloadOptions != nil {
+		loaderOptions := DefaultResourceLoaderOptions{}
+		if opts.ResourceLoaderOptions != nil {
+			loaderOptions = *opts.ResourceLoaderOptions
+		}
+		loaderOptions.CWD, loaderOptions.AgentDir, loaderOptions.SettingsManager = cwd, agentDir, sm
+		services.resourceLoader = NewDefaultResourceLoader(loaderOptions)
+		var reload ResourceLoaderReloadOptions
+		if opts.ResourceLoaderReloadOptions != nil {
+			reload = *opts.ResourceLoaderReloadOptions
+		}
+		if err := services.resourceLoader.ReloadWith(afterCreate, reload); err != nil {
+			services.Close()
+			return nil, fmt.Errorf("coding.CreateAgentSessionServices: reload resources: %w", err)
+		}
+		services.applyLoadedExtensions(afterCreate)
+	}
+	return services, nil
+}
+
+func newConfiguredServices(cwd, agentDir string, auth *ai.AuthStorage, credentials ai.CredentialStore, sm *icodingagent.SettingsManager, reg *icodingagent.ModelRegistry) (*AgentSessionServices, error) {
+	services := &AgentSessionServices{
+		cwd:              cwd,
+		agentDir:         agentDir,
+		auth:             auth,
+		credentials:      credentials,
+		settings:         sm,
+		registry:         &ModelRegistry{ModelRegistry: reg},
+		testFauxProvider: sync.OnceValues(newTestFauxProvider),
+	}
+	modelRuntime, err := NewModelRuntime(services)
+	if err != nil {
+		return nil, err
+	}
+	services.modelRuntime = modelRuntime
+	services.registry = NewModelRegistry(modelRuntime)
+	if TestFauxProviderEnabled() {
+		if err := registerHarnessTestFaux(reg); err != nil {
+			return nil, err
+		}
+	}
+	reg.SetAvailabilityRefresh(func(ctx context.Context, providers []string) ai.ModelsRefreshResult {
+		return modelRuntime.refreshAvailability(ctx, ai.ModelsRefreshOptions{Providers: providers}, ai.ModelsRefreshResult{})
+	})
+	reg.SetAvailabilitySnapshot(modelRuntime.configuredInSnapshot, modelRuntime.syncRegistration)
+	return services, nil
+}
+
+// Close stops the Extension Host of the resource loader's default extension load (the loaded extensions stop), stops admission of model background work, cancels its lifetime, and drains admitted tasks. It does not close caller-owned credential or catalog storage. Call it after Sessions finish and outside model callbacks.
+func (s *AgentSessionServices) Close() {
+	if s != nil && s.resourceLoader != nil && !s.sharedLoader {
+		s.resourceLoader.Close()
+	}
+	if s != nil && s.registry != nil && !s.sharedRuntime {
+		s.registry.CloseModelTasks()
+	}
+}
+
+// ResourceLoader returns the loader created from CreateAgentSessionServicesOptions.ResourceLoaderOptions, already reloaded, or nil when
+// none was requested (a Session then builds a default loader). Upstream AgentSessionServices.resourceLoader.
+func (s *AgentSessionServices) ResourceLoader() *DefaultResourceLoader { return s.resourceLoader }
+
+// Diagnostics are the problems found while creating the Services and applying extension flags. Upstream
+// AgentSessionServices.diagnostics.
+func (s *AgentSessionServices) Diagnostics() []AgentSessionRuntimeDiagnostic {
+	return slices.Clone(s.diagnostics)
+}
+
+// CWD returns the working directory this Services container was
+// constructed with.
+func (s *AgentSessionServices) CWD() string { return s.cwd }
+
+// AgentDir returns the global agent config directory (typically
+// ~/.pig/agent or $PIG_HOME/agent).
+func (s *AgentSessionServices) AgentDir() string { return s.agentDir }
+
+// Auth returns the credential storage backing auth.json. Read-mostly;
+// safe to share across goroutines (file lock serialises writes).
+// It is nil when the ModelRuntime was created with an injected CredentialStore; use Credentials for the store in effect.
+func (s *AgentSessionServices) Auth() *ai.AuthStorage { return s.auth }
+
+// Credentials returns the credential store backing model authentication: the auth.json store, or the CredentialStore passed to CreateModelRuntime.
+func (s *AgentSessionServices) Credentials() ai.CredentialStore { return s.credentials }
+
+// Settings returns the currently merged settings (global ⊕ project).
+// This is a snapshot; call Settings() again to pick up changes after
+// settings files are edited externally.
+func (s *AgentSessionServices) Settings() Settings { return s.settings.Get() }
+
+// SettingsManager returns the underlying live settings reader, useful
+// when callers need to call Reload() or inspect global vs project
+// layers separately.
+func (s *AgentSessionServices) SettingsManager() *SettingsManager { return s.settings }
+
+// ensureSettings loads the settings files of a Services built around a bare ModelRuntime, as upstream's createAgentSession does when no settingsManager is given (sdk.ts: `options.settingsManager ?? SettingsManager.create(cwd, agentDir)`).
+func (s *AgentSessionServices) ensureSettings() {
+	s.settingsOnce.Do(func() {
+		if s.settings == nil {
+			cwd := s.cwd
+			if cwd == "" {
+				cwd, _ = os.Getwd()
+			}
+			s.settings = icodingagent.NewSettingsManager(cwd, s.agentDir)
+		}
+	})
+}
+
+// Registry returns the model registry. Use Registry().Resolve(provider,
+// model) to obtain a ModelEntry with credentials resolved through
+// configvalue (env vars and !cmd shell prefixes).
+func (s *AgentSessionServices) Registry() *ModelRegistry { return s.registry }
+
+// ModelRuntime returns the one runtime shared by every Session and extension
+// registry facade created from these Services.
+func (s *AgentSessionServices) ModelRuntime() *ModelRuntime { return s.modelRuntime }
+
+// DefaultAgentDir is Pi's getAgentDir: the global agent config directory the pig binary uses. PIG_CODING_AGENT_DIR (PI_CODING_AGENT_DIR when
+// PIG_USE_PI_DIRS=1) names it with a leading tilde expanded; otherwise it is $PIG_HOME/agent if PIG_HOME is set, else ~/.pig/agent.
+func DefaultAgentDir() string {
+	return icodingagent.DefaultAgentDir()
+}
+
+// ErrNoServices is returned by APIs that require a Services instance
+// when the caller passed nil.
+var ErrNoServices = errors.New("coding: nil Services")
+
+// ModelRuntime is the mode-independent model execution path owned by Services
+// and shared by every Session and extension ModelRegistry facade.
+type ModelRuntime struct {
+	modelNetworkEnabled bool
+	services            *AgentSessionServices
+	availability        modelAvailability
+	virtuals            virtualModelStore
+	prepare             func(context.Context, *ai.Model, ai.StreamOptions) (*ai.Model, ai.Provider, ai.StreamOptions, error)
+}
+
+// NewModelRuntime constructs a runtime backed by services model configuration
+// and credentials.
+func NewModelRuntime(services *AgentSessionServices) (*ModelRuntime, error) {
+	if services == nil {
+		return nil, ErrNoServices
+	}
+	runtime := &ModelRuntime{services: services, modelNetworkEnabled: icodingagent.ModelNetworkEnabled()}
+	runtime.prepare = runtime.prepareRequest
+	services.Registry().SetAPIStream(runtime.builtinStream)
+	services.Registry().SetAPISimpleStream(runtime.builtinStreamSimple)
+	runtime.availability = modelAvailability{
+		providerSeq:     make(map[string]uint64),
+		listCredentials: services.Registry().ListCredentials,
+		readCredential:  services.Registry().ReadCredential,
+		getAvailable:    runtime.loadAvailableModels,
+	}
+	return runtime, nil
+}
+
+// Close cancels and drains the Services-owned model task group. It also gives callers of CreateModelRuntime an explicit lifetime endpoint; Session Runtime.Close does not close caller-supplied Services.
+func (runtime *ModelRuntime) Close() {
+	if runtime != nil {
+		runtime.services.Close()
+	}
+}
+
+// SettleCredentialWrites waits until the credential modifications already in progress finish, such as an OAuth refresh a background catalog refresh started, so a process that exits next does not lose the rotated token. It fails only with ctx's cancellation cause.
+// upstream: packages/coding-agent/src/core/model-runtime.ts:settleCredentialWrites (b2cb62923)
+func (runtime *ModelRuntime) SettleCredentialWrites(ctx context.Context) error {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.services.Registry().SettleCredentialWrites(ctx)
+}
+
+// startBackground schedules maintenance under the same owner used by availability siblings.
+func (runtime *ModelRuntime) startBackground(work func(context.Context)) bool {
+	return runtime.services.Registry().StartModelTask(context.Background(), work)
+}
+
+// GetModels returns metadata snapshots for the complete static and explicitly registered model catalog, or only the given provider's models.
+func (runtime *ModelRuntime) GetModels(providerID ...string) []*ai.Model {
+	if runtime == nil || runtime.services == nil {
+		return nil
+	}
+	models := runtime.services.Registry().GetAllModelData()
+	for i, model := range models {
+		models[i] = runtime.bindCatalogModel(model)
+	}
+	models = runtime.virtuals.overlay(models)
+	if len(providerID) == 0 {
+		return models
+	}
+	return slices.DeleteFunc(models, func(model *ai.Model) bool { return model.ProviderMeta.ProviderID != providerID[0] })
+}
+
+// runtimeModels lists GetModels() as resolver models without building a plain bundled catalog's models: such a model's BuildSource
+// builds the bound model GetModels lists.
+func (runtime *ModelRuntime) runtimeModels() []icodingagent.RuntimeModel {
+	if runtime == nil || runtime.services == nil {
+		return nil
+	}
+	sources := runtime.services.Registry().GetAllModelDataSources()
+	models := make([]icodingagent.RuntimeModel, 0, len(sources))
+	// The entry is read when the model is built, so a routing variant (D199) is derived only for a model that is kept. One function builds
+	// every listed model: a model's own state is its source, which points into sources.
+	build := func(source *icodingagent.ModelDataSource) *ai.Model {
+		return runtime.bindCatalogModel(source.Entry().ToModel())
+	}
+	for i := range sources {
+		source := &sources[i]
+		generated := source.Generated
+		if generated == nil {
+			models = append(models, runtimeModelOf(runtime.bindCatalogModel(source.Model)))
+			continue
+		}
+		// A catalog entry's model reasons when the entry does (ToCapabilities reports a MaxThinking only for a reasoning entry).
+		models = append(models, icodingagent.RuntimeModel{
+			Provider:    generated.Provider,
+			ID:          source.ID(),
+			Name:        source.Name(),
+			Reasoning:   generated.Reasoning,
+			Headers:     ai.ProviderHeadersFromStrings(generated.Headers),
+			Source:      source,
+			BuildSource: build,
+		})
+	}
+	return overlayVirtualModels(&runtime.virtuals, models, func(model icodingagent.RuntimeModel) (string, string) { return model.Provider, model.ID }, runtimeModelOf)
+}
+
+// GetModel returns a registered model by exact provider and model ID without synthesizing unknown identities.
+func (runtime *ModelRuntime) GetModel(providerID, modelID string) *ai.Model {
+	if runtime == nil || runtime.services == nil || providerID == "" || modelID == "" {
+		return nil
+	}
+	if model := runtime.virtuals.model(providerID, modelID); model != nil {
+		return model
+	}
+	if model := runtime.services.Registry().GetProviderModelDataByID(providerID, modelID); model != nil {
+		return runtime.bindCatalogModel(model)
+	}
+	return nil
+}
+
+// CheckAuth checks the provider's current authentication contract.
+func (runtime *ModelRuntime) CheckAuth(ctx context.Context, providerID string) (*ai.AuthCheck, error) {
+	// A provider of only virtual models needs no credentials. upstream: model-runtime.ts:953-958.
+	if runtime.virtuals.onlyVirtual(providerID, runtime.providerDefined) {
+		return &ai.AuthCheck{Type: ai.CredentialAPIKey, Source: "virtual"}, nil
+	}
+	runtime.services.Registry().StartRegistrationRefresh(ctx)
+	return runtime.services.Registry().CheckRegistryAuth(ctx, providerID)
+}
+
+// SetChangeListener replaces the callback invoked after committed registry changes and returns a draining detach function.
+func (runtime *ModelRuntime) SetChangeListener(listener func()) func() {
+	if runtime == nil || runtime.services == nil {
+		return func() {}
+	}
+	return runtime.services.Registry().SetChangeListener(listener)
+}
+
+// Stream returns immediately. Context normalization happens before asynchronous setup. Setup failures are errors; provider cancellation is aborted, and an established stream owns its terminal event.
+func (runtime *ModelRuntime) Stream(ctx context.Context, model *ai.Model, request ai.Context, options ai.StreamOptions) *ai.AssistantMessageEventStream {
+	if err := assertChat(model); err != nil {
+		return runtime.failedStream(ctx, model, err)
+	}
+	if model != nil && registryOwnsModelBackend(model.Provider) && runtime.services.Registry().GetProvider(model.ProviderMeta.ProviderID) != nil {
+		return runtime.services.Registry().NativeModels().Stream(ctx, model, request, options)
+	}
+	transcript := ai.NormalizeContext(request)
+	outer := ai.NewAssistantMessageEventStream()
+	ctx = outer.ObservationContext(ctx)
+	go runtime.start(ctx, model, transcript, options, outer, false)
+	return outer
+}
+
+// Complete returns the exact terminal pointer produced by Stream.Result.
+func (runtime *ModelRuntime) Complete(ctx context.Context, model *ai.Model, request ai.Context, options ai.StreamOptions) *ai.AssistantMessage {
+	return runtime.Stream(ctx, model, request, options).Result()
+}
+
+// StreamSimple shares normalization and auth preparation with Stream; options is optional, as in pi-ai. Native and caller-owned callbacks receive source options; only registry-built stock API leaves lower simple options.
+func (runtime *ModelRuntime) StreamSimple(ctx context.Context, model *ai.Model, request ai.Context, options ...ai.StreamOptions) *ai.AssistantMessageEventStream {
+	var selected ai.StreamOptions
+	if len(options) > 0 {
+		selected = options[0]
+	}
+	if err := assertChat(model); err != nil {
+		return runtime.failedStream(ctx, model, err)
+	}
+	if IsVirtualModel(model) {
+		return runtime.streamVirtual(ctx, model, request, selected)
+	}
+	if model != nil && registryOwnsModelBackend(model.Provider) && runtime.services.Registry().GetProvider(model.ProviderMeta.ProviderID) != nil {
+		return runtime.services.Registry().NativeModels().StreamSimple(ctx, model, request, selected)
+	}
+	transcript := ai.NormalizeContext(request)
+	outer := ai.NewAssistantMessageEventStream()
+	ctx = outer.ObservationContext(ctx)
+	go runtime.start(ctx, model, transcript, selected, outer, true)
+	return outer
+}
+
+// CompleteSimple returns the exact terminal pointer produced by StreamSimple.
+func (runtime *ModelRuntime) CompleteSimple(ctx context.Context, model *ai.Model, request ai.Context, options ...ai.StreamOptions) *ai.AssistantMessage {
+	return runtime.StreamSimple(ctx, model, request, options...).Result()
+}
+
+func (runtime *ModelRuntime) start(ctx context.Context, model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions, outer *ai.AssistantMessageEventStream, simple bool) {
+	stackprime.Prime()
+	if ctx == nil {
+		runtime.fail(ctx, outer, model, fmt.Errorf("model runtime: nil context"))
+		return
+	}
+	preparedModel, provider, preparedOptions, err := runtime.prepare(ctx, model, options)
+	if err != nil {
+		// lazy.ts:83 (Pi f3a64af07, #8635): a setup that rejected while the request signal is aborted ends as "aborted", with the rejection's message.
+		runtime.fail(ctx, outer, model, err)
+		return
+	}
+	if extension.ModelStreamRequestFromContext(ctx).API {
+		defer func() { _ = provider.Close() }()
+	}
+	if ctx.Err() != nil && runtime.knowsProvider(preparedModel, provider) {
+		// Pi races auth resolution with the request signal (resolve.ts raceWithAbortSignal) inside lazyStream's setup, so a request cancelled before its provider starts is a setup rejection with the signal's reason; lazy.ts:83 reports it as "aborted" (Pi f3a64af07).
+		runtime.fail(ctx, outer, preparedModel, ai.AbortReason(ctx))
+		return
+	}
+	leaf := provider
+	attributed, registryBuilt := leaf.(*requestOptionsProvider)
+	if registryBuilt {
+		leaf = attributed.Provider
+	}
+	_, registeredCallback := leaf.(*registeredStreamProvider)
+	if native, ok := leaf.(*nativeModelProvider); ok {
+		native.simple = simple
+	} else if simple && registryBuilt && !registeredCallback {
+		preparedOptions = prepareSimpleStreamOptions(preparedModel, transcript, preparedOptions)
+	}
+	if registryBuilt {
+		if !registeredCallback {
+			provider = &apiStreamProvider{Provider: provider, model: preparedModel}
+		}
+		provider = &composedStreamProvider{Provider: provider, model: preparedModel}
+	}
+	// Pi lazy.ts:48-60 `setup().then((inner) => forwardStream(outer, inner))`: the provider stream is created and the forwarder registered in one continuation, with one reaction between them. A provider that has its response buffered queues its whole run behind that continuation; creating the stream outside it lets the response finish before the forwarder reads its first event.
+	if err := ai.RunStreamContinuation(ctx, func(observation *ai.StreamObservation) error {
+		ctx := observation.Context(ctx)
+		inner, err := provider.Stream(ctx, transcript, preparedOptions)
+		if err != nil {
+			return err
+		}
+		if inner == nil {
+			return fmt.Errorf("model runtime: provider %q returned a nil stream", provider.ID())
+		}
+		observation.Yield()
+		// Pi lazy.ts:forwardStream drains the provider's iterator and awaits its result without observing a partial snapshot.
+		return outer.ForwardStream(ctx, inner)
+	}); err != nil {
+		runtime.fail(ctx, outer, preparedModel, err)
+	}
+}
+
+// knowsProvider reports whether Pi's Models would resolve auth for the model's provider. A caller-owned provider the runtime does not know is Pi's
+// compat path (registerFauxProvider and compat.complete): no auth resolution rejects an aborted request, the provider reports it as aborted.
+func (runtime *ModelRuntime) knowsProvider(model *ai.Model, provider ai.Provider) bool {
+	if _, registryBuilt := provider.(*requestOptionsProvider); registryBuilt {
+		return true
+	}
+	id := model.ProviderMeta.ProviderID
+	if id == "" && provider != nil {
+		id = provider.ID()
+	}
+	return runtime.GetProvider(id) != nil
+}
+
+func (runtime *ModelRuntime) prepareRequest(ctx context.Context, model *ai.Model, options ai.StreamOptions) (*ai.Model, ai.Provider, ai.StreamOptions, error) {
+	if model == nil {
+		return nil, nil, ai.StreamOptions{}, fmt.Errorf("model runtime: model is nil")
+	}
+	if extension.ModelStreamRequestFromContext(ctx).API {
+		return runtime.prepareAPIRequest(ctx, model, options)
+	}
+	providerID := model.ProviderMeta.ProviderID
+	if providerID == "" && model.Provider != nil {
+		providerID = model.Provider.ID()
+	}
+	if providerID == "" || model.Provider == nil {
+		return nil, nil, ai.StreamOptions{}, fmt.Errorf("Unknown provider: %s", providerID)
+	}
+
+	if native := runtime.services.Registry().NativeProvider(providerID); native != nil && registryOwnsModelBackend(model.Provider) {
+		return runtime.prepareNativeRequest(ctx, model, options, native)
+	}
+	requestModel := model
+	provider := model.Provider
+	configuredHeaders := model.ProviderMeta.Headers
+	var resolvedEnv map[string]string
+	var nativeAuth *ai.AuthResult
+	// Native Go providers expose Pi's auth property through Auth().
+	if native, ok := provider.(interface{ Auth() ai.ProviderAuth }); ok {
+		overrides := ai.AuthResolutionOverrides{Env: options.Env}
+		if options.APIKey != "" {
+			overrides.APIKey = &options.APIKey
+		}
+		resolved, err := ai.ResolveProviderAuth(ctx, providerID, native.Auth(), runtime.services.Credentials(), ai.DefaultProviderAuthContext(), overrides)
+		if err != nil {
+			return nil, nil, ai.StreamOptions{}, err
+		}
+		if resolved == nil || (resolved.Auth.APIKey == "" && resolved.Auth.Headers == nil) {
+			return nil, nil, ai.StreamOptions{}, &modelRuntimeAuthMissingError{provider: providerID}
+		}
+		nativeAuth = resolved
+		resolvedEnv = resolved.Env
+		if resolved.Auth.BaseURL != "" {
+			cloned := *model
+			cloned.ProviderMeta.BaseURL = resolved.Auth.BaseURL
+			requestModel = &cloned
+		}
+	} else if model.ProviderMeta.ProviderID != "" && registryOwnsModelBackend(provider) {
+		overrides := ai.AuthResolutionOverrides{Env: options.Env}
+		if options.APIKey != "" {
+			overrides.APIKey = &options.APIKey
+		}
+		registry := runtime.services.Registry()
+		// A model object an extension set is sent as it is: Pi's request uses the model it is given (model-runtime.ts:667-689 prepareRequest), and the Session replaces the object when the registry's model changes (refreshCurrentModelFromRegistry). A model the host built from a name takes the registry's current model of that name.
+		object := runtime.modelObjectOrigin(model) != nil
+		listed := runtime.GetModel(providerID, model.ID)
+		if listed != nil && !object {
+			requestModel = listed
+		}
+		auth, err := registry.ResolveRegistryModelAuth(ctx, requestModel, overrides)
+		if err != nil {
+			return nil, nil, ai.StreamOptions{}, err
+		}
+		if auth == nil {
+			if options.APIKey == "" && registry.GetProvider(providerID) == nil && !registry.ModelRegistry.HasConfiguredAuth(providerID) {
+				return nil, nil, ai.StreamOptions{}, &modelRuntimeAuthMissingError{provider: providerID}
+			}
+			resolved, err := buildUnauthenticatedRequestModel(model, listed, object, runtime.services, options.APIKey)
+			if err != nil {
+				return nil, nil, ai.StreamOptions{}, err
+			}
+			requestModel, provider = resolved, resolved.Provider
+			configuredHeaders = resolved.ProviderMeta.Headers
+		} else {
+			nativeAuth = new(*auth)
+			nativeAuth.Auth.Headers = registry.RequestAuthHeaders(requestModel, auth.Auth.Headers)
+			resolvedEnv = auth.Env
+			entry := icodingagent.NativeModelEntry(requestModel)
+			entry.Headers = nil // Auth resolution has already assembled model and provider headers.
+			entry.Env = auth.Env
+			entry.Insecure = registry.ProviderInsecure(providerID)
+			if auth.Auth.BaseURL != "" {
+				entry.BaseURL = auth.Auth.BaseURL
+				copy := *requestModel
+				copy.ProviderMeta.BaseURL = auth.Auth.BaseURL
+				requestModel = &copy
+			}
+			provider, err = buildProviderForEntry(providerID, model.ID, requestModel.ProviderMeta.API, entry, runtime.services, auth.Auth.APIKey, auth.Auth.APIKey == "", false)
+			if err != nil {
+				return nil, nil, ai.StreamOptions{}, err
+			}
+			provider = newRequestOptionsProvider(provider, providerID, nil)
+			configuredHeaders = nil
+		}
+	}
+
+	prepared := options
+	prepared.APIKey = ""
+	// The selected model can enable reasoning for a custom ID even when the provider's fallback catalog entry does not.
+	prepared.IsReasoning = options.IsReasoning || model.ProviderMeta.Reasoning || (model.Capabilities.MaxThinking != "") || requestModel.ProviderMeta.Reasoning || (requestModel.Capabilities.MaxThinking != "")
+	prepared.ModelCost = requestModel.CostRates()
+	prepared.Headers = mergeRuntimeHeaders(configuredHeaders, options.Headers)
+	if nativeAuth != nil {
+		prepared.APIKey = nativeAuth.Auth.APIKey
+		prepared.Headers = ai.MergeProviderHeaders(nativeAuth.Auth.Headers, prepared.Headers)
+	}
+	prepared.Headers = withOpenCodeSessionHeaders(providerID, requestModel.ProviderMeta.BaseURL, options.SessionID, prepared.Headers)
+	if options.TransformHeaders != nil {
+		transformed, err := options.TransformHeaders(ctx, maps.Clone(prepared.Headers))
+		if err != nil {
+			return nil, nil, ai.StreamOptions{}, err
+		}
+		prepared.Headers = transformed
+	}
+	prepared.TransformHeaders = nil
+	if len(resolvedEnv) > 0 || len(options.Env) > 0 {
+		prepared.Env = make(ai.ProviderEnv, len(resolvedEnv)+len(options.Env))
+		maps.Copy(prepared.Env, resolvedEnv)
+		maps.Copy(prepared.Env, options.Env)
+	}
+	return requestModel, provider, prepared, nil
+}
+
+type modelRuntimeAuthMissingError struct{ provider string }
+
+func (e *modelRuntimeAuthMissingError) Error() string {
+	return "Provider is not configured: " + e.provider
+}
+
+func mergeRuntimeHeaders(base map[string]string, override ai.ProviderHeaders) ai.ProviderHeaders {
+	if len(base) == 0 && len(override) == 0 {
+		return nil
+	}
+	merged := ai.ProviderHeadersFromStrings(base)
+	if merged == nil {
+		merged = make(ai.ProviderHeaders)
+	}
+	for name, value := range override {
+		for existing := range merged {
+			if strings.EqualFold(existing, name) {
+				delete(merged, existing)
+			}
+		}
+		merged[name] = value
+	}
+	return merged
+}
+
+func (runtime *ModelRuntime) fail(ctx context.Context, stream *ai.AssistantMessageEventStream, model *ai.Model, err error) {
+	reason := ai.StopReasonError
+	if ctx != nil && ctx.Err() != nil {
+		reason = ai.StopReasonAborted
+	}
+	// lazy.ts createSetupErrorMessage builds the message with errorMessage before timestamp; the session file keeps that order.
+	message := &ai.AssistantMessage{
+		Content:              []ai.AssistantContentBlock{},
+		StopReason:           reason,
+		ErrorMessage:         err.Error(),
+		ErrorBeforeTimestamp: true,
+		Timestamp:            time.Now().UnixMilli(),
+	}
+	if model != nil {
+		message.API = model.ProviderMeta.API
+		message.Provider = model.ProviderMeta.ProviderID
+		if message.Provider == "" && model.Provider != nil {
+			message.Provider = model.Provider.ID()
+		}
+		message.Model = model.ID
+	}
+	_ = stream.Push(ai.ErrorEvent{Reason: reason, Error: message})
+}
+
+// testFauxModelID is the one model the harness provider lists (test/parity/testdata/test-faux-provider.ts:706).
+const testFauxModelID = "faux-1"
+
+// IsTestFauxModel reports whether id is a model the harness test-faux provider lists.
+func IsTestFauxModel(id string) bool { return id == testFauxModelID }
+
+// registerHarnessTestFaux registers the provider Pi's parity harness registers from an extension (test/parity/testdata/test-faux-provider.ts): one provider
+// with a configured key, so it is an available provider of the model snapshot as there, and every consumer of that snapshot (the footer's provider count,
+// the selectors, the model lists) sees what Pi's sees. The faux stream itself is built in (buildProviderForEntry).
+func registerHarnessTestFaux(reg *icodingagent.ModelRegistry) error {
+	return reg.RegisterExtensionProvider("test-faux", extension.ProviderConfig{
+		BaseURL: "http://localhost:0",
+		APIKey:  "unused",
+		API:     "test-faux",
+		Models: []extension.ProviderModelConfig{{
+			ID: testFauxModelID, Name: "Test Faux", API: "test-faux", Provider: "test-faux", BaseURL: "http://localhost:0",
+			Input: ai.TestFauxInput(), ContextWindow: ai.TestFauxContextWindow, MaxTokens: ai.TestFauxMaxTokens,
+		}},
+	})
+}

@@ -1,0 +1,66 @@
+# Behavior family: slash-commands
+# Surface: /changelog renders a "What's New" block
+#
+# Upstream evidence (pi v0.69.0, current loop probe):
+#   command: PI_CODING_AGENT_DIR=test/parity/scenarios/slash-commands/testdata/pi-agent pi --no-extensions --session-dir {{TEMP}}/sessions
+#   keys: /changelog Enter
+#   ready_pattern: "Warning: No models available."
+#   raw upstream observation:
+#     Upstream renders DynamicBorder + bold accent "What's New" header + Markdown(entries) + DynamicBorder.
+#     PiG renders Markdown("---\n\n**What's New**\n\n<entries>\n\n---").
+#     Both render "What's New" in the pane.
+#
+# Content differs between binaries (different CHANGELOG.md), so output_equal
+# is impossible. We assert that:
+#   - Both reach the "What's New" header (visible-screen wait after Ctrl+Home)
+#   - Neither crashes
+# The pi changelog is long enough to scroll "What's New" off a 60-row pane.
+# Pi 1.0.0 draws fullscreen by default: the alternate screen has no scrollback, and the
+# transcript follows its newest line, so the header is off screen once /changelog renders.
+# The editor marker is the barrier that /changelog was consumed; Ctrl+Home (tui.altScreen.top)
+# then scrolls the viewport to the transcript top, where both binaries show the header,
+# so the final screen can assert it with both_contain.
+
+name = "04-changelog-structure"
+description = "boot-only: Both binaries render /changelog with 'What's New' header."
+covers = [
+  "packages/coding-agent/src/core/slash-commands.ts",
+]
+tags = ["fast", "hermetic", "tui"]
+driver = "interactive-tmux"
+
+[tmux]
+width = 100
+height = 60
+# Both sides start typing after their startup rebind, which sets the autocomplete provider and then prints this
+# warning; "(auto)" paints before PiG's rebind, and a key sent then is cancelled by it (interactive-mode.ts:1085-1099).
+ready_pattern_pig = "Warning: No models available."
+ready_pattern_pi = "Warning: No models available."
+ready_timeout_seconds = 25
+
+[[tmux.steps]]
+keys = ["/changelog", "Enter"]
+wait_timeout_seconds = 5
+
+[[tmux.steps]]
+keys = ["PARITY_CHANGELOG_BARRIER"]
+wait_visible_contains = ["PARITY_CHANGELOG_BARRIER"]
+wait_timeout_seconds = 5
+
+[[tmux.steps]]
+keys = ["hex:1b 5b 31 3b 35 48"]
+wait_visible_contains = ["What's New"]
+wait_timeout_seconds = 5
+settle_seconds = 2
+
+[env]
+pig = ["PIG_CODING_AGENT_DIR=testdata/pig-agent"]
+pi = ["PI_CODING_AGENT_DIR=testdata/pi-agent"]
+pig_args = ["--no-extensions", "--session-dir", "{{TEMP}}/sessions"]
+pi_args = ["--session-dir", "{{TEMP}}/sessions"]
+
+[assert]
+both_reach_ready = true
+both_contain = ["What's New"]
+both_not_contain = ["unknown command", "panic:", "goroutine ", "No changelog entries found"]
+runs = 1

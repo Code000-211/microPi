@@ -1,0 +1,338 @@
+package cli
+
+// Ports packages/coding-agent/src/core/model-resolver.ts
+
+// Startup model selection. Mirrors upstream main.ts buildSessionOptions (CLI
+// model, then the --models / enabledModels scope for a new session) and
+// sdk.ts createAgentSession's findInitialModel fallback (saved default with
+// auth, then a known provider default, then the first available model) from
+// packages/coding-agent/src/core/model-resolver.ts.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+)
+
+// startupModelRuntime is the ModelRuntime surface startup model selection
+// reads: the composed model list, the models the published availability lists, and per-provider configured auth.
+type startupModelRuntime struct {
+	loaded  []codingagent.RuntimeModel
+	load    func() []codingagent.RuntimeModel
+	hasAuth func(providerID string) bool
+	auth    map[string]bool
+	// availableOf selects the entries of the composed models that the availability lists, in its order.
+	availableOf func([]codingagent.RuntimeModel) []codingagent.RuntimeModel
+}
+
+// newStartupModelRuntime is a runtime over a fixed model list whose availability is its providers' configured auth.
+func newStartupModelRuntime(models []codingagent.RuntimeModel, hasAuth func(providerID string) bool) *startupModelRuntime {
+	rt := &startupModelRuntime{loaded: models, hasAuth: hasAuth, auth: map[string]bool{}}
+	rt.availableOf = func(models []codingagent.RuntimeModel) []codingagent.RuntimeModel {
+		return slices.DeleteFunc(slices.Clone(models), func(model codingagent.RuntimeModel) bool { return !rt.HasConfiguredAuth(model.Provider) })
+	}
+	return rt
+}
+
+// newLazyStartupModelRuntime is a runtime over the models load lists when a selection first reads them: an explicit --model
+// resolves through ModelRuntime and reads none (main.ts:803-819 reads modelRuntime only where a step needs it). availableOf is
+// ModelRuntime.AvailableRuntimeModels.
+func newLazyStartupModelRuntime(load func() []codingagent.RuntimeModel, hasAuth func(providerID string) bool, availableOf func([]codingagent.RuntimeModel) []codingagent.RuntimeModel) *startupModelRuntime {
+	return &startupModelRuntime{load: load, hasAuth: hasAuth, auth: map[string]bool{}, availableOf: availableOf}
+}
+
+// models returns the composed models, loading them on the first read.
+func (rt *startupModelRuntime) models() []codingagent.RuntimeModel {
+	if rt.load != nil {
+		rt.loaded, rt.load = rt.load(), nil
+	}
+	return rt.loaded
+}
+
+// GetModels returns every composed model, or one provider's.
+func (rt *startupModelRuntime) GetModels(providerID string) []codingagent.RuntimeModel {
+	if providerID == "" {
+		return slices.Clone(rt.models())
+	}
+	var models []codingagent.RuntimeModel
+	for _, model := range rt.models() {
+		if model.Provider == providerID {
+			models = append(models, model)
+		}
+	}
+	return models
+}
+
+// HasConfiguredAuth reports the provider's configured auth, read once.
+func (rt *startupModelRuntime) HasConfiguredAuth(providerID string) bool {
+	configured, ok := rt.auth[providerID]
+	if !ok {
+		configured = rt.hasAuth(providerID)
+		rt.auth[providerID] = configured
+	}
+	return configured
+}
+
+// getModel mirrors upstream ModelRuntime.getModel: an exact composed model.
+func (rt *startupModelRuntime) getModel(providerID, modelID string) *codingagent.RuntimeModel {
+	models := rt.models()
+	index := slices.IndexFunc(models, func(model codingagent.RuntimeModel) bool {
+		return model.Provider == providerID && model.ID == modelID
+	})
+	if index < 0 {
+		return nil
+	}
+	return &models[index]
+}
+
+// getAvailable mirrors upstream ModelRuntime.getAvailableSnapshot: the composed models the published availability lists, which a provider may narrow per credential.
+func (rt *startupModelRuntime) getAvailable() []codingagent.RuntimeModel {
+	return rt.availableOf(rt.models())
+}
+
+// GetModel returns an exact composed model without reading authentication.
+func (rt *startupModelRuntime) GetModel(providerID, modelID string) *codingagent.RuntimeModel {
+	return rt.getModel(providerID, modelID)
+}
+
+// GetAvailable serves the startup snapshot as the scope's available models.
+func (rt *startupModelRuntime) GetAvailable(context.Context) ([]codingagent.RuntimeModel, error) {
+	return rt.getAvailable(), nil
+}
+
+// GetAvailableSnapshot returns the existing startup adapter's available-model observation.
+func (rt *startupModelRuntime) GetAvailableSnapshot() []codingagent.RuntimeModel {
+	return rt.getAvailable()
+}
+
+// ScopedModel is the shared scope entry used by startup and interactive selection.
+type ScopedModel = codingagent.ScopedModel
+
+func resolveModelScopeFromModels(patterns []string, availableModels []codingagent.RuntimeModel) ([]ScopedModel, []string) {
+	return resolveModelScopeFromRuntime(patterns, snapshotModels(availableModels))
+}
+
+// snapshotModels is a ModelScopeRuntime over a fixed model list.
+type snapshotModels []codingagent.RuntimeModel
+
+func (models snapshotModels) GetAvailable(context.Context) ([]codingagent.RuntimeModel, error) {
+	return models, nil
+}
+
+func resolveModelScopeFromRuntime(patterns []string, runtime codingagent.ModelScopeRuntime) ([]ScopedModel, []string) {
+	result, err := codingagent.ResolveModelScopeWithDiagnostics(context.Background(), patterns, runtime)
+	if err != nil {
+		return nil, []string{err.Error()}
+	}
+	var warnings []string
+	for _, diagnostic := range result.Diagnostics {
+		warnings = append(warnings, diagnostic.Message)
+	}
+	return result.ScopedModels, warnings
+}
+
+// findInitialModel delegates startup's saved-default and available-model selection to the shared resolver. Session construction still owns startup thinking selection.
+func findInitialModel(rt *startupModelRuntime, defaultProvider, defaultModelID string) (*codingagent.RuntimeModel, error) {
+	result, err := codingagent.FindInitialModel(codingagent.FindInitialModelOptions{
+		ModelRuntime: rt, IsContinuing: true, DefaultProvider: defaultProvider, DefaultModelId: defaultModelID,
+	})
+	return result.Model, err
+}
+
+// startupModelOptions carries the CLI and session inputs startup model
+// selection reads.
+type startupModelOptions struct {
+	CLIProvider string
+	CLIModel    string
+	CLIThinking string
+	// ScopePatterns are --models, else the enabledModels setting.
+	ScopePatterns []string
+	// Continuing reports a session that already has messages (resumed, continued or
+	// forked), whose saved model takes precedence over the scope.
+	Continuing bool
+	// SessionManager is the already-opened Session used for restoration before default-model fallback.
+	SessionManager *coding.SessionManager
+	// APIKey is --api-key: a non-persistent key for the CLI or scope model's
+	// provider.
+	APIKey string
+}
+
+// startupModel keeps the scope warnings, which the runtime's diagnostics list before the session option diagnostics, separate from the model warnings and errors. Selection and fallback continue after an explicit-model diagnostic so metadata can still use the runtime.
+type startupModel struct {
+	Model                *ai.Model
+	Thinking             string
+	Warnings             []string
+	ScopeWarnings        []string
+	Errors               []error
+	ModelFallbackMessage string
+}
+
+// selectStartupModel resolves explicit selection, then the loaded Session's model, then configured/provider defaults. It retains ordered errors in the result and returns their aggregate. A nil Model with nil error means no authenticated model is available.
+func selectStartupModel(ctx context.Context, options startupModelOptions, settings codingagent.Settings, services *coding.AgentSessionServices) (startupModel, error) {
+	// upstream: main.ts:803-819 resolves against modelRuntime, whose catalog and auth include the virtual models the services registered (agent-session-services.ts:182-193).
+	modelRuntime := services.ModelRuntime()
+	rt := newLazyStartupModelRuntime(modelRuntime.RuntimeModels, modelRuntime.HasConfiguredAuth, modelRuntime.AvailableRuntimeModels)
+	var result startupModel
+	selected, err := selectSessionOptionModel(rt, modelRuntime, options, settings, &result)
+	if err != nil {
+		result.Errors = append(result.Errors, err)
+	}
+	if options.APIKey != "" {
+		if selected == nil {
+			result.Errors = append(result.Errors, errors.New("--api-key requires a model to be specified via --model, --provider/--model, or --models"))
+		} else {
+			// upstream: main.ts:835 awaits modelRuntime.setRuntimeApiKey, whose synchronization failure rejects.
+			if err := modelRuntime.SetRuntimeApiKey(ctx, selected.Provider, options.APIKey); err != nil {
+				result.Errors = append(result.Errors, err)
+			}
+		}
+	}
+	if selected == nil && options.SessionManager != nil {
+		// sdk.ts:198-224 restores an authenticated saved model before consulting defaults.
+		branch := options.SessionManager.GetContextBranch()
+		existing := options.SessionManager.BuildSessionContext()
+		// Assistant messages name the physical model that answered, so a virtual selection is only in model_change entries (sdk.ts:201-205).
+		sessionModel := coding.GetBranchSelection(branch, func(provider, modelID string) *ai.Model {
+			if model := rt.getModel(provider, modelID); model != nil && model.NativeModel != nil {
+				return model.NativeModel
+			}
+			return nil
+		})
+		if len(existing.Messages) > 0 && sessionModel != nil {
+			if !sessionModel.Unresolvable {
+				if restored := rt.getModel(sessionModel.Provider, sessionModel.ModelID); restored != nil && rt.HasConfiguredAuth(restored.Provider) {
+					selected = restored
+				}
+			}
+			if selected == nil {
+				result.ModelFallbackMessage = "Could not restore model " + sessionModel.Provider + "/" + sessionModel.ModelID
+			}
+		}
+	}
+	if selected == nil {
+		selected, err = findInitialModel(rt, settings.DefaultProvider, settings.DefaultModel)
+		if err != nil {
+			return result, err
+		}
+		if selected == nil {
+			result.ModelFallbackMessage = codingagent.FormatNoModelsAvailableMessage()
+			return result, errors.Join(result.Errors...)
+		}
+		if result.ModelFallbackMessage != "" {
+			result.ModelFallbackMessage += ". Using " + selected.Provider + "/" + selected.ID
+		}
+	}
+	result.Model, err = buildSelectedModel(ctx, selected, services)
+	// A virtual model is the runtime's shared catalog entry and carries its reasoning from its definition (virtual-models.ts:159-176 createVirtualModel), so startup does not rewrite it.
+	if err == nil && selected.Reasoning && result.Model != nil && !coding.IsVirtualModel(result.Model) {
+		result.Model.ProviderMeta.Reasoning = true
+		if result.Model.Capabilities.MaxThinking == "" {
+			result.Model.Capabilities.MaxThinking = ai.ThinkingLevelHigh
+		}
+	}
+	if err != nil {
+		result.Errors = append(result.Errors, err)
+	}
+	return result, errors.Join(result.Errors...)
+}
+
+// selectSessionOptionModel mirrors upstream main.ts buildSessionOptions: the
+// --model resolution, else the scope's saved default or first entry for a new
+// session. It records the thinking level and warnings in result.
+func selectSessionOptionModel(rt *startupModelRuntime, modelRuntime *coding.ModelRuntime, options startupModelOptions, settings codingagent.Settings, result *startupModel) (*codingagent.RuntimeModel, error) {
+	// Upstream resolves the scope before explicit model selection, including metadata and continuing sessions.
+	var scoped []ScopedModel
+	if len(options.ScopePatterns) > 0 {
+		scoped, result.ScopeWarnings = resolveModelScopeFromModels(options.ScopePatterns, rt.getAvailable())
+	}
+	if model, thinking, ok := testFauxCLIModel(options); ok {
+		result.Thinking = thinking
+		return model, nil
+	}
+	var cliErr error
+	if strings.EqualFold(options.CLIProvider, "melious") && options.CLIModel == "" {
+		options.CLIModel = "glm-5.3"
+	}
+	// Pi 1.0.0 main.ts:469-474 (#10236): --provider only scopes --model, so it fails without one.
+	if options.CLIProvider != "" && options.CLIModel == "" {
+		cliErr = fmt.Errorf("--provider requires --model (for example: --provider %s --model <pattern>)", options.CLIProvider)
+	}
+	if options.CLIModel != "" {
+		resolved := coding.ResolveCliModel(coding.ResolveCliModelOptions{CliProvider: options.CLIProvider, CliModel: options.CLIModel, CliThinking: ai.ThinkingLevel(options.CLIThinking), InlineApiKey: options.APIKey != "", ModelRuntime: modelRuntime})
+		if strings.EqualFold(options.CLIProvider, "melious") && resolved.Warning != "" && strings.Contains(resolved.Warning, "not found for provider") {
+			return nil, fmt.Errorf("unknown model %q for provider %q", options.CLIModel, options.CLIProvider)
+		}
+		if resolved.Warning != "" {
+			result.Warnings = append(result.Warnings, resolved.Warning)
+		}
+		if resolved.Error != "" {
+			cliErr = errors.New(resolved.Error)
+		}
+		if resolved.Model != nil {
+			result.Thinking = string(resolved.ThinkingLevel)
+			return runtimeModelOf(resolved.Model), nil
+		}
+	}
+	if len(scoped) == 0 || options.Continuing {
+		return nil, cliErr
+	}
+	chosen := scoped[0]
+	if saved := rt.getModel(settings.DefaultProvider, settings.DefaultModel); saved != nil {
+		if index := slices.IndexFunc(scoped, func(entry ScopedModel) bool { return modelsAreEqual(entry.Model, *saved) }); index >= 0 {
+			chosen = scoped[index]
+		}
+	}
+	result.Thinking = chosen.ThinkingLevel
+	return &chosen.Model, cliErr
+}
+
+// buildSelectedModel builds the session model of a startup selection. Pi gives the session the model its selection returned (main.ts:536-537
+// `options.model = resolved.model`). For an id no catalog carries that is resolveCliModel's copy of one of the provider's models
+// (model-resolver.ts:302-313 buildFallbackModel), which only the selection holds: the provider and id name no model to build.
+func buildSelectedModel(ctx context.Context, selected *codingagent.RuntimeModel, services *coding.AgentSessionServices) (*ai.Model, error) {
+	if fallback := selected.NativeModel; fallback != nil && services.ModelRuntime().GetModel(selected.Provider, selected.ID) == nil {
+		return coding.BuildFallbackModel(fallback, services)
+	}
+	return buildModelFromRef(ctx, selected.Provider, selected.ID, services)
+}
+
+// testFauxCLIModel selects the test-only test-faux provider's own model for a --model naming it, without the registry resolution a real --model
+// takes (ResolveCliModel, which builds every runtime model). It exists only when PIG_TEST_FAUX=1. The provider is registered in the model registry
+// (registerHarnessTestFaux), so every consumer of the registry sees it as Pi's harness-registered one; only this selection is a shortcut, and
+// the startup allocation ceilings (TestStartupAllocationBudget, test/perfgate), which only move down, are measured with it: the registry
+// resolution adds about 6,100 allocations and 380 KB to the warm first prompt. The resolution itself has its own ceilings, per provider shape
+// (TestStartupAllocationBudgetRealModel, which runs without PIG_TEST_FAUX). The shortcut stands for the resolution only where both select
+// the same model: an id the provider lists. Any other id is resolved like any provider's, as Pi resolves it for the provider its harness
+// registers from an extension: a copy of the listed model under the id, with the custom model id warning (model-resolver.ts:302-313, 518-532).
+func testFauxCLIModel(options startupModelOptions) (*codingagent.RuntimeModel, string, bool) {
+	if !coding.TestFauxProviderEnabled() {
+		return nil, "", false
+	}
+	spec := options.CLIModel
+	if options.CLIProvider == "test-faux" && !strings.HasPrefix(spec, "test-faux/") {
+		spec = "test-faux/" + spec
+	}
+	modelID, ok := strings.CutPrefix(spec, "test-faux/")
+	if !ok || modelID == "" {
+		return nil, "", false
+	}
+	thinking := ""
+	if colon := strings.LastIndex(modelID, ":"); colon != -1 && validThinkingLevels[modelID[colon+1:]] { //portlint:allow utf16units colon is the byte index of ASCII ':' (0x3A), which never occurs inside a multibyte UTF-8 sequence, so the slices split at the same character as lastIndexOf/substring; the suffix is only used when it equals a thinking level (test-faux-only shortcut)
+		modelID, thinking = modelID[:colon], modelID[colon+1:] //portlint:allow utf16units colon is the byte index of ASCII ':' (0x3A), which never occurs inside a multibyte UTF-8 sequence, so the slices split at the same character as lastIndexOf/substring; the suffix is only used when it equals a thinking level (test-faux-only shortcut)
+	}
+	if !coding.IsTestFauxModel(modelID) {
+		return nil, "", false
+	}
+	return &codingagent.RuntimeModel{Provider: "test-faux", ID: modelID, Name: "Test Faux"}, thinking, true
+}
+
+// runtimeModelOf is the selection metadata of a resolved model: what ModelRuntime.RuntimeModels carries for it.
+func runtimeModelOf(model *ai.Model) *codingagent.RuntimeModel {
+	return &codingagent.RuntimeModel{NativeModel: model, Provider: model.ProviderMeta.ProviderID, ID: model.ID, Name: model.DisplayName, Reasoning: model.ProviderMeta.Reasoning || model.Capabilities.MaxThinking != "", Headers: ai.ProviderHeadersFromStrings(model.ProviderMeta.Headers)}
+}

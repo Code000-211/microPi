@@ -1,0 +1,534 @@
+package subprocess
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+	"weak"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/extensions/sdk/frontend"
+	"github.com/MichaelKinsy/PiG/tui/widthx"
+)
+
+// toolRenderSession is one tool card's renderer session in an extension
+// process: upstream's per-card renderer state and last components live there.
+// The card's call and result proxies share the session. When neither is
+// reachable any more, the extension is told to release the card.
+type toolRenderSession struct {
+	card       string
+	conn       *Conn
+	invalidate atomic.Pointer[func()]
+	// order runs the card's render requests one at a time in the order the card asked for them.
+	order renderOrder
+}
+
+// renderOrder makes a card's renderers reach the extension as upstream runs them. ToolExecutionComponent.updateDisplay runs renderCall and then
+// renderResult synchronously on one card, so a result renderer always reads the state the call renderer just wrote. The card's proxies each run their
+// own request loop, and an extension serves requests concurrently, so without this order a result render overtakes the call render that precedes it
+// (a card whose call and result are both known at its first frame: a resumed session, a tool that finishes before the first frame).
+//
+// A proxy that needs a request says so with want, from the thread that runs the card's renderers, so the order is the order the card asked in; the
+// proxy's loop then waits for its turn. A turn is taken when the proxy's request is the oldest wanted and no other request of the card is running, and
+// it ends when the answer arrived or the renderer inactivity boundary (D56) abandoned the request: a call renderer that fails or stalls holds the
+// result renderer back for the length of its request at most, never for good. The zero value is ready to use.
+type renderOrder struct {
+	mu      sync.Mutex
+	next    uint64
+	wanted  map[*toolRenderProxy]uint64
+	busy    bool
+	changed chan struct{}
+}
+
+// want records that p needs a request, after every request wanted so far. A proxy that already waits moves behind them, for its newer inputs are
+// the ones the card asked for last.
+func (o *renderOrder) want(p *toolRenderProxy) {
+	o.mu.Lock()
+	o.next++
+	if o.wanted == nil {
+		o.wanted = make(map[*toolRenderProxy]uint64)
+	}
+	o.wanted[p] = o.next
+	o.wake()
+	o.mu.Unlock()
+}
+
+// wait blocks until it is p's turn and takes it. The request p was wanted for is consumed: a newer want is a request of its own.
+func (o *renderOrder) wait(p *toolRenderProxy) {
+	for {
+		o.mu.Lock()
+		if o.turn(p) {
+			o.busy = true
+			o.mu.Unlock()
+			return
+		}
+		if o.changed == nil {
+			o.changed = make(chan struct{})
+		}
+		changed := o.changed
+		o.mu.Unlock()
+		<-changed
+	}
+}
+
+// turn reports whether p may send its request now and, when it may, consumes the want. A proxy with no want (its loop runs only for one) is wanted
+// now, after the others, so a loop never waits for a turn that nothing will grant.
+func (o *renderOrder) turn(p *toolRenderProxy) bool {
+	if o.busy {
+		return false
+	}
+	seq, ok := o.wanted[p]
+	if !ok {
+		if o.wanted == nil {
+			o.wanted = make(map[*toolRenderProxy]uint64)
+		}
+		o.next++
+		seq = o.next
+		o.wanted[p] = seq
+	}
+	for _, other := range o.wanted {
+		if other < seq {
+			return false
+		}
+	}
+	delete(o.wanted, p)
+	return true
+}
+
+// clear drops what p still wants: its loop ends having rendered inputs newer than the want that was left.
+func (o *renderOrder) clear(p *toolRenderProxy) {
+	o.mu.Lock()
+	delete(o.wanted, p)
+	o.wake()
+	o.mu.Unlock()
+}
+
+// leave ends the turn p took.
+func (o *renderOrder) leave() {
+	o.mu.Lock()
+	o.busy = false
+	o.wake()
+	o.mu.Unlock()
+}
+
+// wake tells the waiting loops that the order changed. o.mu is held.
+func (o *renderOrder) wake() {
+	if o.changed != nil {
+		//portlint:allow doubleclose every caller holds o.mu, and the channel is set to nil as it is closed, so each channel is closed once
+		close(o.changed)
+		o.changed = nil
+	}
+}
+
+// toolRenderSessions routes an extension's invalidate notifications to live
+// card sessions. Entries are weak, so a card that leaves the transcript
+// releases its session.
+type toolRenderSessions struct {
+	mu     sync.Mutex
+	byCard map[string]weak.Pointer[toolRenderSession]
+}
+
+var toolRenderCardSeq atomic.Uint64
+
+// session returns the live session of card on conn, creating it when card has
+// none. An empty card gets a session of its own.
+func (r *toolRenderSessions) session(conn *Conn, card string) *toolRenderSession {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if card != "" {
+		if existing, ok := r.byCard[card]; ok {
+			if session := existing.Value(); session != nil && session.conn == conn {
+				return session
+			}
+		}
+	} else {
+		card = fmt.Sprintf("host-%d", toolRenderCardSeq.Add(1))
+	}
+	session := &toolRenderSession{card: card, conn: conn}
+	if r.byCard == nil {
+		r.byCard = make(map[string]weak.Pointer[toolRenderSession])
+	}
+	r.byCard[card] = weak.Make(session)
+	runtime.AddCleanup(session, r.release, toolRenderRelease{card: card, conn: conn})
+	return session
+}
+
+type toolRenderRelease struct {
+	card string
+	conn *Conn
+}
+
+// release drops a collected session and tells its extension to free the
+// card's renderer state.
+func (r *toolRenderSessions) release(released toolRenderRelease) {
+	r.mu.Lock()
+	if existing, ok := r.byCard[released.card]; ok && existing.Value() == nil {
+		delete(r.byCard, released.card)
+	}
+	r.mu.Unlock()
+	if released.conn == nil {
+		return
+	}
+	args, err := json.Marshal(ToolRenderCardPayload{Card: released.card})
+	if err != nil {
+		return
+	}
+	_ = released.conn.Send(&Envelope{Type: MsgNotify, Notify: &NotifyPayload{Method: NotifyToolRenderRelease, Args: args}})
+}
+
+// invalidate runs the invalidate callback of card's latest render context.
+func (r *toolRenderSessions) invalidate(conn *Conn, card string) {
+	r.mu.Lock()
+	existing, ok := r.byCard[card]
+	r.mu.Unlock()
+	if !ok {
+		return
+	}
+	session := existing.Value()
+	if session == nil || session.conn != conn {
+		return
+	}
+	if invalidate := session.invalidate.Load(); invalidate != nil && *invalidate != nil {
+		(*invalidate)()
+	}
+}
+
+// toolRenderProxy is the host-side component a subprocess tool's renderCall
+// or renderResult returns. Render never performs IPC: it returns the last
+// frame the extension rendered and starts at most one owned background
+// request loop when the renderer inputs or the width change.
+type toolRenderProxy struct {
+	session *toolRenderSession
+	tool    string
+	// renderers names resolved renderers of the extension, or "" for the registered tool's.
+	renderers  string
+	phase      string
+	inactivity time.Duration
+	repaint    func()
+
+	mu         sync.Mutex
+	payload    RenderToolPayload
+	rerender   bool
+	lines      []string
+	linesWidth int
+	failed     bool
+	fallback   func(width int) []string
+	width      int
+	generation uint64
+	requesting bool
+	retry      renderRetry
+	dirty      bool
+	// view is the view of the renderer's results (D107).
+	view rendererView
+}
+
+// makeToolRenderCall returns the renderCall the host registers for a
+// subprocess tool that defines one.
+func (h *Host) makeToolRenderCall(me *managedExt, toolName string) extension.ToolRenderCallFunc {
+	return func(args json.RawMessage, _ extension.Theme, context extension.ToolRenderContext) extension.Component {
+		return h.toolRenderProxyFor(me, toolName, "call", context, RenderToolPayload{Args: args})
+	}
+}
+
+// makeToolRenderResult returns the renderResult the host registers for a
+// subprocess tool that defines one.
+func (h *Host) makeToolRenderResult(me *managedExt, toolName string) extension.ToolRenderResultFunc {
+	return func(result extension.AgentToolResult, options extension.ToolRenderResultOptions, _ extension.Theme, context extension.ToolRenderContext) extension.Component {
+		args, _ := context.Args.(json.RawMessage)
+		return h.toolRenderProxyFor(me, toolName, "result", context, RenderToolPayload{
+			Args:    args,
+			Result:  renderToolResultPayload(result),
+			Options: &options,
+		})
+	}
+}
+
+// toolRenderProxyFor reuses the card's last proxy for phase, as upstream
+// hands a renderer its last component, and schedules the renderer to run with
+// the new inputs.
+func (h *Host) toolRenderProxyFor(me *managedExt, toolName, phase string, context extension.ToolRenderContext, payload RenderToolPayload) *toolRenderProxy {
+	me = me.current()
+	conn := me.connection()
+	proxy, _ := context.LastComponent.(*toolRenderProxy)
+	if proxy == nil || proxy.phase != phase || proxy.tool != toolName || proxy.renderers != payload.Renderers || proxy.session.conn != conn || (context.Card != "" && proxy.session.card != context.Card) {
+		proxy = &toolRenderProxy{
+			renderers:  payload.Renderers,
+			session:    me.toolRenders.session(conn, context.Card),
+			tool:       toolName,
+			phase:      phase,
+			inactivity: rendererInactivity,
+			repaint: func() {
+				if h.uiBridge != nil {
+					h.uiBridge.Invalidate()
+				}
+			},
+		}
+	}
+	invalidate := context.Invalidate
+	proxy.session.invalidate.Store(&invalidate)
+	payload.Card = proxy.session.card
+	payload.Phase = phase
+	payload.Context = RenderToolContext{
+		ToolCallID:       context.ToolCallID,
+		Cwd:              context.Cwd,
+		ExecutionStarted: context.ExecutionStarted,
+		ArgsComplete:     context.ArgsComplete,
+		IsPartial:        context.IsPartial,
+		Expanded:         context.Expanded,
+		ShowImages:       context.ShowImages,
+		IsError:          context.IsError,
+		OutputPad:        context.OutputPad,
+		DurationMs:       context.DurationMs,
+	}
+	proxy.update(payload)
+	return proxy
+}
+
+// renderToolResultPayload converts the host's tool result to upstream's
+// {content, details} shape.
+func renderToolResultPayload(result extension.AgentToolResult) *RenderToolResult {
+	out := &RenderToolResult{Content: []RenderToolContent{}}
+	toolResult := result
+	for _, block := range toolResult.Content {
+		switch value := block.(type) {
+		case ai.TextContent:
+			out.Content = append(out.Content, RenderToolContent{Type: "text", Text: value.Text, TextSignature: value.TextSignature})
+		case ai.ImageContent:
+			out.Content = append(out.Content, RenderToolContent{Type: "image", Data: value.Data, MimeType: value.MimeType})
+		}
+	}
+	if toolResult.Details != nil {
+		if details, err := json.Marshal(toolResult.Details); err == nil {
+			out.Details = details
+		}
+	} else if toolResult.DetailsNull() {
+		// upstream: tool-execution.ts updateResult keeps the result as given, so a renderer sees a tool's details: null.
+		out.Details = json.RawMessage("null")
+	}
+	return out
+}
+
+// SetRendererFallback supplies what the card draws in place of a renderer
+// that throws, as upstream catches a renderer error and shows its fallback.
+func (p *toolRenderProxy) SetRendererFallback(fallback func(width int) []string) {
+	p.mu.Lock()
+	p.fallback = fallback
+	p.mu.Unlock()
+}
+
+// IsDirty reports a frame that arrived after the last Render, or an authoritative view whose loader animates on its own.
+func (p *toolRenderProxy) IsDirty() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dirty || (p.linesWidth > 0 && p.view.animates())
+}
+
+func (p *toolRenderProxy) update(payload RenderToolPayload) {
+	p.mu.Lock()
+	p.payload = payload
+	p.rerender = true
+	start := false
+	if p.width > 0 {
+		p.generation++
+		p.session.order.want(p)
+		if !p.requesting {
+			p.requesting = true
+			start = true
+		}
+	}
+	p.mu.Unlock()
+	if start {
+		go p.requestLoop()
+	}
+}
+
+func (p *toolRenderProxy) Render(width int) []string {
+	p.mu.Lock()
+	p.dirty = false
+	start := false
+	if width > 0 && width != p.width {
+		p.width = width
+		p.generation++
+		p.session.order.want(p)
+		if !p.requesting {
+			p.requesting = true
+			start = true
+		}
+	}
+	// pig divergence (D56): the first frame after an abandoned render's retry came due asks the extension again.
+	if p.retry.takeDue() && !start && !p.requesting && p.width > 0 {
+		p.session.order.want(p)
+		p.requesting = true
+		start = true
+	}
+	failed, fallback := p.failed, p.fallback
+	lines := widthx.FrameAt(p.lines, p.linesWidth, width)
+	if live, ok := p.view.live(width); ok && p.linesWidth == width {
+		lines = live
+	}
+	lines = append([]string(nil), lines...)
+	p.mu.Unlock()
+	if start {
+		go p.requestLoop()
+	}
+	if failed && fallback != nil {
+		return fallback(width)
+	}
+	return lines
+}
+
+// RenderNow runs the renderer in the extension at width and waits for its
+// frame, for a caller off the TUI loop that needs the component's lines at
+// once, as HTML export renders upstream's synchronous renderers. answered is
+// false when no frame arrived within the renderer inactivity boundary;
+// failed reports a renderer that threw.
+func (p *toolRenderProxy) RenderNow(width int) (lines []string, failed, answered bool) {
+	p.mu.Lock()
+	generation := p.generation
+	payload := p.payload
+	payload.Width = width
+	payload.Rerender = p.rerender
+	p.rerender = false
+	p.mu.Unlock()
+	lines, failed, answered, _ = p.request(payload)
+	p.mu.Lock()
+	if answered {
+		p.lines, p.linesWidth, p.failed = lines, width, failed
+		// An answer to the current inputs at the current width ends a pending retry.
+		if generation == p.generation && width == p.width {
+			p.retry.answered()
+		}
+	} else if payload.Rerender {
+		p.rerender = true
+	}
+	p.mu.Unlock()
+	return lines, failed, answered
+}
+
+// Invalidate is a no-op: the card runs its renderers again on
+// invalidation, which schedules a new generation through update.
+func (p *toolRenderProxy) Invalidate() {}
+
+// requestLoop renders the newest generation, when the card's order gives it
+// the turn. A request that a newer generation overtook is discarded and the
+// loop renders again.
+func (p *toolRenderProxy) requestLoop() {
+	for {
+		p.session.order.wait(p)
+		p.mu.Lock()
+		generation := p.generation
+		payload := p.payload
+		payload.Width = p.width
+		payload.Rerender = p.rerender
+		p.rerender = false
+		p.mu.Unlock()
+
+		lines, failed, ok, stall := p.requestInTurn(payload)
+
+		p.mu.Lock()
+		if !ok && payload.Rerender {
+			p.rerender = true
+		}
+		current := generation == p.generation
+		if current && ok {
+			p.lines = lines
+			p.linesWidth = payload.Width
+			p.failed = failed
+			p.dirty = true
+		}
+		if current {
+			p.requesting = false
+			// A want a newer update left while the request ran is answered by this request's inputs: it carried them.
+			p.session.order.clear(p)
+			var epoch uint64
+			var backoff time.Duration
+			var settled <-chan struct{}
+			if stall != nil {
+				epoch, backoff, settled = p.retry.abandoned(p.inactivity, stall.Settled)
+			} else {
+				p.retry.answered()
+			}
+			p.mu.Unlock()
+			if ok && p.repaint != nil {
+				p.repaint()
+			}
+			if stall != nil {
+				p.session.conn.afterRetryBackoff(settled, backoff, func() { p.retryDue(epoch) }, nil)
+			}
+			return
+		}
+		p.mu.Unlock()
+	}
+}
+
+// requestInTurn is request that gives the card's turn back when it returns: an answer, a failed renderer and an abandoned request (D56) all end it.
+func (p *toolRenderProxy) requestInTurn(payload RenderToolPayload) (lines []string, failed, ok bool, stall *HandlerStalledError) {
+	defer p.session.order.leave()
+	return p.request(payload)
+}
+
+// retryDue makes the retry of abandonment epoch due and asks for the frame
+// that sends it. The proxy reports itself dirty, so the card renders it again
+// instead of reusing its cached lines.
+func (p *toolRenderProxy) retryDue(epoch uint64) {
+	p.mu.Lock()
+	due := p.retry.comeDue(epoch)
+	if due {
+		p.dirty = true
+	}
+	p.mu.Unlock()
+	if due && p.repaint != nil {
+		p.repaint()
+	}
+}
+
+// request runs one render in the extension. failed reports a renderer that
+// threw; ok is false when no answer arrived, and stall is set when the
+// renderer inactivity boundary abandoned the request.
+func (p *toolRenderProxy) request(payload RenderToolPayload) (lines []string, failed, ok bool, stall *HandlerStalledError) {
+	args, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, false, nil
+	}
+	// pig divergence (D56): a tool renderer generation has the renderer
+	// inactivity boundary off the TUI loop and keeps the last frame;
+	// renderRetry asks again once the extension can answer.
+	resp, err := p.session.conn.requestWithInactivity(context.Background(), &Envelope{
+		Type:    MsgRequest,
+		Request: &RequestPayload{Method: RequestRenderTool, Tool: p.tool, Args: args},
+	}, p.inactivity, RequestRenderTool+" "+p.tool)
+	if abandoned, isStall := errors.AsType[*HandlerStalledError](err); isStall {
+		return nil, false, false, abandoned
+	}
+	if err != nil || resp == nil || resp.Response == nil {
+		return nil, false, false, nil
+	}
+	if resp.Response.Error != nil {
+		return nil, true, true, nil
+	}
+	var result RenderResult
+	if err := json.Unmarshal(resp.Response.Result, &result); err != nil {
+		return nil, true, true, nil
+	}
+	// A rejected view keeps the last frame, as a missing answer does.
+	lines, ok = p.view.apply(p.session.conn, p.repaint, "", nil, result, payload.Width)
+	return lines, false, ok, nil
+}
+
+// FrontendView reports the structure of the renderer's result to a D91
+// frontend (D107) while the result shown is the one laid out at width.
+func (p *toolRenderProxy) FrontendView(width int) *frontend.View {
+	p.mu.Lock()
+	current := len(p.lines) > 0 && p.linesWidth == width && !p.failed
+	p.mu.Unlock()
+	if !current {
+		return nil
+	}
+	return p.view.frontendView(width)
+}

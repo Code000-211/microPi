@@ -1,0 +1,393 @@
+//go:build parity
+
+package runner
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/coding"
+	"github.com/MichaelKinsy/PiG/internal/pioracle"
+)
+
+// BinaryRef describes one binary to run a scenario against.
+type BinaryRef struct {
+	Label string   // "pig" or "pi"
+	Path  string   // absolute path
+	Args  []string // base args prepended to every scenario invocation
+	Env   []string // base env vars (KEY=value)
+}
+
+// upstreamPiInstallDirs lists the mise install directories we accept as
+// homes for the upstream pi comparator binary, in priority order.
+//
+// The upstream package was renamed when the project moved from
+// earendil-works/pi to earendil-works/pi in May 2026. The OLD npm package
+// (@mariozechner/pi-coding-agent) stopped publishing at v0.73.1; v0.74+
+// only exists under the NEW name (@earendil-works/pi-coding-agent).
+// We prefer the new path. Old path is kept as fallback for legacy installs.
+var upstreamPiInstallDirs = []string{
+	"npm-earendil-works-pi-coding-agent",
+	"npm-mariozechner-pi-coding-agent",
+}
+
+// pigBinUnderTest resolves the explicitly provided pig binary: PIG_PARITY_PIG_BIN
+// then PIG_BIN. It returns "" when neither is set, and intentionally has no
+// installed-pig fallback so the runner never reads user state.
+func pigBinUnderTest() string {
+	if bin := os.Getenv("PIG_PARITY_PIG_BIN"); bin != "" {
+		return bin
+	}
+	return os.Getenv("PIG_BIN")
+}
+
+// ResolvePigBin returns a BinaryRef for the pig binary under test.
+//
+// Quality-control rule: parity runs against an explicitly provided, freshly
+// built pig, never a silently borrowed install. Resolve PIG_PARITY_PIG_BIN then
+// PIG_BIN; if neither is set, skip rather than fall back to ~/.local/bin/pig, so
+// the runner cannot compare upstream pi against stale or unrelated user state.
+// requireFreshPig still guards an explicitly provided binary against staleness.
+func ResolvePigBin(t *testing.T) BinaryRef {
+	t.Helper()
+	bin := pigBinUnderTest()
+	if bin == "" {
+		failOrSkipMissingBinary(t, "no pig binary under test: build one (`go build -o bin/pig-parity ./cmd/pig`) "+
+			"and set PIG_PARITY_PIG_BIN, or set PIG_BIN; `make parity` does this. The runner "+
+			"never falls back to an installed pig so it cannot silently compare against user state")
+	}
+	if !filepath.IsAbs(bin) {
+		abs, err := filepath.Abs(bin)
+		if err == nil {
+			bin = abs
+		}
+	}
+	if _, err := os.Stat(bin); err != nil {
+		failOrSkipMissingBinary(t, fmt.Sprintf("pig binary not found at %s: build it and set PIG_PARITY_PIG_BIN or PIG_BIN", bin))
+	}
+
+	// Guard default pig state the same way ResolveUpstreamPiBin guards pi
+	// state. Parity scenarios must never read or mutate the user's real ~/.pig
+	// unless a scenario explicitly overrides PIG_HOME/PIG_CODING_AGENT_DIR.
+	//
+	// The runner never reads the operator's real ~/.pig or ~/.pi credentials
+	// here by default: requires-auth scenarios would otherwise silently see
+	// them on any machine where the operator happens to be logged in. Stage
+	// real credentials only when PIG_PARITY_REAL_AUTH names the exact
+	// auth.json to use; see realAuthSourcePath.
+	safeHome := t.TempDir()
+	safeAgentDir := filepath.Join(safeHome, "agent")
+	_ = os.MkdirAll(safeAgentDir, 0o700)
+	// An existing settings.json keeps PiG's first-time setup (D88) out of scenarios that compare with Pi, which never shows it for PiG.
+	_ = os.WriteFile(filepath.Join(safeAgentDir, "settings.json"), []byte("{}\n"), 0o600)
+	if src := realAuthSourcePath(); src != "" {
+		if data, err := os.ReadFile(src); err == nil {
+			_ = os.WriteFile(filepath.Join(safeAgentDir, "auth.json"), data, 0o600)
+		}
+	}
+
+	return BinaryRef{
+		Label: "pig",
+		Path:  bin,
+		// The same baseline as the pi oracle below: upstream 0.99.1 starts the built-in
+		// extensions (llama.cpp, MCP, ...) unless --no-extensions is given, and PiG's
+		// built-ins would otherwise add commands and tools to scenarios that compare
+		// the registered extension surface. (main.ts:569, resource-loader.ts:716)
+		Args: []string{"--no-extensions"},
+		Env: []string{
+			"PIG_USE_PI_DIRS=", // Sharing is selected only by a scenario, never by the operator's environment.
+			"PIG_QUIET_STARTUP=1",
+			"PIG_HOME=" + safeHome,
+			"PIG_CODING_AGENT_DIR=", // Derive from PIG_HOME unless the scenario explicitly overrides the agent directory.
+			// The same startup release-check switch the Pi oracle receives, so an
+			// operator's PIG_UPDATE_URL cannot draw a D39 update notice and both
+			// binaries hand extensions the same value.
+			"PI_SKIP_VERSION_CHECK=1",
+		},
+	}
+}
+
+// allowParityVersionSkew reports whether the operator explicitly opted into
+// running parity against a reference pi binary that failed its version
+// check. See failOrSkipVersionMismatch.
+func allowParityVersionSkew() bool {
+	return os.Getenv("PIG_PARITY_ALLOW_VERSION_SKEW") != ""
+}
+
+// failOrSkipVersionMismatch reports a broken or mismatched reference pi
+// binary. It FAILS the run by default: a version check that only skips (as it
+// did before) lets a broken or mismatched pi produce a green-looking parity
+// run, because TestParity returns before any scenario executes and `go test`
+// still exits 0 (see require-parity-ran in automation/make/parity.mk, which
+// treats that as a hard failure only via the results file, not via the test's
+// own exit code). Set PIG_PARITY_ALLOW_VERSION_SKEW=1 to accept a version
+// mismatch on purpose (mirrors PIG_PARITY_ALLOW_ZERO's opt-out pattern for
+// require-parity-ran).
+func failOrSkipVersionMismatch(t *testing.T, reason string) {
+	t.Helper()
+	if allowParityVersionSkew() {
+		t.Skipf("%s (PIG_PARITY_ALLOW_VERSION_SKEW set: accepting on purpose)", reason)
+		return
+	}
+	t.Fatalf("%s; a broken or mismatched reference pi must fail parity, not silently skip it. "+
+		"Set PIG_PARITY_ALLOW_VERSION_SKEW=1 to accept this on purpose.", reason)
+}
+
+// allowZeroScenarios reports whether the operator explicitly accepted a parity
+// run that compares nothing. It is the same PIG_PARITY_ALLOW_ZERO that
+// require-parity-ran (automation/make/parity.mk) honors.
+func allowZeroScenarios() bool {
+	return os.Getenv("PIG_PARITY_ALLOW_ZERO") != ""
+}
+
+// failOrSkipMissingBinary reports a pig or pi binary the parity run needs but
+// cannot find. It FAILS the run by default: TestParity resolves both binaries
+// before it runs a scenario, so a skip here compares nothing and `go test`
+// still exits 0, which a family gate reports as ok. PIG_PARITY_ALLOW_ZERO=1
+// accepts that outcome on purpose.
+func failOrSkipMissingBinary(t *testing.T, reason string) {
+	t.Helper()
+	if allowZeroScenarios() {
+		t.Skipf("%s (PIG_PARITY_ALLOW_ZERO set: accepting a run that compares nothing)", reason)
+		return
+	}
+	t.Fatalf("%s; a parity run without its binaries compares nothing and must fail, not skip. "+
+		"Set PIG_PARITY_ALLOW_ZERO=1 to accept this on purpose.", reason)
+}
+
+// upstreamMirrorMissing reports why the Pi source mirror (.upstream/current, made by `make upstream-mirror`) is unusable, or nil. Scenario
+// oracles and extensions import the mirrored Pi source (the codemode declarations, the example extensions), and the mirror is untracked, so a
+// fresh clone has none: without this check each of those scenarios fails on its own module-not-found or build-type error, on both sides, and the
+// cause reads as a scenario failure.
+func upstreamMirrorMissing(repoRoot string) error {
+	mirror := filepath.Join(repoRoot, ".upstream", "current")
+	info, err := os.Stat(filepath.Join(mirror, "packages"))
+	if err == nil && info.IsDir() {
+		return nil
+	}
+	return fmt.Errorf("Pi mirror missing: %s has no packages directory: run `make upstream-mirror`", mirror)
+}
+
+// ResolveUpstreamPiBin finds the highest-versioned upstream pi binary
+// installed by mise.
+//
+// The oracle runs with PI_SKIP_VERSION_CHECK=1 (pi utils/version-check.ts
+// checkForNewPiVersion). Otherwise Pi fetches https://pi.dev/api/latest-version
+// and draws an "Update Available" box whenever the live release is newer than
+// the pinned version, so a capture that outlasts the reply differs from run to
+// run for reasons unrelated to PiG. A scenario that needs the check overrides
+// the variable in its own [env].
+func ResolveUpstreamPiBin(t *testing.T) BinaryRef {
+	t.Helper()
+	home, _ := os.UserHomeDir()
+	want := coding.UpstreamPackageVersion
+
+	// Guard: default PI_HOME and PI_CODING_AGENT_DIR to ephemeral temp
+	// dirs so scenarios that forget to declare them in their [env]
+	// section can never pollute the user's real ~/.pi/ config.
+	// PI_CODING_AGENT_DIR is the env var pi actually reads (not PI_HOME).
+	// Scenarios that DO set these override via the driver's env-append
+	// (last-wins), so the guard is invisible to well-written scenarios.
+	safeHome := t.TempDir()
+	safeAgentDir := filepath.Join(safeHome, "agent")
+	_ = os.MkdirAll(safeAgentDir, 0o700)
+
+	// The runner never reads the operator's real ~/.pi or ~/.pig credentials
+	// here by default: requires-auth scenarios would otherwise silently see
+	// them on any machine where the operator happens to be logged in. Stage
+	// real credentials only when PIG_PARITY_REAL_AUTH names the exact
+	// auth.json to use; see realAuthSourcePath.
+	if src := realAuthSourcePath(); src != "" {
+		if data, err := os.ReadFile(src); err == nil {
+			_ = os.WriteFile(filepath.Join(safeAgentDir, "auth.json"), data, 0o600)
+		}
+	}
+
+	// PIG_PARITY_PI_VERSION carries the exact pin to pi_bin wrapper scripts
+	// (e.g. pi-ai-copilot-wrapper.mjs) that locate a pi-ai build by scanning
+	// mise install dirs. Without it they pick the highest-installed version,
+	// which silently diverges from the oracle pin once a newer pi is installed
+	// (e.g. during a bump) - the exact skew this function forbids for the
+	// direct pi path.
+	piEnv := []string{"PI_HOME=" + safeHome, "PI_CODING_AGENT_DIR=" + safeAgentDir, "PIG_PARITY_PI_VERSION=" + want, "PI_SKIP_VERSION_CHECK=1"}
+
+	// CI parity images bake the exact upstream oracle outside mise's writable
+	// home. Prefer the explicit binary when provided, but keep the same exact
+	// version guard so oracle skew cannot pass silently.
+	if bin := os.Getenv("PIG_PARITY_PI_BIN"); bin != "" {
+		if !filepath.IsAbs(bin) {
+			if abs, err := filepath.Abs(bin); err == nil {
+				bin = abs
+			}
+		}
+		if _, err := os.Stat(bin); err != nil {
+			failOrSkipMissingBinary(t, fmt.Sprintf("PIG_PARITY_PI_BIN not found at %s", bin))
+		}
+		//nolint:gosec // G204 (class c): program is PIG_PARITY_PI_BIN, a developer-set oracle path, run with the fixed "--version".
+		out, err := exec.Command(bin, "--version").Output()
+		if err != nil {
+			failOrSkipVersionMismatch(t, fmt.Sprintf("PIG_PARITY_PI_BIN version check failed at %s: %v", bin, err))
+		} else if got := strings.TrimSpace(string(out)); got != want {
+			failOrSkipVersionMismatch(t, fmt.Sprintf("PIG_PARITY_PI_BIN version = %s, want %s", got, want))
+		} else if reason := oracleCommitMismatch(bin); reason != "" {
+			failOrSkipVersionMismatch(t, reason)
+		}
+		return BinaryRef{
+			Label: "pi",
+			Path:  bin,
+			Args:  []string{"--no-extensions"},
+			Env:   piEnv,
+		}
+	}
+
+	// Without PIG_PARITY_PI_BIN the oracle is the Pi that `make parity-deps` built from source at the pin and
+	// linked into extensions/sdk-ts, checked against the pinned commit like an explicit PIG_PARITY_PI_BIN. A
+	// published Pi of the same package version is a different build, so it is used only when the run opts in
+	// (PIG_PARITY_PI_PUBLISHED=1), and then only for a release-tag pin: the exact published version from mise,
+	// not 0.73.0 or 0.74.0 when the pin is 0.73.1.
+	cwd, _ := os.Getwd()
+	tried := upstreamPiCandidates(home, want, !publishedOracleAllowed(), cwd)
+	for _, bin := range tried {
+		if _, err := os.Stat(bin); err != nil {
+			continue
+		}
+		if reason := oracleCommitMismatch(bin); reason != "" {
+			failOrSkipVersionMismatch(t, reason)
+		}
+		return BinaryRef{
+			Label: "pi",
+			Path:  bin,
+			// Upstream needs --no-extensions by default so scenarios see a
+			// minimal baseline matching pig's startup. Scenarios that need
+			// extensions can override via Args in the scenario file.
+			Args: []string{"--no-extensions"},
+			// A scenario's helper script finds its oracle through PIG_PARITY_PI_BIN; the variable is unset here, so the child gets the path resolved above.
+			Env: append(slices.Clone(piEnv), "PIG_PARITY_PI_BIN="+bin),
+		}
+	}
+
+	hint := "make parity-deps (builds Pi from source at pinned commit " + coding.UpstreamCommit + ")"
+	if publishedOracleAllowed() {
+		hint = fmt.Sprintf("mise install npm:@earendil-works/pi-coding-agent@%s", want)
+	}
+	failOrSkipMissingBinary(t, fmt.Sprintf("upstream pi %s not installed (required by coding.UpstreamVersion). Tried:\n  %s\nInstall with:\n  %s",
+		coding.UpstreamVersion, joinPaths(tried), hint))
+	return BinaryRef{} // reached only when PIG_PARITY_ALLOW_ZERO skipped the test
+}
+
+// publishedOracleAllowed reports whether the run opted into a published Pi as the oracle. Only a release-tag pin has one.
+func publishedOracleAllowed() bool {
+	return os.Getenv("PIG_PARITY_PI_PUBLISHED") == "1" && coding.UpstreamVersion == coding.UpstreamPackageVersion
+}
+
+// upstreamPiCandidates lists the oracle binaries to try when PIG_PARITY_PI_BIN is unset: the source-built oracle linked into
+// extensions/sdk-ts, or with fromSource false the exact published versions mise installed.
+func upstreamPiCandidates(home, want string, fromSource bool, cwd string) []string {
+	if fromSource {
+		for dir := cwd; ; dir = filepath.Dir(dir) {
+			if _, err := os.Stat(filepath.Join(dir, "extensions", "sdk-ts", "package.json")); err == nil {
+				return []string{filepath.Join(dir, "extensions", "sdk-ts", "node_modules", ".bin", "pi")}
+			}
+			if dir == filepath.Dir(dir) {
+				return nil
+			}
+		}
+	}
+	var tried []string
+	for _, dirName := range upstreamPiInstallDirs {
+		tried = append(tried, filepath.Join(home, ".local", "share", "mise", "installs", dirName, want, "bin", "pi"))
+	}
+	return tried
+}
+
+func joinPaths(ps []string) string {
+	out := ""
+	for i, p := range ps {
+		if i > 0 {
+			out += "\n  "
+		}
+		out += p
+	}
+	return out
+}
+
+// oracleCommitMismatch rejects an oracle that is not the pinned Pi build. The
+// version string alone cannot tell two commits of one package version apart, so
+// every pin needs the build stamp that automation/pin/oracle.py writes beside
+// the oracle's node_modules, and a stamp that names another commit never passes.
+// Only a release-tag pin with PIG_PARITY_PI_PUBLISHED=1 accepts an unstamped
+// (published) oracle.
+func oracleCommitMismatch(bin string) string {
+	real, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		return ""
+	}
+	for dir := filepath.Dir(real); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		data, err := os.ReadFile(filepath.Join(dir, ".pig-pi-oracle.json"))
+		if err != nil {
+			continue
+		}
+		var stamp struct {
+			Commit string `json:"commit"`
+		}
+		if json.Unmarshal(data, &stamp) != nil || stamp.Commit != coding.UpstreamCommit {
+			return fmt.Sprintf("the Pi at %s is the build of Pi commit %q, want %s", bin, stamp.Commit, coding.UpstreamCommit)
+		}
+		// The backports patch compiled output and pi runs a bundle of it: the oracle must run the bundle its build made from the patched output.
+		return pioracle.BundleProblem(real, data)
+	}
+	if !publishedOracleAllowed() {
+		return fmt.Sprintf("the Pi at %s is a published package, not the source build of pinned commit %s (make parity-deps builds it; PIG_PARITY_PI_PUBLISHED=1 opts into the published release of a tag pin)", bin, coding.UpstreamCommit)
+	}
+	return ""
+}
+
+// UpstreamVersion returns the pi version label this run is comparing
+// against. With the version-pinned resolver above this always equals
+// coding.UpstreamVersion, but we still derive it from the binary path
+// so a future resolver change shows through immediately.
+func UpstreamVersion(ref BinaryRef) string {
+	parts := splitPath(ref.Path)
+	for i, p := range parts {
+		for _, dirName := range upstreamPiInstallDirs {
+			if p == dirName && i+1 < len(parts) {
+				return parts[i+1]
+			}
+		}
+	}
+	return "unknown"
+}
+
+// splitPath returns p's names, root excluded. The walk ends at a relative
+// path's first name or at the root, which filepath.Split returns unchanged:
+// "/", a volume such as C:\, or a UNC share.
+func splitPath(p string) []string {
+	var out []string
+	for {
+		dir, base := filepath.Split(p)
+		if base != "" {
+			out = append([]string{base}, out...)
+		}
+		next := filepath.Clean(dir)
+		if dir == "" || next == p {
+			break
+		}
+		p = next
+	}
+	return out
+}
+
+// MustExist fatals if the binary is missing. Use in cmd/coverage which
+// doesn't have t.Skipf.
+func MustExist(ref BinaryRef) error {
+	if _, err := os.Stat(ref.Path); err != nil {
+		return fmt.Errorf("binary %s not found at %s", ref.Label, ref.Path)
+	}
+	return nil
+}

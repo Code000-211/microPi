@@ -1,0 +1,324 @@
+package packagemanager
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+
+	sourceref "github.com/MichaelKinsy/PiG/coding/source"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+)
+
+// Ports packages/coding-agent/src/core/package-manager.ts (updateConfiguredSources, updateNpmBatch, installNpmBatch).
+const packageUpdateConcurrency = 4
+
+type npmUpdateTarget struct {
+	ref    sourceref.Ref
+	source string
+	local  bool
+	// installedVersion is the version installed before the update, if any; targetVersion is the newer version the registry reported, if the lookup succeeded.
+	installedVersion string
+	targetVersion    string
+}
+
+type npmUpdateBatch struct {
+	root     string
+	registry string
+	local    bool
+	sources  []npmUpdateTarget
+}
+
+func updateConfiguredSources(cwd string, sm *codingagent.SettingsManager, packages []ConfiguredPackage, progress ProgressCallback, output CommandOutput) error {
+	if IsOfflineModeEnabled() || len(packages) == 0 {
+		return nil
+	}
+	var npm []npmUpdateTarget
+	var git []ConfiguredPackage
+	for _, pkg := range packages {
+		switch DetectSourceKind(pkg.Source.Source) {
+		case "npm":
+			if IsPinnedNpm(pkg.Source.Source) {
+				continue
+			}
+			ref, err := ParseNpmInstallRef(pkg.Source.Source)
+			if err != nil {
+				return err
+			}
+			npm = append(npm, npmUpdateTarget{ref: ref, source: pkg.Source.Source, local: pkg.Scope == "project"})
+		case "git":
+			git = append(git, pkg)
+		}
+	}
+	checks := make([]func() error, len(npm))
+	shouldUpdate := make([]bool, len(npm))
+	for i, target := range npm {
+		checks[i] = func() error {
+			check := shouldUpdateNpmSource(cwd, sm, target.ref, target.local)
+			shouldUpdate[i] = check.shouldUpdate
+			npm[i].installedVersion, npm[i].targetVersion = check.installedVersion, check.targetVersion
+			return nil
+		}
+	}
+	if err := runPackageTasks(checks, nil); err != nil {
+		return err
+	}
+	var batches []npmUpdateBatch
+	// Pi starts user npm batches before project npm batches, then Git work.
+	for _, local := range []bool{false, true} {
+		for i, target := range npm {
+			if !shouldUpdate[i] || target.local != local {
+				continue
+			}
+			root := NpmInstallRoot(cwd, sm.AgentDir(), target.ref, local)
+			index := -1
+			for j, batch := range batches {
+				if batch.root == root && batch.local == local {
+					index = j
+					break
+				}
+			}
+			if index < 0 {
+				index = len(batches)
+				batches = append(batches, npmUpdateBatch{root: root, registry: target.ref.NPMRegistry, local: local})
+			}
+			batches[index].sources = append(batches[index].sources, target)
+		}
+	}
+	var progressMu sync.Mutex
+	report := func(event ProgressEvent) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		EmitProgress(progress, event)
+	}
+	// updatedGit collects the Git packages whose commit changed, keyed by source and scope, so the results can follow configured order.
+	var updatedGit sync.Map
+	var tasks []func() error
+	for _, batch := range batches {
+		label := "user npm packages"
+		if batch.local {
+			label = "project npm packages"
+		}
+		if len(batch.sources) == 1 {
+			label = batch.sources[0].source
+		}
+		report(ProgressEvent{Type: "start", Action: "update", Source: label, Message: new(fmt.Sprintf("Updating %s...", label))})
+		tasks = append(tasks, func() error {
+			if err := FinishPackageProgress(report, "update", label, installNpmBatch(sm, batch, output)); err != nil {
+				return err
+			}
+			reportUnchangedNpmUpdates(cwd, sm, batch, report)
+			return nil
+		})
+	}
+	if len(git) > 0 {
+		tasks = append(tasks, func() error {
+			groups := groupGitUpdatesByCheckout(cwd, sm.AgentDir(), git)
+			start := func(pkg ConfiguredPackage) {
+				source := pkg.Source.Source
+				report(ProgressEvent{Type: "start", Action: "update", Source: source, Message: new(fmt.Sprintf("Updating %s...", source))})
+			}
+			gitTasks := make([]func() error, len(groups))
+			for i, group := range groups {
+				gitTasks[i] = func() error {
+					// Packages of one repository share a managed checkout and each moves it to its own ref, so they run one at a time in settings order and the last one decides the checked-out commit.
+					var first error
+					for j, pkg := range group {
+						if j > 0 {
+							start(pkg)
+						}
+						checkout, _ := GitCheckoutPath(cwd, sm.AgentDir(), pkg.Source.Source, pkg.Scope == "project")
+						from := gitHead(checkout)
+						err := FinishPackageProgress(report, "update", pkg.Source.Source, InstallManagedGit(cwd, sm.AgentDir(), sm, pkg.Source.Source, pkg.Scope == "project", WithProgressReporter(report), WithCommandOutput(output)))
+						if err != nil && first == nil {
+							first = err
+						}
+						if err == nil {
+							if to := gitHead(checkout); from != to {
+								updatedGit.Store(updatedPackageKey{source: pkg.Source.Source, scope: pkg.Scope}, updatedPackage{kind: "git", scope: pkg.Scope, source: pkg.Source.Source, from: from, to: to})
+							}
+						}
+					}
+					return first
+				}
+			}
+			return runPackageTasks(gitTasks, func(i int) { start(groups[i][0]) })
+		})
+	}
+	if err := runPackageTasks(tasks, nil); err != nil {
+		return err
+	}
+
+	var updated []updatedPackage
+	for i, target := range npm {
+		if !shouldUpdate[i] {
+			continue
+		}
+		to := ReadInstalledNpmVersion(npmInstalledPath(cwd, sm, target.ref, target.local))
+		if to != target.installedVersion {
+			updated = append(updated, updatedPackage{kind: "npm", scope: scopeOf(target.local), source: target.source, from: target.installedVersion, to: to})
+		}
+	}
+	// Keep Git results in configured order, independent of completion order.
+	for _, pkg := range git {
+		if update, ok := updatedGit.Load(updatedPackageKey{source: pkg.Source.Source, scope: pkg.Scope}); ok {
+			updated = append(updated, update.(updatedPackage))
+		}
+	}
+	// Report each changed package, for example "npm:foo 1.2.0 -> 1.3.0".
+	for _, pkg := range updated {
+		report(ProgressEvent{Type: "result", Action: "update", Source: pkg.source, Message: new(pkg.message())})
+	}
+	return nil
+}
+
+// updatedPackageKey identifies a configured Git package.
+type updatedPackageKey struct{ source, scope string }
+
+// updatedPackage is a configured package whose installed npm version or Git commit changed during an update. from and to are empty when
+// the package was not installed before or has no version or commit now.
+type updatedPackage struct {
+	kind, scope, source string
+	from, to            string
+}
+
+func scopeOf(local bool) string {
+	if local {
+		return "project"
+	}
+	return "user"
+}
+
+// message is `<source>[ (project)] <from> -> <to>`, with Git commits shortened to 7 characters.
+func (p updatedPackage) message() string {
+	format := func(value string) string {
+		switch {
+		case value == "":
+			return "(none)"
+		case p.kind == "git":
+			return value[:min(len(value), 7)]
+		}
+		return value
+	}
+	scope := ""
+	if p.scope == "project" {
+		scope = " (project)"
+	}
+	return p.source + scope + " " + format(p.from) + " -> " + format(p.to)
+}
+
+// gitHead is the commit a managed checkout is on, or "" when it does not exist or cannot be read (package-manager.ts getGitHead).
+func gitHead(checkout string) string {
+	if checkout == "" {
+		return ""
+	}
+	if _, err := os.Stat(checkout); err != nil {
+		return ""
+	}
+	head, err := RunWithTimeout(gitCaptureCommand(checkout, "rev-parse", "HEAD"), UpdateCheckNetworkTimeout)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(head)
+}
+
+// groupGitUpdatesByCheckout collects Git packages that resolve to one managed checkout, in input order, with groups ordered by their first package. Pi's updateConfiguredSources gives each package its own task and so races two updates of one checkout (package-manager.ts:1171-1181, 1931-1945): both fetch into one FETCH_HEAD and both run `git reset --hard`, which fails on index.lock. A source whose checkout path cannot be computed stays alone, so InstallManagedGit reports its error for that package only.
+func groupGitUpdatesByCheckout(cwd, agentDir string, git []ConfiguredPackage) [][]ConfiguredPackage {
+	var groups [][]ConfiguredPackage
+	byCheckout := map[string]int{}
+	for _, pkg := range git {
+		checkout, err := GitCheckoutPath(cwd, agentDir, pkg.Source.Source, pkg.Scope == "project")
+		if err == nil {
+			if i, shared := byCheckout[checkout]; shared {
+				groups[i] = append(groups[i], pkg)
+				continue
+			}
+			byCheckout[checkout] = len(groups)
+		}
+		groups = append(groups, []ConfiguredPackage{pkg})
+	}
+	return groups
+}
+
+// reportUnchangedNpmUpdates warns about every announced update that left the installed version unchanged. npm can resolve stale
+// registry metadata shortly after a publish and install the old version without an error (package-manager.ts reportUnchangedNpmUpdates,
+// 0d23d534, #11571).
+func reportUnchangedNpmUpdates(cwd string, sm *codingagent.SettingsManager, batch npmUpdateBatch, report ProgressCallback) {
+	for _, target := range batch.sources {
+		if target.installedVersion == "" || target.targetVersion == "" {
+			continue
+		}
+		versionAfter := ReadInstalledNpmVersion(npmInstalledPath(cwd, sm, target.ref, batch.local))
+		if versionAfter != target.installedVersion {
+			continue
+		}
+		report(ProgressEvent{Type: "progress", Action: "update", Source: target.source, Message: new(fmt.Sprintf("%s is still %s (registry reports %s); npm registry metadata may be stale, try again in a few minutes", target.source, versionAfter, target.targetVersion))})
+	}
+}
+
+func installNpmBatch(sm *codingagent.SettingsManager, batch npmUpdateBatch, output CommandOutput) error {
+	if batch.local && !sm.IsProjectTrusted() {
+		return fmt.Errorf("Project is not trusted; refusing to access project package storage")
+	}
+	if err := EnsureManagedPackageRoot(batch.root); err != nil {
+		return err
+	}
+	specs := make([]string, len(batch.sources))
+	for i, target := range batch.sources {
+		specs[i] = target.ref.Locator
+		if target.ref.NPMVer == "" {
+			specs[i] = target.ref.NPMName + "@latest"
+		}
+	}
+	command := DefaultNpmCommand(sm)
+	args := append([]string{}, command[1:]...)
+	// The single-source argument builder owns npm/pnpm/Bun options for both paths.
+	manager, err := PackageManagerName(command)
+	if err != nil {
+		return err
+	}
+	root, err := RealInstallRoot(batch.root)
+	if err != nil {
+		return err
+	}
+	installArgs := NpmInstallArgs(manager, specs[0], root, batch.registry)
+	args = append(args, installArgs[0])
+	args = append(args, specs...)
+	args = append(args, installArgs[2:]...)
+	return RunPackageProcess(output, "", command[0], args...)
+}
+
+// runPackageTasks joins every started operation and reports the first rejection. Start callbacks run in input order before work leaves the queue; metadata and Git pools use Pi's bounded concurrency.
+func runPackageTasks(tasks []func() error, onStart func(int)) error {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	next := 0
+	var firstErr error
+	for range min(packageUpdateConcurrency, len(tasks)) {
+		wg.Go(func() {
+			for {
+				mu.Lock()
+				i := next
+				if i >= len(tasks) {
+					mu.Unlock()
+					return
+				}
+				next++
+				if onStart != nil {
+					onStart(i)
+				}
+				mu.Unlock()
+				if err := tasks[i](); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	return firstErr
+}

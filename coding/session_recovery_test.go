@@ -1,0 +1,759 @@
+package coding
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+)
+
+// Ports of the packages/coding-agent/test/suite/agent-session-boundaries.test.ts
+// cases that exercise Session recovery and context accounting without the
+// actionable turn_end / agent_before_settle extension boundaries.
+
+// scriptedResponse builds one faux provider response from the request.
+type scriptedResponse func(request []ai.Message) *ai.AssistantMessage
+
+// scriptedProvider answers each model call with the next scripted response,
+// like the upstream faux harness. It records every request.
+type scriptedProvider struct {
+	mu            sync.Mutex
+	responses     []scriptedResponse
+	requests      []string
+	estimateUsage func(ai.TranscriptContext, ai.StreamOptions, *ai.AssistantMessage)
+	// streamDeltas replays each scripted message through the real faux provider so subscribers see block and delta events.
+	streamDeltas bool
+	// wrap cycles through responses when more calls arrive than responses were scripted (the upstream faux stream function's modulo).
+	wrap bool
+}
+
+func (p *scriptedProvider) ID() string   { return "faux" }
+func (p *scriptedProvider) Close() error { return nil }
+
+func (p *scriptedProvider) Stream(ctx context.Context, request ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+	p.mu.Lock()
+	messages := request.Messages()
+	// A real provider repairs the tool flow the agent loop asks for (D48) before it converts the request.
+	if options.RepairToolFlow {
+		messages = ai.RepairToolFlow(messages)
+	}
+	raw, _ := json.Marshal(messages)
+	p.requests = append(p.requests, string(raw))
+	index := len(p.requests) - 1
+	if p.wrap && len(p.responses) > 0 {
+		index %= len(p.responses)
+	}
+	p.mu.Unlock()
+	message := &ai.AssistantMessage{Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonStop, ErrorMessage: "no scripted response", Timestamp: time.Now().UnixMilli()}
+	if index < len(p.responses) {
+		message = p.responses[index](messages)
+	}
+	if p.streamDeltas {
+		return streamScriptedMessageWithDeltas(ctx, request, options, message)
+	}
+	// Pi's faux provider (faux.ts streamWithDeltas) ends a request whose signal is already aborted with the response's fields, no content,
+	// stopReason "aborted" and "Request was aborted".
+	if ctx.Err() != nil {
+		aborted := *message
+		aborted.Content, aborted.StopReason, aborted.ErrorMessage, aborted.Timestamp = nil, ai.StopReasonAborted, "Request was aborted", time.Now().UnixMilli()
+		return newSessionTestStream(ai.ErrorEvent{Reason: ai.StopReasonAborted, Error: &aborted}), nil
+	}
+	if p.estimateUsage != nil {
+		p.estimateUsage(request, options, message)
+	}
+	if message.StopReason == ai.StopReasonError {
+		return newSessionTestStream(ai.StartEvent{Partial: message}, ai.ErrorEvent{Reason: ai.StopReasonError, Error: message}), nil
+	}
+	return newSessionTestStream(ai.StartEvent{Partial: message}, ai.DoneEvent{Reason: message.StopReason, Message: message}), nil
+}
+
+func (p *scriptedProvider) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.requests)
+}
+
+func fauxReply(text string, reason ai.StopReason, offset time.Duration) scriptedResponse {
+	return func([]ai.Message) *ai.AssistantMessage {
+		var content []ai.AssistantContentBlock
+		if text != "" {
+			content = append(content, ai.TextContent{Text: text})
+		}
+		return &ai.AssistantMessage{Content: content, Provider: "faux", Model: "faux-1", StopReason: reason, Timestamp: time.Now().Add(offset).UnixMilli()}
+	}
+}
+
+func fauxError(message string) scriptedResponse {
+	return func([]ai.Message) *ai.AssistantMessage {
+		return &ai.AssistantMessage{Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonError, ErrorMessage: message, Timestamp: time.Now().UnixMilli()}
+	}
+}
+
+func fauxToolCall(name string) scriptedResponse {
+	return func([]ai.Message) *ai.AssistantMessage {
+		return &ai.AssistantMessage{
+			Content:  []ai.AssistantContentBlock{ai.ToolCall{ID: "call-" + name, Name: name, Arguments: ai.JsonObject{}}},
+			Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonToolUse, Timestamp: time.Now().UnixMilli(),
+		}
+	}
+}
+
+type harnessOptions struct {
+	withConfiguredAuth  *bool
+	emptySessionManager bool
+	defaultTools        bool
+	settings            string
+	contextWindow       int
+	maxTokens           int
+	inputLimits         *ai.ModelInputLimits
+	// reasoning makes the model a reasoning model, so the thinking level can be set.
+	reasoning bool
+	tools     []agent.AgentTool
+	extension extension.Extension
+	// extensions are loaded after extension, in order.
+	extensions []extension.Extension
+	resources  *SystemPromptResources
+	// runtime is the extension runtime the extension loader shares with the runner (loader.ts createExtensionRuntime); nil creates the runner's own.
+	runtime *extension.ExtensionRuntime
+	// sessionManager is the in-memory session an emptySessionManager harness opens instead of a new one (the suite harness's options.sessionManager), so a second harness resumes the first one's transcript.
+	sessionManager *icodingagent.Session
+	// allowedTools and excludedTools are the Session's `--tools` and `--exclude-tools` entries (names or patterns).
+	allowedTools, excludedTools map[string]struct{}
+	// compatStream streams through the model's provider, as the suite harness's Agent does with pi-ai/compat's streamSimple
+	// (test/suite/harness.ts createHarness streamFn), not through the model runtime: the faux provider reports a run aborted before its
+	// request as aborted, where the runtime's request setup rejects it with the signal's reason (lazy.ts lazyStream).
+	compatStream bool
+	// provider replaces the scripted provider as the model's provider, so a session runs against a real provider over a hermetic server; the scripted responses are then unused.
+	provider ai.Provider
+	// transport is the Session's SessionOptions.Transport, the caller's own choice that outranks the settings'.
+	transport ai.Transport
+}
+
+type recoveryHarness struct {
+	session  *Session
+	provider *scriptedProvider
+	mu       sync.Mutex
+	events   []agent.AgentEvent
+	done     chan struct{}
+}
+
+func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scriptedResponse) *recoveryHarness {
+	t.Helper()
+	// Home and cwd are short temp directories, as upstream test/suite/harness.ts createTempDir makes (tmpdir()/pi-suite-<time>-<random>). The system prompt names the cwd and the docs bundle under PIG_HOME, and the faux provider counts their tokens, so t.TempDir's test-name paths pushed the tight compaction suites over their context window when TMPDIR was long.
+	home := suiteTempDir(t, "pig-home-")
+	t.Setenv("PIG_HOME", home)
+	agentDir := filepath.Join(home, "agent")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := opts.settings
+	if settings == "" {
+		settings = "{}"
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "settings.json"), []byte(settings), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: suiteTempDir(t, "pi-suite-"), AgentDir: agentDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.withConfiguredAuth == nil || *opts.withConfiguredAuth {
+		configureFauxAuth(t, services)
+	}
+	// Services owns the model background work that reads and writes the agent dir; Cleanup runs it after the Session closes.
+	t.Cleanup(services.Close)
+	provider := &scriptedProvider{responses: responses}
+	contextWindow := opts.contextWindow
+	if contextWindow == 0 {
+		contextWindow = 128_000
+	}
+	var modelProvider ai.Provider = provider
+	if opts.provider != nil {
+		modelProvider = opts.provider
+	}
+	model := &ai.Model{ID: "faux-1", DisplayName: "faux-1", Provider: modelProvider, Capabilities: ai.ModelCapabilities{ContextWindow: contextWindow, MaxOutputTokens: opts.maxTokens}, InputLimits: opts.inputLimits, ProviderMeta: ai.ProviderMetadata{Reasoning: opts.reasoning}}
+	var runner *inproc.Runner
+	if opts.extension.Handlers != nil || len(opts.extensions) > 0 {
+		loaded := opts.extensions
+		if opts.extension.Handlers != nil {
+			loaded = append([]extension.Extension{opts.extension}, loaded...)
+		}
+		runner = inproc.NewRunner(loaded, t.TempDir(), opts.runtime)
+	}
+	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources, AllowedTools: opts.allowedTools, ExcludedTools: opts.excludedTools}
+	options.Transport = opts.transport
+	if opts.emptySessionManager {
+		options.existing = opts.sessionManager
+		if options.existing == nil {
+			options.existing = icodingagent.NewSession("suite-session", services.CWD())
+		}
+	}
+	session, err := NewSession(services, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.compatStream {
+		session.Agent().SetStreamFunction(func(ctx context.Context, model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+			return model.Provider.Stream(ctx, transcript, options)
+		})
+	}
+	if opts.emptySessionManager {
+		// A supplied in-memory manager is not a clone; bind its fresh reference runner explicitly.
+		session.bindExtensionCommandActions(runner)
+	}
+	h := &recoveryHarness{session: session, provider: provider, done: make(chan struct{})}
+	eventsCh := session.Events()
+	go func() {
+		defer close(h.done)
+		for event := range eventsCh {
+			if AcknowledgeEvent(event) {
+				continue
+			}
+			h.mu.Lock()
+			h.events = append(h.events, event)
+			h.mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = session.Close()
+		<-h.done
+	})
+	return h
+}
+
+func suiteTempDir(t *testing.T, prefix string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// settle waits until the Session's ordered agent_settled event is published.
+func (h *recoveryHarness) settle(t *testing.T) []agent.AgentEvent {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		for _, event := range h.events {
+			if _, ok := event.(agent.AgentSettledEvent); ok {
+				events := append([]agent.AgentEvent(nil), h.events...)
+				h.mu.Unlock()
+				return events
+			}
+		}
+		h.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("agent_settled was not published")
+	return nil
+}
+
+func (h *recoveryHarness) entries(entryType string) []icodingagent.SessionEntry {
+	var out []icodingagent.SessionEntry
+	for _, entry := range h.session.Inner().GetEntries() {
+		if entry.Base().Type == entryType {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// omittedTargets returns each context_edit target with whether its latest
+// edit omits it.
+func (h *recoveryHarness) omittedTargets(t *testing.T) map[string]bool {
+	t.Helper()
+	out := make(map[string]bool)
+	for _, entry := range h.entries("context_edit") {
+		var edit icodingagent.ContextEditEntry
+		if err := json.Unmarshal(entry.Raw(), &edit); err != nil {
+			t.Fatal(err)
+		}
+		out[edit.TargetID] = edit.Replacement == nil
+	}
+	return out
+}
+
+func messageEntryIDs(t *testing.T, h *recoveryHarness, match func(*agent.AssistantMessage) bool) []string {
+	t.Helper()
+	var ids []string
+	for _, entry := range h.entries("message") {
+		message, ok := entry.(icodingagent.MessageEntry)
+		if ok && message.Message.Assistant != nil && match(message.Message.Assistant) {
+			ids = append(ids, entry.Base().ID)
+		}
+	}
+	return ids
+}
+
+func projectionContains(h *recoveryHarness, text string) bool {
+	raw, _ := json.Marshal(h.session.Inner().BuildSessionProjection().Messages)
+	return strings.Contains(string(raw), text)
+}
+
+func summaryFromPreparation(summary string) extension.Extension {
+	return extension.Extension{Handlers: map[string][]extension.HandlerFn{
+		"session_before_compact": {func(args ...any) (any, error) {
+			event := args[0].(extension.SessionBeforeCompactEvent)
+			raw, err := json.Marshal(event.Preparation)
+			if err != nil {
+				return nil, err
+			}
+			var prep struct {
+				FirstKeptEntryID string
+				TokensBefore     int
+			}
+			if err := json.Unmarshal(raw, &prep); err != nil {
+				return nil, err
+			}
+			return extension.SessionBeforeCompactResult{Compaction: &extension.CompactionResult{
+				Summary: summary, FirstKeptEntryID: prep.FirstKeptEntryID, TokensBefore: prep.TokensBefore,
+			}}, nil
+		}},
+	}}
+}
+
+func TestBoundaryDoesNotTriggerThresholdCompactionFromPostEditUsageCapturedBeforeALaterCompaction(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"compaction":{"enabled":true,"keepRecentTokens":1,"reserveTokens":0}}`, contextWindow: 10_000, maxTokens: 100})
+	inner := h.session.Inner()
+	userID, err := inner.AppendMessage(agent.AgentMessage{User: &agent.UserMessage{Role: agent.RoleUser, Content: ai.UserContentBlocks{ai.TextContent{Text: "small input"}}, Timestamp: time.Now().UnixMilli() - 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.AppendContextEdit(userID, &icodingagent.ContextEditReplacement{Content: json.RawMessage(`"edited input"`)}); err != nil {
+		t.Fatal(err)
+	}
+	response := &agent.AssistantMessage{Role: agent.RoleAssistant, Content: []ai.AssistantContentBlock{ai.TextContent{Text: "answer"}}, Provider: "faux", ModelID: "faux-1",
+		Usage: &ai.Usage{Input: 50_000, Output: 1, TotalTokens: 50_001}, StopReason: ai.StopReasonStop, Timestamp: time.Now().UnixMilli() - 2}
+	if _, err := inner.AppendMessage(agent.AgentMessage{Assistant: response}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.AppendCompaction("small summary", userID, 50_001, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.session.RefreshContext()
+	errorMessage := &agent.AssistantMessage{Role: agent.RoleAssistant, Provider: "faux", ModelID: "faux-1", StopReason: ai.StopReasonError, ErrorMessage: "invalid_api_key", Timestamp: time.Now().UnixMilli() + 1_000}
+
+	if continueRun, err := h.session.checkCompaction(context.Background(), errorMessage, true); err != nil || continueRun {
+		t.Fatalf("checkCompaction = %v, %v", continueRun, err)
+	}
+	if n := len(h.entries("compaction")); n != 1 {
+		t.Fatalf("compactions = %d, want the original 1", n)
+	}
+}
+
+func TestBoundaryDoesNotTreatRetainedPreCompactionAssistantUsageAsPostCompactionUsage(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{})
+	inner := h.session.Inner()
+	retained := &agent.AssistantMessage{Role: agent.RoleAssistant, Content: []ai.AssistantContentBlock{ai.TextContent{Text: "retained"}}, Provider: "faux", ModelID: "faux-1",
+		Usage: &ai.Usage{Input: 10_000, TotalTokens: 10_001}, StopReason: ai.StopReasonStop, Timestamp: time.Now().UnixMilli()}
+	retainedID, err := inner.AppendMessage(agent.AgentMessage{Assistant: retained})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.AppendCompaction("summary", retainedID, 10_001, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.session.RefreshContext()
+
+	usage := h.session.ContextUsage()
+	if usage == nil || usage.Tokens != nil || usage.Percent != nil {
+		t.Fatalf("context usage = %+v, want unknown tokens", usage)
+	}
+}
+
+func TestDurableLengthRecoveryResetsAfterASuccessfulIntermediateAssistantTurn(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{
+		settings:      `{"compaction":{"keepRecentTokens":1,"reserveTokens":0}}`,
+		contextWindow: 1000, maxTokens: 100,
+		tools:     []agent.AgentTool{&fakeTool{name: "noop"}},
+		extension: summaryFromPreparation("recovered input"),
+	},
+		fauxReply("first partial", ai.StopReasonLength, 0),
+		fauxToolCall("noop"),
+		fauxReply("second partial", ai.StopReasonLength, time.Second),
+		fauxReply("completed second recovery", ai.StopReasonStop, 2*time.Second),
+	)
+
+	if _, err := h.session.Send(context.Background(), strings.Repeat("x", 5000)); err != nil {
+		t.Fatal(err)
+	}
+	h.settle(t)
+
+	lengthIDs := messageEntryIDs(t, h, func(m *agent.AssistantMessage) bool { return m.StopReason == ai.StopReasonLength })
+	if len(lengthIDs) != 2 {
+		t.Fatalf("length responses = %d, want 2", len(lengthIDs))
+	}
+	omitted := h.omittedTargets(t)
+	for _, id := range lengthIDs {
+		if !omitted[id] {
+			t.Fatalf("length response %s was not omitted; edits = %v", id, omitted)
+		}
+	}
+	if got := h.provider.callCount(); got != 3 {
+		t.Fatalf("model calls = %d, want 3", got)
+	}
+}
+
+func TestDurableRecoveryFinishesRetryBookkeepingWhenARetryReceivesANonretryableError(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":true,"maxRetries":2,"baseDelayMs":1}}`},
+		fauxError("overloaded_error"),
+		fauxError("invalid_api_key"),
+	)
+
+	_, _ = h.session.Send(context.Background(), "start")
+	events := h.settle(t)
+
+	if got := h.provider.callCount(); got != 2 {
+		t.Fatalf("model calls = %d, want 2", got)
+	}
+	found := false
+	for _, event := range events {
+		if end, ok := event.(agent.AutoRetryEndEvent); ok && !end.Success && end.Attempt == 1 && end.FinalError == "invalid_api_key" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("auto_retry_end{success:false, attempt:1, finalError:invalid_api_key} missing from %#v", events)
+	}
+}
+
+func TestDurableRecoveryOmitsARecoverableProjectedReplacementByItsSourceEntryID(t *testing.T) {
+	cancel := extension.Extension{Handlers: map[string][]extension.HandlerFn{
+		"session_before_compact": {func(...any) (any, error) {
+			return extension.SessionBeforeCompactResult{Cancel: true}, nil
+		}},
+	}}
+	h := newRecoveryHarness(t, harnessOptions{
+		settings:      `{"compaction":{"enabled":true,"keepRecentTokens":1,"reserveTokens":0}}`,
+		contextWindow: 1_000, maxTokens: 100, extension: cancel,
+	}, fauxReply("new answer", ai.StopReasonStop, 0))
+	inner := h.session.Inner()
+	if _, err := inner.AppendMessage(agent.AgentMessage{User: &agent.UserMessage{Role: agent.RoleUser, Content: ai.UserContentBlocks{ai.TextContent{Text: strings.Repeat("x", 5_000)}}, Timestamp: time.Now().UnixMilli() - 2}}); err != nil {
+		t.Fatal(err)
+	}
+	partial := &agent.AssistantMessage{Role: agent.RoleAssistant, Content: []ai.AssistantContentBlock{ai.TextContent{Text: "original partial"}}, Provider: "faux", ModelID: "faux-1",
+		Usage: &ai.Usage{}, StopReason: ai.StopReasonLength, Timestamp: time.Now().UnixMilli() - 1}
+	partialID, err := inner.AppendMessage(agent.AgentMessage{Assistant: partial})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.AppendContextEdit(partialID, &icodingagent.ContextEditReplacement{Content: json.RawMessage(`[{"type":"text","text":"edited partial"}]`)}); err != nil {
+		t.Fatal(err)
+	}
+	h.session.RefreshContext()
+
+	if _, err := h.session.Send(context.Background(), "next prompt"); err != nil {
+		t.Fatal(err)
+	}
+	h.settle(t)
+
+	if omitted, edited := h.omittedTargets(t)[partialID]; !edited || !omitted {
+		t.Fatalf("latest edit of %s does not omit it", partialID)
+	}
+	if projectionContains(h, "edited partial") {
+		t.Fatal("projection still contains the edited partial")
+	}
+}
+
+func TestDurableRecoveryMarksTheExhaustedRetryRunAsFinal(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":true,"maxRetries":1,"baseDelayMs":1}}`},
+		fauxError("overloaded_error"),
+		fauxError("overloaded_error"),
+	)
+
+	_, _ = h.session.Send(context.Background(), "start")
+	events := h.settle(t)
+
+	var willRetry []bool
+	retryFailed := false
+	for _, event := range events {
+		switch event := event.(type) {
+		case agent.AgentEndEvent:
+			willRetry = append(willRetry, event.WillRetry)
+		case agent.AutoRetryEndEvent:
+			retryFailed = retryFailed || (!event.Success && event.Attempt == 1)
+		}
+	}
+	if len(willRetry) != 2 || !willRetry[0] || willRetry[1] {
+		t.Fatalf("agent_end willRetry = %v, want [true false]", willRetry)
+	}
+	if !retryFailed {
+		t.Fatal("auto_retry_end{success:false, attempt:1} missing")
+	}
+}
+
+func TestDurableRecoveryKeepsOmissionsAndDoesNotRetryWhenRecoveryCompactionFails(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{
+		settings:      `{"compaction":{"keepRecentTokens":1,"reserveTokens":0},"retry":{"enabled":false,"maxRetries":0,"baseDelayMs":1}}`,
+		contextWindow: 1000, maxTokens: 100,
+	},
+		fauxReply("partial response", ai.StopReasonLength, 0),
+		fauxError("summary failed"),
+		fauxReply("must not retry", ai.StopReasonStop, 0),
+	)
+
+	if _, err := h.session.Send(context.Background(), strings.Repeat("x", 5000)); err != nil {
+		t.Fatal(err)
+	}
+	h.settle(t)
+
+	if len(h.entries("context_edit")) == 0 {
+		t.Fatal("no context_edit omission was persisted")
+	}
+	if len(h.entries("compaction")) != 0 {
+		t.Fatal("a failed recovery compaction appended an entry")
+	}
+	if ids := messageEntryIDs(t, h, func(m *agent.AssistantMessage) bool { return assistantText(m) == "partial response" }); len(ids) != 1 {
+		t.Fatalf("raw partial response entries = %d, want 1", len(ids))
+	}
+	if projectionContains(h, "partial response") {
+		t.Fatal("projection still contains the omitted partial response")
+	}
+	if got := h.provider.callCount(); got != 2 {
+		t.Fatalf("model calls = %d, want 2", got)
+	}
+
+}
+
+func TestRecoveryEventsFollowAgentEndDispatch(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	ext := extension.Extension{Handlers: map[string][]extension.HandlerFn{
+		"agent_end": {func(...any) (any, error) {
+			once.Do(func() { close(entered); <-release })
+			return nil, nil
+		}},
+	}}
+	h := newRecoveryHarness(t, harnessOptions{
+		settings: `{"retry":{"enabled":true,"maxRetries":1,"baseDelayMs":1}}`, extension: ext,
+	}, fauxError("overloaded_error"), fauxError("invalid_api_key"))
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = h.session.Send(context.Background(), "start") }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("agent_end handler was not entered")
+	}
+	// Upstream awaits extension handlers before the run continues, so the run
+	// waits while agent_end dispatch is held, and every later event follows it.
+	select {
+	case <-done:
+		close(release)
+		t.Fatal("the run continued while its agent_end handler was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider run did not finish")
+	}
+	events := h.settle(t)
+	ended := 0
+	for _, event := range events {
+		switch event.(type) {
+		case agent.AgentEndEvent:
+			ended++
+		case agent.AutoRetryStartEvent:
+			if ended != 1 {
+				t.Fatalf("retry start followed %d agent_end events, want 1", ended)
+			}
+		case agent.AutoRetryEndEvent:
+			if ended != 2 {
+				t.Fatalf("retry failure followed %d agent_end events, want 2", ended)
+			}
+		}
+	}
+}
+
+func TestQueuedUserMessageResetsRecoveryBudget(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{})
+	h.session.overflowRecoveryAttempted.Store(true)
+	if err := h.session.persistMessage(agent.AgentMessage{User: &agent.UserMessage{
+		Role: agent.RoleUser, Content: ai.UserContentBlocks{ai.TextContent{Text: "queued follow-up"}},
+	}}); err != nil {
+		t.Fatalf("persist queued user message: %v", err)
+	}
+	if h.session.overflowRecoveryAttempted.Load() {
+		t.Fatal("new user message retained the previous recovery budget")
+	}
+}
+
+// Port of packages/coding-agent/test/suite/regressions/11227-recovery-omits-tool-results.test.ts
+// (https://github.com/earendil-works/pi/issues/11227): pre-prompt recovery of a resumed length
+// stop omits the truncated call together with the result that answered it.
+func TestPrePromptRecoveryOfAResumedLengthStopOmitsTheTruncatedCallAndItsResult(t *testing.T) {
+	h := newRecoveryHarness(t, harnessOptions{
+		settings:      `{"compaction":{"enabled":true}}`,
+		contextWindow: 100_000, maxTokens: 1_000,
+		extension: summaryFromPreparation("summary"),
+	}, fauxReply("done", ai.StopReasonStop, 0))
+	inner := h.session.Inner()
+	now := time.Now().UnixMilli()
+	if _, err := inner.AppendMessage(agent.AgentMessage{User: &agent.UserMessage{Role: agent.RoleUser, Content: ai.UserContentBlocks{ai.TextContent{Text: "check status"}}, Timestamp: now - 1000}}); err != nil {
+		t.Fatal(err)
+	}
+	truncated := &agent.AssistantMessage{Role: agent.RoleAssistant,
+		Content:  []ai.AssistantContentBlock{ai.ToolCall{ID: "call_truncated", Name: "bash", Arguments: ai.JsonObject{"command": "echo"}}},
+		Provider: "faux", ModelID: "faux-1", StopReason: ai.StopReasonLength, Timestamp: now - 500,
+		Usage: &ai.Usage{Input: 100, Output: 16, TotalTokens: 116}}
+	if _, err := inner.AppendMessage(agent.AgentMessage{Assistant: truncated}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.AppendMessage(agent.AgentMessage{ToolResult: &agent.ToolResultMessage{Role: "toolResult", ToolCallID: "call_truncated", ToolName: "bash", IsError: true,
+		Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "Not executed: output token limit reached."}}, Timestamp: now - 400}}); err != nil {
+		t.Fatal(err)
+	}
+	h.session.RefreshContext()
+
+	if _, err := h.session.Send(context.Background(), "continue"); err != nil {
+		t.Fatal(err)
+	}
+	h.settle(t)
+
+	h.provider.mu.Lock()
+	requests := append([]string(nil), h.provider.requests...)
+	h.provider.mu.Unlock()
+	if len(requests) != 1 {
+		t.Fatalf("model calls = %d, want 1", len(requests))
+	}
+	if strings.Contains(requests[0], `"role":"toolResult"`) || strings.Contains(requests[0], `"stopReason":"length"`) {
+		t.Fatalf("request still carries the truncated call or its result: %s", requests[0])
+	}
+}
+
+func TestDefaultRetryDeciderDrivesSessionRetriesAndDelays(t *testing.T) {
+	t.Cleanup(func() { icodingagent.SetDefaultRetryDecider(nil, false) })
+	var seen []int
+	icodingagent.SetDefaultRetryDecider(func(attempt, maxAttempts int, response ai.AssistantMessage) ai.RetryDecision {
+		seen = append(seen, attempt)
+		status := 0
+		if response.FailureResponse != nil {
+			status = response.FailureResponse.Status
+		}
+		if status == 401 && attempt <= 2 && attempt <= maxAttempts {
+			return ai.RetryDecision{Retry: true, DelayMs: 2 + attempt}
+		}
+		return ai.RetryDecision{Retry: false}
+	}, true)
+	unauth := func([]ai.Message) *ai.AssistantMessage {
+		return &ai.AssistantMessage{
+			Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonError,
+			ErrorMessage:    `401 {"message":"bad key"}`,
+			FailureResponse: &ai.FailureResponse{Status: 401, Headers: map[string]string{"retry-after": "1"}},
+			Timestamp:       time.Now().UnixMilli(),
+		}
+	}
+	h := newRecoveryHarness(t, harnessOptions{settings: `{"retry":{"enabled":true,"maxRetries":5,"baseDelayMs":500}}`},
+		unauth, unauth, unauth, fauxReply("unreachable", ai.StopReasonStop, 0),
+	)
+	_, _ = h.session.Send(context.Background(), "hello")
+	events := h.settle(t)
+	if got := h.provider.callCount(); got != 3 {
+		t.Fatalf("model calls = %d, want 3 (initial + 2 auth retries)", got)
+	}
+	var willRetry []bool
+	var delays []int
+	for _, ev := range events {
+		switch ev := ev.(type) {
+		case agent.AgentEndEvent:
+			willRetry = append(willRetry, ev.WillRetry)
+		case agent.AutoRetryStartEvent:
+			delays = append(delays, ev.DelayMs)
+		}
+	}
+	if len(willRetry) != 3 || !willRetry[0] || !willRetry[1] || willRetry[2] {
+		t.Fatalf("willRetry = %v, want [true true false]", willRetry)
+	}
+	if len(delays) != 2 || delays[0] != 3 || delays[1] != 4 {
+		t.Fatalf("delays = %v, want [3 4]", delays)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("decider called %d times, want 3 (once per attempt)", len(seen))
+	}
+}
+
+func TestDefaultRetryDeciderRetainsFailureResponseHeadersAfterJSONMessageEndReplacement(t *testing.T) {
+	t.Cleanup(func() { icodingagent.SetDefaultRetryDecider(nil, false) })
+	var seenHeaders []map[string]string
+	icodingagent.SetDefaultRetryDecider(func(attempt, maxAttempts int, response ai.AssistantMessage) ai.RetryDecision {
+		if response.FailureResponse != nil {
+			seenHeaders = append(seenHeaders, response.FailureResponse.Headers)
+		} else {
+			seenHeaders = append(seenHeaders, nil)
+		}
+		if attempt <= maxAttempts && response.FailureResponse != nil && response.FailureResponse.Headers["retry-after"] == "2" {
+			return ai.RetryDecision{Retry: true, DelayMs: 7}
+		}
+		return ai.RetryDecision{Retry: false}
+	}, true)
+	rateLimited := func([]ai.Message) *ai.AssistantMessage {
+		return &ai.AssistantMessage{
+			Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonError,
+			ErrorMessage:    `429 {"message":"rate limited"}`,
+			FailureResponse: &ai.FailureResponse{Status: 429, Headers: map[string]string{"retry-after": "2"}},
+			Timestamp:       time.Now().UnixMilli(),
+		}
+	}
+	ext := extension.Extension{
+		Path: "/ext/rewrite",
+		Handlers: map[string][]extension.HandlerFn{
+			"message_end": {func(args ...any) (any, error) {
+				ev := args[0].(extension.MessageEndEvent)
+				if ev.Message.Assistant == nil || ev.Message.Assistant.StopReason != ai.StopReasonError {
+					return nil, nil
+				}
+				raw, err := json.Marshal(ev.Message)
+				if err != nil {
+					return nil, err
+				}
+				var wire map[string]any
+				if err := json.Unmarshal(raw, &wire); err != nil {
+					return nil, err
+				}
+				wire["errorMessage"] = ev.Message.Assistant.ErrorMessage + " (service temporarily unavailable)"
+				res, err := json.Marshal(map[string]any{"message": wire})
+				if err != nil {
+					return nil, err
+				}
+				return json.RawMessage(res), nil
+			}},
+		},
+	}
+	h := newRecoveryHarness(t, harnessOptions{
+		settings:  `{"retry":{"enabled":true,"maxRetries":2,"baseDelayMs":500}}`,
+		extension: ext,
+	}, rateLimited, fauxReply("recovered", ai.StopReasonStop, 0))
+	_, _ = h.session.Send(context.Background(), "hello")
+	events := h.settle(t)
+	if got := h.provider.callCount(); got != 2 {
+		t.Fatalf("model calls = %d, want 2", got)
+	}
+	if len(seenHeaders) != 1 || seenHeaders[0]["retry-after"] != "2" {
+		t.Fatalf("seenHeaders = %#v, want retry-after=2", seenHeaders)
+	}
+	var delays []int
+	for _, ev := range events {
+		if start, ok := ev.(agent.AutoRetryStartEvent); ok {
+			delays = append(delays, start.DelayMs)
+		}
+	}
+	if len(delays) != 1 || delays[0] != 7 {
+		t.Fatalf("delays = %v, want [7]", delays)
+	}
+}

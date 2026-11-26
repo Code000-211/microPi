@@ -1,0 +1,142 @@
+// pig divergence (D74): the provider implementations behind pi-ai's builtin
+// APIs (api/<api>.js in the pinned release) run in PiG's host instead of the
+// extension process. Pi's own lazy wrappers, api registry, compat dispatch and
+// env-key injection load these bridges in place of the SDK-backed modules
+// (automation/gen/vendor-pi-dist.sh writes the one-line stubs), so an extension
+// sees Pi's dispatch, credential order and result shapes, and the request runs
+// on PiG's port of the same provider.
+import { currentRuntime } from "../state.mjs";
+import { bridgeStream, closeCodexWebSocketSessions, getCodexWebSocketDebugStats, resetCodexWebSocketDebugStats } from "./provider-bridge-client.mjs";
+import { registerSessionResourceCleanup } from "./pi-dist/pi-ai/session-resources.js";
+import { AssistantMessageEventStream } from "./pi-dist/pi-ai/sdk-bundle/index.js";
+
+// Headers that stand in for an API key, per upstream API implementation
+// (assertRequestAuth / getClientApiKey). An API not listed needs options.apiKey.
+const headerCredentials = {
+  "anthropic-messages": ["authorization", "x-api-key", "cf-aig-authorization"],
+  "openai-completions": ["authorization", "cf-aig-authorization"],
+  "openai-responses": ["authorization", "cf-aig-authorization"],
+};
+
+// APIs whose upstream implementation authenticates from the environment
+// (Vertex application-default credentials, the AWS credential chain) and so
+// never requires options.apiKey.
+const ambientCredentials = new Set(["google-vertex", "bedrock-converse-stream"]);
+
+function hasHeader(headers, name) {
+  if (!headers) return false;
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name && typeof value === "string" && value.trim().length > 0) return true;
+  }
+  return false;
+}
+
+// providerEnvValue is upstream getProviderEnvValue: a scoped override, then the process env.
+// upstream: packages/ai/src/utils/provider-env.ts:getProviderEnvValue
+function providerEnvValue(name, env) {
+  return env?.[name] || process.env[name] || undefined;
+}
+
+// hasAnthropicFederation reports whether anthropic-messages authenticates with workload identity federation, which
+// replaces the request-auth assertion: provider anthropic with the rule, organization and identity token file set.
+// upstream: packages/ai/src/api/anthropic-messages.ts:343-372 (getAnthropicFederation), 614-615, 935-937
+function hasAnthropicFederation(model, env) {
+  return (
+    model.provider === "anthropic" &&
+    ["ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE"].every((name) => !!providerEnvValue(name, env))
+  );
+}
+
+function missingKeyMessage(api, provider) {
+  return api === "pi-messages" ? `No API key provided for provider "${provider}"` : `No API key for provider: ${provider}`;
+}
+
+// failedStream ends a stream the way an upstream provider ends a request that
+// failed before it was sent.
+function failedStream(model, message, options) {
+  const reason = options?.signal?.aborted ? "aborted" : "error";
+  const output = {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: reason,
+    errorMessage: message,
+    timestamp: Date.now(),
+  };
+  const stream = new AssistantMessageEventStream();
+  stream.push({ type: "error", reason, error: output });
+  stream.end();
+  return stream;
+}
+
+function bridged(api, simple) {
+  return (model, context, options) => {
+    if (
+      !ambientCredentials.has(api) &&
+      !options?.apiKey &&
+      !(headerCredentials[api] ?? []).some((name) => hasHeader(options?.headers, name)) &&
+      !(api === "anthropic-messages" && hasAnthropicFederation(model, options?.env))
+    ) {
+      return failedStream(model, missingKeyMessage(api, model.provider), options);
+    }
+    // A signal that fired before the request ends it without sending, as
+    // upstream's request wrapper does (utils/provider-retry.ts).
+    if (options?.signal?.aborted) return failedStream(model, "Request aborted", options);
+    // streamSimple carries the thinking level as options.reasoning; stream()
+    // takes provider-specific options instead, so it runs without reasoning
+    // unless the caller names a level. Neither inherits the session's level.
+    // upstream: packages/ai/src/api/google-generative-ai.ts:stream and google-vertex.ts:stream accept the global fetch identity, but reject a different implementation.
+    if ((api === "google-generative-ai" || api === "google-vertex") && options?.fetch === globalThis.fetch) {
+      options = { ...options, fetch: undefined };
+    }
+    // No extension runtime: a detached helper, a forked child or a worker that loads this module from the harness package (the runtime's loader hooks are not passed on to it). Its stream runs in a provider bridge process it owns.
+    const runtime = currentRuntime();
+    if (!runtime) {
+      return bridgeStream(model, context, { ...options, reasoning: (simple ? options?.reasoning : undefined) ?? "off" }, simple, failedStream);
+    }
+    const reasoning = (simple ? options?.reasoning : undefined) ?? "off";
+    return runtime.startModelStream(model, context, { ...options, reasoning }, simple, true);
+  };
+}
+
+// bridgeApi returns the stream functions for one builtin pi-ai API.
+export function bridgeApi(api) {
+  return { stream: bridged(api, false), streamSimple: bridged(api, true) };
+}
+
+// bridgeImages returns openrouter-images' generateImages. Image generation has
+// no host provider in PiG, so it ends the way upstream ends a request whose
+// provider cannot load.
+export function bridgeImages(api) {
+  return async (model) => ({
+    api: model?.api ?? api,
+    provider: model?.provider,
+    model: model?.id,
+    output: [],
+    stopReason: "error",
+    errorMessage: "Image generation is not available to extensions running in PiG (see docs/parity/DIVERGENCES.md D74)",
+    timestamp: Date.now(),
+  });
+}
+
+// bridgeCodexWebSocketHelpers returns the three values api/openai-codex-responses exports beside stream and streamSimple (closeOpenAICodexWebSocketSessions, getOpenAICodexWebSocketDebugStats,
+// resetOpenAICodexWebSocketDebugStats). Pi's act on process-local maps; here the cache is the Go one of the provider-bridge child serving this process, reached through provider-bridge-client.mjs:
+// close and reset are one-way lines to it, the getter reads a replica it pushes (see there for when it is exact). As in Pi, loading the module registers the close function as a session resource
+// cleanup; the registration starts no child. There is no 'extension runtime present' branch: an extension's own streams run in the host, which holds the cache and the counters, and an extension
+// process cannot import api/* at all (D74).
+export function bridgeCodexWebSocketHelpers() {
+  function closeOpenAICodexWebSocketSessions(sessionId) {
+    closeCodexWebSocketSessions(sessionId);
+  }
+  function getOpenAICodexWebSocketDebugStats(sessionId) {
+    return getCodexWebSocketDebugStats(sessionId);
+  }
+  function resetOpenAICodexWebSocketDebugStats(sessionId) {
+    resetCodexWebSocketDebugStats(sessionId);
+  }
+  registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
+  return { closeOpenAICodexWebSocketSessions, getOpenAICodexWebSocketDebugStats, resetOpenAICodexWebSocketDebugStats };
+}

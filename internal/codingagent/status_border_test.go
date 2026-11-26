@@ -1,0 +1,375 @@
+package codingagent
+
+// pi: packages/coding-agent/src/modes/interactive/components/status-indicator.ts
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/tui"
+	"github.com/MichaelKinsy/PiG/tui/widthx"
+)
+
+func TestWorkingStatusUsesEditorBorder(t *testing.T) {
+	m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: t.TempDir()})
+	m.editor = tui.NewEditor()
+	m.editor.EmbedWorkingStatus = true
+	m.statusContainer = tui.NewContainer()
+	m.tuiInst = tui.NewWithOutput(io.Discard, 80, 24)
+	m.handleAgentEvent(agent.TurnStartEvent{})
+	if lines := m.statusContainer.Render(80); len(lines) != 0 {
+		t.Fatalf("status occupies separate rows: %#v", lines)
+	}
+	top := widthx.StripAnsi(strings.Join(m.editor.Render(80), "\n"))
+	if !strings.Contains(top, "── ⠋ Working ─") || strings.Contains(top, "Working...") {
+		t.Fatalf("editor status=%q", top)
+	}
+	m.handleAgentEvent(agent.AgentEndEvent{})
+	if strings.Contains(strings.Join(m.editor.Render(80), "\n"), "Working") {
+		t.Fatal("settled status remains")
+	}
+}
+
+func TestWorkingStatusStaysVisibleThroughPendingAndRunningToolsUntilAgentEnd(t *testing.T) {
+	m := statusBorderMode(t, true)
+	assistant := agent.AgentMessage{Assistant: &agent.AssistantMessage{
+		Role:       agent.RoleAssistant,
+		Content:    []ai.AssistantContentBlock{ai.ToolCall{ID: "call-1", Name: "read", Arguments: ai.JsonObject{"path": "main.go"}}},
+		StopReason: ai.StopReasonStop,
+	}}
+	events := []agent.AgentEvent{
+		agent.TurnStartEvent{},
+		agent.MessageStartEvent{Message: assistant},
+		agent.MessageEndEvent{Message: assistant},
+		agent.ToolExecutionStartEvent{ToolCallID: "call-1", ToolName: "read", Args: json.RawMessage(`{"path":"main.go"}`)},
+		agent.ToolExecutionEndEvent{ToolCallID: "call-1", ToolName: "read", Result: agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "contents"}}}},
+		agent.TurnEndEvent{Message: assistant},
+	}
+	for _, event := range events {
+		m.handleAgentEvent(event)
+		if m.activeStatusIndicator == nil || m.activeStatusIndicator.Kind != "working" {
+			t.Fatalf("%T cleared the working indicator while tool work was pending or running", event)
+		}
+	}
+
+	m.handleAgentEvent(agent.AgentEndEvent{})
+	if m.activeStatusIndicator != nil {
+		t.Fatalf("agent_end retained status indicator %#v", m.activeStatusIndicator)
+	}
+}
+
+func statusBorderMode(t testing.TB, embedded bool) *InteractiveMode {
+	t.Helper()
+	m := NewInteractiveMode(nil, InteractiveModeOptions{CWD: t.TempDir()})
+	m.editor = tui.NewEditor()
+	m.editor.EmbedWorkingStatus = embedded
+	m.statusContainer = tui.NewContainer()
+	m.chatContainer = tui.NewContainer()
+	m.pendingMessagesContainer = tui.NewContainer()
+	m.tuiInst = tui.NewWithOutput(io.Discard, 80, 24)
+	m.statusLine = NewFooterComponent(nil, "", nil)
+	m.agent = mustNewAgent(agent.AgentOptions{})
+	return m
+}
+
+func TestStatusBorderIdleCompactionAndMatchingEnd(t *testing.T) {
+	m := statusBorderMode(t, true)
+	m.isIdle = true
+	m.handleAgentEvent(agent.CompactionStartEvent{Reason: "manual"})
+	if got := widthx.StripAnsi(m.editor.Render(80)[0]); !strings.Contains(got, "── ⠋ Compacting context... (escape to cancel)") {
+		t.Fatalf("compaction border=%q", got)
+	}
+	if len(m.statusContainer.Render(80)) != 0 {
+		t.Fatal("embedded compaction reserves status rows")
+	}
+	m.tickStatusIndicators(m.statusLastFrame.Add(80 * time.Millisecond))
+	if m.activeStatusIndicator.Frame != 1 {
+		t.Fatal("idle manual compaction does not animate")
+	}
+	m.stopWorkingLoader()
+	if m.activeStatusIndicator == nil || m.activeStatusIndicator.Kind != "compaction" {
+		t.Fatal("working end cleared compaction")
+	}
+	m.startWorkingLoader()
+	m.handleAgentEvent(agent.CompactionEndEvent{Reason: "manual"})
+	if m.activeStatusIndicator == nil || m.activeStatusIndicator.Kind != "working" {
+		t.Fatal("compaction end cleared replacement working status")
+	}
+	m.stopWorkingLoader()
+	if strings.Contains(widthx.StripAnsi(m.editor.Render(80)[0]), "Working") {
+		t.Fatal("working end retained status")
+	}
+}
+
+func TestStatusBorderFallbackAndIdleRows(t *testing.T) {
+	for _, mode := range []string{"regular", "fullscreen"} {
+		for _, embedded := range []bool{false, true} {
+			m := statusBorderMode(t, embedded)
+			m.opts.TuiMode = mode
+			m.opts.Settings.ClearOnShrink = new(true)
+			m.tuiInst.SetClearOnShrink(true)
+			m.startWorkingLoader()
+			if standalone := len(m.statusContainer.Render(40)); (standalone == 0) != embedded {
+				t.Fatalf("mode=%s embedded=%v status rows=%d", mode, embedded, standalone)
+			}
+			m.stopWorkingLoader()
+			want := 0
+			if !embedded && mode == "regular" {
+				want = 2
+			}
+			if got := len(m.statusContainer.Render(40)); got != want {
+				t.Fatalf("mode=%s embedded=%v idle rows=%d want%d", mode, embedded, got, want)
+			}
+		}
+	}
+}
+
+// Pi: packages/coding-agent/src/core/extensions/types.ts:138 (WorkingIndicatorOptions.intervalMs).
+func TestWorkingStatusOptionsAndVisibility(t *testing.T) {
+	m := statusBorderMode(t, true)
+	m.isIdle = false
+	m.startWorkingLoader()
+	ui := &ExtUIContext{m: m}
+	ui.SetWorkingMessage("Indexing")
+	ui.SetWorkingIndicator(extension.WorkingIndicatorOptions{Frames: new([]string{"A", "B"}), IntervalMs: new(float64(200))})
+	if got := widthx.StripAnsi(m.editor.Render(80)[0]); !strings.Contains(got, "── A Indexing ") {
+		t.Fatalf("custom status=%q", got)
+	}
+	m.tickStatusIndicators(m.statusLastFrame.Add(100 * time.Millisecond))
+	if m.activeStatusIndicator.Frame != 0 {
+		t.Fatal("custom interval advanced early")
+	}
+	m.tickStatusIndicators(m.statusLastFrame.Add(200 * time.Millisecond))
+	if m.activeStatusIndicator.Frame != 1 {
+		t.Fatal("custom interval did not advance")
+	}
+	ui.SetWorkingIndicator(extension.WorkingIndicatorOptions{Frames: new([]string{})})
+	if got := widthx.StripAnsi(m.editor.Render(80)[0]); !strings.Contains(got, "── Indexing ") {
+		t.Fatalf("hidden spinner=%q", got)
+	}
+	ui.SetWorkingVisible(false)
+	if m.activeStatusIndicator != nil {
+		t.Fatal("working visibility did not clear indicator")
+	}
+	ui.SetWorkingVisible(true)
+	if m.activeStatusIndicator == nil {
+		t.Fatal("working visibility did not restore indicator")
+	}
+	ui.SetWorkingIndicator(extension.WorkingIndicatorOptions{})
+	ui.ClearWorkingMessage()
+	if got := widthx.StripAnsi(m.editor.Render(80)[0]); !strings.Contains(got, "── ⠋ Working ") {
+		t.Fatalf("reset status=%q", got)
+	}
+	m.handleAgentEvent(agent.CompactionStartEvent{Reason: "threshold"})
+	ui.SetWorkingVisible(false)
+	if m.activeStatusIndicator.Kind != "compaction" {
+		t.Fatal("working visibility cleared compaction")
+	}
+}
+
+func TestStatusReplacementDisposesQueuedRetryFrames(t *testing.T) {
+	m := statusBorderMode(t, true)
+	m.setStatusContainerLabel("Retrying")
+	stop := make(chan struct{})
+	m.retryCountdownStop = func() { close(stop) }
+	m.postRetryStatusUpdate(stop, "stale retry")
+	m.handleAgentEvent(agent.CompactionStartEvent{Reason: "manual"})
+	select {
+	case <-stop:
+	default:
+		t.Fatal("replaced retry timer not disposed")
+	}
+	select {
+	case apply := <-m.uiTaskCh:
+		apply()
+	default:
+		t.Fatal("retry frame was not queued")
+	}
+	if m.activeStatusIndicator.Kind != "compaction" || strings.Contains(m.activeStatusIndicator.Message, "stale") {
+		t.Fatal("stale retry overwrote replacement")
+	}
+}
+
+func TestStatusTickStopsWithOwnerContext(t *testing.T) {
+	m := statusBorderMode(t, true)
+	m.startWorkingLoader()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); m.tickSpinner(ctx) }()
+	var apply func()
+	select {
+	case apply = <-m.uiTaskCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ticker did not queue frame")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ticker did not stop")
+	}
+	apply()
+	if m.activeStatusIndicator.Frame != 0 {
+		t.Fatal("cancelled owner's queued tick mutated status")
+	}
+}
+
+// Pi: packages/coding-agent/src/core/extensions/types.ts:135 (WorkingIndicatorOptions.frames).
+func TestWorkingOptionsAreOwnedAndSurviveCallerMutation(t *testing.T) {
+	m := statusBorderMode(t, true)
+	m.startWorkingLoader()
+	m.runCtx = t.Context()
+	ui := &ExtUIContext{m: m}
+	frames := []string{"source"}
+	ui.SetWorkingIndicator(extension.WorkingIndicatorOptions{Frames: new(frames)})
+	frames[0] = "mutated"
+	if m.activeStatusIndicator.Frames[0] != "⠋" {
+		t.Fatal("extension mutated UI off owner loop")
+	}
+	select {
+	case apply := <-m.uiTaskCh:
+		apply()
+	default:
+		t.Fatal("owner update missing")
+	}
+	if m.activeStatusIndicator.Frames[0] != "source" {
+		t.Fatal("queued options alias caller")
+	}
+}
+
+func TestRetryStatusRemainsAtZeroUntilEnd(t *testing.T) {
+	m := statusBorderMode(t, true)
+	m.handleAgentEvent(agent.AutoRetryStartEvent{Attempt: 1, MaxAttempts: 2, DelayMs: 100})
+	defer m.clearStatusIndicator("")
+	if m.activeStatusIndicator == nil {
+		t.Fatal("short retry has no status")
+	}
+	select {
+	case apply := <-m.uiTaskCh:
+		apply()
+	case <-time.After(5 * time.Second):
+		t.Fatal("countdown did not reach zero")
+	}
+	if m.activeStatusIndicator == nil || !strings.Contains(m.activeStatusIndicator.Message, "in 0s") {
+		t.Fatalf("expired retry status = %#v", m.activeStatusIndicator)
+	}
+	m.handleAgentEvent(agent.AutoRetryEndEvent{Success: true})
+	if m.activeStatusIndicator != nil {
+		t.Fatal("retry end retained indicator")
+	}
+}
+
+// Upstream auto_retry_end shows every final failure, a cancelled retry
+// included, with showError("Retry failed after N attempts: ..."), so it stays
+// in the transcript instead of flashing in the footer.
+func TestAutoRetryEndFailureShowsPersistentError(t *testing.T) {
+	for _, tc := range []struct {
+		event agent.AutoRetryEndEvent
+		want  string
+	}{
+		{agent.AutoRetryEndEvent{Attempt: 3, FinalError: "overloaded_error"}, "Error: Retry failed after 3 attempts: overloaded_error"},
+		{agent.AutoRetryEndEvent{Attempt: 1, FinalError: "Retry cancelled"}, "Error: Retry failed after 1 attempts: Retry cancelled"},
+		{agent.AutoRetryEndEvent{Attempt: 2}, "Error: Retry failed after 2 attempts: Unknown error"},
+	} {
+		m := statusBorderMode(t, true)
+		m.handleAgentEvent(tc.event)
+		chat := widthx.StripAnsi(strings.Join(m.chatContainer.Render(80), "\n"))
+		if !strings.Contains(chat, tc.want) {
+			t.Fatalf("chat after %+v = %q, want %q", tc.event, chat, tc.want)
+		}
+	}
+	m := statusBorderMode(t, true)
+	m.handleAgentEvent(agent.AutoRetryEndEvent{Success: true, Attempt: 1})
+	if chat := widthx.StripAnsi(strings.Join(m.chatContainer.Render(80), "\n")); strings.Contains(chat, "Retry failed") {
+		t.Fatalf("a successful retry shows an error: %q", chat)
+	}
+}
+
+// Upstream summarization_retry_scheduled shows the error with showError, a
+// transcript entry, not a footer flash with a fixed lifetime (GUARD-10).
+func TestSummarizationRetryScheduledShowsTheError(t *testing.T) {
+	m := statusBorderMode(t, true)
+	m.handleAgentEvent(agent.SummarizationRetryScheduledEvent{ErrorMessage: "summarizer overloaded", Attempt: 1, MaxAttempts: 3})
+	chat := widthx.StripAnsi(strings.Join(m.chatContainer.Render(80), "\n"))
+	if !strings.Contains(chat, "Error: summarizer overloaded") {
+		t.Fatalf("chat = %q, want the summarization error shown", chat)
+	}
+}
+
+// Pi's setWorkingMessage(message?: string) shows `message ?? defaultWorkingMessage` (interactive-mode.ts:2641-2646): undefined restores the default label and
+// an empty string is a message, so the label is empty. Both before and after the loader exists.
+func TestWorkingMessageEmptyStringIsAMessageAndNilRestoresTheDefault(t *testing.T) {
+	m := &InteractiveMode{statusLine: NewFooterComponent(nil, "", nil), workingVisible: true}
+	ui := &ExtUIContext{m: m}
+
+	ui.SetWorkingMessage("")
+	if m.workingMessage == nil || *m.workingMessage != "" {
+		t.Fatalf("workingMessage = %v, want a pointer to the empty string", m.workingMessage)
+	}
+	ui.SetWorkingMessage("Indexing")
+	ui.ClearWorkingMessage()
+	if m.workingMessage != nil {
+		t.Fatalf("workingMessage = %q after clearing, want nil (the default)", *m.workingMessage)
+	}
+}
+
+// Pi draws `message ?? defaultWorkingMessage` on the running working indicator (interactive-mode.ts:2641-2646) and on one started later (:2354): an empty
+// message is drawn as an empty label, and only no message draws the default "Working".
+func TestWorkingMessageEmptyLabelIsDrawnAndClearRestoresWorking(t *testing.T) {
+	m := statusBorderMode(t, true)
+	m.isIdle = false
+	m.startWorkingLoader()
+	ui := &ExtUIContext{m: m}
+	ui.SetWorkingIndicator(extension.WorkingIndicatorOptions{Frames: new([]string{"A"})})
+	status := func() string { return widthx.StripAnsi(m.editor.Render(80)[0]) }
+
+	ui.SetWorkingMessage("")
+	if got := status(); strings.Contains(got, "Working") || !strings.Contains(got, "── A ") {
+		t.Fatalf("running indicator with an empty message = %q, want the frame and an empty label", got)
+	}
+	ui.SetWorkingVisible(false)
+	ui.SetWorkingVisible(true)
+	if got := status(); strings.Contains(got, "Working") || !strings.Contains(got, "── A ") {
+		t.Fatalf("restarted indicator with an empty message = %q, want the frame and an empty label", got)
+	}
+	ui.ClearWorkingMessage()
+	if got := status(); !strings.Contains(got, "── A Working ") {
+		t.Fatalf("indicator after clearing = %q, want the default label", got)
+	}
+	ui.SetWorkingVisible(false)
+	ui.SetWorkingVisible(true)
+	if got := status(); !strings.Contains(got, "── A Working ") {
+		t.Fatalf("restarted indicator after clearing = %q, want the default label", got)
+	}
+}
+
+// A Session replacement resets the working message, visibility and indicator an extension set (interactive-mode.ts:2474-2482 `workingMessage = undefined; workingVisible = true;
+// setWorkingIndicator()`); they used to survive into the next Session.
+func TestSessionReplacementResetsTheWorkingStatus(t *testing.T) {
+	m := statusBorderMode(t, true)
+	ui := &ExtUIContext{m: m}
+	ui.SetWorkingMessage("Indexing")
+	ui.SetWorkingVisible(false)
+	ui.SetWorkingIndicator(extension.WorkingIndicatorOptions{Frames: new([]string{"A"})})
+
+	m.resetExtensionUIForReplacement()
+
+	if m.workingMessage != nil {
+		t.Errorf("workingMessage = %q after the replacement, want the default (nil)", *m.workingMessage)
+	}
+	if !m.workingVisible {
+		t.Error("workingVisible is still false after the replacement, want true")
+	}
+	if m.workingIndicatorOptions != nil {
+		t.Errorf("workingIndicatorOptions = %+v after the replacement, want the default (nil)", m.workingIndicatorOptions)
+	}
+}

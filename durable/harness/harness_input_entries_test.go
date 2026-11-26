@@ -1,0 +1,701 @@
+// Ports packages/durable/test/harness-input-entries.test.ts.
+
+package harness
+
+// pi: packages/durable/src/harness/inbox.ts
+// pi: packages/durable/src/harness/submissions.ts
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/durable"
+	"github.com/MichaelKinsy/PiG/durable/storage"
+)
+
+// requestLog is a faux response that records the role and text of each request message, as the provider receives them.
+func requestLog(requests *[][]string, mu *sync.Mutex, reply ai.FauxResponseStep) ai.FauxResponseStep {
+	return ai.FauxFactoryStep(func(transcript ai.TranscriptContext, options ai.StreamOptions, state *ai.FauxProviderState, model *ai.Model) (ai.AssistantMessage, error) {
+		lines := []string{}
+		for _, message := range transcript.Messages() {
+			text, _ := textOf(message)
+			lines = append(lines, string(message.MessageRole())+":"+text)
+		}
+		mu.Lock()
+		*requests = append(*requests, lines)
+		mu.Unlock()
+		if response, static := reply.(ai.FauxResponse); static {
+			return response.AssistantMessage(), nil
+		}
+		return reply.(ai.FauxResponseFactory)(transcript, options, state, model)
+	})
+}
+
+// dataTranscript is the kind, application data and model text of each entry, skipping system entries.
+func dataTranscript(t *testing.T, entries []durable.EntryRecord) []string {
+	t.Helper()
+	lines := []string{}
+	for _, entry := range entries {
+		if entry.Kind == "pi.system" {
+			continue
+		}
+		line := entry.Kind
+		if entry.Data != nil && !strings.HasPrefix(entry.Kind, "pi.") {
+			line += "|" + jsonText(t, entry.Data)
+		}
+		if len(entry.Model) > 0 {
+			if _, isResult := entry.Model[0].(ai.ToolResultMessage); !isResult {
+				if text, ok := textOf(entry.Model[0]); ok {
+					line += "|" + text
+				}
+			}
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func mention(text string) *durable.InputEntry {
+	return &durable.InputEntry{Kind: "chat.mention", Data: map[string]any{"author": "ann", "text": text}}
+}
+
+func inputWith(content string, entry *durable.InputEntry, whenBusy durable.WhenBusy) durable.SubmissionDraft {
+	return durable.SubmissionDraft{Type: durable.SubmissionTypeInput, Content: ai.UserText(content), InputEntry: entry, WhenBusy: whenBusy}
+}
+
+func inboxItemsOf(t *testing.T, harness Harness, conversation Conversation) []InboxItem {
+	t.Helper()
+	return must(durable.Snapshot(testContext, harness, InboxDoc, conversation.Id())).Items
+}
+
+func inboxIds(items []InboxItem) []durable.SubmissionId {
+	ids := []durable.SubmissionId{}
+	for _, item := range items {
+		ids = append(ids, item.Id)
+	}
+	return ids
+}
+
+// stubbornReply is gatedReply that ignores the abort signal: the run it answers stays in flight until release.
+func stubbornReply(text string) gatedAnswer {
+	reached, gate := deferred(), deferred()
+	return gatedAnswer{
+		reached: reached,
+		gate:    gate,
+		step: ai.FauxFactoryStep(func(_ ai.TranscriptContext, _ ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
+			reached.resolve()
+			if err := gate.wait(context.Background()); err != nil {
+				return ai.FauxResponse{}.AssistantMessage(), err
+			}
+			return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText(text)}}.AssistantMessage(), nil
+		}),
+	}
+}
+
+// expectWithdrawnByTheAbort asserts the submission is unanswered with reason aborted soon after the abort's commit: a
+// submission the abort left queued fails here, by assertion, instead of waiting for a withdrawal that never comes.
+func expectWithdrawnByTheAbort(t *testing.T, submission durable.Submission) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		record := status(t, submission)
+		if record.Status == durable.SubmissionUnanswered && record.Reason != nil && *record.Reason == "aborted" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("submission %d is %s after the abort's commit, want unanswered aborted", submission.Id(), record.Status)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestInputEntries: an input places as the entry it names (harness-input-entries.test.ts "input entries").
+func TestInputEntries(t *testing.T) {
+	// harness-input-entries.test.ts:99 it("places an idle input as its entry: the given kind and data, with the content as its user message")
+	t.Run("places an idle input as its entry: the given kind and data, with the content as its user message", func(t *testing.T) {
+		setup := chatSetup(t)
+		setup.SetNow(func() float64 { return 42 })
+		var requests [][]string
+		var mu sync.Mutex
+		setup.Faux.SetResponses([]ai.FauxResponseStep{requestLog(&requests, &mu, fauxAnswer("hi ann"))})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		submission := submit(t, root, inputWith("ann: hi", mention("hi"), ""))
+		settled := must(submission.Wait(testContext))
+		entries := allEntries(t, root)
+		expectEqualJSON(t, dataTranscript(t, entries), `["chat.mention|{\"author\":\"ann\",\"text\":\"hi\"}|ann: hi","pi.assistant|hi ann"]`)
+		var placed durable.EntryRecord
+		for _, entry := range entries {
+			if entry.Kind == "chat.mention" {
+				placed = entry
+			}
+		}
+		expectEqualJSON(t, placed.Model, `[{"role":"user","content":"ann: hi","timestamp":42}]`)
+		if settled.Status != durable.SubmissionDone || settled.Entry == nil || *settled.Entry != placed.Id || settled.Answer == nil || *settled.Answer != entries[len(entries)-1].Id {
+			t.Fatalf("settled = %s, want done with entry %d and the last entry as the answer", jsonText(t, settled), placed.Id)
+		}
+		if len(requests) != 1 || strings.Join(requests[0], "|") != "user:ann: hi" {
+			t.Fatalf("requests = %v, want [[user:ann: hi]]", requests)
+		}
+		// The context of a fork at the input is the same as for a pi.user entry.
+		view := must(root.Context(testContext, &durable.ContextOptions{At: &placed.Id}))
+		var messages []ai.Message
+		for _, message := range view.Messages {
+			if message.MessageRole() != "system" {
+				messages = append(messages, message)
+			}
+		}
+		expectEqualJSON(t, messages, jsonText(t, placed.Model))
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:122 it("rejects an input entry whose kind is not a non-empty string or starts with pi., writing nothing").
+	// The typed InputEntry.Kind is a string, so Pi's kind 123 has no form here; durable/core/inbox
+	// TestAnInputEntryWhoseKindIsNotANonEmptyStringOutsidePiIsATypeErrorThatWritesNothing rejects it on the JSON draft path.
+	t.Run("rejects an input entry whose kind is empty or starts with pi., writing nothing", func(t *testing.T) {
+		setup := chatSetup(t)
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		before := len(allEntries(t, root))
+		for _, kind := range []string{"", "pi.user", "pi.compaction"} {
+			_, err := root.Submit(testContext, inputWith("x", &durable.InputEntry{Kind: kind}, ""))
+			var typeError *TypeError
+			if want := `An input entry's kind must be a non-empty string not starting with "pi.", got ` + kind; err == nil || err.Error() != want || !errors.As(err, &typeError) {
+				t.Fatalf("kind %q: err = %v, want the TypeError %q", kind, err, want)
+			}
+		}
+		// The kind is checked before a known request ID returns its submission (submissions.ts admitSubmission).
+		known := durable.SubmissionDraft{Type: durable.SubmissionTypeWrite, Entry: &durable.EntryDraft{Kind: "note", Data: "n"}, RequestId: new("r-known")}
+		if _, err := root.Submit(testContext, known); err != nil {
+			t.Fatal(err)
+		}
+		before++
+		again := inputWith("x", &durable.InputEntry{Kind: "pi.user"}, "")
+		again.RequestId = new("r-known")
+		var typeError *TypeError
+		if _, err := root.Submit(testContext, again); !errors.As(err, &typeError) {
+			t.Fatalf("a known request ID with a pi. kind: err = %v, want the TypeError", err)
+		}
+		if after := len(allEntries(t, root)); after != before {
+			t.Fatalf("entries = %d, want %d", after, before)
+		}
+		expectEqualJSON(t, liveOf(t, harness, root.Id()), `{}`)
+		// Writes keep their kinds: reset() writes pi.reset.
+		resetTo(t, root, nil)
+		if entries := allEntries(t, root); entries[len(entries)-1].Kind != "pi.reset" {
+			t.Fatalf("last entry = %s, want pi.reset", entries[len(entries)-1].Kind)
+		}
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:172 it("queues busy inputs with their entries in the inbox and places them as those entries at boundaries")
+	t.Run("queues busy inputs with their entries in the inbox and places them as those entries at boundaries", func(t *testing.T) {
+		setup := chatSetup(t)
+		gate := deferred()
+		holdTool(t, setup, gate, durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{ai.TextContent{Text: "held"}}})
+		setup.Faux.SetResponses([]ai.FauxResponseStep{holdStep(), fauxAnswer("after tools"), fauxAnswer("follow-up")})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		input := submit(t, root, inputDraft("a"))
+		toolRunning(t, harness, root)
+		draft := inputWith("s", mention("s"), durable.WhenBusySteer)
+		draft.RequestId = new("r-s")
+		steer := submit(t, root, draft)
+		followUp := submit(t, root, inputWith("f", &durable.InputEntry{Kind: "p2.input"}, durable.WhenBusyFollowUp))
+		items := inboxItemsOf(t, harness, root)
+		expectEqualJSON(t, items, jsonText(t, []any{
+			map[string]any{"id": steer.Id(), "mode": "steer", "content": "s", "entry": map[string]any{"kind": "chat.mention", "data": map[string]any{"author": "ann", "text": "s"}}},
+			map[string]any{"id": followUp.Id(), "mode": "followUp", "content": "f", "entry": map[string]any{"kind": "p2.input"}},
+		}))
+		// The request ID deduplicates a queued input with an entry as any other.
+		again := inputWith("other", mention("other"), durable.WhenBusySteer)
+		again.RequestId = new("r-s")
+		if got := submit(t, root, again); got.Id() != steer.Id() {
+			t.Fatalf("again = %d, want %d", got.Id(), steer.Id())
+		}
+		_, err := root.Submit(testContext, inputWith("x", mention("x"), durable.WhenBusyReject))
+		if _, ok := errors.AsType[*durable.ConversationBusy](err); !ok {
+			t.Fatalf("err = %v, want ConversationBusy", err)
+		}
+		if got := len(inboxItemsOf(t, harness, root)); got != 2 {
+			t.Fatalf("inbox = %d items, want 2", got)
+		}
+
+		gate.resolve()
+		must(followUp.Wait(testContext))
+		entries := allEntries(t, root)
+		expectEqualJSON(t, dataTranscript(t, entries), `["pi.user|a","pi.assistant","pi.tool-result","chat.mention|{\"author\":\"ann\",\"text\":\"s\"}|s","pi.assistant|after tools","p2.input|f","pi.assistant|follow-up"]`)
+		answers := assistants(t, root)
+		placedId := func(kind string) durable.EntryId {
+			for _, entry := range entries {
+				if entry.Kind == kind {
+					return entry.Id
+				}
+			}
+			t.Fatalf("no %s entry", kind)
+			return 0
+		}
+		expectAnswered(t, status(t, input), answers[1].Id)
+		if record := status(t, steer); record.Status != durable.SubmissionDone || record.Entry == nil || *record.Entry != placedId("chat.mention") || record.Answer == nil || *record.Answer != answers[1].Id {
+			t.Fatalf("steer = %s", jsonText(t, record))
+		}
+		if record := status(t, followUp); record.Status != durable.SubmissionDone || record.Entry == nil || *record.Entry != placedId("p2.input") || record.Answer == nil || *record.Answer != answers[2].Id {
+			t.Fatalf("followUp = %s", jsonText(t, record))
+		}
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:236 it("withdraws queued inputs with entries, one by one and by conversation abort")
+	t.Run("withdraws queued inputs with entries, one by one and by conversation abort", func(t *testing.T) {
+		setup := chatSetup(t)
+		first := gatedReply("first")
+		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		input := submit(t, root, inputDraft("a"))
+		first.awaitReached(t)
+		withdrawn := submit(t, root, inputWith("w", mention("w"), ""))
+		aborted := submit(t, root, inputWith("x", mention("x"), ""))
+		if result := must(withdrawn.Abort(testContext)); result != durable.SubmissionAborted {
+			t.Fatalf("abort = %s", result)
+		}
+		if ids := inboxIds(inboxItemsOf(t, harness, root)); len(ids) != 1 || ids[0] != aborted.Id() {
+			t.Fatalf("inbox = %v, want [%d]", ids, aborted.Id())
+		}
+		mustOK(t, root.Abort(testContext, nil))
+		for _, submission := range []durable.Submission{withdrawn, aborted, input} {
+			expectWithdrawnByTheAbort(t, submission)
+			expectSettled(t, must(submission.Wait(testContext)), durable.SubmissionUnanswered, "aborted")
+		}
+		if items := inboxItemsOf(t, harness, root); len(items) != 0 {
+			t.Fatalf("inbox = %v, want empty", items)
+		}
+		for _, entry := range allEntries(t, root) {
+			if entry.Kind == "chat.mention" {
+				t.Fatalf("a withdrawn input was placed: %+v", entry)
+			}
+		}
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:258 it("keeps onAbort: keep inputs queued through a conversation abort; the next input places them")
+	t.Run("keeps onAbort: keep inputs queued through a conversation abort; the next input places them", func(t *testing.T) {
+		setup := chatSetup(t)
+		first := gatedReply("first")
+		var requests [][]string
+		var mu sync.Mutex
+		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		input := submit(t, root, inputDraft("a"))
+		first.awaitReached(t)
+		withdrawn := submit(t, root, inputDraft("w"))
+		keptDraft := inputWith("k", mention("k"), durable.WhenBusyFollowUp)
+		keptDraft.OnAbort = durable.OnAbortKeep
+		kept := submit(t, root, keptDraft)
+		mustOK(t, root.Abort(testContext, nil))
+		expectSettled(t, status(t, withdrawn), durable.SubmissionUnanswered, "aborted")
+		expectSettled(t, must(withdrawn.Wait(testContext)), durable.SubmissionUnanswered, "aborted")
+		expectSettled(t, must(input.Wait(testContext)), durable.SubmissionUnanswered, "aborted")
+		// Kept as a failed run keeps its queue: still queued, no run started for it. The stored item is Pi's bytes (the
+		// field after the entry, only for keep).
+		expectEqualJSON(t, inboxItemsOf(t, harness, root), `[{"id":`+jsonText(t, kept.Id())+`,"mode":"followUp","content":"k","entry":{"kind":"chat.mention","data":{"author":"ann","text":"k"}},"onAbort":"keep"}]`)
+		if record := status(t, kept); record.Status != durable.SubmissionQueued {
+			t.Fatalf("kept = %s, want queued", jsonText(t, record))
+		}
+		if run := must(durable.Snapshot(testContext, harness, LiveDoc, root.Id())).Run; run != nil {
+			t.Fatalf("a run started for the kept input: %+v", run)
+		}
+		// The next input queues behind it and places it first (one follow-up at a time: a run each).
+		setup.Faux.SetResponses([]ai.FauxResponseStep{requestLog(&requests, &mu, fauxAnswer("second")), requestLog(&requests, &mu, fauxAnswer("third"))})
+		next := submit(t, root, inputDraft("n"))
+		expectSettled(t, must(kept.Wait(testContext)), durable.SubmissionDone, "")
+		expectSettled(t, must(next.Wait(testContext)), durable.SubmissionDone, "")
+		last := []string{}
+		for _, request := range requests {
+			last = append(last, request[len(request)-1])
+		}
+		expectEqualJSON(t, last, `["user:k","user:n"]`)
+		// The explicit withdrawal still withdraws a kept input.
+		busy := gatedReply("fourth")
+		setup.Faux.SetResponses([]ai.FauxResponseStep{busy.step})
+		running := submit(t, root, inputDraft("b"))
+		busy.awaitReached(t)
+		explicitDraft := inputDraft("e")
+		explicitDraft.OnAbort = durable.OnAbortKeep
+		explicit := submit(t, root, explicitDraft)
+		if result := must(explicit.Abort(testContext)); result != durable.SubmissionAborted {
+			t.Fatalf("explicit abort = %s", result)
+		}
+		busy.release()
+		expectSettled(t, must(running.Wait(testContext)), durable.SubmissionDone, "")
+		closeHarness(t, harness)
+	})
+
+	// Not in Pi's test file; the expected bytes and order are what Pi e67aa1a4e prints for the same inputs (a scratch case run
+	// in Pi's tree): a stored onAbort field only for "keep"; an abort in flight withdraws what its commit found queued and
+	// not an input enqueued after that commit, kept or not; kept inputs place by ID order with the rest.
+	t.Run("stores onAbort only for keep, and an abort in flight withdraws what its commit found queued", func(t *testing.T) {
+		setup := chatSetup(t)
+		first := stubbornReply("first")
+		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		a := submit(t, root, inputDraft("a"))
+		first.awaitReached(t)
+		with := func(content string, whenBusy durable.WhenBusy, onAbort durable.OnAbort) durable.Submission {
+			draft := inputDraft(content, whenBusy)
+			draft.OnAbort = onAbort
+			return submit(t, root, draft)
+		}
+		p := with("p", "", "")
+		q := with("q", "", durable.OnAbortWithdraw)
+		r := with("r", "", "later")
+		k := with("k", "", durable.OnAbortKeep)
+		s := with("s", durable.WhenBusySteer, durable.OnAbortKeep)
+		w := submit(t, root, durable.SubmissionDraft{Type: durable.SubmissionTypeWrite, Entry: &durable.EntryDraft{Kind: "note", Model: []ai.Message{ai.UserMessage{Content: ai.UserText("wnote")}}}})
+		id := func(submission durable.Submission) string { return jsonText(t, submission.Id()) }
+		item := func(submission durable.Submission, mode, content, onAbort string) string {
+			return `{"id":` + id(submission) + `,"mode":"` + mode + `","content":"` + content + `"` + onAbort + `}`
+		}
+		const keep = `,"onAbort":"keep"`
+		wantQueued := func(items ...string) string { return "[" + strings.Join(items, ",") + "]" }
+		// Pi stores the field after the entry for keep only: never "withdraw", never an unknown value, never null.
+		queued := inboxItemsOf(t, harness, root)
+		if len(queued) != 6 || queued[5].Mode != InboxWrite || queued[5].Id != w.Id() {
+			t.Fatalf("inbox = %s", jsonText(t, queued))
+		}
+		expectEqualJSON(t, queued[:5], wantQueued(item(p, "followUp", "p", ""), item(q, "followUp", "q", ""), item(r, "followUp", "r", ""), item(k, "followUp", "k", keep), item(s, "steer", "s", keep)))
+		// An item stored with another value reads as withdraw (inbox.ts: `item.onAbort !== "keep"`).
+		commitValue(t, root, func(tx durable.Tx) (any, error) {
+			draft, err := durable.TxDoc(tx, InboxDoc, root.Id())
+			if err != nil {
+				return nil, err
+			}
+			return nil, setJSON(draft.Array("items").Object(0), "onAbort", "later")
+		})
+		expectEqualJSON(t, inboxItemsOf(t, harness, root)[0], item(p, "followUp", "p", `,"onAbort":"later"`))
+		aborting := make(chan error, 1)
+		go func() { aborting <- root.Abort(testContext, nil) }()
+		for _, submission := range []durable.Submission{p, q, r} {
+			expectWithdrawnByTheAbort(t, submission)
+			expectSettled(t, must(submission.Wait(testContext)), durable.SubmissionUnanswered, "aborted")
+		}
+		for _, submission := range []durable.Submission{k, s} {
+			if record := status(t, submission); record.Status != durable.SubmissionQueued {
+				t.Fatalf("kept = %s, want queued", jsonText(t, record))
+			}
+		}
+		// The abort's commit is over and the run is still ending: these queue behind, and this abort does not withdraw them.
+		lateKeep := with("lk", "", durable.OnAbortKeep)
+		late := with("l", "", "")
+		first.release()
+		mustOK(t, <-aborting)
+		after := inboxItemsOf(t, harness, root)
+		wantAfter := []durable.SubmissionId{k.Id(), s.Id(), w.Id(), lateKeep.Id(), late.Id()}
+		if !slices.Equal(inboxIds(after), wantAfter) {
+			t.Fatalf("inbox = %s, want ids %v", jsonText(t, after), wantAfter)
+		}
+		expectEqualJSON(t, []InboxItem{after[0], after[1], after[3], after[4]}, wantQueued(item(k, "followUp", "k", keep), item(s, "steer", "s", keep), item(lateKeep, "followUp", "lk", keep), item(late, "followUp", "l", "")))
+		expectSettled(t, must(a.Wait(testContext)), durable.SubmissionUnanswered, "aborted")
+		for _, submission := range []durable.Submission{k, s, lateKeep, late} {
+			if record := status(t, submission); record.Status != durable.SubmissionQueued {
+				t.Fatalf("%s = %s, want queued", id(submission), jsonText(t, record))
+			}
+		}
+		if run := must(durable.Snapshot(testContext, harness, LiveDoc, root.Id())).Run; run != nil {
+			t.Fatalf("a run started: %+v", run)
+		}
+		var requests [][]string
+		var mu sync.Mutex
+		setup.Faux.SetResponses([]ai.FauxResponseStep{
+			requestLog(&requests, &mu, fauxAnswer("x1")), requestLog(&requests, &mu, fauxAnswer("x2")),
+			requestLog(&requests, &mu, fauxAnswer("x3")), requestLog(&requests, &mu, fauxAnswer("x4")),
+		})
+		next := submit(t, root, inputDraft("n"))
+		expectSettled(t, must(next.Wait(testContext)), durable.SubmissionDone, "")
+		last := []string{}
+		for _, request := range requests {
+			last = append(last, request[len(request)-1])
+		}
+		expectEqualJSON(t, last, `["user:s","user:lk","user:l","user:n"]`)
+		if items := inboxItemsOf(t, harness, root); len(items) != 0 {
+			t.Fatalf("inbox = %s, want empty", jsonText(t, items))
+		}
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:391 it("keeps a queued input's entry across reopen and places it as that entry") (Pi's "data-only writes" describe)
+	t.Run("keeps a queued input's entry across reopen and places it as that entry", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		setup := chatSetup(t)
+		first := gatedReply("first")
+		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step, fauxAnswer("first again"), fauxAnswer("for f")})
+		harness, root := openAt(t, path, setup)
+		submit(t, root, inputDraft("a"))
+		first.awaitReached(t)
+		f := submit(t, root, inputWith("f", mention("f"), "")).Id()
+		closeHarness(t, harness)
+
+		harness, root = openAt(t, path, setup)
+		queuedItem := false
+		for _, item := range inboxItemsOf(t, harness, root) {
+			if item.Id == f {
+				queuedItem = true
+				expectEqualJSON(t, item.Entry, `{"kind":"chat.mention","data":{"author":"ann","text":"f"}}`)
+			}
+		}
+		if !queuedItem {
+			t.Fatalf("the reopened inbox has no item %d", f)
+		}
+		settled := must(submissionOfHarness(t, harness, f).Wait(testContext))
+		var placed durable.EntryRecord
+		for _, entry := range allEntries(t, root) {
+			if entry.Kind == "chat.mention" {
+				placed = entry
+			}
+		}
+		if settled.Status != durable.SubmissionDone || settled.Entry == nil || *settled.Entry != placed.Id {
+			t.Fatalf("settled = %s, want done with entry %d", jsonText(t, settled), placed.Id)
+		}
+		expectEqualJSON(t, placed.Data, `{"author":"ann","text":"f"}`)
+		if len(placed.Model) != 1 || placed.Model[0].MessageRole() != "user" {
+			t.Fatalf("model = %s, want one user message", jsonText(t, placed.Model))
+		}
+		if text, _ := textOf(placed.Model[0]); text != "f" {
+			t.Fatalf("model text = %q, want f", text)
+		}
+		closeHarness(t, harness)
+	})
+}
+
+// TestDataOnlyWrites: a write of only kind and data is appended at once (harness-input-entries.test.ts "data-only writes").
+func TestDataOnlyWrites(t *testing.T) {
+	// harness-input-entries.test.ts:259 it("appends a data-only write mid-run in time order, leaving the model's messages unchanged")
+	t.Run("appends a data-only write mid-run in time order, leaving the model's messages unchanged", func(t *testing.T) {
+		setup := chatSetup(t)
+		gate := deferred()
+		holdTool(t, setup, gate, durable.ToolExecutionResult{Output: []ai.ToolResultMessageContent{ai.TextContent{Text: "held"}}})
+		var requests [][]string
+		var mu sync.Mutex
+		setup.Faux.SetResponses([]ai.FauxResponseStep{requestLog(&requests, &mu, holdStep()), requestLog(&requests, &mu, fauxAnswer("done"))})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		history := viewHistory(t, harness, root.Id())
+		input := submit(t, root, inputDraft("a"))
+		toolRunning(t, harness, root)
+		chat := durable.EntryDraft{Kind: "chat.message", Data: map[string]any{"author": "bob", "text": "lunch?"}}
+		draft := writeDraft(chat)
+		draft.RequestId = new("bob:1")
+		write := submit(t, root, draft)
+		// Settled and appended in its own commit, between the call and its still-running tool's result.
+		settled := status(t, write)
+		if settled.Status != durable.SubmissionDone || settled.Entry == nil {
+			t.Fatalf("write = %s, want done", jsonText(t, settled))
+		}
+		if items := inboxItemsOf(t, harness, root); len(items) != 0 {
+			t.Fatalf("inbox = %v, want empty", items)
+		}
+		expectEqualJSON(t, dataTranscript(t, allEntries(t, root)), `["pi.user|a","pi.assistant","chat.message|{\"author\":\"bob\",\"text\":\"lunch?\"}"]`)
+		// The view shows it while the run goes on.
+		var shown *ConversationView
+		for _, view := range history.All() {
+			if slices.ContainsFunc(view.Entries, func(entry durable.EntryRecord) bool { return entry.Kind == "chat.message" }) {
+				shown = &view
+				break
+			}
+		}
+		if shown == nil || shown.Entries[len(shown.Entries)-1].Kind != "chat.message" || shown.Entries[len(shown.Entries)-1].Id != *settled.Entry {
+			t.Fatalf("view = %+v, want the chat.message entry %d last", shown, *settled.Entry)
+		}
+		if run := liveValue(t, *shown).Run; run == nil || !slices.Equal(run.Inputs, []durable.SubmissionId{input.Id()}) {
+			t.Fatalf("run = %+v, want the run of %d", run, input.Id())
+		}
+		// A repeated request ID returns the same write without a second entry.
+		if again := submit(t, root, draft); again.Id() != write.Id() {
+			t.Fatalf("again = %d, want %d", again.Id(), write.Id())
+		}
+
+		gate.resolve()
+		must(input.Wait(testContext))
+		expectEqualJSON(t, dataTranscript(t, allEntries(t, root)), `["pi.user|a","pi.assistant","chat.message|{\"author\":\"bob\",\"text\":\"lunch?\"}","pi.tool-result","pi.assistant|done"]`)
+		mu.Lock()
+		got := requests
+		mu.Unlock()
+		expectEqualJSON(t, got, `[["system:","user:a"],["system:","user:a","assistant:","toolResult:held"]]`)
+		history.Detach()
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:310 it("queues a data-only write behind a queued reset, so it lands after the reset and stays visible")
+	t.Run("queues a data-only write behind a queued reset, so it lands after the reset and stays visible", func(t *testing.T) {
+		setup := chatSetup(t)
+		first := gatedReply("first")
+		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		input := submit(t, root, inputDraft("a"))
+		first.awaitReached(t)
+		resetTo(t, root, nil)
+		chat := submit(t, root, writeDraft(durable.EntryDraft{Kind: "chat.message", Data: "hi"}))
+		if got := status(t, chat).Status; got != durable.SubmissionQueued {
+			t.Fatalf("status = %s, want queued", got)
+		}
+		first.release()
+		must(input.Wait(testContext))
+		settled := must(chat.Wait(testContext))
+		var reset durable.EntryRecord
+		for _, entry := range allEntries(t, root) {
+			if entry.Kind == "pi.reset" {
+				reset = entry
+			}
+		}
+		if settled.Status != durable.SubmissionDone || settled.Entry == nil || *settled.Entry <= reset.Id {
+			t.Fatalf("settled = %s, want done after the reset %d", jsonText(t, settled), reset.Id)
+		}
+		view := must(root.Context(testContext, nil))
+		kinds := []string{}
+		for _, entry := range view.Entries {
+			kinds = append(kinds, entry.Kind)
+		}
+		expectEqualJSON(t, kinds, `["pi.reset","chat.message"]`)
+		// Once the reset is placed, display-only writes go in at once again.
+		later := submit(t, root, writeDraft(durable.EntryDraft{Kind: "chat.message", Data: "again"}))
+		if got := status(t, later).Status; got != durable.SubmissionDone {
+			t.Fatalf("later = %s, want done", got)
+		}
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:333 it("leaves the request unchanged by a data-only write that lands while the generation prepares")
+	t.Run("leaves the request unchanged by a data-only write that lands while the generation prepares", func(t *testing.T) {
+		setup := chatSetup(t)
+		rendering, render := deferred(), deferred()
+		renders := 0
+		addSection(t, setup.Registry, "slow", func(ctx context.Context, _ durable.PromptInput) (*string, error) {
+			renders++
+			if renders == 2 {
+				rendering.resolve()
+				if err := render.wait(ctx); err != nil {
+					return nil, err
+				}
+			}
+			return new("SLOW"), nil
+		})
+		var requests [][]string
+		var mu sync.Mutex
+		setup.Faux.SetResponses([]ai.FauxResponseStep{requestLog(&requests, &mu, fauxAnswer("one")), requestLog(&requests, &mu, fauxAnswer("two"))})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		must(submit(t, root, inputDraft("a")).Wait(testContext))
+		second := submit(t, root, inputDraft("b"))
+		if err := rendering.wait(testContext); err != nil {
+			t.Fatal(err)
+		}
+		submit(t, root, writeDraft(durable.EntryDraft{Kind: "chat.message", Data: "hi"}))
+		render.resolve()
+		must(second.Wait(testContext))
+		mu.Lock()
+		second2 := requests[1]
+		mu.Unlock()
+		if got := strings.Join(second2, "|"); got != "system:|user:a|assistant:one|user:b" {
+			t.Fatalf("request = %s", got)
+		}
+		kinds := []string{}
+		for _, entry := range allEntries(t, root) {
+			kinds = append(kinds, entry.Kind)
+		}
+		// The unchanged prompt adds no second pi.system entry.
+		expectEqualJSON(t, kinds, `["pi.user","pi.system","pi.assistant","pi.user","chat.message","pi.assistant"]`)
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:361 it("appends a data-only write while idle after a failed run without placing the queued items")
+	t.Run("appends a data-only write while idle after a failed run without placing the queued items", func(t *testing.T) {
+		setup := chatSetup(t)
+		failing := gatedResponse(ai.FauxResponse{StopReason: "error", ErrorMessage: "invalid request"})
+		setup.Faux.SetResponses([]ai.FauxResponseStep{failing.step, fauxAnswer("for f")})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		input := submit(t, root, inputDraft("a"))
+		failing.awaitReached(t)
+		f := submit(t, root, inputWith("f", mention("f"), ""))
+		failing.release()
+		failed := must(input.Wait(testContext))
+		expectSettled(t, failed, durable.SubmissionUnanswered, "model_error")
+		mustOK(t, harness.WaitForIdle(testContext))
+		note := submit(t, root, writeDraft(durable.EntryDraft{Kind: "note", Data: "n"}))
+		if got := status(t, note).Status; got != durable.SubmissionDone {
+			t.Fatalf("note = %s, want done", got)
+		}
+		mustOK(t, harness.WaitForIdle(testContext))
+		if got := status(t, f).Status; got != durable.SubmissionQueued {
+			t.Fatalf("f = %s, want queued", got)
+		}
+		if ids := inboxIds(inboxItemsOf(t, harness, root)); len(ids) != 1 || ids[0] != f.Id() {
+			t.Fatalf("inbox = %v, want [%d]", ids, f.Id())
+		}
+		// toEqual: the whole pi.live is exactly this runFailure (taskId and first any numbers), nothing else.
+		var live map[string]any
+		if err := json.Unmarshal([]byte(jsonText(t, liveOf(t, harness, root.Id()))), &live); err != nil {
+			t.Fatal(err)
+		}
+		failure, _ := live["runFailure"].(map[string]any)
+		if _, ok := failure["taskId"].(float64); !ok || len(live) != 1 || len(failure) != 5 {
+			t.Fatalf("pi.live = %s, want exactly a runFailure of taskId, inputs, reason, detail and first", jsonText(t, live))
+		}
+		if _, ok := failure["first"].(float64); !ok {
+			t.Fatalf("runFailure.first = %v, want a number", failure["first"])
+		}
+		delete(failure, "taskId")
+		expectEqualJSON(t, live, jsonText(t, map[string]any{"runFailure": map[string]any{"inputs": []durable.SubmissionId{input.Id()}, "reason": "model_error", "detail": "invalid request", "first": *failed.Entry}}))
+		if calls := setup.Faux.CallCount(); calls != 1 {
+			t.Fatalf("calls = %d, want 1", calls)
+		}
+		// The next input places the waiting mention first.
+		g := submit(t, root, inputDraft("g"))
+		must(g.Wait(testContext))
+		lines := []string{}
+		for _, line := range dataTranscript(t, allEntries(t, root)) {
+			if !strings.HasPrefix(line, "pi.assistant") {
+				lines = append(lines, line)
+			}
+		}
+		expectEqualJSON(t, lines, `["pi.user|a","note|\"n\"","chat.mention|{\"author\":\"ann\",\"text\":\"f\"}|f","pi.user|g"]`)
+		closeHarness(t, harness)
+	})
+
+	// harness-input-entries.test.ts:418 it("appends a data-only write at once behind a non-empty inbox, and still queues writes with model or edits")
+	t.Run("appends a data-only write at once behind a non-empty inbox, and still queues writes with model or edits", func(t *testing.T) {
+		setup := chatSetup(t)
+		first := gatedReply("first")
+		setup.Faux.SetResponses([]ai.FauxResponseStep{first.step, fauxAnswer("second")})
+		harness, root := openChat(t, storage.NewMemoryStorage(), setup)
+		input := submit(t, root, inputDraft("a"))
+		first.awaitReached(t)
+		followUp := submit(t, root, inputDraft("f"))
+		model := submit(t, root, writeDraft(durable.EntryDraft{Kind: "note", Model: []ai.Message{ai.UserMessage{Content: ai.UserText("m")}}}))
+		var target durable.EntryRecord
+		for _, entry := range allEntries(t, root) {
+			if entry.Kind == "pi.user" {
+				target = entry
+			}
+		}
+		edit := submit(t, root, writeDraft(durable.EntryDraft{Kind: "redact", Edits: []durable.ContextEdit{{Target: target.Id, Action: "omit"}}}))
+		note := submit(t, root, writeDraft(durable.EntryDraft{Kind: "note", Data: "n"}))
+		if got := status(t, note).Status; got != durable.SubmissionDone {
+			t.Fatalf("note = %s, want done", got)
+		}
+		expectEqualJSON(t, inboxOf(t, harness, root), jsonText(t, [][]any{{followUp.Id(), "followUp"}, {model.Id(), "write"}, {edit.Id(), "write"}}))
+		first.release()
+		must(followUp.Wait(testContext))
+		expectEqualJSON(t, dataTranscript(t, allEntries(t, root)), `["pi.user|a","note|\"n\"","pi.assistant|first","note|m","redact","pi.user|f","pi.assistant|second"]`)
+		expectSettled(t, status(t, input), durable.SubmissionDone, "")
+		closeHarness(t, harness)
+	})
+}
+
+func mustOK(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}

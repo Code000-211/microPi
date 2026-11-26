@@ -1,0 +1,28 @@
+import { adoptPiProcessIdentity } from "./process-identity.mjs";
+import { Generations } from "./generations.mjs";
+import { exitAfterStderr } from "./exit-after-stderr.mjs";
+
+const entry = process.argv[2];
+if (!entry) {
+  exitAfterStderr("usage: node cli.mjs <extension-entry>");
+  await new Promise(() => {});
+}
+
+adoptPiProcessIdentity();
+// The first generation loads at start; later generations arrive on stdin, so /reload re-invokes the factory in this process.
+const generations = new Generations();
+// Pi keys its factory cache by the resolved configured cwd, which the host passes; process.cwd() is the physical path behind a symlink.
+const cwd = process.env.PIG_EXT_CWD || process.cwd();
+delete process.env.PIG_EXT_CWD;
+// pig additive (D232): the group of the Host that spawned this process when it shares cells, which later generations receive on their admission line; "" otherwise.
+const group = process.env.PIG_EXT_GROUP || "";
+delete process.env.PIG_EXT_GROUP;
+const first = { name: process.env.PIG_EXT_NAME, entry, socket: process.env.PIG_EXT_SOCKET, cwd, group };
+if (!(await generations.admit(first))) process.exit(1);
+// The entry module does not await serve: Bun keeps a process whose entry module has a pending top-level await alive and never emits beforeExit, and the quit drain after RPC input ends depends on beforeExit (runtime.mjs listenForQuitDrain). A serve rejection ends the process with exit code 1, as a rejected top-level await does, whatever unhandledRejection listeners an extension added.
+// served settles when the process has served every generation: the join a top-level await of serve would be.
+export const served = generations.serve(process.stdin).catch(failServe);
+
+function failServe(error) {
+  exitAfterStderr(error);
+}

@@ -1,0 +1,63 @@
+// divguard:path coding/session.go
+
+package coding
+
+import "fmt"
+
+type Session struct {
+	listeners []func(int)
+	onError   func(error)
+}
+
+// dispatch recovers each listener on its own and reports the panic.
+func (s *Session) dispatch(ev int) {
+	for _, l := range s.listeners {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.onError(fmt.Errorf("listener panicked: %v", r))
+				}
+			}()
+			l(ev)
+		}()
+	}
+}
+
+// run rethrows after cleanup.
+func run(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			panic(r)
+		}
+	}()
+	fn()
+}
+
+// capture hands the panic value to its caller through a named result.
+func capture(fn func()) (failure any) {
+	defer func() { failure = recover() }()
+	fn()
+	return nil
+}
+
+// settle assigns the panic value to a variable declared outside the deferred
+// function, where the caller reads it.
+func settle(fn func()) any {
+	var failure any
+	func() {
+		defer func() { failure = recover() }()
+		fn()
+	}()
+	return failure
+}
+
+// relay copies the panic value of an outer variable into another one.
+func relay(fn func()) any {
+	var failure any
+	func() {
+		defer func() { failure = recover() }()
+		fn()
+	}()
+	var copied = failure
+	return copied
+}

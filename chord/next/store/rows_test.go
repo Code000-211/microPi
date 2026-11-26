@@ -1,0 +1,233 @@
+package store
+
+import (
+	"maps"
+	"math"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/chord/next/contracts"
+	"github.com/MichaelKinsy/PiG/chord/next/data"
+	"github.com/MichaelKinsy/PiG/chord/next/internal/nexttest"
+	"github.com/MichaelKinsy/PiG/chord/sqlite"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// pi: packages/chord/src/store/rows.ts
+// Ports packages/chord/test/store/rows.test.ts: rows (slice 6a §5, §9): `put` rows and keys checked and encoded,
+// stored rows decoded.
+//
+// Go test conventions: Pi's `{ ...row, id: undefined }` is the row without the key (an absent key is `undefined`; a
+// key present with nil is JavaScript's `null`, see rows.go). Designed out: the BigInt case of "serializes json cells
+// at staging" (Go has no BigInt; the cycle case is kept).
+
+func rowsTable(t *testing.T) *TableDefinition {
+	t.Helper()
+	definition, err := DefineTable("t", TableOptions{
+		Version: 3,
+		Columns: []ColumnProp{
+			Col("id", Str()),
+			Col("n", Int(contracts.Default(7))),
+			Col("x", Num()),
+			Col("b", Bool()),
+			Col("note", Opt(Str())),
+			Col("meta", Json(contracts.Obj(contracts.Prop("a", contracts.Int())), JsonColumnOptions{Version: 2})),
+		},
+		Key: []string{"id"},
+	})
+	if err != nil {
+		t.Fatalf("DefineTable: %v", err)
+	}
+	return definition
+}
+
+func rowsPutFails(t *testing.T, codec *RowCodec, row any, want string) {
+	t.Helper()
+	_, err := codec.Put(row, 3)
+	if err == nil {
+		t.Fatalf("Put(%v) succeeded, want %q", row, want)
+	}
+	if want == "" {
+		_ = rejected(t, err, data.CodeInvalid, data.ReasonArgs)
+	} else if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Put error = %v, want it to contain %q", err, want)
+	}
+}
+
+func rowsWith(row Row, key string, value any) Row {
+	next := Row{}
+	maps.Copy(next, row)
+	if value == nil {
+		delete(next, key)
+	} else {
+		next[key] = value
+	}
+	return next
+}
+
+func TestPutRows(t *testing.T) {
+	codec := rowsTable(t).Rows
+
+	t.Run("encodes a row in physical order, defaults filled, booleans as 0 and 1, json serialized with its version", func(t *testing.T) {
+		encoded, err := codec.Put(Row{"id": "a", "x": 1.5, "b": true, "meta": delta.JsonObjectOf("a", float64(1))}, 3)
+		if err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		wantParams := []sqlite.SqliteValue{"a", int64(7), 1.5, int64(1), nil, `{"a":1}`, int64(2), int64(3)}
+		if !reflect.DeepEqual(encoded.Params, wantParams) {
+			t.Fatalf("params = %#v, want %#v", encoded.Params, wantParams)
+		}
+		nexttest.RequireJSONEqual(t, encoded.Row, delta.JsonObjectOf("id", "a", "n", float64(7), "x", 1.5, "b", true, "meta", delta.JsonObjectOf("a", float64(1))))
+		nexttest.RequireJSONEqual(t, encoded.Columns, delta.JsonObjectOf("meta", float64(2)))
+		key, err := codec.Key(Row{"id": "a"}, "get")
+		if err != nil || encoded.ID != key.ID {
+			t.Fatalf("row id = %q, key id = %v, %v", encoded.ID, key, err)
+		}
+	})
+
+	t.Run("is a closed check: missing and unknown columns, wrong types, unsafe integers, non-finite numbers, NUL", func(t *testing.T) {
+		row := Row{"id": "a", "x": float64(1), "b": false, "meta": delta.NewJsonObject(0)}
+		rowsPutFails(t, codec, rowsWith(row, "id", nil), "")
+		rowsPutFails(t, codec, rowsWith(row, "extra", 1), `unknown column "extra"`)
+		rowsPutFails(t, codec, rowsWith(row, "n", float64(1<<53)), "")
+		rowsPutFails(t, codec, rowsWith(row, "n", 1.5), "")
+		rowsPutFails(t, codec, rowsWith(row, "x", jsstringInfinity()), "")
+		rowsPutFails(t, codec, rowsWith(row, "b", int64(1)), "")
+		rowsPutFails(t, codec, rowsWith(row, "id", "a\x00"), "NUL")
+		rowsPutFails(t, codec, rowsWith(row, "note", struct{}{}), "")
+		// A key present with nil is JavaScript's `null`: no str value.
+		withNull := rowsWith(row, "note", "x")
+		withNull["note"] = nil
+		rowsPutFails(t, codec, withNull, "")
+		rowsPutFails(t, codec, []any{}, "expected an object")
+	})
+
+	t.Run("serializes json cells at staging: a cycle fails there (rule 8)", func(t *testing.T) {
+		cycle := map[string]any{}
+		cycle["self"] = cycle
+		rowsPutFails(t, codec, Row{"id": "a", "x": float64(1), "b": false, "meta": cycle}, "")
+	})
+
+	t.Run("replaces lone surrogates in text", func(t *testing.T) {
+		lone := jsstring.FromUTF16([]uint16{'a', 0xD800})
+		encoded, err := codec.Put(Row{"id": lone, "x": float64(1), "b": false, "meta": delta.NewJsonObject(0)}, 3)
+		if err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		if id := encoded.Row.Value("id"); id != "a\uFFFD" {
+			t.Fatalf("id = %q, want a U+FFFD", id)
+		}
+	})
+}
+
+func TestKeys(t *testing.T) {
+	codec := rowsTable(t).Rows
+
+	t.Run("takes exactly the key columns", func(t *testing.T) {
+		key, err := codec.Key(Row{"id": "a"}, "get")
+		if err != nil || !reflect.DeepEqual(key.Params, []sqlite.SqliteValue{"a"}) {
+			t.Fatalf("Key = %+v, %v; want params [a]", key, err)
+		}
+		_, err = codec.Key(Row{}, "get")
+		if err == nil || !strings.Contains(err.Error(), "is missing") {
+			t.Fatalf("Key({}) error = %v, want is missing", err)
+		}
+		_, err = codec.Key(Row{"id": "a", "n": 1}, "get")
+		if err == nil || !strings.Contains(err.Error(), `unknown column "n"`) {
+			t.Fatalf("Key(extra) error = %v, want unknown column", err)
+		}
+		_, err = codec.Key(Row{"id": 1}, "get")
+		_ = rejected(t, err, data.CodeInvalid, data.ReasonArgs)
+	})
+}
+
+func TestDecoding(t *testing.T) {
+	codec := rowsTable(t).Rows
+
+	t.Run("reads booleans, leaves NULL opt columns absent and parses json cells", func(t *testing.T) {
+		row, err := codec.Decode(background, sqlite.SqliteRow{"id": "a", "n": int64(1), "x": float64(2), "b": int64(0), "note": nil, "meta": `{"a":1}`, "meta$v": int64(2)})
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if len(row) != 5 || row["id"] != "a" || row["n"] != int64(1) || row["x"] != float64(2) || row["b"] != false {
+			t.Fatalf("row = %#v", row)
+		}
+		nexttest.RequireJSONEqual(t, row["meta"], delta.JsonObjectOf("a", float64(1)))
+	})
+
+	t.Run("refuses a json cell of a newer version", func(t *testing.T) {
+		_, err := codec.Decode(background, sqlite.SqliteRow{"id": "a", "n": int64(1), "x": float64(2), "b": int64(0), "note": nil, "meta": "{}", "meta$v": int64(3)})
+		if err == nil || !strings.Contains(err.Error(), "newer than 2") {
+			t.Fatalf("Decode error = %v, want newer than 2", err)
+		}
+	})
+}
+
+// jsstringInfinity is Number.POSITIVE_INFINITY.
+func jsstringInfinity() float64 { return math.Inf(1) }
+
+func TestHostCells(t *testing.T) {
+	session := hostColKind(t, "session")
+	pins := qDefine(t, "pins", TableOptions{
+		Version: 1,
+		Columns: []ColumnProp{Col("id", Str()), Col("session", Host(session))},
+		Key:     []string{"id"},
+	})
+	S1 := hostColAddress(session, "S1")
+
+	t.Run("are put and keyed as their address's key, decoded into the address", func(t *testing.T) {
+		encoded, err := pins.Rows.Put(Row{"id": "p", "session": S1}, 1)
+		must(t, err)
+		qEqual(t, encoded.Params, []sqlite.SqliteValue{"p", "session|S1", int64(1)})
+		qEqual(t, qJSON(t, encoded.Row), `{"id":"p","session":"session|S1"}`)
+		decoded, err := pins.Rows.Decode(background, sqlite.SqliteRow{"id": "p", "session": "session|S1"})
+		must(t, err)
+		qEqual(t, decoded, Row{"id": "p", "session": S1})
+		_, err = pins.Rows.Put(Row{"id": "p", "session": "session|S1"}, 1)
+		qFails(t, err, "expected an address of session")
+	})
+
+	t.Run("turn between the stored key and the address (`stored`, `addressed`); rows without a host column stay", func(t *testing.T) {
+		read := Row{"id": "p", "session": S1}
+		qEqual(t, pins.Rows.Stored(read), Row{"id": "p", "session": "session|S1"})
+		addressed, err := pins.Rows.Addressed(pins.Rows.Stored(read))
+		must(t, err)
+		qEqual(t, addressed, read)
+		plain := rowsTable(t)
+		row := Row{"id": "a", "x": int64(1)}
+		if got := plain.Rows.Stored(row); reflect.ValueOf(got).Pointer() != reflect.ValueOf(row).Pointer() {
+			t.Fatalf("Stored copied a row without a host column")
+		}
+		got, err := plain.Rows.Addressed(row)
+		must(t, err)
+		if reflect.ValueOf(got).Pointer() != reflect.ValueOf(row).Pointer() {
+			t.Fatalf("Addressed copied a row without a host column")
+		}
+	})
+}
+
+// Pi 92e1db6ca rows.ts `decodeScalar` has no test of its own in Pi (row decoding and named queries reach it); these
+// are its three arms and the pass-through, on the columns of the fixtures above.
+func TestDecodeScalar(t *testing.T) {
+	session := hostColKind(t, "session")
+	pins := qDefine(t, "pins", TableOptions{
+		Version: 1,
+		Columns: []ColumnProp{Col("id", Str()), Col("session", Host(session)), Col("b", Bool()), Col("x", Num()), Col("n", Int())},
+		Key:     []string{"id"},
+	})
+	decode := func(name string, value sqlite.SqliteValue) any {
+		t.Helper()
+		column := pins.ByName[name]
+		got, err := DecodeScalar(column, value)
+		must(t, err)
+		return got
+	}
+	qEqual(t, decode("b", int64(1)), true)
+	qEqual(t, decode("b", int64(0)), false)
+	qEqual(t, decode("session", "session|S1"), hostColAddress(session, "S1"))
+	qEqual(t, decode("id", "a"), "a")
+	qEqual(t, decode("n", int64(3)), int64(3))
+	qEqual(t, decode("x", int64(2)), float64(2))
+}

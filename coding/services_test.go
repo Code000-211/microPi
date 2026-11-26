@@ -1,0 +1,188 @@
+package coding
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+)
+
+// withTempHome isolates PIG_HOME for a test so settings + auth lookups
+// don't touch the developer's real config.
+func withTempHome(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("PIG_HOME", tmp)
+	return tmp
+}
+
+func TestNewServicesDefaults(t *testing.T) {
+	withTempHome(t)
+	srv, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{})
+	if err != nil {
+		t.Fatalf("CreateAgentSessionServices: %v", err)
+	}
+	if srv == nil {
+		t.Fatal("nil services")
+	}
+	if srv.CWD() == "" {
+		t.Errorf("CWD should default to os.Getwd(); got empty")
+	}
+	if srv.AgentDir() == "" {
+		t.Errorf("AgentDir should default; got empty")
+	}
+	if srv.Auth() == nil {
+		t.Errorf("Auth should be non-nil")
+	}
+	if srv.Registry() == nil {
+		t.Errorf("Registry should be non-nil")
+	}
+}
+
+func TestNewServicesAuthDirSelectsCorrectFile(t *testing.T) {
+	tmp := withTempHome(t)
+	srv, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{
+		AgentDir: filepath.Join(tmp, "agent"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(tmp, "agent")
+	if got := srv.AgentDir(); got != want {
+		t.Errorf("AgentDir = %q, want %q", got, want)
+	}
+	// Pi AuthStorage.create ensures an empty auth.json during Services startup.
+	wantAuth := filepath.Join(want, "auth.json")
+	if got := srv.Auth().Path(); got != wantAuth {
+		t.Errorf("auth path = %q, want %q", got, wantAuth)
+	}
+	if data, err := os.ReadFile(wantAuth); err != nil || string(data) != "{}" {
+		t.Fatalf("startup auth.json = %q, %v; want {}", data, err)
+	}
+}
+
+func TestNewServicesExplicitCWDIsHonored(t *testing.T) {
+	withTempHome(t)
+	tmp := t.TempDir()
+	srv, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{CWD: tmp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.CWD(); got != tmp {
+		t.Errorf("CWD = %q, want %q", got, tmp)
+	}
+}
+
+func TestServicesAreImmutableAfterConstruction(t *testing.T) {
+	// There are no public mutators on Services itself; this test
+	// asserts that intent at the type level. If a future refactor
+	// adds e.g. SetCWD, this test should also be updated to either
+	// remove the immutability claim from godoc or keep the contract.
+	withTempHome(t)
+	srv, _ := CreateAgentSessionServices(CreateAgentSessionServicesOptions{})
+
+	cwdBefore := srv.CWD()
+	dirBefore := srv.AgentDir()
+	// Mutating returned settings struct should not affect future reads.
+	s1 := srv.Settings()
+	s1.QuietStartup = QuietStartupTrue
+	s2 := srv.Settings()
+	if s1.QuietStartup == s2.QuietStartup {
+		// They were the same after mutation → settings is value-typed (good)
+		// OR mutation worked (bad); verify by checking against pristine.
+		if cwdBefore != srv.CWD() || dirBefore != srv.AgentDir() {
+			t.Errorf("identity fields changed after Settings mutation")
+		}
+	}
+}
+
+// agent-session-services.ts:140-147 builds the model runtime and the settings manager without making the agent directory: createAgentSessionServices resolves for a directory that cannot be made (the first write reports it), where PiG used to fail with its own "open auth storage" error.
+func TestNewServicesOpensWhereTheAgentDirCannotBeMade(t *testing.T) {
+	withTempHome(t)
+	tmp := t.TempDir()
+	notADir := filepath.Join(tmp, "blocker")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	services, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{AgentDir: filepath.Join(notADir, "agent")})
+	if err != nil {
+		t.Fatalf("CreateAgentSessionServices under a regular file = %v, want services", err)
+	}
+	services.Close()
+}
+
+func TestServicesSettingsReflectsProjectOverlay(t *testing.T) {
+	tmp := withTempHome(t)
+	cwd := t.TempDir()
+	// Write a project-level settings file to verify it's picked up.
+	// Using `theme` (string) rather than `quietStartup` (bool) because
+	// internal/codingagent.mergeSettings only overrides string/slice
+	// fields today: bools always come from the global layer. (Tracked
+	// as a separate parity follow-up; not in F2 scope.)
+	projSettingsDir := filepath.Join(cwd, ".pig")
+	if err := os.MkdirAll(projSettingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projFile := filepath.Join(projSettingsDir, "settings.json")
+	if err := os.WriteFile(projFile, []byte(`{"theme": "my-project-theme"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := CreateAgentSessionServices(CreateAgentSessionServicesOptions{
+		CWD:      cwd,
+		AgentDir: filepath.Join(tmp, "agent"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.Settings().Theme; got != "my-project-theme" {
+		t.Errorf("project-overlay theme = %q, want %q", got, "my-project-theme")
+	}
+}
+
+func TestDefaultAgentDirHonorsPIG_HOME(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PIG_HOME", tmp)
+	got := DefaultAgentDir()
+	want := filepath.Join(tmp, "agent")
+	if got != want {
+		t.Errorf("DefaultAgentDir = %q, want %q", got, want)
+	}
+}
+
+// Pi's getAgentDir (config.ts) returns the directory named by the agent directory variable, tilde expanded, before any default; PiG's embedder entry point
+// and the pig binary's resolver must name the same directory.
+func TestDefaultAgentDirHonorsTheAgentDirVariable(t *testing.T) {
+	home := t.TempDir()
+	for _, test := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"PIG_CODING_AGENT_DIR", map[string]string{"PIG_CODING_AGENT_DIR": filepath.Join(home, "custom")}, filepath.Join(home, "custom")},
+		{"tilde is expanded", map[string]string{"PIG_CODING_AGENT_DIR": "~/custom"}, filepath.Join(home, "custom")},
+		{"it wins over PIG_HOME", map[string]string{"PIG_CODING_AGENT_DIR": filepath.Join(home, "custom"), "PIG_HOME": filepath.Join(home, "pighome")}, filepath.Join(home, "custom")},
+		{"shared mode reads PI_CODING_AGENT_DIR", map[string]string{"PIG_USE_PI_DIRS": "1", "PI_CODING_AGENT_DIR": filepath.Join(home, "pi"), "PIG_CODING_AGENT_DIR": filepath.Join(home, "ignored")}, filepath.Join(home, "pi")},
+		{"PI_CODING_AGENT_DIR is ignored outside shared mode", map[string]string{"PI_CODING_AGENT_DIR": filepath.Join(home, "pi"), "PIG_HOME": filepath.Join(home, "pighome")}, filepath.Join(home, "pighome", "agent")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			for _, name := range []string{"PIG_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR", "PIG_HOME", "PIG_USE_PI_DIRS"} {
+				t.Setenv(name, "")
+			}
+			for name, value := range test.env {
+				t.Setenv(name, value)
+			}
+			if got := DefaultAgentDir(); got != test.want {
+				t.Errorf("coding.DefaultAgentDir() = %q, want %q", got, test.want)
+			}
+			if got := icodingagent.AgentDir(); got != test.want {
+				t.Errorf("AgentDir() = %q, want the same directory %q", got, test.want)
+			}
+			if got := icodingagent.DefaultSkillsDir(); got != filepath.Join(test.want, "skills") {
+				t.Errorf("DefaultSkillsDir() = %q, want it under %q", got, test.want)
+			}
+		})
+	}
+}

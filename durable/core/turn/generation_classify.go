@@ -1,0 +1,477 @@
+// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
+// SPDX-License-Identifier: MIT
+
+package turn
+
+import (
+	"math"
+
+	"github.com/MichaelKinsy/PiG/durable/core/history"
+	"github.com/MichaelKinsy/PiG/durable/core/inbox"
+	"github.com/MichaelKinsy/PiG/durable/core/internal/delta"
+	"github.com/MichaelKinsy/PiG/durable/core/jv"
+	"github.com/MichaelKinsy/PiG/durable/core/session"
+)
+
+func withCompacted(cp *jv.Object, compacted ID) {
+	if compacted != 0 {
+		cp.Set("compacted", float64(compacted))
+	}
+}
+
+// classify classifies a terminal provider message in one commit that also clears the partial.
+func (r *run) classify(req requestInfo, message *jv.Object) {
+	h := r.g.Host
+	if r.rt.Signal().Aborted() {
+		// An abort mark or close: the abort invocation or the reopened run handles the committed state.
+		r.fail(session.ErrAborted)
+		return
+	}
+	// Record the requested level, as pi-agent-core's agent loop does.
+	if req.thinking != nil {
+		message.Set("thinkingLevel", req.thinking)
+	}
+	stop := str(message, "stopReason")
+	if handle := objField(message, "deferred"); stop == "deferred" && handle != nil {
+		after := float64(defaultPollAfterMs)
+		if v, ok := handle.Get("pollAfterMs"); ok {
+			if f, isNum := v.(float64); isNum {
+				after = f
+			}
+		}
+		pollAt := r.now() + after
+		if req.pollAt != nil {
+			pollAt = math.Max(pollAt, *req.pollAt+1)
+		}
+		r.commitDone(func(tx *session.Tx, _ *jv.Object) (*jv.Object, error) {
+			live, err := tx.Doc(LiveDef, session.DocArgs{Owner: r.conv})
+			if err != nil {
+				return nil, err
+			}
+			at, attempt := any(pollAt), any(req.attempt)
+			if err := live.Set("generation", jobj("attempt", attempt, "deferred", jobj("pollAt", at))); err != nil {
+				return nil, err
+			}
+			cp := jobj("phase", phasePoll, "attempt", attempt)
+			withCompacted(cp, req.compacted)
+			cp.Set("model", req.model.object())
+			if req.thinking != nil {
+				cp.Set("thinkingLevel", req.thinking)
+			}
+			cp.Set("cutoff", float64(req.cutoff))
+			cp.Set("handle", handle)
+			cp.Set("pollAt", at)
+			return jobj("status", "sleeping", "checkpoint", cp, "until", at), nil
+		})
+		return
+	}
+	r.eachHook("afterResponse", func() *jv.Object { return jobj("message", message) }, func(any) bool { return false }, func(err error) {
+		if err != nil {
+			r.fail(err)
+			return
+		}
+		var calls []*jv.Object
+		content, _ := arrayField(message, "content")
+		for _, c := range content {
+			if o, ok := c.(*jv.Object); ok && str(o, "type") == "toolCall" {
+				calls = append(calls, o)
+			}
+		}
+		switch {
+		case stop == "toolUse" && len(calls) > 0:
+			r.startToolRound(req, message, calls)
+		case stop == "stop" || stop == "length" || stop == "toolUse":
+			r.answer(message)
+		default:
+			r.classifyFailure(req, message, h.Settings())
+		}
+	})
+}
+
+func (r *run) classifyFailure(req requestInfo, message *jv.Object, settings Settings) {
+	stop := str(message, "stopReason")
+	overflow := stop == "error" && IsContextOverflow(message)
+	if !overflow || req.compacted != 0 {
+		r.retryOrFail(req, message, settings, stop, overflow)
+		return
+	}
+	// generation.ts classify reads the agent only for an overflow nothing was compacted for yet; the policy it resolves keeps a
+	// cut or the failure is retried or ended as any. Past the check above the answer is an overflow, so the closures name its stop
+	// reason and overflow flag as constants: that keeps the two locals off the heap.
+	r.agent(func(agent *Agent) {
+		compaction := settings.CompactionFor(req.model, agent.Compaction)
+		if !compaction.Enabled {
+			r.retryOrFail(req, message, settings, "error", true)
+			return
+		}
+		r.context(req.cutoff, func(view *history.View) {
+			if _, ok := view.SelectCut(compaction.KeepRecentTokens); ok {
+				text := "Context overflow"
+				if s, ok := stringField(message, "errorMessage"); ok {
+					text = s
+				}
+				r.commitDone(func(tx *session.Tx, _ *jv.Object) (*jv.Object, error) {
+					live, err := tx.Doc(LiveDef, session.DocArgs{Owner: r.conv})
+					if err != nil {
+						return nil, err
+					}
+					if _, err := appendAssistant(tx, r.conv, message); err != nil {
+						return nil, err
+					}
+					live.Delete("generation")
+					child, err := createCompaction(tx, r.conv, "overflow", r.rt.TaskID())
+					if err != nil {
+						return nil, err
+					}
+					cp := jobj("phase", phasePrepare, "attempt", req.attempt, "compacted", float64(child), "overflow", text)
+					return jobj("status", "waiting", "checkpoint", cp, "on", idList([]ID{child}), "policy", "allSettled"), nil
+				})
+				return
+			}
+			r.retryOrFail(req, message, settings, "error", true)
+		})
+	})
+}
+
+// retryOrFail commits a failed answer: a retry with its backoff, or the terminal failure.
+func (r *run) retryOrFail(req requestInfo, message *jv.Object, settings Settings, stop string, overflow bool) {
+	// An overflow is never retried: only a compaction can make the next request fit.
+	retry := stop == "error" && !overflow && IsRetryableAssistantError(message) && settings.RetryEnabled && req.attempt <= settings.MaxRetries
+	until := 0.0
+	if retry {
+		until = r.now() + RetryDelayMs(settings.BaseDelayMs, settings.MaxAgentDelayMs, req.attempt)
+	}
+	r.commitDone(func(tx *session.Tx, _ *jv.Object) (*jv.Object, error) {
+		// Read before the first table write; only a failure uses it.
+		var failed failure
+		if !retry {
+			var err error
+			if failed, err = r.prepareFailure(tx); err != nil {
+				return nil, err
+			}
+		}
+		live, err := tx.Doc(LiveDef, session.DocArgs{Owner: r.conv})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := appendAssistant(tx, r.conv, message); err != nil {
+			return nil, err
+		}
+		if retry {
+			at, attempt := any(until), any(req.attempt)
+			if err := live.Set("generation", jobj("attempt", attempt, "retry", jobj("at", at, "error", str(message, "errorMessage")))); err != nil {
+				return nil, err
+			}
+			cp := jobj("phase", phaseRetry, "attempt", attempt)
+			withCompacted(cp, req.compacted)
+			cp.Set("until", at)
+			return jobj("status", "sleeping", "checkpoint", cp, "until", at), nil
+		}
+		text, ok := stringField(message, "errorMessage")
+		if !ok {
+			text = "Model response ended with stop reason " + stop
+		}
+		if err := r.endFailedRun(tx, live, failed, UnansweredWith("model_error", text)); err != nil {
+			return nil, err
+		}
+		return failedTerminal(text, "model_error"), nil
+	})
+}
+
+// failure is what a failed run's end needs from the table, read before the commit's first table write (generation.ts Failure).
+type failure struct {
+	policy   string
+	boundary *inbox.Boundary
+}
+
+// prepareFailure reads the boundary a failed run's end may apply, only under the continue policy (generation.ts
+// prepareFailure, an async function its caller awaits).
+func (r *run) prepareFailure(tx *session.Tx) (failure, error) {
+	settings := r.g.Host.Settings()
+	policy := settings.AfterFailedRun
+	if policy != "continue" {
+		tx.Await(1)
+		return failure{policy: policy}, nil
+	}
+	boundary, err := prepareBoundary(tx, r.conv, settings.Queue)
+	if err != nil {
+		return failure{}, err
+	}
+	tx.Await(1)
+	return failure{policy: policy, boundary: boundary}, nil
+}
+
+// endFailedRun ends a failed run, settling its inputs and recording why, and does with the inputs queued behind it what
+// settings.afterFailedRun says (spec section 6): keep them, start the next run with them, or withdraw them (generation.ts
+// endFailedRun, an async function its caller awaits).
+func (r *run) endFailedRun(tx *session.Tx, live *delta.Obj, failed failure, end RunEnd) error {
+	if err := EndRun(tx, live, r.rt.TaskID(), end); err != nil {
+		return err
+	}
+	if failed.policy == "withdraw" {
+		if err := inbox.WithdrawQueuedFor(tx, r.conv, "run_failed"); err != nil {
+			return err
+		}
+		tx.Await(1)
+	}
+	if failed.boundary != nil {
+		applied, err := applyBoundary(tx, failed.boundary, true, r.now())
+		if err != nil {
+			return err
+		}
+		if len(applied.Users) > 0 {
+			if err := awaitStartRun(tx, r.conv, live, applied.Start(), true); err != nil {
+				return err
+			}
+		}
+	}
+	tx.Await(1)
+	return nil
+}
+
+// answer is a final answer; the final boundary places queued items (spec section 6). The first onYield continuation appends a user
+// message and hands the run to a successor generation, but only when the inbox holds no user item and no reset. Otherwise the run's
+// inputs settle done; with `afterRun` hooks selected the run waits for the tasks they ask for, in finish and drain, before the final
+// boundary; without, selected user items start the next run now.
+func (r *run) answer(message *jv.Object) {
+	var continuation any
+	r.eachHook("onYield", func() *jv.Object { return jobj("answer", message) }, func(result any) bool {
+		if o, ok := result.(*jv.Object); ok {
+			if c, has := o.Get("continue"); has && c != nil {
+				continuation = c
+				return true
+			}
+		}
+		return false
+	}, func(err error) {
+		if err != nil {
+			r.fail(err)
+			return
+		}
+		r.asksAfterRun(func(afterRun bool) {
+			r.commitDone(func(tx *session.Tx, _ *jv.Object) (*jv.Object, error) {
+				// Queue modes are read on the Session line, when the boundary is decided.
+				boundary, err := prepareBoundary(tx, r.conv, r.g.Host.Settings().Queue)
+				if err != nil {
+					return nil, err
+				}
+				live, err := tx.Doc(LiveDef, session.DocArgs{Owner: r.conv})
+				if err != nil {
+					return nil, err
+				}
+				entry, err := appendAssistant(tx, r.conv, message)
+				if err != nil {
+					return nil, err
+				}
+				entryID := idField(entry, "id")
+				result := completedTerminal(entryID)
+				var continues any
+				if continuation != nil && inbox.TakesContinuation(boundary) {
+					continues = continuation
+				}
+				if continues == nil && afterRun {
+					held, ok, err := r.holdRun(tx, live, "answer", entryID, entryID)
+					if err != nil {
+						return nil, err
+					}
+					if ok {
+						tx.Await(1) // Pi v1.6.0 generation.ts answer: returning async concludeAnswer()
+						return held, nil
+					}
+				}
+				applied, err := applyBoundary(tx, boundary, true, r.now())
+				if err != nil {
+					return nil, err
+				}
+				if continues != nil {
+					user := jobj("role", "user", "content", continues, "timestamp", r.now())
+					if _, err := tx.AppendEntry(r.conv, entryDraft(KindUser, jobj("model", []any{user}))); err != nil {
+						return nil, err
+					}
+					// The continuation starts the run's turn count over: bounding `onYield` loops is the extension's job.
+					if run := live.Obj("run"); run != nil && sameID(run.Get("taskId"), r.rt.TaskID()) {
+						if err := run.Set("turns", float64(0)); err != nil {
+							return nil, err
+						}
+					}
+					next, err := createGeneration(tx, r.conv, nil)
+					if err != nil {
+						return nil, err
+					}
+					handOver(live, r.rt.TaskID(), next)
+					live.Delete("generation")
+					tx.Await(1) // Pi v1.6.0 generation.ts answer: returning async concludeAnswer()
+					return result, nil
+				}
+				if err := EndRun(tx, live, r.rt.TaskID(), Answered(entryID)); err != nil {
+					return nil, err
+				}
+				if len(applied.Users) > 0 {
+					if err := awaitStartRun(tx, r.conv, live, applied.Start(), false); err != nil {
+						return nil, err
+					}
+				}
+				tx.Await(1) // Pi v1.6.0 generation.ts answer: returning async concludeAnswer()
+				return result, nil
+			})
+		})
+	})
+}
+
+// createGeneration creates a generation owned by its conversation; a run's inputs are the submissions whose carriers it takes as its
+// trace and links (generation.ts createGeneration, `submissionIds`).
+func createGeneration(tx *session.Tx, conv ID, inputs []ID) (ID, error) {
+	return tx.CreateTask(GenerationDef, jv.NewObject(), session.TaskOptions{ConversationID: conv, Submissions: inputs})
+}
+
+// startRun starts a run for run.Inputs, placed input submissions, whose first entry is run.First (LiveRun.first): a new generation takes
+// pi.live.run. It removes `runFailure`, unless keepFailure: a run started in the commit that ended the failed one keeps its failure.
+func startRun(tx *session.Tx, conv ID, live *delta.Obj, run inbox.RunStart, keepFailure bool) error {
+	id, err := createGeneration(tx, conv, run.Inputs)
+	if err != nil {
+		return err
+	}
+	record := jobj("taskId", float64(id), "inputs", idList(run.Inputs), "turns", float64(0))
+	if run.HasFirst {
+		record.Set("first", float64(run.First))
+	}
+	if err := live.Set("run", record); err != nil {
+		return err
+	}
+	if !keepFailure {
+		live.Delete("runFailure")
+	}
+	return nil
+}
+
+// handOver hands run control from one task to another; the run's inputs move with it.
+func handOver(live *delta.Obj, from, to ID) {
+	if run := live.Obj("run"); run != nil && run.Get("taskId") == float64(from) {
+		_ = run.Set("taskId", float64(to))
+	}
+}
+
+// Runs implements inbox.Runs: the conversation's pi.live document and the start of a run for placed inputs.
+type Runs struct{}
+
+// Live returns the pi.live draft of a conversation.
+func (Runs) Live(tx *session.Tx, conv ID) (*delta.Obj, error) {
+	return tx.Doc(LiveDef, session.DocArgs{Owner: conv})
+}
+
+// Start is startRun.
+func (Runs) Start(tx *session.Tx, conv ID, live *delta.Obj, run inbox.RunStart) error {
+	return startRun(tx, conv, live, run, false)
+}
+
+// createToolTask creates a tool task for call callID, owned by the generation; unoffered for a call to a tool its request did not offer.
+func createToolTask(tx *session.Tx, owner, assistant ID, callID string, unoffered bool) (ID, error) {
+	input := jobj("kind", "model", "assistant", float64(assistant), "callId", callID)
+	if unoffered {
+		input.Set("unoffered", true)
+	}
+	return tx.CreateTask(ToolDef, input, session.TaskOptions{OwnerTask: owner})
+}
+
+// startToolRound appends the tool-calling answer and starts its tool round in one commit (spec section 8.3). Every call gets a tool task
+// owned by the generation, in call order, only the first one now when the round is sequential; a call to a tool the request did not
+// offer is flagged, and its task settles tool_unavailable. The generation then waits for them in its tools phase, keeping the run.
+func (r *run) startToolRound(req requestInfo, message *jv.Object, calls []*jv.Object) {
+	if req.messages != nil {
+		r.startToolRoundWith(req.messages, message, calls)
+		return
+	}
+	r.requestContext(req.cutoff, func(view RequestContext) { r.startToolRoundWith(view.SystemMessages(), message, calls) })
+}
+
+func (r *run) startToolRoundWith(messages []*jv.Object, message *jv.Object, calls []*jv.Object) {
+	offered := map[string]bool{}
+	for _, t := range CurrentTools(messages) {
+		offered[nameOf(t)] = true
+	}
+	// Read as the round starts; a tool is resolved as its tool task resolves it.
+	r.agent(func(agent *Agent) { r.startRoundWith(message, calls, offered, agent) })
+}
+
+func (r *run) startRoundWith(message *jv.Object, calls []*jv.Object, offered map[string]bool, agent *Agent) {
+	h := r.g.Host
+	sequential := h.Settings().ToolExecution == "sequential"
+	for _, call := range calls {
+		name := str(call, "name")
+		if !offered[name] {
+			continue
+		}
+		for _, t := range agent.Tools {
+			if nameOf(t.Declaration) == name {
+				if t.ExecutionMode == "sequential" {
+					sequential = true
+				}
+				break
+			}
+		}
+	}
+	r.commitDone(func(tx *session.Tx, _ *jv.Object) (*jv.Object, error) {
+		live, err := tx.Doc(LiveDef, session.DocArgs{Owner: r.conv})
+		if err != nil {
+			return nil, err
+		}
+		entry, err := appendAssistant(tx, r.conv, message)
+		if err != nil {
+			return nil, err
+		}
+		assistant := idField(entry, "id")
+		var slots, started []any
+		var tools []ID
+		pending := []any{}
+		for _, call := range calls {
+			id, name := str(call, "id"), str(call, "name")
+			unoffered := !offered[name]
+			if sequential && len(tools) > 0 {
+				pending = append(pending, id)
+				slot := jobj("callId", id, "name", name, "status", "pending")
+				if unoffered {
+					slot.Set("unoffered", true)
+				}
+				slots = append(slots, slot)
+				continue
+			}
+			taskID, err := createToolTask(tx, r.rt.TaskID(), assistant, id, unoffered)
+			if err != nil {
+				return nil, err
+			}
+			tools = append(tools, taskID)
+			taskValue := any(float64(taskID))
+			started = append(started, taskValue)
+			slot := jobj("callId", id, "name", name, "taskId", taskValue, "status", "pending")
+			if unoffered {
+				slot.Set("unoffered", true)
+			}
+			slots = append(slots, slot)
+		}
+		live.Delete("generation")
+		if slots == nil {
+			slots = []any{}
+		}
+		if err := live.Set("tools", slots); err != nil {
+			return nil, err
+		}
+		if started == nil {
+			started = []any{}
+		}
+		if run := live.Obj("run"); run != nil && sameID(run.Get("taskId"), r.rt.TaskID()) {
+			// A tool round is one turn of the run (`AgentState.maxTurns`).
+			turns, _ := run.Get("turns").(float64)
+			if err := run.Set("turns", turns+1); err != nil {
+				return nil, err
+			}
+			// A run its boundary started without placing anything, as a continue after an answer, begins here.
+			if run.Get("first") == nil {
+				if err := run.Set("first", float64(assistant)); err != nil {
+					return nil, err
+				}
+			}
+		}
+		cp := jobj("phase", phaseTools, "assistant", float64(assistant), "tools", started, "pending", pending)
+		return jobj("status", "waiting", "checkpoint", cp, "on", idList(tools), "policy", "allSettled"), nil
+	})
+}

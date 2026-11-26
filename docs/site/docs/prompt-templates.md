@@ -1,0 +1,148 @@
+> PiG can create prompt templates. Ask it to build one for your workflow.
+
+# Prompt Templates
+
+Prompt templates are Markdown snippets that expand into full prompts. Type `/name` in the editor to invoke a template, where `name` is the filename without `.md`.
+
+## Locations
+
+PiG loads prompt templates from:
+
+- Global: `~/.pig/agent/prompts/*.md`
+- Project: `.pig/prompts/*.md` (only after the project is trusted)
+- Packages: `prompts/` directories or `pi.prompts` entries in `package.json`
+- Settings: `prompts` array with files or directories
+- CLI: `--prompt-template <path>` (repeatable)
+
+Disable discovery with `--no-prompt-templates`. Run `/reload` after you add or change a template in an active session.
+
+A leading `~` in a `prompts` setting entry expands to your home directory, also in `!`, `+`, `-` and wildcard entries such as `"!~/prompts/old.md"`, as in Pi 1.6.0.
+
+## Format
+
+```markdown
+---
+description: Review staged git changes
+---
+Review the staged changes (`git diff --cached`). Focus on:
+- Bugs and logic errors
+- Security issues
+- Error handling gaps
+```
+
+- The filename becomes the command name. `review.md` becomes `/review`.
+- `description` is optional. If missing, the first non-empty line is used.
+- `argument-hint` is optional. When set, the hint is displayed before the description in the autocomplete dropdown.
+
+### Argument Hints
+
+Use `argument-hint` in frontmatter to show expected arguments in autocomplete. Use `<angle brackets>` for required arguments and `[square brackets]` for optional ones:
+
+```markdown
+---
+description: Review PRs from URLs with structured issue and code analysis
+argument-hint: "<PR-URL>"
+---
+```
+
+This renders in the autocomplete dropdown as:
+
+```
+→ pr   <PR-URL>      : Review PRs from URLs with structured issue and code analysis
+  is   <issue>       : Analyze GitHub issues (bugs or feature requests)
+  wr   [instructions]: Finish the current task end-to-end
+  cl  : Audit changelog entries before release
+```
+
+## Usage
+
+Type `/` followed by the template name in the editor. Autocomplete shows available templates with descriptions. PiG expands the template before the text reaches the agent. Extensions receive the raw input first through the `input` event, unless an extension command with the same name handles it.
+
+```
+/review                           # Expands review.md
+/component Button                 # Expands with argument
+/component Button "click handler" # Multiple arguments
+```
+
+## Arguments
+
+Templates support positional arguments, defaults, and simple slicing:
+
+- `$1`, `$2`, ... positional args
+- `$@` or `$ARGUMENTS` for all args joined
+- `${1:-default}` uses arg 1 when present/non-empty, otherwise `default`
+- `${@:-default}` or `${ARGUMENTS:-default}` uses all arguments when present/non-empty, otherwise `default`
+- `${@:N}` for args from the Nth position (1-indexed)
+- `${@:N:L}` for `L` args starting at N
+
+Arguments follow shell-like quoting, so `/review "API compatibility"` supplies one argument that contains a space. A quote only starts quoting at the beginning of an argument, so apostrophes inside words such as `doesn't` stay as text, and a quote with no closing match is kept as text. Inside a quoted argument, a backslash before the same quote character keeps it as text, so `/review "the \"fast\" path"` supplies `the "fast" path`; other backslashes are kept as typed.
+
+Example:
+
+```markdown
+---
+description: Create a component
+---
+Create a React component named $1 with features: $@
+```
+
+Default values are useful for optional arguments:
+
+```markdown
+Summarize the current state in ${1:-7} bullet points.
+```
+
+Usage: `/component Button "onClick handler" "disabled support"`
+
+## Loading Rules
+
+- Template discovery in `prompts/` is non-recursive.
+- If you want templates in subdirectories, add them explicitly via `prompts` settings or a package manifest.
+
+
+## Worked example
+
+Save this as `~/.pig/agent/prompts/review.md`:
+
+```markdown
+---
+description: Review staged git changes
+argument-hint: "[focus]"
+---
+Review the staged changes (`git diff --cached`). Focus on: $1
+Bugs, security issues and error handling gaps.
+```
+
+Type a slash and the first letters of the name (here `re`) in the editor. The autocomplete list shows the template with its argument hint, its description and where it came from (`[u]` for your own templates, `[p]` for the project's):
+
+```text
+  reload      Reload keybindings, extensions, skills, prompts, themes, and context files
+  review      [focus] — [u] Review staged git changes
+```
+
+Type `/review security` and press `Enter`. PiG sends the expanded text, not the command. Checked in the provider request:
+
+```text
+Review the staged changes (`git diff --cached`). Focus on: security
+Bugs, security issues and error handling gaps.
+```
+
+The argument forms, checked on PiG. For the template `Create a React component named $1 with features: $@`, typing `/component Button "onClick handler" "disabled support"` sends:
+
+```text
+Create a React component named Button with features: Button onClick handler disabled support
+```
+
+`$@` is **all** arguments, including the first. For the template `Summarize the current state in ${1:-7} bullet points. Rest: ${@:2}`, saved as `sum.md`:
+
+```text
+you type:   /sum
+PiG sends:  Summarize the current state in 7 bullet points. Rest:
+
+you type:   /sum 3 alpha beta
+PiG sends:  Summarize the current state in 3 bullet points. Rest: alpha beta
+```
+
+A template whose name matches a built-in command never runs: the built-in wins ([Slash commands](/docs/latest/slash-commands)).
+
+See [upstream Pi's prompt template documentation](https://pi.dev/docs/latest/prompt-templates) for the reference implementation.

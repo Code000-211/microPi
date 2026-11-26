@@ -1,0 +1,622 @@
+package surfaces
+
+import (
+	"context"
+	"sync"
+
+	"github.com/MichaelKinsy/PiG/chord"
+	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/chord/next/host"
+	"github.com/MichaelKinsy/PiG/chord/next/link"
+	"github.com/MichaelKinsy/PiG/telemetry"
+)
+
+// Ports packages/chord/src/surfaces/client.ts. A client host with its plugins (slice 11 §2, §4, decisions "Slice 11, P4" to
+// "P6"): what a page and a terminal's sandbox both run. A client host (no address) loads the plugin scripts it started with
+// beside the app's core facets, keeps its link to the server with the connection loop, and holds the kind's scripts object: a
+// new set fetches the changed scripts and reloads the host in place (a failed plugin keeps its old facet; a failed fetch is
+// tried again), a page's new stylesheets loaded before the reload and each plugin left with the one of the code it runs; a new
+// base bundle means this client's code is outdated, which the app answers by starting over (a page reloads). The surface
+// specifics (how a socket opens, how a script is fetched, what is outdated, the stylesheets) are given.
+//
+// Forced Go differences (language mechanics: Go's context and goroutines for Pi's promises and one JavaScript thread): the callbacks that are promises in Pi (`fetchScript`, `serverBase`, `canRetry`,
+// `styles.prepare`) take the client's context and block; the loop's, a watch's and an update's events run on goroutines of
+// their own, one update at a time, in order. A watch's listener queues the update and waits for it, as Pi's `await this.#queue(...)`
+// does (the watch delivers the next set after the call returned); the reload the update makes waits on the host's own publications,
+// which would wait for the listener's return, so the listener says it has entered (chord.DeliveryEntered, D224) before it waits.
+// `Host.Connect` fails with an error where Pi's throws; it
+// is reported as `connect_failed` and the link closed (the loop tries again).
+
+// ClientErrorKind tags a ClientError.
+type ClientErrorKind string
+
+const (
+	// ClientHostError: the client's host reported an error (Host).
+	ClientHostError ClientErrorKind = "host"
+	// ClientPluginsError: plugins left out at a load or kept old at a reload (Failed).
+	ClientPluginsError ClientErrorKind = "plugins"
+	// ClientUpdateFailed: an update failed (Err); it is tried again.
+	ClientUpdateFailed ClientErrorKind = "update_failed"
+	// ClientStylesheetFailed: a plugin's stylesheet did not load (Reason "error") or not within 10 s (Reason "timeout"; this
+	// does not itself prevent the plugin's new code): Plugin, URL, Reason.
+	ClientStylesheetFailed ClientErrorKind = "stylesheet_failed"
+	// ClientMessages: a message rendered by a fallback, a contributed message that threw, a foreign message (each once): Report.
+	ClientMessages ClientErrorKind = "messages"
+	// ClientConnectFailed: the host refused the new link (Err): it was closed.
+	ClientConnectFailed ClientErrorKind = "connect_failed"
+)
+
+// ClientError is what a client reports, by Kind.
+type ClientError struct {
+	Kind   ClientErrorKind
+	Host   host.HostError
+	Failed []host.PluginFailure
+	Err    error
+	Plugin string
+	URL    string
+	Reason string
+	Report MessagesReport
+}
+
+// ClientStyles are a page's plugin stylesheets around each update: Prepare before the host reloads, Settle after it (or alone
+// when no script changed).
+type ClientStyles interface {
+	// Prepare fetches, without applying them, the stylesheets of set that differ from those of the code each plugin runs or
+	// did not load; it returns once each loaded, failed or waited 10 s, or when ctx ends (the client stops: what it prepared is
+	// removed, Settle never follows).
+	Prepare(ctx context.Context, set ScriptSet)
+	// Settle applies each prepared stylesheet whose plugin runs its new code now and retires the one it replaces; a plugin that
+	// kept names (its new script failed: it kept its old code) keeps its old one, its prepared one dropped unapplied; the
+	// stylesheets of plugins no longer in set go.
+	Settle(set ScriptSet, kept map[string]bool)
+}
+
+// ClientOptions is what StartClient takes.
+type ClientOptions struct {
+	// Scripts is the kind's scripts object (WebScripts, TuiScripts).
+	Scripts ScriptsContract
+	// Base is the hash of the base bundle this client runs.
+	Base string
+	// Initial are the plugin scripts it started with (the combined file's), in any order.
+	Initial []RegisteredScript
+	// Modules are the modules its plugin scripts import, by specifier.
+	Modules ClientModules
+	// Core are the app's own facets, loaded with the plugins.
+	Core []host.HostFacet
+	// Open opens one socket to the server and its link; the socket reports to events.
+	Open func(events SocketEvents) link.Link
+	// Limits are the limits per part of what arrives from the server (nil: an untrusted link's, 16 MiB on the wire).
+	Limits *link.PartLimits
+	// FetchScript fetches a plugin's script of a set (at its URL), which registers itself.
+	FetchScript func(ctx context.Context, entry ScriptEntry) (RegisteredScript, error)
+	// ServerBase is the server's current base bundle hash, asked at each reconnect beside the next attempt (nil: unknown, try
+	// again): another one means this client is outdated (a new protocol comes with a new base bundle).
+	ServerBase func(ctx context.Context) (*string, error)
+	// Outdated says this client's code is outdated: the app starts it over (a page reloads); the loop has stopped.
+	Outdated func()
+	// CanRetry is asked at each reconnect, beside the next attempt; false stops the loop (a guest's ended share). Nil: always true.
+	CanRetry     func(ctx context.Context) (bool, error)
+	OnConnection func(state ConnectionState)
+	// Styles are the plugins' stylesheets (a page's; a terminal has none). Nil: none.
+	Styles      ClientStyles
+	Environment LoopEnvironment
+	// Telemetry makes the host's telemetry adapter (nil: none); incarnation names the host's run (it is read at the adapter's
+	// first span, after the host was made).
+	Telemetry func(incarnation func() string) telemetry.TelemetryContext
+	// Follow is whether the client follows the scripts object (new sets applied, another base Outdated, the server's base asked
+	// at each reconnect): yes by default (nil); false for a static client (a page built offline and served elsewhere).
+	Follow  *bool
+	OnError func(err ClientError)
+}
+
+// Client is a running client: its host, once its plugins are loaded, and its Stop.
+type Client struct {
+	Host    host.Host
+	connect *Connection
+	updates *updates
+	// following is the background follow of the scripts object (none for a static client): Stop ends it and waits for it.
+	following sync.WaitGroup
+}
+
+// StartClient starts a client: its host loaded with the initial scripts, its link kept, its plugins kept current from the scripts
+// object once the server answers (returning before: a client starts offline). As in Pi
+// the client's lifetime is BACKGROUND_CONTEXT (context.Background): it bounds the scripts object's hold and watch, the
+// script fetches and the stylesheets' loads, and Stop ends it.
+func StartClient(options ClientOptions) (*Client, error) {
+	//portlint:allow ctxbackground client.ts:99 `const context = BACKGROUND_CONTEXT`: startClient takes no signal, the client's lifetime is its own and Stop ends it
+	ctx, cancel := context.WithCancel(context.Background())
+	var made host.Host
+	var madeMu sync.Mutex
+	hostOptions := host.HostOptions{OnError: func(err host.HostError) { options.OnError(ClientError{Kind: ClientHostError, Host: err}) }}
+	if options.Telemetry != nil {
+		// Read at the first span, which starts once the host exists (in its load at the earliest).
+		hostOptions.Telemetry = options.Telemetry(func() string {
+			madeMu.Lock()
+			defer madeMu.Unlock()
+			return made.(interface{ Incarnation() string }).Incarnation()
+		})
+	}
+	h, err := host.CreateHost(hostOptions)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	madeMu.Lock()
+	made = h
+	madeMu.Unlock()
+	entries := make([]SetEntry, len(options.Initial))
+	for i, script := range options.Initial {
+		entries[i] = entryOf(script, options.Modules)
+	}
+	loaded, report, err := LoadFacets(h, options.Core, entries, ctx)
+	if err != nil {
+		cancel()
+		_ = h.Close(ctx)
+		return nil, err
+	}
+	if len(report.Failed) > 0 {
+		options.OnError(ClientError{Kind: ClientPluginsError, Failed: report.Failed})
+	}
+	left := map[string]bool{}
+	for _, each := range report.Failed {
+		left[each.Plugin] = true
+	}
+	u := newUpdates(h, loaded, left, options, ctx, cancel)
+	follow := options.Follow == nil || *options.Follow
+	// A static client asks no base: it never learns it is outdated.
+	serverBase := options.ServerBase
+	if !follow {
+		serverBase = func(context.Context) (*string, error) { return nil, nil }
+	}
+	loop := connect(h, options, ctx, serverBase, func(state ConnectionState) {
+		if follow && state == Connected {
+			u.reconnected()
+		}
+	})
+	client := &Client{Host: h, connect: loop, updates: u}
+	if follow {
+		// In the background: the scripts object is the server's, and a client starts (a page renders) without it, offline too.
+		// Pi's `void updates.follow(context).catch(...)`: what follow does before its first await (the hold of the scripts
+		// object, its release recorded) is done when the client is returned; the rest (the watch, which waits for the server)
+		// is a task the client owns, whose failure is reported and which Stop ends and waits for.
+		held, err := u.hold()
+		client.following.Go(func() {
+			if err == nil {
+				err = u.follow(held)
+			}
+			if err != nil {
+				options.OnError(ClientError{Kind: ClientUpdateFailed, Err: err})
+			}
+		})
+	}
+	return client, nil
+}
+
+// Stop stops the client: its connection loop, its updates (and the background follow of the scripts object, which it ends and
+// joins), its host.
+func (c *Client) Stop(ctx context.Context) error {
+	c.connect.Stop()
+	c.updates.stop()
+	c.following.Wait()
+	return c.Host.Close(ctx)
+}
+
+// connect keeps h's parent link to the server, asking ServerBase and CanRetry at every reconnect; onState hears each state
+// after the app's OnConnection.
+func connect(h host.Host, options ClientOptions, ctx context.Context, serverBase func(context.Context) (*string, error), onState func(ConnectionState)) *Connection {
+	var loop *Connection
+	loop = newConnection(LoopOptions{
+		Open: func(events SocketEvents) LoopLink {
+			// The loop and the host both follow the link's close; a link has one close listener.
+			shared := newSharedClose(options.Open(events))
+			// A client's parent is the server; the principal only labels the link (a client serves no remote types).
+			linkOptions := host.LinkOptions{Principal: delta.JsonObjectOf("kind", "server")}
+			if options.Limits != nil {
+				linkOptions.Limits = *options.Limits
+			}
+			if err := h.Connect(shared, linkOptions, ctx); err != nil {
+				options.OnError(ClientError{Kind: ClientConnectFailed, Err: err})
+				shared.Close()
+			}
+			return shared
+		},
+		OnState: func(state ConnectionState) {
+			if options.OnConnection != nil {
+				options.OnConnection(state)
+			}
+			onState(state)
+		},
+		CanRetry: func(ctx context.Context) (bool, error) {
+			base, err := serverBase(ctx)
+			if err != nil {
+				return false, err
+			}
+			if base != nil && *base != options.Base {
+				// Stopped first, as Outdated promises: an attempt made meanwhile ends with it.
+				loop.stopNow()
+				options.Outdated()
+				return false, nil
+			}
+			if options.CanRetry == nil {
+				return true, nil
+			}
+			return options.CanRetry(ctx)
+		},
+		Environment: options.Environment,
+	})
+	loop.start()
+	return loop
+}
+
+// sharedClose is a link whose close several follow (the host and the connection loop): each listener added runs once it closes.
+type sharedClose struct {
+	link      link.Link
+	mu        sync.Mutex
+	listeners []func()
+	closed    bool
+}
+
+func newSharedClose(l link.Link) *sharedClose {
+	s := &sharedClose{link: l}
+	l.OnClose(func() {
+		s.mu.Lock()
+		s.closed = true
+		listeners := s.listeners
+		s.listeners = nil
+		s.mu.Unlock()
+		for _, listener := range listeners {
+			listener()
+		}
+	})
+	return s
+}
+
+func (s *sharedClose) Send(message []byte)                     { s.link.Send(message) }
+func (s *sharedClose) OnMessage(listener func(message []byte)) { s.link.OnMessage(listener) }
+func (s *sharedClose) Close()                                  { s.link.Close() }
+
+// OnClose adds a listener: it runs at once when the link closed already.
+func (s *sharedClose) OnClose(listener func()) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		listener()
+		return
+	}
+	s.listeners = append(s.listeners, listener)
+	s.mu.Unlock()
+}
+
+// entryOf is script as one plugin of a complete set: its digest, and its evaluation with modules when it is new.
+func entryOf(script RegisteredScript, modules ClientModules) SetEntry {
+	digest := script.Digest
+	return SetEntry{Name: script.Plugin, Digest: &digest, Prepare: func() Prepared {
+		facet, err := EvaluateRegistered(script, modules)
+		if err != nil {
+			return Prepared{Err: err}
+		}
+		return Prepared{Facet: facet, Digest: script.Digest}
+	}}
+}
+
+// The first pause before a failed update is tried again: 1 s, doubling from there.
+const updateRetryInitialMs = 1000
+
+// The longest pause between tries of a failed update: 30 s.
+const updateRetryMaxMs = 30_000
+
+// updates are the client's plugin updates: it holds the scripts object and applies each new set in order (fetching the changed
+// scripts, loading their stylesheets, reloading the host with the complete set, settling the stylesheets); a new base calls
+// Outdated instead. An update that failed (a script that did not load) is tried again after a growing pause (1 s doubling to
+// 30 s) until it applies or a newer set replaces it: the scripts object shows nothing new until the next rollout or reconnect.
+type updates struct {
+	host    host.Host
+	loaded  *LoadedFacets
+	options ClientOptions
+	ctx     context.Context
+	abort   context.CancelFunc
+
+	mu sync.Mutex
+	// scripts is the script each plugin runs, by plugin: a plugin whose new script failed keeps its old one here, so a later
+	// set with that script (a reconnect's snapshot) tries it again.
+	scripts map[string]RegisteredScript
+	release func()
+	watch   chord.WatchHandle[delta.JsonValue]
+	// latest is the newest set shown: a retry applies only it.
+	latest *ScriptSet
+	// queue are the updates in order: one at a time, a retry's among them.
+	queue   []queued
+	working bool
+	// retry is the pending retry's cancel, and pause the pause it waited (0: none waited yet).
+	retry func()
+	pause int64
+}
+
+type queued struct {
+	set *ScriptSet
+	// done is closed once the update was applied or skipped (a set that is not the newest, a stopped client).
+	done chan struct{}
+}
+
+func newUpdates(h host.Host, loaded *LoadedFacets, left map[string]bool, options ClientOptions, ctx context.Context, abort context.CancelFunc) *updates {
+	u := &updates{host: h, loaded: loaded, options: options, ctx: ctx, abort: abort, scripts: map[string]RegisteredScript{}}
+	for _, script := range options.Initial {
+		if !left[script.Plugin] {
+			u.scripts[script.Plugin] = script
+		}
+	}
+	return u
+}
+
+// hold holds the scripts object and records its release: what Pi's `follow` does before its first await.
+func (u *updates) hold() (*host.Reference, error) {
+	held, err := u.host.Hold(u.ctx, u.options.Scripts, delta.NewJsonObject(0), host.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	u.mu.Lock()
+	u.release = held.Release
+	u.mu.Unlock()
+	return held, nil
+}
+
+// follow applies the set the held scripts object shows when following begins (a watch's current value is no frame) and
+// every set it shows after (a reconnect's snapshot too). It returns once the watch is started: the watch waits for the
+// server (StartClient runs it in the background), and an error is why there is no following.
+func (u *updates) follow(held *host.Reference) error {
+	watch, err := held.Member("set").Watch(u.ctx)
+	if err != nil {
+		return err
+	}
+	u.mu.Lock()
+	if err := u.ctx.Err(); err != nil {
+		u.mu.Unlock()
+		_, _ = watch.Stop()
+		return err
+	}
+	u.watch = watch
+	u.mu.Unlock()
+	// The set shown when the watch began (a set published before it, while the client started, is no frame): Pi's `void this.#take(...)`.
+	u.take(ScriptSetOf(watch.Value()))
+	chord.StartUnlessEnded(func() {
+		watch.Start(func(_ context.Context, call chord.WatchCall[delta.JsonValue]) error {
+			if call.Kind != chord.WatchCallValue {
+				return nil
+			}
+			// Pi: `await this.#take(set, ctx)`: the watch's call returns when the update ended.
+			applied := u.take(ScriptSetOf(call.Value))
+			chord.DeliveryEntered()
+			<-applied
+			return nil
+		})
+	})
+	return nil
+}
+
+// take takes set as the newest: a pending retry of an older one is dropped, set applied in turn; the channel it returns is closed
+// when the update ended (Pi's `#take`).
+func (u *updates) take(set ScriptSet) <-chan struct{} {
+	u.mu.Lock()
+	u.latest = &set
+	retry := u.retry
+	u.retry = nil
+	u.pause = 0
+	u.mu.Unlock()
+	if retry != nil {
+		retry()
+	}
+	return u.enqueue(&set)
+}
+
+// reconnected: the link is back: the newest set is applied again when this client does not run all of it (a plugin kept its
+// old code), since the scripts object shows an unchanged set no second time.
+func (u *updates) reconnected() {
+	u.mu.Lock()
+	set := u.latest
+	runs := set == nil || u.runsAll(*set)
+	u.mu.Unlock()
+	if !runs {
+		u.enqueue(set)
+	}
+}
+
+// stop stops following: the watch ends, the hold is released, a pending retry is dropped.
+func (u *updates) stop() {
+	u.abort()
+	u.mu.Lock()
+	retry, release, watch := u.retry, u.release, u.watch
+	u.retry, u.release = nil, nil
+	u.mu.Unlock()
+	if retry != nil {
+		retry()
+	}
+	if watch != nil {
+		_, _ = watch.Stop()
+	}
+	if release != nil {
+		release()
+	}
+}
+
+// enqueue applies set after the updates before it, unless a newer set replaced it meanwhile; the channel it returns is closed when
+// the update ended (Pi's `#queue` promise).
+func (u *updates) enqueue(set *ScriptSet) <-chan struct{} {
+	done := make(chan struct{})
+	u.mu.Lock()
+	u.queue = append(u.queue, queued{set, done})
+	if u.working {
+		u.mu.Unlock()
+		return done
+	}
+	u.working = true
+	u.mu.Unlock()
+	//portlint:allow golifetime work drains the queue and returns when none is left (the `working` flag admits one drainer); there is no longer-lived owner to join
+	go u.work() //portlint:allow asyncorder client.ts:276-281 #queue chains each update onto #applying, one at a time in arrival order; work drains the queue in that order and the working flag admits one drainer
+	return done
+}
+
+// work applies the queued updates one after another until none is left.
+func (u *updates) work() {
+	for {
+		u.mu.Lock()
+		if len(u.queue) == 0 {
+			u.working = false
+			u.mu.Unlock()
+			return
+		}
+		next := u.queue[0]
+		u.queue = u.queue[1:]
+		current := u.latest == next.set
+		u.mu.Unlock()
+		if current && u.ctx.Err() == nil && !u.apply(*next.set) {
+			u.retryLater(next.set)
+		}
+		close(next.done)
+	}
+}
+
+// retryLater tries set again after the next pause (1 s doubling to 30 s). The retry's cancel is in place before its timer
+// exists: Pi's `#retry = { cancel: after(…) }` is one step, and the two steps here must not leave a gap a newer set could land
+// in unseen (its watch call then finds nothing to cancel). A newer set that lands while the timer is being set cancels it the
+// moment it exists.
+func (u *updates) retryLater(set *ScriptSet) {
+	u.mu.Lock()
+	if u.pause == 0 {
+		u.pause = updateRetryInitialMs
+	} else {
+		u.pause = min(u.pause*2, updateRetryMaxMs)
+	}
+	pause := u.pause
+	var cancelled bool
+	var cancelTimer func()
+	u.retry = func() {
+		u.mu.Lock()
+		cancelled = true
+		cancel := cancelTimer
+		u.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	}
+	u.mu.Unlock()
+	cancel := u.options.Environment.After(pause, func() {
+		u.mu.Lock()
+		if cancelled {
+			u.mu.Unlock()
+			return
+		}
+		u.retry = nil
+		u.mu.Unlock()
+		u.enqueue(set)
+	})
+	u.mu.Lock()
+	cancelTimer = cancel
+	replaced := cancelled
+	u.mu.Unlock()
+	if replaced {
+		cancel()
+	}
+}
+
+// apply applies set: a new base calls Outdated; else the changed scripts fetched, their new stylesheets loaded, the host
+// reloaded with all and the stylesheets settled. False when it failed (reported `update_failed`): it is tried again.
+func (u *updates) apply(set ScriptSet) bool {
+	options := u.options
+	if set.Base != options.Base {
+		options.Outdated()
+		return true
+	}
+	// The first frame usually shows what this client runs already: nothing to reload.
+	u.mu.Lock()
+	changed := !u.runsAll(set)
+	u.mu.Unlock()
+	fail := func(err error) bool {
+		// A client stopped meanwhile fails its update with its host closed: nothing to report.
+		if u.ctx.Err() == nil {
+			options.OnError(ClientError{Kind: ClientUpdateFailed, Err: err})
+		}
+		return false
+	}
+	var scripts []RegisteredScript
+	if changed {
+		for _, entry := range set.Plugins {
+			u.mu.Lock()
+			known, has := u.scripts[entry.Name]
+			u.mu.Unlock()
+			if has && known.Digest == entry.Digest {
+				scripts = append(scripts, known)
+				continue
+			}
+			fetched, err := options.FetchScript(u.ctx, entry)
+			if err != nil {
+				return fail(err)
+			}
+			scripts = append(scripts, fetched)
+		}
+	}
+	if options.Styles != nil {
+		options.Styles.Prepare(u.ctx, set)
+	}
+	if u.ctx.Err() != nil {
+		return true
+	}
+	kept := map[string]bool{}
+	if changed {
+		var err error
+		if kept, err = u.reload(scripts); err != nil {
+			return fail(err)
+		}
+	}
+	if options.Styles != nil {
+		options.Styles.Settle(set, kept)
+	}
+	return true
+}
+
+// runsAll reports whether this client runs every script of set and nothing else (u.mu held).
+func (u *updates) runsAll(set ScriptSet) bool {
+	if len(set.Plugins) != len(u.scripts) {
+		return false
+	}
+	for _, entry := range set.Plugins {
+		if running, ok := u.scripts[entry.Name]; !ok || running.Digest != entry.Digest {
+			return false
+		}
+	}
+	return true
+}
+
+// reload reloads the host with scripts, the complete set, and records the script each plugin runs now; it returns the plugins
+// that kept their old code (or, added, were left out).
+func (u *updates) reload(scripts []RegisteredScript) (map[string]bool, error) {
+	options := u.options
+	entries := make([]SetEntry, len(scripts))
+	for i, script := range scripts {
+		entries[i] = entryOf(script, options.Modules)
+	}
+	report, err := u.loaded.Reload(u.host, entries, u.ctx)
+	if err != nil {
+		return nil, err
+	}
+	kept := map[string]bool{}
+	for _, each := range report.Failed {
+		kept[each.Plugin] = true
+	}
+	u.mu.Lock()
+	running := map[string]RegisteredScript{}
+	for _, script := range scripts {
+		runs, has := script, true
+		if kept[script.Plugin] {
+			runs, has = u.scripts[script.Plugin]
+		}
+		if has {
+			running[script.Plugin] = runs
+		}
+	}
+	u.scripts = running
+	u.mu.Unlock()
+	if len(report.Failed) > 0 {
+		options.OnError(ClientError{Kind: ClientPluginsError, Failed: report.Failed})
+	}
+	return kept, nil
+}

@@ -1,0 +1,515 @@
+package subprocess
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/coding/extension/host/runtimecell"
+	"github.com/MichaelKinsy/PiG/internal/pigsdklock"
+)
+
+// stageOutcome is the result of staging one planner cell. ReloadCellReport is
+// populated for every attempted cell so /reload --explain reflects the full
+// planner decision.
+type stageOutcome struct {
+	staged []stagedManagedExt
+	report ReloadCellReport
+}
+
+func cellExtNames(cell CellSpec) []string {
+	names := make([]string, 0, len(cell.Extensions))
+	for _, cfg := range cell.Extensions {
+		names = append(names, cfg.Name)
+	}
+	return names
+}
+
+func (h *Host) markCellExtensions(cell CellSpec, phase string) {
+	for _, cfg := range cell.Extensions {
+		h.markExtension(cfg.Name, phase)
+	}
+}
+
+// packedCellFailedReason starts the reason of a member that runs in its own process because the packed cell it was planned into failed to
+// build or start. The reason carries the error that ended the packed cell: the retry reports only a member that fails in isolation too, so
+// without it a member that survives its retry shows a placement the plan does not explain.
+// pig additive (D21): the reload report and /reload --explain are PiG diagnostics, shown only on request.
+const packedCellFailedReason = "packed cell failed"
+
+func reasonFor(cell CellSpec) string {
+	switch cell.Strategy {
+	case CellStrategyIsolated:
+		if strings.HasPrefix(cell.Isolation, packedCellFailedReason) {
+			return cell.Isolation
+		}
+		if len(cell.Extensions) == 1 {
+			cfg := cell.Extensions[0]
+			switch {
+			case cfg.fusedRebuiltFrom != "":
+				// pig additive (D31): a fused member whose source changed runs from its source.
+				return "subprocess, rebuilt from " + cfg.fusedRebuiltFrom
+			case cfg.EntrypointKind == "factory":
+				return "factory isolated (strict or unpackable)"
+			case cfg.RuntimeKind == "subprocess":
+				return "isolated subprocess (source/command)"
+			default:
+				return "isolated"
+			}
+		}
+		return "isolated"
+	case CellStrategyPackedGo:
+		return "go factory packed (shared-ok)"
+	case CellStrategyPackedRust:
+		return "rust factory packed (shared-ok)"
+	case CellStrategyPackedPython:
+		return "python factory packed (shared-ok)"
+	case CellStrategyPackedLisp:
+		return "lisp factory packed (shared-ok)"
+	case CellStrategyPackedNode:
+		if name, ok := strings.CutPrefix(cell.Isolation, "quarantined:"); ok {
+			return "Node crash culprit in its own process: " + name
+		}
+		return "node factory packed (shared-ok)"
+	default:
+		return string(cell.Strategy)
+	}
+}
+
+// cellFailure is one extension that failed to stage.
+type cellFailure struct {
+	cfg ExtConfig
+	err error
+}
+
+// isolateCellFailure preserves successful staged outcomes and retries each
+// member of a failed packed cell in isolation. Callers that prepared the packed
+// cell concurrently can reuse its outcome without repeating that preparation.
+func (h *Host) isolateCellFailure(ctx context.Context, cell CellSpec, oldByName map[string]*managedExt, outcome stageOutcome, err error) ([]stageOutcome, []cellFailure) {
+	if err == nil {
+		return []stageOutcome{outcome}, nil
+	}
+	if acceptErr, ok := errors.AsType[*packedAcceptError](err); ok {
+		// One or more members failed to register after the shared process
+		// was already spawned; outcome.staged already holds every member
+		// that succeeded (packedAcceptError's doc comment on
+		// startGoPackedCell). Report exactly the named failures and skip
+		// the isolated-retry loop below entirely: retrying would silently
+		// re-invoke an already-succeeded sibling's factory a second time,
+		// breaking LoadFinalExtensionSet's "loaded before trust extensions
+		// are reused exactly once" contract.
+		failures := make([]cellFailure, 0, len(acceptErr.perMember))
+		for _, cfg := range cell.Extensions {
+			if memberErr, failed := acceptErr.perMember[cfg.Name]; failed {
+				failures = append(failures, cellFailure{cfg: cfg, err: memberErr})
+			}
+		}
+		return []stageOutcome{outcome}, failures
+	}
+	if len(cell.Extensions) == 1 {
+		return []stageOutcome{outcome}, []cellFailure{{cfg: cell.Extensions[0], err: err}}
+	}
+	outcomes := []stageOutcome{outcome}
+	var failures []cellFailure
+	reason := packedCellFailedReason + ": " + strings.Join(strings.Fields(err.Error()), " ")
+	for _, cfg := range cell.Extensions {
+		member, memberErr := h.stageCell(ctx, isolatedCell(cfg, reason), oldByName)
+		outcomes = append(outcomes, member)
+		if memberErr != nil {
+			failures = append(failures, cellFailure{cfg: cfg, err: memberErr})
+		}
+	}
+	return outcomes, failures
+}
+
+func (h *Host) stageCell(ctx context.Context, cell CellSpec, oldByName map[string]*managedExt) (stageOutcome, error) {
+	ctx = context.WithValue(ctx, packedConfigsKey{}, cell.Extensions)
+	ctx = context.WithValue(ctx, retentionGroupKey{}, cell.Group)
+	if strings.HasPrefix(cell.Isolation, "quarantined:") {
+		// pig additive (D232): a quarantined cell starts isolated and is never shared.
+		ctx = context.WithValue(ctx, unsharedCellKey{}, true)
+	}
+	ctx, closeLine := h.withBuildLine(ctx, []CellSpec{cell})
+	defer closeLine()
+	ctx, cellDone := observeBuildLine(ctx, cell)
+	defer cellDone()
+	work := func() (stageOutcome, error) {
+		rep := ReloadCellReport{
+			Key:        cell.Key,
+			Strategy:   cell.Strategy,
+			Language:   cell.Language,
+			Extensions: cellExtNames(cell),
+			Reason:     reasonFor(cell),
+		}
+		switch cell.Strategy {
+		case CellStrategyIsolated:
+			if len(cell.Extensions) != 1 {
+				return stageOutcome{}, fmt.Errorf("isolated cell %s has %d extensions", cell.Key, len(cell.Extensions))
+			}
+			staged, err := h.stageIsolated(ctx, cell.Extensions[0], oldByName, &rep)
+			return stageOutcome{staged: staged, report: rep}, err
+		case CellStrategyPackedGo:
+			staged, err := h.stagePackedGo(ctx, cell, oldByName, &rep)
+			return stageOutcome{staged: staged, report: rep}, err
+		case CellStrategyPackedRust:
+			staged, err := h.stagePackedRust(ctx, cell, oldByName, &rep)
+			return stageOutcome{staged: staged, report: rep}, err
+		case CellStrategyPackedPython:
+			staged, err := h.stagePackedPython(ctx, cell, oldByName, &rep)
+			return stageOutcome{staged: staged, report: rep}, err
+		case CellStrategyPackedLisp:
+			staged, err := h.stageLisp(ctx, cell, oldByName, &rep)
+			return stageOutcome{staged: staged, report: rep}, err
+		case CellStrategyPackedNode:
+			staged, err := h.stagePackedNode(ctx, cell, oldByName, &rep)
+			return stageOutcome{staged: staged, report: rep}, err
+		default:
+			return stageOutcome{}, fmt.Errorf("unsupported cell strategy %q", cell.Strategy)
+		}
+	}
+	// Packed Python runners import the staged SDK when the subprocess starts, so
+	// keep its lease through registration. Go and Rust consume staged sources
+	// only while compiling; their builders own a narrower lease and must not
+	// hold the global transaction lock while a subprocess registers.
+	if cell.Language == "python" || cell.Language == "lisp" {
+		return pigsdklock.WithBuild(ctx, h.builder.configRoot, work)
+	}
+	return work()
+}
+
+func (h *Host) stageIsolated(ctx context.Context, cfg ExtConfig, oldByName map[string]*managedExt, rep *ReloadCellReport) ([]stagedManagedExt, error) {
+	if isGoFactoryConfig(cfg) {
+		return h.stageIsolatedGoFactory(ctx, cfg, oldByName, rep)
+	}
+	if isRustFactoryConfig(cfg) {
+		return h.stageIsolatedRustFactory(ctx, cfg, oldByName, rep)
+	}
+	if isPythonFactoryConfig(cfg) {
+		return h.stageIsolatedPythonFactory(ctx, cfg, oldByName, rep)
+	}
+	if isLispFactoryConfig(cfg) {
+		return h.stageLisp(ctx, isolatedCell(cfg, "factory"), oldByName, rep)
+	}
+	resolved := cfg
+	h.markExtension(cfg.Name, "build-check-start")
+	if resolved.Source != "" && resolved.Path == "" {
+		result, err := h.builder.BuildContext(ctx, resolved.Name, resolved.Source)
+		if err != nil {
+			return nil, fmt.Errorf("build %q: %w", resolved.Name, err)
+		}
+		resolved.Path = result.BinaryPath
+	}
+	h.markExtension(cfg.Name, "build-check-done")
+	rep.BinaryPath = resolved.Path
+	// Upstream reload invokes every extension factory again inside the process that holds its module, so an unchanged extension gets a fresh instance in the same runtime: a Node factory extension re-invokes its factory in the retained process.
+	old := oldByName[resolved.Name]
+	var retained *processShare
+	if entry, ok := nodeLauncherEntry(resolved.Path); ok {
+		isolatedKey := "node-extension:" + resolved.Name + "\x00" + entry
+		share := h.retention().claim(isolatedKey)
+		if share == nil && h.sharesCells(ctx) {
+			// pig additive (D232): without a parked process of its own, a Host that joined a CellRegistry admits into the live process another Host runs for this extension; it holds the key's start lock until the process it spawns is registered.
+			// pig additive (D232): the key lock is taken after the start turn, as the packed path does, so Hosts that start the same cells in opposite order never wait on each other's locks.
+			if err := waitStartTurn(ctx); err != nil {
+				return nil, fmt.Errorf("reload %q: %w", resolved.Name, err)
+			}
+			key := h.cellRegistryKey(isolatedKey)
+			defer h.cells.startLock(key)()
+			share = h.cells.lookup(key)
+		}
+		retained = h.dropStaleTier(ctx, share, resolved.Path, resolved.Name)
+	}
+	me, _, err := h.startManagedIn(ctx, resolved, retained)
+	if err != nil {
+		return nil, fmt.Errorf("reload %q: %w", resolved.Name, err)
+	}
+	rep.Replaced = old != nil
+	return []stagedManagedExt{{name: resolved.Name, me: me}}, nil
+}
+
+func (h *Host) stageIsolatedGoFactory(ctx context.Context, cfg ExtConfig, oldByName map[string]*managedExt, rep *ReloadCellReport) ([]stagedManagedExt, error) {
+	goExt, err := goExtensionFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return h.stageBuilt(ctx, isolatedCell(cfg, "factory"), oldByName, rep, "", h.goCellBuild(ctx, []runtimecell.GoExtension{goExt}))
+}
+
+func (h *Host) stageIsolatedRustFactory(ctx context.Context, cfg ExtConfig, oldByName map[string]*managedExt, rep *ReloadCellReport) ([]stagedManagedExt, error) {
+	rustExt, err := rustExtensionFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return h.stageBuilt(ctx, isolatedCell(cfg, "factory"), oldByName, rep, "Rust ", rustCellBuild(ctx, []runtimecell.RustExtension{rustExt}))
+}
+
+func (h *Host) stageIsolatedPythonFactory(ctx context.Context, cfg ExtConfig, oldByName map[string]*managedExt, rep *ReloadCellReport) ([]stagedManagedExt, error) {
+	pyExt, err := pythonExtensionFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return h.stageBuilt(ctx, isolatedCell(cfg, "factory"), oldByName, rep, "Python ", pythonCellBuild(ctx, []runtimecell.PythonExtension{pyExt}))
+}
+
+func (h *Host) stagePackedGo(ctx context.Context, cell CellSpec, oldByName map[string]*managedExt, rep *ReloadCellReport) ([]stagedManagedExt, error) {
+	goExts, err := cell.GoExtensions()
+	if err != nil {
+		return nil, err
+	}
+	return h.stageBuilt(ctx, cell, oldByName, rep, "", h.goCellBuild(ctx, goExts))
+}
+
+// cellBuild builds, or reuses from the cache, the runner image of the members of the cell key names, and returns it as the cell the host starts.
+type cellBuild func(cacheRoot, key string) (*runtimecell.GoPackedCell, error)
+
+func (h *Host) goCellBuild(ctx context.Context, exts []runtimecell.GoExtension) cellBuild {
+	return func(cacheRoot, key string) (*runtimecell.GoPackedCell, error) {
+		return runtimecell.BuildGoPackedCellWithSDKRoot(ctx, cacheRoot, key, exts, h.stagedGoSDKRoot())
+	}
+}
+
+func rustCellBuild(ctx context.Context, exts []runtimecell.RustExtension) cellBuild {
+	return func(cacheRoot, key string) (*runtimecell.GoPackedCell, error) {
+		packed, err := runtimecell.BuildRustPackedCell(ctx, cacheRoot, key, exts)
+		if err != nil {
+			return nil, err
+		}
+		return rustStartCell(packed)
+	}
+}
+
+func pythonCellBuild(ctx context.Context, exts []runtimecell.PythonExtension) cellBuild {
+	return func(cacheRoot, key string) (*runtimecell.GoPackedCell, error) {
+		packed, err := runtimecell.BuildPythonPackedCell(ctx, cacheRoot, key, exts)
+		if err != nil {
+			return nil, err
+		}
+		return pythonStartCell(packed)
+	}
+}
+
+// stageBuilt builds the runner image of the members of cell, a packed cell or the one-member cell of an isolated factory, and starts it. label names the language in an error and is empty for Go.
+func (h *Host) stageBuilt(ctx context.Context, cell CellSpec, oldByName map[string]*managedExt, rep *ReloadCellReport, label string, build cellBuild) ([]stagedManagedExt, error) {
+	isolated := cell.Strategy == CellStrategyIsolated
+	what := "packed " + label + "cell " + cell.Key
+	if isolated {
+		what = "isolated " + label + "factory " + cell.Extensions[0].Name
+	}
+	h.markCellExtensions(cell, "build-check-start")
+	packed, err := build(filepath.Dir(h.builder.cacheDir), cell.Key)
+	if err != nil {
+		return nil, fmt.Errorf("build %s: %w", what, err)
+	}
+	h.markCellExtensions(cell, "build-check-done")
+	rep.Hash = packed.Hash
+	rep.BinaryPath = packed.BinaryPath
+	rep.Cached = packed.Cached
+	rep.BuildDuration = packed.BuildDuration
+	staged, _, err := h.startGoPackedCell(ctx, packed)
+	if err != nil {
+		if acceptErr, ok := errors.AsType[*packedAcceptError](err); ok && !isolated {
+			// One or more members failed to register, but the shared
+			// process and any already-accepted siblings are already
+			// running: keep staged and propagate acceptErr unwrapped, so
+			// isolateCellFailure reports exactly the failed member(s)
+			// instead of retrying every member (including the ones that
+			// already succeeded) in isolation.
+			rep.Replaced = anyExisting(cell.Extensions, oldByName)
+			return staged, acceptErr
+		}
+		return nil, fmt.Errorf("reload %s: %w", what, err)
+	}
+	rep.Replaced = anyExisting(cell.Extensions, oldByName)
+	return staged, nil
+}
+
+// stagedGoSDKRoot is the Go SDK this binary stages under the host's config root, or "" when it embeds none and the build resolves the SDK elsewhere.
+func (h *Host) stagedGoSDKRoot() string {
+	dir, err := pigsdklock.StagedSDKDir(h.builder.configRoot, "go")
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+func (h *Host) stagePackedRust(ctx context.Context, cell CellSpec, oldByName map[string]*managedExt, rep *ReloadCellReport) ([]stagedManagedExt, error) {
+	rustExts, err := cell.RustExtensions()
+	if err != nil {
+		return nil, err
+	}
+	return h.stageBuilt(ctx, cell, oldByName, rep, "Rust ", rustCellBuild(ctx, rustExts))
+}
+
+type packedConfigsKey struct{}
+
+func (h *Host) stagePackedNode(ctx context.Context, cell CellSpec, oldByName map[string]*managedExt, rep *ReloadCellReport) ([]stagedManagedExt, error) {
+	nodeExts, unresolved, err := cell.nodeMembers()
+	if err != nil {
+		return nil, err
+	}
+	if len(unresolved) != 0 {
+		// A member whose entry point does not resolve fails alone, with its own error, and the others load, as Pi's loader reports one error per extension
+		// (loader.ts loadExtensions) and as an isolated extension does. Its admission is answered here, since it takes no turn in the cell's process. Its error
+		// is the one an isolated extension gets from the same source, its build's.
+		for _, cfg := range cell.Extensions {
+			if _, gone := unresolved[cfg.Name]; gone && cfg.Source != "" {
+				if _, buildErr := h.builder.BuildContext(ctx, cfg.Name, cfg.Source); buildErr != nil {
+					unresolved[cfg.Name] = fmt.Errorf("build %q: %w", cfg.Name, buildErr)
+				}
+			}
+		}
+		for name, memberErr := range unresolved {
+			if admission := admissionFor(ctx, name); admission != nil {
+				admission.publish(nil, memberErr)
+			}
+		}
+		if len(nodeExts) == 0 {
+			return nil, &packedAcceptError{perMember: unresolved}
+		}
+		cell.Extensions = slices.DeleteFunc(slices.Clone(cell.Extensions), func(cfg ExtConfig) bool {
+			_, gone := unresolved[cfg.Name]
+			return gone
+		})
+	}
+	// Claim this attempt's generation before any build/cache work (CNC-002):
+	// see startNodePackedCell's doc comment.
+	generation := h.nextPackedCellGeneration(cell.Key)
+	cacheRoot := filepath.Dir(h.builder.cacheDir)
+	h.markCellExtensions(cell, "build-check-start")
+	packed, err := buildNodePackedCell(ctx, cacheRoot, cell.Key, nodeExts)
+	if err != nil {
+		return nil, fmt.Errorf("build packed Node cell %s: %w", cell.Key, err)
+	}
+	h.markCellExtensions(cell, "build-check-done")
+	rep.Hash = packed.Hash
+	rep.BinaryPath = packed.BinaryPath
+	rep.Cached = packed.Cached
+	staged, _, err := h.startNodePackedCell(ctx, packed, generation)
+	var acceptErr *packedAcceptError
+	if err != nil {
+		var ok bool
+		if acceptErr, ok = errors.AsType[*packedAcceptError](err); !ok {
+			return nil, fmt.Errorf("reload packed Node cell %s: %w", cell.Key, err)
+		}
+	}
+	rep.Replaced = anyExisting(cell.Extensions, oldByName)
+	if len(unresolved) != 0 {
+		// The members that did load are in staged; the failures a caller without admissions reads are the ones named here.
+		if acceptErr == nil {
+			acceptErr = &packedAcceptError{perMember: make(map[string]error, len(unresolved))}
+		}
+		maps.Copy(acceptErr.perMember, unresolved)
+	}
+	if acceptErr != nil {
+		return staged, acceptErr
+	}
+	return staged, nil
+}
+
+func (h *Host) stagePackedPython(ctx context.Context, cell CellSpec, oldByName map[string]*managedExt, rep *ReloadCellReport) ([]stagedManagedExt, error) {
+	pyExts, err := cell.PythonExtensions()
+	if err != nil {
+		return nil, err
+	}
+	return h.stageBuilt(ctx, cell, oldByName, rep, "Python ", pythonCellBuild(ctx, pyExts))
+}
+
+func anyExisting(cfgs []ExtConfig, oldByName map[string]*managedExt) bool {
+	for _, cfg := range cfgs {
+		if _, ok := oldByName[cfg.Name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func isGoFactoryConfig(cfg ExtConfig) bool {
+	return cfg.RuntimeKind == "subprocess" && cfg.RuntimeLanguage == "go" && cfg.EntrypointKind == "factory" && cfg.Source != "" && cfg.Package != "" && cfg.Factory == "Extension"
+}
+
+func isRustFactoryConfig(cfg ExtConfig) bool {
+	return cfg.RuntimeKind == "subprocess" && cfg.RuntimeLanguage == "rust" && cfg.EntrypointKind == "factory" && cfg.Source != "" && cfg.Package != "" && cfg.Factory == "new_extension"
+}
+
+func isPythonFactoryConfig(cfg ExtConfig) bool {
+	return cfg.RuntimeKind == "subprocess" && cfg.RuntimeLanguage == "python" && cfg.EntrypointKind == "factory" && cfg.Source != "" && cfg.Package != "" && cfg.Factory == "new_extension"
+}
+
+func isLispFactoryConfig(cfg ExtConfig) bool {
+	return cfg.RuntimeKind == "subprocess" && cfg.RuntimeLanguage == "lisp" && cfg.EntrypointKind == "factory" && cfg.Source != "" && cfg.Package != "" && cfg.Factory == "new-extension"
+}
+
+func goExtensionFromConfig(cfg ExtConfig) (runtimecell.GoExtension, error) {
+	if !isGoFactoryConfig(cfg) {
+		return runtimecell.GoExtension{}, fmt.Errorf("extension %q is not a Go factory extension", cfg.Name)
+	}
+	return runtimecell.GoExtension{
+		Name:             cfg.Name,
+		Root:             cfg.Source,
+		ModulePath:       cfg.ModulePath,
+		Package:          cfg.Package,
+		Factory:          cfg.Factory,
+		Hash:             valueOr(cfg.ContentHash, cfg.Source),
+		WorkspaceModules: append([]string(nil), cfg.GoWorkspaceModules...),
+		Verify:           cfg.sourceCheck,
+	}, nil
+}
+
+func rustExtensionFromConfig(cfg ExtConfig) (runtimecell.RustExtension, error) {
+	if !isRustFactoryConfig(cfg) {
+		return runtimecell.RustExtension{}, fmt.Errorf("extension %q is not a Rust factory extension", cfg.Name)
+	}
+	return runtimecell.RustExtension{
+		Name:    cfg.Name,
+		Root:    cfg.Source,
+		Package: cfg.Package,
+		Factory: cfg.Factory,
+		Hash:    valueOr(cfg.ContentHash, cfg.Source),
+		Verify:  cfg.sourceCheck,
+	}, nil
+}
+
+func pythonExtensionFromConfig(cfg ExtConfig) (runtimecell.PythonExtension, error) {
+	if !isPythonFactoryConfig(cfg) {
+		return runtimecell.PythonExtension{}, fmt.Errorf("extension %q is not a Python factory extension", cfg.Name)
+	}
+	return runtimecell.PythonExtension{
+		Name:    cfg.Name,
+		Root:    cfg.Source,
+		Package: cfg.Package,
+		Factory: cfg.Factory,
+		Hash:    valueOr(cfg.ContentHash, cfg.Source),
+	}, nil
+}
+
+// quarantineReports returns synthetic ReloadCellReports for any quarantined
+// packed cell hashes that the planner fissioned during this Reload. Used by
+// Reload() to make quarantine/fission decisions visible in /reload --explain.
+func (h *Host) quarantineReports(now time.Time) []ReloadCellReport {
+	q := h.QuarantinedCells()
+	if len(q) == 0 && len(h.nodeFaults) == 0 && len(h.nativeFaults) == 0 {
+		return nil
+	}
+	_ = now
+	out := make([]ReloadCellReport, 0, len(q))
+	for key, reason := range q {
+		out = append(out, ReloadCellReport{
+			Key:         key,
+			Strategy:    CellStrategyIsolated,
+			Quarantined: true,
+			Reason:      "fissioned (quarantined): " + reason,
+		})
+	}
+	for name, reason := range h.nodeFaults {
+		out = append(out, ReloadCellReport{Key: "node-member:" + name, Strategy: CellStrategyIsolated, Language: "node", Extensions: []string{name}, Quarantined: true, Reason: "Node culprit isolated; healthy members remain shared: " + reason})
+	}
+	for name, reason := range h.nativeFaults {
+		out = append(out, ReloadCellReport{Key: "native-member:" + name, Strategy: CellStrategyIsolated, Extensions: []string{name}, Quarantined: true, Reason: nativeFaultNotice(reason)})
+	}
+	return out
+}

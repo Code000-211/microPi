@@ -1,0 +1,8692 @@
+//! Context passed to tool/command/event handlers.
+//!
+//! Provides access to the host's UI and session state. Every method maps 1:1
+//! to a Go SDK `Context` method and a wire-protocol `call` message.
+
+use crate::login::{LoginDefinition, SpriteDefinition};
+use crate::protocol::{CallResultMsg, Connection, MAX_FRAME_SIZE};
+use crate::theme::{Theme, UiState};
+use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Result of one focused component input event.
+pub struct RemoteComponentResult {
+    pub done: bool,
+    pub value: Option<serde_json::Value>,
+}
+
+impl RemoteComponentResult {
+    pub fn pending() -> Self {
+        Self {
+            done: false,
+            value: None,
+        }
+    }
+
+    pub fn done(value: Option<serde_json::Value>) -> Self {
+        Self { done: true, value }
+    }
+}
+
+pub type RemoteComponentInvalidate = Arc<dyn Fn() + Send + Sync>;
+
+/// pi-tui's `TuiMouseEvent`: one cell-based pointer event, zero-based, with
+/// `x`/`y` relative to the component's first rendered cell. `kind` is
+/// `"press"`, `"release"`, `"move"`, `"drag"`, `"click"` or `"wheel"`, and
+/// `button` is `"left"`, `"middle"`, `"right"` or `"none"`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MouseEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub button: String,
+    pub x: i32,
+    pub y: i32,
+    pub screen_x: i32,
+    pub screen_y: i32,
+    pub width: i32,
+    pub height: i32,
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub ctrl: bool,
+    /// Lines a wheel event scrolls; negative scrolls up.
+    #[serde(default)]
+    pub wheel_delta: i32,
+    /// 1, 2 or 3 for consecutive clicks on one cell.
+    #[serde(default)]
+    pub click_count: i32,
+}
+
+/// A subprocess component rendered locally while the host overlay owns focus.
+pub trait RemoteComponent: Send {
+    fn render(&self, width: u32) -> Vec<String>;
+    /// Raw input preserves lone UTF-16 units just like terminal listeners.
+    fn handle_input(&mut self, data: &crate::JsString) -> Result<RemoteComponentResult, String>;
+    fn set_invalidate(&mut self, _invalidate: Option<RemoteComponentInvalidate>) {}
+    /// Pi's optional `Component.invalidate()`: the host's TUI was invalidated (a theme change, a cell-size report, a change
+    /// of image support; Pi's `TUI.invalidate`, tui.ts:951-954), so the component drops what it kept from the state before.
+    /// A theme change is applied first, and a frame is rendered after it. It runs on the worker
+    /// [`Self::handle_input`] runs on, in order with the input. The default does nothing, and the component is rendered again
+    /// all the same.
+    fn invalidate(&mut self) {}
+    fn dispose(&mut self) {}
+    /// Whether the component captures viewport input, as an upstream component with
+    /// `capturesViewportInput` does: the host's fullscreen viewport keys (scroll, page) go to it instead
+    /// of the viewport. Read each time a frame is drawn and sent with the frame as `capturesViewportInput`
+    /// (omitted when false); a frame goes out when only this changed. The default is false.
+    fn captures_viewport_input(&self) -> bool {
+        false
+    }
+    /// Whether the component takes the mouse, as an upstream component with
+    /// `handleMouse` does; see [`Self::handle_mouse`]. The default is false.
+    fn handles_mouse(&self) -> bool {
+        false
+    }
+    /// A fullscreen mouse event inside the component's bounds, delivered
+    /// while [`Self::handles_mouse`] is true: press, release, move, drag,
+    /// click and wheel, in order; a left click arrives as press, release,
+    /// then click. Pi routes the mouse to components only in fullscreen
+    /// mode, and so does PiG. The host answers the terminal at once, so a
+    /// component that takes the mouse handles every event in its bounds and
+    /// text selection does not start over it. It runs on the worker
+    /// [`Self::handle_input`] runs on, and its result means the same.
+    fn handle_mouse(&mut self, _event: &MouseEvent) -> Result<RemoteComponentResult, String> {
+        Ok(RemoteComponentResult::pending())
+    }
+}
+
+/// A focused `ui.custom` component that describes its frame as a kit view
+/// (D107), opened with [`Context::custom_view`]. The host renders the view
+/// and owns the state of its lists: keys the focused list binds go to it,
+/// every other key reaches [`Self::handle_input`].
+///
+/// The lists' callbacks arrive at [`Self::handle_view_event`] after every
+/// input sent before them, on the same worker as [`Self::handle_input`], so
+/// the two never run at once. A result means what it means for input: done
+/// closes the overlay with its value, an error closes it with the error, and
+/// pending renders the next frame.
+pub trait ViewComponent: Send {
+    fn view(&self, width: u32) -> crate::kit::View;
+    /// Raw input preserves lone UTF-16 units just like terminal listeners.
+    fn handle_input(&mut self, data: &crate::JsString) -> Result<RemoteComponentResult, String>;
+    /// A callback of an interactive node (select, cancel, selectionChange,
+    /// change). The default ignores it.
+    fn handle_view_event(
+        &mut self,
+        _event: crate::kit::Event,
+    ) -> Result<RemoteComponentResult, String> {
+        Ok(RemoteComponentResult::pending())
+    }
+    fn set_invalidate(&mut self, _invalidate: Option<RemoteComponentInvalidate>) {}
+    /// Pi's optional `Component.invalidate()`: the host's TUI was invalidated (a theme change, a cell-size report, a change
+    /// of image support; Pi's `TUI.invalidate`, tui.ts:951-954), so the component drops what it kept from the state before.
+    /// A theme change is applied first, and a frame is rendered after it. It runs on the worker
+    /// [`Self::handle_input`] runs on, in order with the input. The default does nothing, and the component is rendered again
+    /// all the same.
+    fn invalidate(&mut self) {}
+    fn dispose(&mut self) {}
+    /// Whether the component captures viewport input; see
+    /// [`RemoteComponent::captures_viewport_input`]. The default is false.
+    fn captures_viewport_input(&self) -> bool {
+        false
+    }
+    /// Whether the component takes the mouse; see
+    /// [`RemoteComponent::handles_mouse`]. The default is false.
+    fn handles_mouse(&self) -> bool {
+        false
+    }
+    /// A fullscreen mouse event the view's components left: they take one
+    /// first, as Pi's do (a select-list row selects on press and fires
+    /// select on click). See [`RemoteComponent::handle_mouse`].
+    fn handle_mouse(&mut self, _event: &MouseEvent) -> Result<RemoteComponentResult, String> {
+        Ok(RemoteComponentResult::pending())
+    }
+}
+
+/// The component of a focused overlay: one that draws lines or one that
+/// describes a view.
+pub(crate) enum OverlayComponent {
+    Lines(Box<dyn RemoteComponent>),
+    View(Box<dyn ViewComponent>),
+}
+
+impl OverlayComponent {
+    fn invalidate(&mut self) {
+        match self {
+            OverlayComponent::Lines(component) => component.invalidate(),
+            OverlayComponent::View(component) => component.invalidate(),
+        }
+    }
+    fn handle_input(&mut self, data: &crate::JsString) -> Result<RemoteComponentResult, String> {
+        match self {
+            OverlayComponent::Lines(component) => component.handle_input(data),
+            OverlayComponent::View(component) => component.handle_input(data),
+        }
+    }
+
+    fn captures_viewport_input(&self) -> bool {
+        match self {
+            OverlayComponent::Lines(component) => component.captures_viewport_input(),
+            OverlayComponent::View(component) => component.captures_viewport_input(),
+        }
+    }
+
+    fn handles_mouse(&self) -> bool {
+        match self {
+            OverlayComponent::Lines(component) => component.handles_mouse(),
+            OverlayComponent::View(component) => component.handles_mouse(),
+        }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent) -> Result<RemoteComponentResult, String> {
+        match self {
+            OverlayComponent::Lines(component) => component.handle_mouse(event),
+            OverlayComponent::View(component) => component.handle_mouse(event),
+        }
+    }
+
+    fn set_invalidate(&mut self, invalidate: Option<RemoteComponentInvalidate>) {
+        match self {
+            OverlayComponent::Lines(component) => component.set_invalidate(invalidate),
+            OverlayComponent::View(component) => component.set_invalidate(invalidate),
+        }
+    }
+
+    fn dispose(&mut self) {
+        match self {
+            OverlayComponent::Lines(component) => component.dispose(),
+            OverlayComponent::View(component) => component.dispose(),
+        }
+    }
+}
+
+pub(crate) struct RemoteComponentState {
+    pub(crate) component: OverlayComponent,
+    pub(crate) last_lines: Vec<String>,
+    /// The `capturesViewportInput` the last frame carried.
+    pub(crate) last_captures: bool,
+    /// The last view frame's wire body, without image data, and the width it
+    /// went out for.
+    pub(crate) last_view: Option<(serde_json::Value, u32)>,
+    pub(crate) seq: u64,
+    pub(crate) last_render: Option<Instant>,
+    /// The overlay layout whose width the component renders at; `None` renders at the terminal width.
+    pub(crate) layout: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Pi renders an overlay component at the width `TUI.resolveOverlayLayout` resolves and an inline component at the
+/// terminal width. The host composites an overlay with the same layout unless it opens the legacy titled modal (no
+/// `overlayOptions`, with `title`, `widthFraction` or `heightFraction`), which renders at the terminal width.
+pub(crate) fn overlay_render_layout(
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    use serde_json::Value;
+    if options.get("overlay").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    if let Some(Value::Object(layout)) = options.get("overlayOptions") {
+        return Some(layout.clone());
+    }
+    let positive = |name: &str| {
+        options
+            .get(name)
+            .and_then(Value::as_f64)
+            .is_some_and(|value| value > 0.0)
+    };
+    let titled = options
+        .get("title")
+        .and_then(Value::as_str)
+        .is_some_and(|title| !title.is_empty());
+    if titled || positive("widthFraction") || positive("heightFraction") {
+        return None;
+    }
+    Some(serde_json::Map::new())
+}
+
+/// Upstream `parseSizeValue` (tui.ts:228-237): a number is cells, `N%` is a floored share of `reference`.
+fn parse_overlay_size(value: Option<&serde_json::Value>, reference: f64) -> Option<f64> {
+    match value? {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(text) => {
+            let digits = text.strip_suffix('%')?;
+            let (whole, fraction) = match digits.split_once('.') {
+                Some((whole, fraction)) => (whole, Some(fraction)),
+                None => (digits, None),
+            };
+            let all_digits =
+                |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+            if !all_digits(whole) || fraction.is_some_and(|fraction| !all_digits(fraction)) {
+                return None;
+            }
+            Some((reference * digits.parse::<f64>().ok()? / 100.0).floor())
+        }
+        _ => None,
+    }
+}
+
+/// The width rule of upstream `TUI.resolveOverlayLayout` (tui.ts:1212-1233).
+pub(crate) fn resolve_overlay_width(
+    layout: &serde_json::Map<String, serde_json::Value>,
+    term_width: u32,
+) -> u32 {
+    use serde_json::Value;
+    let (left, right) = match layout.get("margin") {
+        Some(Value::Number(all)) => {
+            let all = all.as_f64().unwrap_or(0.0);
+            (all, all)
+        }
+        Some(Value::Object(edges)) => {
+            let edge = |name: &str| edges.get(name).and_then(Value::as_f64).unwrap_or(0.0);
+            (edge("left"), edge("right"))
+        }
+        _ => (0.0, 0.0),
+    };
+    let term = f64::from(term_width);
+    let avail = (term - left.max(0.0) - right.max(0.0)).max(1.0);
+    let mut width =
+        parse_overlay_size(layout.get("width"), term).unwrap_or_else(|| avail.min(80.0));
+    if let Some(min_width) = layout.get("minWidth").and_then(Value::as_f64) {
+        width = width.max(min_width);
+    }
+    width.min(avail).max(1.0).trunc() as u32
+}
+
+enum RemoteComponentEvent {
+    Render,
+    Input(crate::JsString),
+    ViewEvent(Box<crate::kit::Event>),
+    Mouse(MouseEvent),
+    /// The host's `ui.custom.opened`: the overlay is mounted, with this state.
+    Opened(OverlayState),
+    /// The host's `ui.custom.focus`: the component lost (false) or regained (true) TUI focus.
+    Focus(bool),
+    /// The host's `ui.custom.invalidate`: its TUI was invalidated this many times.
+    Invalidate(u64),
+    Stop,
+}
+
+/// The host's state of a mounted overlay at a control or input boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OverlayState {
+    pub hidden: bool,
+    pub focused: bool,
+    pub visible: bool,
+    pub bounds: Option<OverlayBounds>,
+}
+
+/// The last rendered terminal-relative rectangle of a mounted overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayBounds {
+    pub row: i64,
+    pub col: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+impl OverlayState {
+    pub(crate) fn from_wire(value: &serde_json::Value) -> Self {
+        let flag = |name: &str| {
+            value
+                .get(name)
+                .and_then(|flag| flag.as_bool())
+                .unwrap_or(false)
+        };
+        let bounds = value
+            .get("bounds")
+            .filter(|bounds| bounds.is_object())
+            .map(|bounds| {
+                let number = |name: &str| {
+                    bounds
+                        .get(name)
+                        .and_then(|number| number.as_i64())
+                        .unwrap_or(0)
+                };
+                OverlayBounds {
+                    row: number("row"),
+                    col: number("col"),
+                    width: number("width"),
+                    height: number("height"),
+                }
+            });
+        Self {
+            hidden: flag("hidden"),
+            focused: flag("focused"),
+            visible: flag("visible"),
+            bounds,
+        }
+    }
+}
+
+/// Where `unfocus_target` puts keyboard focus (Pi's `unfocus({ target })`): nothing, the editor component installed with
+/// `set_editor_component`, or another overlay this extension mounted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnfocusTarget {
+    Nothing,
+    Editor,
+    Overlay(String),
+}
+
+type OnHandleFn = Arc<dyn Fn(OverlayHandle) + Send + Sync>;
+
+/// Pi's `OverlayHandle` (tui.ts) of a mounted overlay: pass `on_handle` to [`Context::custom_component_with_handle`] and it is called once,
+/// on the component's own event queue, when the host mounted the overlay. Each control is a host call that returns after the host applied it;
+/// `is_hidden`, `is_focused` and `bounds` read the state it returned. After the overlay closed they read the last state and the controls do
+/// nothing, except `set_hidden`, which records its value.
+#[derive(Clone)]
+pub struct OverlayHandle {
+    conn: Arc<Connection>,
+    key: String,
+    overlay: RemoteComponentRef,
+    /// The scope of the call that opened the overlay, which its controls belong to.
+    request_parent: Option<Arc<crate::protocol::RequestParent>>,
+    request_id: String,
+}
+
+impl OverlayHandle {
+    /// The overlay's key, to name it as another overlay's `unfocus_target`.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    fn control(
+        &self,
+        action: &str,
+        hidden: Option<bool>,
+        target: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        if !self.overlay.active.load(Ordering::Acquire) {
+            if let ("setHidden", Some(hidden)) = (action, hidden) {
+                self.overlay.handle_state.lock().unwrap().hidden = hidden;
+            }
+            return Ok(());
+        }
+        let mut args = serde_json::json!({"key": self.key, "action": action});
+        if let Some(hidden) = hidden {
+            args["hidden"] = serde_json::Value::Bool(hidden);
+        }
+        if let Some(target) = target {
+            args["target"] = target;
+        }
+        let state = self
+            .conn
+            .call_for_scope(
+                self.request_parent.as_deref(),
+                (!self.request_id.is_empty()).then_some(self.request_id.as_str()),
+                "ui.custom.control",
+                Some(args),
+            )
+            .and_then(call_result_value)?;
+        *self.overlay.handle_state.lock().unwrap() = OverlayState::from_wire(&state);
+        Ok(())
+    }
+    /// Removes the overlay (Pi's `hide()` disposes it).
+    pub fn hide(&self) -> io::Result<()> {
+        self.control("hide", None, None)
+    }
+    pub fn set_hidden(&self, hidden: bool) -> io::Result<()> {
+        self.control("setHidden", Some(hidden), None)
+    }
+    pub fn is_hidden(&self) -> bool {
+        self.overlay.handle_state.lock().unwrap().hidden
+    }
+    pub fn focus(&self) -> io::Result<()> {
+        self.control("focus", None, None)
+    }
+    /// Takes keyboard focus from the overlay; the host puts it back where it chooses.
+    pub fn unfocus(&self) -> io::Result<()> {
+        self.control("unfocus", None, None)
+    }
+    /// Takes keyboard focus from the overlay and gives it to exactly `target`.
+    pub fn unfocus_target(&self, target: UnfocusTarget) -> io::Result<()> {
+        let target = match target {
+            UnfocusTarget::Nothing => serde_json::json!({"kind": "null"}),
+            UnfocusTarget::Editor => serde_json::json!({"kind": "editor"}),
+            UnfocusTarget::Overlay(key) => serde_json::json!({"kind": "overlay", "key": key}),
+        };
+        self.control("unfocus", None, Some(target))
+    }
+    pub fn is_focused(&self) -> bool {
+        self.overlay.handle_state.lock().unwrap().focused
+    }
+    /// The overlay's last rendered rectangle, None while it is not visible.
+    pub fn bounds(&self) -> Option<OverlayBounds> {
+        let state = self.overlay.handle_state.lock().unwrap();
+        if state.visible { state.bounds } else { None }
+    }
+}
+
+pub(crate) struct RemoteOverlay {
+    state: Mutex<RemoteComponentState>,
+    events: SyncSender<RemoteComponentEvent>,
+    pub(crate) active: AtomicBool,
+    render_pending: AtomicBool,
+    /// The image refs the last view frame names, apart from `state`, which a
+    /// running handler holds.
+    view_refs: Mutex<Vec<String>>,
+    /// Sends the next view frame even when it equals the last one, after the
+    /// host evicted one of its images.
+    force_view: AtomicBool,
+    /// ui.custom()'s onHandle option, called once when the host mounted the overlay, and the host's last state of it.
+    on_handle: Mutex<Option<OnHandleFn>>,
+    pub(crate) handle_state: Mutex<OverlayState>,
+}
+
+impl RemoteOverlay {
+    pub(crate) fn request_render(&self) {
+        if !self.active.load(Ordering::Acquire) || self.render_pending.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        match self.events.try_send(RemoteComponentEvent::Render) {
+            Ok(()) => {}
+            Err(TrySendError::Full(RemoteComponentEvent::Render)) => {
+                self.render_pending.store(false, Ordering::Release);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.render_pending.store(false, Ordering::Release);
+                self.active.store(false, Ordering::Release);
+            }
+            Err(TrySendError::Full(_)) => unreachable!(),
+        }
+    }
+
+    pub(crate) fn send_input(&self, data: crate::JsString) -> Result<(), String> {
+        self.send(RemoteComponentEvent::Input(data))
+    }
+
+    /// Queues the host's `ui.custom.opened` behind the input already queued.
+    pub(crate) fn send_opened(&self, state: OverlayState) -> Result<(), String> {
+        self.send(RemoteComponentEvent::Opened(state))
+    }
+
+    /// Queues the host's `ui.custom.focus` behind the input already queued.
+    pub(crate) fn send_focus(&self, focused: bool) -> Result<(), String> {
+        self.send(RemoteComponentEvent::Focus(focused))
+    }
+
+    /// Queues the host's `ui.custom.invalidate` behind the input already queued.
+    pub(crate) fn send_invalidate(&self, count: u64) -> Result<(), String> {
+        self.send(RemoteComponentEvent::Invalidate(count))
+    }
+
+    /// Queues a `ui.view.event` behind the input already queued.
+    pub(crate) fn send_view_event(&self, event: crate::kit::Event) -> Result<(), String> {
+        self.send(RemoteComponentEvent::ViewEvent(Box::new(event)))
+    }
+
+    /// Queues a `ui.custom.mouse` event behind the input already queued.
+    pub(crate) fn send_mouse(&self, event: MouseEvent) -> Result<(), String> {
+        self.send(RemoteComponentEvent::Mouse(event))
+    }
+
+    fn send(&self, event: RemoteComponentEvent) -> Result<(), String> {
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.events.try_send(event).map_err(|err| match err {
+            TrySendError::Full(_) => "focused input queue is full".to_string(),
+            TrySendError::Disconnected(_) => "focused component is closed".to_string(),
+        })
+    }
+
+    /// Renders a view component again, bypassing dedup, when its last frame
+    /// names an evicted image.
+    pub(crate) fn resend_if_references(&self, evicted: &std::collections::HashSet<String>) {
+        if self
+            .view_refs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|reference| evicted.contains(reference))
+        {
+            self.force_view.store(true, Ordering::Release);
+            self.request_render();
+        }
+    }
+
+    fn stop(&self) {
+        self.active.store(false, Ordering::Release);
+        let _ = self.events.try_send(RemoteComponentEvent::Stop);
+    }
+}
+
+pub(crate) type RemoteComponentRef = Arc<RemoteOverlay>;
+pub(crate) type RemoteComponents = Arc<Mutex<HashMap<String, RemoteComponentRef>>>;
+
+fn render_remote_component_frame(
+    conn: &Connection,
+    key: &str,
+    overlay: &RemoteOverlay,
+    width: u32,
+) -> io::Result<()> {
+    let mut state = overlay.state.lock().unwrap();
+    let render_width = state
+        .layout
+        .as_ref()
+        .map_or(width, |layout| resolve_overlay_width(layout, width));
+    let frame = match &state.component {
+        OverlayComponent::Lines(component) => crate::diagnostic::recover(|| {
+            crate::kit::Rendered::Lines(component.render(render_width))
+        }),
+        OverlayComponent::View(component) => {
+            crate::diagnostic::recover(|| crate::kit::Rendered::view(component.view(width)))
+        }
+    }
+    .map_err(|_| io::Error::other("focused render panicked"))?;
+    state.last_render = Some(Instant::now());
+    let captures = state.component.captures_viewport_input();
+    let mut frame = match frame {
+        crate::kit::Rendered::Lines(lines) => {
+            if lines == state.last_lines && captures == state.last_captures {
+                return Ok(());
+            }
+            state.last_lines.clone_from(&lines);
+            serde_json::json!({"key": key, "lines": lines, "width": width})
+        }
+        // An authoritative view: lines absent (D107). A frame equal to the
+        // last one at the same width is not sent, unless it names images the
+        // connection has not sent or the host evicted one of its images.
+        crate::kit::Rendered::View(view) => {
+            let encoded = conn.views.encode(&view).map_err(io::Error::other)?;
+            let force = overlay.force_view.swap(false, Ordering::AcqRel);
+            if !force
+                && captures == state.last_captures
+                && state
+                    .last_view
+                    .as_ref()
+                    .is_some_and(|(body, last)| *body == encoded.body && *last == width)
+                && !conn.views.has_unsent(&encoded)
+            {
+                return Ok(());
+            }
+            state.last_view = Some((encoded.body.clone(), width));
+            *overlay.view_refs.lock().unwrap() = encoded.refs();
+            serde_json::json!({"key": key, "view": conn.views.wire(&encoded), "width": width})
+        }
+    };
+    state.seq += 1;
+    state.last_captures = captures;
+    frame["seq"] = serde_json::Value::from(state.seq);
+    if captures {
+        frame["capturesViewportInput"] = serde_json::Value::Bool(true);
+    }
+    // The host hands a component that takes the mouse its events.
+    if state.component.handles_mouse() {
+        frame["mouse"] = serde_json::Value::Bool(true);
+    }
+    drop(state);
+    conn.notify("ui.custom.render", Some(frame))
+}
+
+struct RemoteComponentWorker {
+    conn: Arc<Connection>,
+    key: String,
+    overlay: RemoteComponentRef,
+    width: Arc<AtomicU32>,
+    events: Receiver<RemoteComponentEvent>,
+    done: std::sync::mpsc::Sender<()>,
+    request_parent: Option<Arc<crate::protocol::RequestParent>>,
+    request_id: String,
+}
+
+fn run_remote_component_worker(worker: RemoteComponentWorker) {
+    let RemoteComponentWorker {
+        conn,
+        key,
+        overlay,
+        width,
+        events,
+        done,
+        request_parent,
+        request_id,
+    } = worker;
+    while overlay.active.load(Ordering::Acquire) {
+        let Ok(event) = events.recv() else {
+            break;
+        };
+        if !overlay.active.load(Ordering::Acquire) || matches!(event, RemoteComponentEvent::Stop) {
+            break;
+        }
+        let result = match event {
+            RemoteComponentEvent::Render => {
+                overlay.render_pending.store(false, Ordering::Release);
+                let delay = {
+                    let state = overlay.state.lock().unwrap();
+                    state
+                        .last_render
+                        .map(|last| Duration::from_millis(16).saturating_sub(last.elapsed()))
+                        .unwrap_or_default()
+                };
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+                if !overlay.active.load(Ordering::Acquire) {
+                    break;
+                }
+                render_remote_component_frame(&conn, &key, &overlay, width.load(Ordering::Relaxed))
+            }
+            RemoteComponentEvent::Input(_)
+            | RemoteComponentEvent::ViewEvent(_)
+            | RemoteComponentEvent::Mouse(_) => {
+                // Pi's renderer draws again after press, click, drag and wheel only
+                // (tui-alt-screen.ts applyMouseDispatchResult).
+                let redraw = !matches!(&event, RemoteComponentEvent::Mouse(mouse) if mouse.kind == "move" || mouse.kind == "release");
+                let outcome = {
+                    let mut state = overlay.state.lock().unwrap();
+                    match (&mut state.component, event) {
+                        (component, RemoteComponentEvent::Input(data)) => Some(
+                            crate::diagnostic::recover(|| component.handle_input(&data))
+                                .map_err(|_| "focused input panicked".to_string()),
+                        ),
+                        (
+                            OverlayComponent::View(component),
+                            RemoteComponentEvent::ViewEvent(event),
+                        ) => Some(
+                            crate::diagnostic::recover(|| component.handle_view_event(*event))
+                                .map_err(|_| "focused view event panicked".to_string()),
+                        ),
+                        (component, RemoteComponentEvent::Mouse(event)) => Some(
+                            crate::diagnostic::recover(|| component.handle_mouse(&event))
+                                .map_err(|_| "focused mouse panicked".to_string()),
+                        ),
+                        // A line component has no view, so it ignores view events.
+                        _ => None,
+                    }
+                };
+                let Some(outcome) = outcome else {
+                    continue;
+                };
+                match outcome {
+                    Ok(Ok(result)) if result.done => {
+                        overlay.active.store(false, Ordering::Release);
+                        conn.notify(
+                            "ui.custom.close",
+                            Some(serde_json::json!({"key": &key, "result": result.value})),
+                        )
+                    }
+                    Ok(Ok(_)) if !redraw => Ok(()),
+                    Ok(Ok(_)) => render_remote_component_frame(
+                        &conn,
+                        &key,
+                        &overlay,
+                        width.load(Ordering::Relaxed),
+                    ),
+                    Ok(Err(err)) | Err(err) => Err(io::Error::other(err)),
+                }
+            }
+            RemoteComponentEvent::Opened(state) => {
+                *overlay.handle_state.lock().unwrap() = state;
+                let on_handle = overlay.on_handle.lock().unwrap().clone();
+                if let Some(on_handle) = on_handle {
+                    let handle = OverlayHandle {
+                        conn: conn.clone(),
+                        key: key.clone(),
+                        overlay: overlay.clone(),
+                        request_parent: request_parent.clone(),
+                        request_id: request_id.clone(),
+                    };
+                    crate::diagnostic::recover(|| on_handle(handle))
+                        .map_err(|_| io::Error::other("onHandle panicked"))
+                } else {
+                    Ok(())
+                }
+            }
+            RemoteComponentEvent::Focus(focused) => {
+                // Another custom component opened over this one or closed: Pi's setFocus clears and sets its focused flag, which the
+                // handle's is_focused reads, and the component renders again.
+                overlay.handle_state.lock().unwrap().focused = focused;
+                render_remote_component_frame(&conn, &key, &overlay, width.load(Ordering::Relaxed))
+            }
+            RemoteComponentEvent::Invalidate(count) => {
+                // Pi's TUI.invalidate reached the component (tui.ts:951-954): the theme_change that preceded this on the connection
+                // is applied, the component drops what it kept, and the frame it builds now goes out.
+                let outcome = {
+                    let mut state = overlay.state.lock().unwrap();
+                    crate::diagnostic::recover(|| {
+                        for _ in 0..count {
+                            state.component.invalidate();
+                        }
+                    })
+                };
+                match outcome {
+                    Ok(()) => render_remote_component_frame(
+                        &conn,
+                        &key,
+                        &overlay,
+                        width.load(Ordering::Relaxed),
+                    ),
+                    Err(_) => Err(io::Error::other("focused invalidate panicked")),
+                }
+            }
+            RemoteComponentEvent::Stop => break,
+        };
+        if let Err(err) = result {
+            overlay.active.store(false, Ordering::Release);
+            let _ = conn.notify(
+                "ui.custom.close",
+                Some(serde_json::json!({"key": &key, "error": err.to_string()})),
+            );
+            break;
+        }
+    }
+    let _ = done.send(());
+}
+
+fn dispose_remote_component(overlay: &RemoteOverlay) {
+    let mut state = overlay
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = crate::diagnostic::recover(|| state.component.set_invalidate(None));
+    let _ = crate::diagnostic::recover(|| state.component.dispose());
+}
+
+/// A raw terminal-input handler's verdict on one chunk, mirroring upstream's
+/// `{ consume?: boolean; data?: string }`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TerminalInputResult {
+    /// Suppresses normal handling of the chunk, so the editor and keybindings
+    /// never see it.
+    pub consume: bool,
+    /// When set, replaces the chunk for later handlers and for normal
+    /// handling. An empty replacement drops the chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<crate::JsString>,
+}
+
+/// A handler receiving every raw input chunk before the editor does.
+///
+/// Like upstream's synchronous listener, the input waits for the verdict, so a
+/// handler should return promptly.
+pub type TerminalInputHandler = Box<dyn Fn(&crate::JsString) -> TerminalInputResult + Send + Sync>;
+
+pub(crate) type TerminalInputSubs = Arc<Mutex<Vec<(u64, Arc<TerminalInputHandler>)>>>;
+
+/// Width handlers, invoked after the shared width is stored so a handler that
+/// calls [`Context::width`] observes the new value.
+pub(crate) type WidthChangeHandler = Box<dyn Fn(u32) + Send + Sync>;
+pub(crate) type WidthChangeSubs = Arc<Mutex<Vec<(u64, Arc<WidthChangeHandler>)>>>;
+
+/// Returns opts, an object, with key set to value. A non-object opts is replaced by an empty object.
+fn with_field(mut opts: serde_json::Value, key: &str, value: &str) -> serde_json::Value {
+    if !opts.is_object() {
+        opts = serde_json::json!({});
+    }
+    if let Some(object) = opts.as_object_mut() {
+        object.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    opts
+}
+
+/// The message of a failed host call as the Node runtime rejects with it: the
+/// host's message, prefixed by "code: " only when the host names a code.
+pub(crate) fn host_error_message(error: crate::protocol::ErrorInfo) -> String {
+    match error.code.as_deref() {
+        Some(code) if !code.is_empty() => format!("{code}: {}", error.message),
+        _ => error.message,
+    }
+}
+
+/// The wire declaration of a tool definition (`ToolDecl` in the host's protocol.go), after the check of Pi's registerTool: the schema is an object.
+pub(crate) fn tool_declaration(
+    definition: &crate::ToolDefinition,
+) -> io::Result<serde_json::Value> {
+    if !definition.parameters.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tool parameters must be an object",
+        ));
+    }
+    let mut declaration = serde_json::json!({
+        "name": definition.name, "label": definition.label, "description": definition.description,
+        "parameters": definition.parameters, "prompt_snippet": definition.prompt_snippet,
+        "prompt_guidelines": definition.prompt_guidelines, "constrained_sampling": definition.constrained_sampling,
+        "execution_mode": definition.execution_mode,
+        "render_shell": if definition.render_shell == crate::ToolRenderShell::SelfShell { "self" } else { "default" },
+        "renders_call": definition.render_call.is_some() || definition.render_call_view.is_some(),
+        "renders_result": definition.render_result.is_some() || definition.render_result_view.is_some(),
+    });
+    let optional = [
+        ("output_schema", definition.output_schema.clone()),
+        (
+            "exposure",
+            definition
+                .exposure
+                .map(|exposure| serde_json::Value::from(exposure.as_str())),
+        ),
+        (
+            "namespace",
+            definition
+                .namespace
+                .as_ref()
+                .and_then(|namespace| serde_json::to_value(namespace).ok()),
+        ),
+        (
+            "annotations",
+            definition
+                .annotations
+                .as_ref()
+                .and_then(|annotations| serde_json::to_value(annotations).ok()),
+        ),
+        (
+            "default_active",
+            definition.default_active.map(serde_json::Value::from),
+        ),
+        (
+            "prepares_loadout",
+            definition
+                .prepare_loadout
+                .is_some()
+                .then_some(serde_json::Value::Bool(true)),
+        ),
+        (
+            "reaches_tools",
+            definition
+                .reaches_tools
+                .is_some()
+                .then_some(serde_json::Value::Bool(true)),
+        ),
+        (
+            "prepares_arguments",
+            definition
+                .prepare_arguments
+                .is_some()
+                .then_some(serde_json::Value::Bool(true)),
+        ),
+    ];
+    for (key, value) in optional {
+        if let Some(value) = value {
+            declaration[key] = value;
+        }
+    }
+    Ok(declaration)
+}
+
+pub(crate) fn call_result_to_io(result: CallResultMsg) -> io::Result<()> {
+    if let Some(err) = result.error {
+        return Err(io::Error::other(host_error_message(err)));
+    }
+    Ok(())
+}
+
+/// The message a panic carries, as upstream's `error.message` of a throw.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "extension callback panicked".to_string()
+    }
+}
+
+fn invalid_reply(method: &str, field: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("host reply to {method} has no {field:?}"),
+    )
+}
+
+fn call_result_value(result: CallResultMsg) -> io::Result<serde_json::Value> {
+    if let Some(err) = result.error {
+        return Err(io::Error::other(host_error_message(err)));
+    }
+    Ok(result.result.unwrap_or_default())
+}
+
+/// Installs the route of a virtual model, then registers it with the host, and restores the previous route when the host refuses. The route is installed first: the host may route a request as soon as it has registered the model.
+fn install_virtual_model(
+    conn: &Connection,
+    model: crate::VirtualModel,
+    register: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let key = (model.provider.clone(), model.id.clone());
+    let previous = conn
+        .virtual_models
+        .lock()
+        .unwrap()
+        .insert(key.clone(), Arc::new(model));
+    if let Err(error) = register() {
+        let mut models = conn.virtual_models.lock().unwrap();
+        match previous {
+            Some(previous) => models.insert(key, previous),
+            None => models.remove(&key),
+        };
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) type ModelStreams = Arc<Mutex<HashMap<String, Arc<ModelEventStream>>>>;
+
+#[derive(Default)]
+struct ModelStreamState {
+    events: VecDeque<serde_json::Value>,
+    terminal: bool,
+    result: Option<serde_json::Value>,
+    started: Option<Result<(), String>>,
+    /// Set on a stream made by [`create_assistant_message_event_stream`]: when it was created, as Unix milliseconds and on a monotonic clock.
+    timing: Option<(i64, std::time::Instant)>,
+}
+
+/// `AssistantMessageEventStream`'s `#time` (`packages/ai/src/utils/event-stream.ts`): the final message gets `durationMs`, the milliseconds since the stream was created on a
+/// monotonic clock, unless the message already has one or its `timestamp` predates the stream (a response that started elsewhere, such as a deferred result fetched later, stays
+/// untimed).
+fn time_message(
+    timing: Option<(i64, std::time::Instant)>,
+    message: Option<&mut serde_json::Value>,
+) {
+    let (Some((started_at, started)), Some(serde_json::Value::Object(message))) = (timing, message)
+    else {
+        return;
+    };
+    if message.contains_key("durationMs")
+        || message
+            .get("timestamp")
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|timestamp| timestamp < started_at as f64)
+    {
+        return;
+    }
+    message.insert(
+        "durationMs".into(),
+        serde_json::json!((started.elapsed().as_secs_f64() * 1000.0).round().max(0.0) as u64),
+    );
+}
+
+/// Pi's `createAssistantMessageEventStream`: a provider-owned event stream of one assistant response. It times the response as Pi's does: the final message (the `done` event's
+/// `message`, the `error` event's `error`, or the result passed to [`ModelEventStream::end`]) gets `durationMs`, measured from this call, unless it already has one or its
+/// `timestamp` predates the stream.
+pub fn create_assistant_message_event_stream() -> Arc<ModelEventStream> {
+    let stream = ModelEventStream::new();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64);
+    stream.state.lock().unwrap().timing = Some((started_at, std::time::Instant::now()));
+    Arc::new(stream)
+}
+
+pub struct ModelEventStream {
+    state: Mutex<ModelStreamState>,
+    changed: Condvar,
+    callbacks: Mutex<Option<(serde_json::Value, ModelStreamCallbacks)>>,
+}
+
+type OnPayloadFn = Arc<
+    dyn Fn(serde_json::Value, &serde_json::Value) -> Result<Option<serde_json::Value>, String>
+        + Send
+        + Sync,
+>;
+type OnResponseFn =
+    Arc<dyn Fn(serde_json::Value, &serde_json::Value) -> Result<(), String> + Send + Sync>;
+type TransformHeadersFn = Arc<
+    dyn Fn(serde_json::Value, &serde_json::Value) -> Result<serde_json::Value, String>
+        + Send
+        + Sync,
+>;
+
+/// Pi's `ProviderRequestOptions` callbacks `onPayload`, `onResponse` and `transformHeaders` (packages/ai/src/types.ts) of one model stream.
+/// They stay in this process; the host is told which exist and asks for each by name (`model_stream_callback`) while its provider request
+/// proceeds. `on_payload` returns the replacement payload, `None` keeps it; `transform_headers` returns the headers the request is sent with;
+/// an `Err` rejects the provider request. Each receives the stream's model as its second argument.
+#[derive(Clone, Default)]
+pub struct ModelStreamCallbacks {
+    on_payload: Option<OnPayloadFn>,
+    on_response: Option<OnResponseFn>,
+    transform_headers: Option<TransformHeadersFn>,
+    fetch: Option<ModelFetchFn>,
+    fetches: Arc<Mutex<ModelFetchState>>,
+}
+
+type ModelFetchBody = Arc<Mutex<Box<dyn std::io::Read + Send>>>;
+
+/// One fetch of a stream: its signal and, once the response arrived, its body.
+struct ModelFetchEntry {
+    signal: crate::ProviderSignal,
+    body: Option<ModelFetchBody>,
+}
+
+#[derive(Default)]
+struct ModelFetchState {
+    closed: bool,
+    entries: HashMap<String, ModelFetchEntry>,
+}
+
+/// A model request reaching the extension's `fetch` (Pi's `ProviderRequestOptions.fetch`). `signal` is Pi's `init.signal`: it is
+/// cancelled when the host cancels the fetch or a body read, when the host closes the response, and when the stream ends.
+#[derive(Clone)]
+pub struct ModelFetchRequest {
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    pub signal: crate::ProviderSignal,
+}
+
+/// The extension's answer to a [`ModelFetchRequest`]; `body` streams back to the host in bounded reads and is dropped when the host closes it.
+pub struct ModelFetchResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Box<dyn std::io::Read + Send>>,
+}
+
+type ModelFetchFn =
+    Arc<dyn Fn(ModelFetchRequest) -> Result<ModelFetchResponse, String> + Send + Sync>;
+
+impl ModelStreamCallbacks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn on_payload(
+        mut self,
+        callback: impl Fn(
+            serde_json::Value,
+            &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.on_payload = Some(Arc::new(callback));
+        self
+    }
+    pub fn on_response(
+        mut self,
+        callback: impl Fn(serde_json::Value, &serde_json::Value) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.on_response = Some(Arc::new(callback));
+        self
+    }
+    pub fn transform_headers(
+        mut self,
+        callback: impl Fn(serde_json::Value, &serde_json::Value) -> Result<serde_json::Value, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.transform_headers = Some(Arc::new(callback));
+        self
+    }
+    /// The transport the provider request goes through (Pi's `fetch(input, init)`, which has no model argument). The host's request
+    /// reaches it with its method, URL, headers, body and signal. A response that arrives after the stream ended or after its signal was
+    /// cancelled is dropped and the fetch fails.
+    pub fn fetch(
+        mut self,
+        callback: impl Fn(ModelFetchRequest) -> Result<ModelFetchResponse, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.fetch = Some(Arc::new(callback));
+        self
+    }
+    fn is_empty(&self) -> bool {
+        self.on_payload.is_none()
+            && self.on_response.is_none()
+            && self.transform_headers.is_none()
+            && self.fetch.is_none()
+    }
+}
+
+impl ModelStreamCallbacks {
+    /// Ends the stream's fetch transport, as runtime-node/model-fetch.mjs `disposeFetch` does: every fetch's signal is cancelled and the
+    /// bodies the host did not close are dropped.
+    fn dispose_fetches(&self) {
+        let entries = {
+            let mut state = self.fetches.lock().unwrap();
+            state.closed = true;
+            std::mem::take(&mut state.entries)
+        };
+        for entry in entries.into_values() {
+            entry.signal.cancel();
+        }
+    }
+}
+
+/// Serves the host's `fetch`, `fetchRead` and `fetchClose`. `cancel` is the host's request for this one callback: its cancellation
+/// cancels the fetch's signal while the fetch or a read is in progress.
+fn serve_model_fetch(
+    callbacks: &ModelStreamCallbacks,
+    name: &str,
+    value: &serde_json::Value,
+    cancel: &crate::ProviderSignal,
+) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let id = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let forward = |signal: &crate::ProviderSignal| {
+        let signal = signal.clone();
+        cancel.subscribe(Arc::new(move || signal.cancel()))
+    };
+    match name {
+        "fetch" => {
+            let mut headers = Vec::new();
+            for (header, values) in value
+                .get("headers")
+                .and_then(|headers| headers.as_object())
+                .into_iter()
+                .flatten()
+            {
+                for entry in values
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.as_str())
+                {
+                    headers.push((header.clone(), entry.to_string()));
+                }
+            }
+            let body = match value.get("body").and_then(|body| body.as_str()) {
+                Some(encoded) => Some(
+                    crate::user_bash::base64_decode(encoded).ok_or("fetch body is not base64")?,
+                ),
+                None => None,
+            };
+            let signal = crate::ProviderSignal::new();
+            {
+                let mut state = callbacks.fetches.lock().unwrap();
+                if state.closed {
+                    return Err("model fetch transport is closed".to_string());
+                }
+                state.entries.insert(
+                    id.clone(),
+                    ModelFetchEntry {
+                        signal: signal.clone(),
+                        body: None,
+                    },
+                );
+            }
+            let request = ModelFetchRequest {
+                url: value
+                    .get("url")
+                    .and_then(|url| url.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                method: value
+                    .get("method")
+                    .and_then(|method| method.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                headers,
+                body,
+                signal: signal.clone(),
+            };
+            let subscription = forward(&signal);
+            let result = (callbacks.fetch.as_ref().unwrap())(request);
+            drop(subscription);
+            let mut state = callbacks.fetches.lock().unwrap();
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    if state
+                        .entries
+                        .get(&id)
+                        .is_some_and(|entry| entry.body.is_none())
+                    {
+                        state.entries.remove(&id);
+                    }
+                    return Err(error);
+                }
+            };
+            let closed = state.closed;
+            let aborted = closed || signal.is_cancelled();
+            let has_body = response.body.is_some();
+            if aborted || !has_body {
+                if state
+                    .entries
+                    .get(&id)
+                    .is_some_and(|entry| entry.body.is_none())
+                {
+                    state.entries.remove(&id);
+                }
+            } else if let Some(entry) = state.entries.get_mut(&id) {
+                entry.body = response.body.map(|body| Arc::new(Mutex::new(body)));
+            }
+            drop(state);
+            if aborted {
+                return Err(if closed {
+                    "model fetch transport is closed"
+                } else {
+                    "model fetch was cancelled"
+                }
+                .to_string());
+            }
+            Ok(serde_json::json!({
+                "status": response.status,
+                "statusText": response.status_text,
+                "headers": response.headers.iter().map(|(name, value)| [name, value]).collect::<Vec<_>>(),
+                "body": has_body,
+            }))
+        }
+        "fetchRead" => {
+            let (signal, body) = {
+                let state = callbacks.fetches.lock().unwrap();
+                match state.entries.get(&id) {
+                    Some(ModelFetchEntry {
+                        signal,
+                        body: Some(body),
+                    }) => (signal.clone(), body.clone()),
+                    _ => return Err(format!("unknown model fetch response {id}")),
+                }
+            };
+            let size = value
+                .get("size")
+                .and_then(|size| size.as_u64())
+                .unwrap_or(0) as usize;
+            if !(1..=64 * 1024).contains(&size) {
+                return Err("invalid model fetch read size".to_string());
+            }
+            let subscription = forward(&signal);
+            let mut buffer = vec![0u8; size];
+            let count = body
+                .lock()
+                .unwrap()
+                .read(&mut buffer)
+                .map_err(|err| err.to_string());
+            drop(subscription);
+            let count = count?;
+            Ok(
+                serde_json::json!({"data": crate::user_bash::base64(&buffer[..count]), "done": count == 0}),
+            )
+        }
+        _ => {
+            let entry = {
+                let mut state = callbacks.fetches.lock().unwrap();
+                if state
+                    .entries
+                    .get(&id)
+                    .is_some_and(|entry| entry.body.is_some())
+                {
+                    state.entries.remove(&id)
+                } else {
+                    None
+                }
+            };
+            if let Some(entry) = entry {
+                entry.signal.cancel();
+            }
+            Ok(serde_json::Value::Null)
+        }
+    }
+}
+
+/// Answers the host's `model_stream_callback` request for a stream in flight.
+pub(crate) fn dispatch_model_stream_callback(
+    streams: &ModelStreams,
+    args: &serde_json::Value,
+    cancel: &crate::ProviderSignal,
+) -> Result<serde_json::Value, String> {
+    let stream_id = args
+        .get("streamId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let name = args
+        .get("callback")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let value = args
+        .get("value")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let stream = streams.lock().unwrap().get(stream_id).cloned();
+    let owned = stream.and_then(|stream| stream.callbacks.lock().unwrap().clone());
+    let Some((model, callbacks)) = owned else {
+        if name == "fetchClose" {
+            return Ok(serde_json::Value::Null); // a deferred Body.Close may follow the terminal stream event
+        }
+        return Err(format!("unknown model stream callback {stream_id}/{name}"));
+    };
+    match name {
+        "fetch" | "fetchRead" | "fetchClose" if callbacks.fetch.is_some() => {
+            serve_model_fetch(&callbacks, name, &value, cancel)
+        }
+        "onPayload" if callbacks.on_payload.is_some() => {
+            let replacement = (callbacks.on_payload.as_ref().unwrap())(value, &model)?;
+            Ok(serde_json::json!({"defined": replacement.is_some(), "value": replacement}))
+        }
+        "onResponse" if callbacks.on_response.is_some() => {
+            (callbacks.on_response.as_ref().unwrap())(value, &model)?;
+            Ok(serde_json::Value::Null)
+        }
+        "transformHeaders" if callbacks.transform_headers.is_some() => {
+            (callbacks.transform_headers.as_ref().unwrap())(value, &model)
+        }
+        _ => Err(format!("unknown model stream callback {stream_id}/{name}")),
+    }
+}
+
+impl Default for ModelEventStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModelEventStream {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(ModelStreamState::default()),
+            changed: Condvar::new(),
+            callbacks: Mutex::new(None),
+        }
+    }
+    pub(crate) fn mark_started(&self, error: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        if state.started.is_none() {
+            state.started = Some(error.map_or(Ok(()), Err));
+            self.changed.notify_all();
+        }
+    }
+    pub(crate) fn wait_started(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(result) = &state.started {
+                return result.clone();
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+    pub fn push(&self, mut event: serde_json::Value) {
+        let mut state = self.state.lock().unwrap();
+        if state.terminal {
+            return;
+        }
+        if matches!(
+            event.get("type").and_then(|v| v.as_str()),
+            Some("done" | "error")
+        ) {
+            let member = if event.get("type").and_then(|v| v.as_str()) == Some("done") {
+                "message"
+            } else {
+                "error"
+            };
+            time_message(state.timing, event.get_mut(member));
+            state.terminal = true;
+            state.result = if event.get("type").and_then(|v| v.as_str()) == Some("done") {
+                event.get("message").cloned()
+            } else {
+                event.get("error").cloned()
+            };
+        }
+        state.events.push_back(event);
+        self.changed.notify_all();
+    }
+    pub fn end(&self, mut result: serde_json::Value) {
+        let mut state = self.state.lock().unwrap();
+        if state.terminal {
+            return;
+        };
+        time_message(state.timing, Some(&mut result));
+        state.terminal = true;
+        state.result = Some(result);
+        self.changed.notify_all();
+    }
+
+    pub fn next(&self) -> Option<serde_json::Value> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(event) = state.events.pop_front() {
+                return Some(event);
+            }
+            if state.terminal {
+                return None;
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+    pub(crate) fn forward(
+        self: &Arc<Self>,
+        stopped: &crate::provider::ProviderSignal,
+        mut emit: impl FnMut(serde_json::Value) -> Result<(), String>,
+    ) -> Result<(), String> {
+        // pig additive (D19): teardown releases transport waits without settling the caller-owned stream.
+        let stream = Arc::downgrade(self);
+        let _wake = stopped.subscribe(Arc::new(move || {
+            if let Some(stream) = stream.upgrade() {
+                let _state = stream.state.lock().unwrap();
+                stream.changed.notify_all();
+            }
+        }));
+        loop {
+            let event = {
+                let mut state = self.state.lock().unwrap();
+                while state.events.is_empty() && !state.terminal && !stopped.is_cancelled() {
+                    state = self.changed.wait(state).unwrap();
+                }
+                if stopped.is_cancelled() {
+                    return Err("Provider connection closed".into());
+                }
+                state.events.pop_front()
+            };
+            match event {
+                Some(event) => emit(event)?,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    pub fn result(&self) -> Option<serde_json::Value> {
+        let mut state = self.state.lock().unwrap();
+        while !state.terminal {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.result.clone()
+    }
+}
+
+pub(crate) fn model_stream_error_event(
+    message: &str,
+    model: &serde_json::Value,
+) -> serde_json::Value {
+    let provider = model
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            model
+                .get("provider")
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_default();
+    let model_id = model
+        .get("modelId")
+        .and_then(|value| value.as_str())
+        .or_else(|| model.get("id").and_then(|value| value.as_str()))
+        .unwrap_or_default();
+    let api = model
+        .get("api")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    serde_json::json!({
+        "type":"error", "reason":"error",
+        "error":{
+            "role":"assistant", "content":[], "api":api, "provider":provider, "model":model_id,
+            "usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
+            "stopReason":"error", "errorMessage":message, "timestamp":timestamp
+        }
+    })
+}
+
+/// ModelRegistry exposes Session model discovery, request authentication, and
+/// model operations through the host-owned runtime.
+pub struct ModelRegistry {
+    /// The runtime this registry forwards to ([`ModelRegistry::new`]); `None` is the Session's registry.
+    pub(crate) runtime: Option<Arc<crate::ModelRuntime>>,
+    request_parent: Option<Arc<crate::protocol::RequestParent>>,
+    conn: Arc<Connection>,
+    request_id: String,
+    streams: ModelStreams,
+    sequence: Arc<AtomicU64>,
+}
+
+impl ModelRegistry {
+    /// Pi's `new ModelRegistry(runtime)` (model-registry.ts:48-52): the compatibility facade over a runtime the extension built. Every member forwards to the runtime, as Pi's does, so it answers from that runtime and not from the Session's registry; a provider is registered by configuration without functions.
+    pub fn new(runtime: Arc<crate::ModelRuntime>) -> ModelRegistry {
+        ModelRegistry {
+            runtime: Some(runtime.clone()),
+            ..runtime.context().model_registry()
+        }
+    }
+    pub fn get_registered_native_provider(
+        &self,
+        id: &str,
+    ) -> io::Result<Option<Arc<crate::Provider>>> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_registered_native_provider(id);
+        }
+        let snapshot = self.state()?;
+        let Some(declaration) = snapshot["registered"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry["name"] == id && entry["native"].is_object())
+            })
+            .map(|entry| entry["native"].clone())
+        else {
+            return Ok(None);
+        };
+        let state = self
+            .conn
+            .provider_objects
+            .get()
+            .ok_or_else(|| io::Error::other("Provider runtime unavailable"))?;
+        state
+            .get(self.conn.clone(), declaration)
+            .map(Some)
+            .map_err(io::Error::other)
+    }
+    // pig divergence (D78): builtin/composed Provider methods still need a native SDK carrier.
+    pub fn get_provider(&self, id: &str) -> io::Result<Option<Arc<crate::Provider>>> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_provider(id);
+        }
+        if let Some(provider) = self.get_registered_native_provider(id)? {
+            return Ok(Some(provider));
+        }
+        if self.state()?["providers"].get(id).is_some() {
+            return Err(io::Error::other(
+                "builtin/composed Provider object carrier is unavailable (D78)",
+            ));
+        }
+        Ok(None)
+    }
+    pub fn register_native_provider(&self, provider: Arc<crate::Provider>) -> io::Result<()> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.register_native_provider(provider);
+        }
+        let state = self
+            .conn
+            .provider_objects
+            .get()
+            .ok_or_else(|| io::Error::other("Provider runtime unavailable"))?;
+        let declaration = state.register(provider).map_err(io::Error::other)?;
+        self.call(
+            "registerProvider",
+            serde_json::to_value(declaration).map_err(io::Error::other)?,
+        )?;
+        Ok(())
+    }
+    fn call(&self, method: &str, args: serde_json::Value) -> io::Result<serde_json::Value> {
+        let parent = (!self.request_id.is_empty()).then_some(self.request_id.as_str());
+        self.conn
+            .call_for_scope(self.request_parent.as_deref(), parent, method, Some(args))
+            .and_then(call_result_value)
+    }
+    fn state(&self) -> io::Result<serde_json::Value> {
+        self.call("getModelRegistryState", serde_json::Value::Null)
+    }
+    pub fn get_all(&self) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_models(None);
+        }
+        Ok(self.state()?["models"].clone())
+    }
+    /// Every known model of a type (`chat`, `image` or `classifier`), optionally for one provider. Chat models come from the registry state's `models` and the others from its `typedModels`, in the host's order (`model-registry.ts` `getModelsOfType`).
+    pub fn get_models_of_type(
+        &self,
+        model_type: &str,
+        provider: Option<&str>,
+    ) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_models_of_type(model_type, provider);
+        }
+        let state = self.state()?;
+        let mut models = Vec::new();
+        for list in [&state["models"], &state["typedModels"]] {
+            for model in list.as_array().into_iter().flatten() {
+                let kind = model["type"]
+                    .as_str()
+                    .filter(|kind| !kind.is_empty())
+                    .unwrap_or("chat");
+                if kind == model_type
+                    && provider.is_none_or(|provider| model["provider"] == provider)
+                {
+                    models.push(model.clone());
+                }
+            }
+        }
+        Ok(serde_json::Value::Array(models))
+    }
+    /// One model of a type by provider and id, or `None` (`getModelOfType`).
+    pub fn get_model_of_type(
+        &self,
+        model_type: &str,
+        provider: &str,
+        model_id: &str,
+    ) -> io::Result<Option<serde_json::Value>> {
+        if let Some(runtime) = &self.runtime {
+            return runtime
+                .get_model_of_type(model_type, provider, model_id)
+                .map(|model| (!model.is_null()).then_some(model));
+        }
+        Ok(self
+            .get_models_of_type(model_type, Some(provider))?
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == model_id))
+            .cloned())
+    }
+    /// One model of a type by provider and id, or `None` (`findOfType`).
+    pub fn find_of_type(
+        &self,
+        model_type: &str,
+        provider: &str,
+        model_id: &str,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.get_model_of_type(model_type, provider, model_id)
+    }
+    /// The models of a type whose provider has working credentials. It awaits the host (`getAvailableOfType`).
+    pub fn get_available_of_type(
+        &self,
+        model_type: &str,
+        provider: Option<&str>,
+    ) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_available_of_type(model_type, provider);
+        }
+        let mut args = serde_json::json!({"type": model_type});
+        if let Some(provider) = provider {
+            args["provider"] = serde_json::json!(provider);
+        }
+        self.call("getAvailableOfType", args)
+    }
+    /// Classifies structured state with request-time authentication. It never fails: a failure, and a cancelled request, are a result with `stopReason` `error` or `aborted` that names the model (`classify`).
+    pub fn classify(
+        &self,
+        model: &serde_json::Value,
+        context: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        if let Some(runtime) = &self.runtime {
+            return runtime.classify(model, context, options);
+        }
+        let mut args = serde_json::json!({"model": model, "context": context});
+        if let Some(options) = options {
+            args["options"] = options;
+        }
+        match self.call("classify", args) {
+            Ok(result) => result,
+            Err(error) => {
+                let aborted = self
+                    .request_parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.cancelled());
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                serde_json::json!({
+                    "api": model["api"], "provider": model["provider"], "model": model["id"], "answers": {},
+                    "stopReason": if aborted { "aborted" } else { "error" }, "errorMessage": error.to_string(), "timestamp": timestamp
+                })
+            }
+        }
+    }
+    /// Generates images with request-time authentication. `context` is `{"input": [...]}` with text and image blocks and the result is the `AssistantImages` object. It never fails: a failure, and a cancelled request, are a result with `stopReason` `error` or `aborted` that names the model (`generateImages`).
+    pub fn generate_images(
+        &self,
+        model: &serde_json::Value,
+        context: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        if let Some(runtime) = &self.runtime {
+            return runtime.generate_images(model, context, options);
+        }
+        let mut args = serde_json::json!({"model": model, "context": context});
+        if let Some(options) = options {
+            args["options"] = options;
+        }
+        match self.call("generateImages", args) {
+            Ok(result) => result,
+            Err(error) => {
+                let aborted = self
+                    .request_parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.cancelled());
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                serde_json::json!({
+                    "api": model["api"], "provider": model["provider"], "model": model["id"], "output": [],
+                    "stopReason": if aborted { "aborted" } else { "error" }, "errorMessage": error.to_string(), "timestamp": timestamp
+                })
+            }
+        }
+    }
+    /// Registers a virtual model, as [`Context::register_virtual_model`] does (`registerVirtualModel`).
+    pub fn register_virtual_model(&self, model: crate::VirtualModel) -> io::Result<()> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.register_virtual_model(model);
+        }
+        let declaration = serde_json::to_value(model.declaration()).map_err(io::Error::other)?;
+        install_virtual_model(&self.conn, model, || {
+            self.call("registerVirtualModel", declaration).map(|_| ())
+        })
+    }
+    /// Removes a virtual model (`unregisterVirtualModel`).
+    pub fn unregister_virtual_model(&self, provider: &str, id: &str) -> io::Result<()> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.unregister_virtual_model(provider, id);
+        }
+        self.call(
+            "unregisterVirtualModel",
+            serde_json::json!({"provider": provider, "id": id}),
+        )?;
+        self.conn
+            .virtual_models
+            .lock()
+            .unwrap()
+            .remove(&(provider.to_string(), id.to_string()));
+        Ok(())
+    }
+    pub fn get_available(&self) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_available_snapshot();
+        }
+        let state = self.state()?;
+        let models = state["models"].as_array().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry models must be an array",
+            )
+        })?;
+        Ok(serde_json::Value::Array(
+            models
+                .iter()
+                .filter(|m| {
+                    let provider = &state["providers"][m["provider"].as_str().unwrap_or_default()];
+                    provider["configured"] == true
+                        && provider["availableModelIds"]
+                            .as_array()
+                            .is_none_or(|ids| ids.contains(&m["id"]))
+                })
+                .cloned()
+                .collect(),
+        ))
+    }
+    pub fn get_error(&self) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return Ok(runtime
+                .get_error()?
+                .map_or(serde_json::Value::Null, serde_json::Value::String));
+        }
+        Ok(self.state()?["error"].clone())
+    }
+    pub fn has_configured_auth(&self, model: &serde_json::Value) -> io::Result<bool> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.has_configured_auth(model["provider"].as_str().unwrap_or_default());
+        }
+        Ok(
+            self.state()?["providers"][model["provider"].as_str().unwrap_or_default()]["configured"]
+                == true,
+        )
+    }
+    pub fn is_using_oauth(&self, model: &serde_json::Value) -> io::Result<bool> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.is_using_oauth(model["provider"].as_str().unwrap_or_default());
+        }
+        Ok(
+            self.state()?["providers"][model["provider"].as_str().unwrap_or_default()]["usingOAuth"]
+                == true,
+        )
+    }
+    pub fn get_provider_auth_status(&self, provider: &str) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_provider_auth_status(provider);
+        }
+        let state = self.state()?;
+        Ok(state["providers"]
+            .get(provider)
+            .map(|p| p["authStatus"].clone())
+            .unwrap_or_else(|| serde_json::json!({"configured":false})))
+    }
+    pub fn get_provider_display_name(&self, provider: &str) -> io::Result<String> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.provider_display_name(provider);
+        }
+        Ok(self.state()?["providers"][provider]["name"]
+            .as_str()
+            .unwrap_or(provider)
+            .to_owned())
+    }
+    pub fn get_provider_auth(&self, provider: &str) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_auth(serde_json::json!(provider), None);
+        }
+        self.call("getProviderAuth", serde_json::json!({"provider":provider}))
+    }
+    pub fn get_api_key_for_provider(&self, provider: &str) -> Option<String> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_auth(serde_json::json!(provider), None).ok()?["auth"]["apiKey"]
+                .as_str()
+                .map(str::to_owned);
+        }
+        self.get_provider_auth(provider).ok()?["auth"]["apiKey"]
+            .as_str()
+            .map(str::to_owned)
+    }
+    pub fn get_registered_provider_ids(&self) -> io::Result<Vec<String>> {
+        if let Some(runtime) = &self.runtime {
+            return runtime
+                .get_registered_provider_ids()
+                .and_then(|ids| serde_json::from_value(ids).map_err(io::Error::other));
+        }
+        let state = self.state()?;
+        let registered = state["registered"].as_array().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry registrations must be an array",
+            )
+        })?;
+        registered
+            .iter()
+            .map(|r| {
+                r["name"].as_str().map(str::to_owned).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "registry name must be a string")
+                })
+            })
+            .collect()
+    }
+    pub fn get_registered_provider_config(&self, provider: &str) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.get_registered_provider_config(provider);
+        }
+        let state = self.state()?;
+        let registered = state["registered"].as_array().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry registrations must be an array",
+            )
+        })?;
+        Ok(registered
+            .iter()
+            .find(|r| r["name"] == provider)
+            .map(|r| r["config"].clone())
+            .unwrap_or_default())
+    }
+    pub fn register_provider(&self, name: &str, config: serde_json::Value) -> io::Result<()> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.register_provider(name, config);
+        }
+        self.register_provider_operations(name, config, crate::ProviderOperations::new())
+    }
+    /// Applies a provider config at once, as Pi's `pi.registerProvider` does after the factory finished (types.ts:1766-1803, runner.ts:517-523). The config's `images`, `classifiers` and `streamSimple` run in this extension as a factory registration's do: they stay here and the call names them. A registration the host refuses leaves the implementations the provider had.
+    pub fn register_provider_operations(
+        &self,
+        name: &str,
+        config: serde_json::Value,
+        operations: crate::ProviderOperations,
+    ) -> io::Result<()> {
+        if self.runtime.is_some() {
+            return Err(io::Error::other(
+                "a runtime registry registers a provider by configuration without functions",
+            ));
+        }
+        let callbacks = self
+            .conn
+            .provider_callbacks
+            .get()
+            .ok_or_else(|| io::Error::other("Provider runtime unavailable"))?;
+        let kept = callbacks.held(name);
+        let declaration = callbacks.declare(name.to_string(), config, operations);
+        let outcome = serde_json::to_value(declaration)
+            .map_err(io::Error::other)
+            .and_then(|args| self.call("registerProvider", args));
+        if outcome.is_err() {
+            callbacks.restore(name, kept);
+        }
+        outcome.map(|_| ())
+    }
+    /// Removes a provider and, once the host removed it, drops the implementations the extension held for it.
+    pub fn unregister_provider(&self, name: &str) -> io::Result<()> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.unregister_provider(name);
+        }
+        self.call("unregisterProvider", serde_json::json!({"name":name}))?;
+        if let Some(callbacks) = self.conn.provider_callbacks.get() {
+            callbacks.restore(name, None);
+        }
+        Ok(())
+    }
+    pub fn refresh(&self, options: serde_json::Value) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return runtime.refresh(Some(options));
+        }
+        let result = self.call("refreshModelRegistry", options)?;
+        Ok(serde_json::json!({"aborted":result["aborted"],"errors":result["errors"]}))
+    }
+
+    /// Resolves a model by exact provider and model ID through the host registry. `Ok(None)` means no model matches, as Pi's `find` returns undefined (model-registry.ts:72); a host or transport failure is the `Err`, never a model that is absent.
+    pub fn find(&self, provider_id: &str, model_id: &str) -> io::Result<Option<serde_json::Value>> {
+        if let Some(runtime) = &self.runtime {
+            return runtime
+                .get_model(provider_id, model_id)
+                .map(|model| (!model.is_null()).then_some(model));
+        }
+        let model = self.call(
+            "getModel",
+            serde_json::json!({"provider":provider_id,"modelId":model_id}),
+        )?;
+        Ok((!model.is_null()).then_some(model))
+    }
+
+    pub fn get_api_key_and_headers(
+        &self,
+        model: &serde_json::Value,
+    ) -> io::Result<serde_json::Value> {
+        if let Some(runtime) = &self.runtime {
+            return Ok(runtime.request_auth(model));
+        }
+        let provider = model
+            .get("provider")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                model
+                    .get("provider")
+                    .and_then(|value| value.get("id"))
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or_default();
+        let model_id = model
+            .get("modelId")
+            .and_then(|value| value.as_str())
+            .or_else(|| model.get("id").and_then(|value| value.as_str()))
+            .unwrap_or_default();
+        let parent = (!self.request_id.is_empty()).then_some(self.request_id.as_str());
+        self.conn
+            .call_for_scope(
+                self.request_parent.as_deref(),
+                parent,
+                "getModelAuth",
+                Some(serde_json::json!({"provider":provider,"modelId":model_id})),
+            )
+            .and_then(call_result_value)
+    }
+
+    pub fn stream(
+        &self,
+        model: serde_json::Value,
+        request: serde_json::Value,
+        options: serde_json::Value,
+    ) -> Arc<ModelEventStream> {
+        self.stream_with_method(
+            model,
+            request,
+            options,
+            false,
+            ModelStreamCallbacks::default(),
+            None,
+        )
+    }
+    /// `stream` with Pi's provider request callbacks (`onPayload`, `onResponse`, `transformHeaders`).
+    pub fn stream_with_callbacks(
+        &self,
+        model: serde_json::Value,
+        request: serde_json::Value,
+        options: serde_json::Value,
+        callbacks: ModelStreamCallbacks,
+    ) -> Arc<ModelEventStream> {
+        self.stream_with_method(model, request, options, false, callbacks, None)
+    }
+    /// `stream_simple` with Pi's provider request callbacks.
+    pub fn stream_simple_with_callbacks(
+        &self,
+        model: serde_json::Value,
+        request: serde_json::Value,
+        options: serde_json::Value,
+        callbacks: ModelStreamCallbacks,
+    ) -> Arc<ModelEventStream> {
+        self.stream_with_method(model, request, options, true, callbacks, None)
+    }
+    /// A stream on the session graph `ModelRuntime` whose object is given.
+    pub(crate) fn stream_on_runtime(
+        &self,
+        runtime: Arc<crate::graph::GraphObject>,
+        model: serde_json::Value,
+        request: serde_json::Value,
+        options: serde_json::Value,
+        simple: bool,
+    ) -> Arc<ModelEventStream> {
+        self.stream_with_method(
+            model,
+            request,
+            options,
+            simple,
+            ModelStreamCallbacks::default(),
+            Some(runtime),
+        )
+    }
+    fn stream_with_method(
+        &self,
+        model: serde_json::Value,
+        request: serde_json::Value,
+        options: serde_json::Value,
+        simple: bool,
+        callbacks: ModelStreamCallbacks,
+        runtime: Option<Arc<crate::graph::GraphObject>>,
+    ) -> Arc<ModelEventStream> {
+        // The thread below owns the runtime's object until the host's stream call is answered: the object's release names the handle.
+        let runtime = runtime.or_else(|| self.runtime.as_ref().map(|runtime| runtime.object()));
+        let id = format!(
+            "model-stream-{}",
+            self.sequence.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        let stream = Arc::new(ModelEventStream::new());
+        let flags = (
+            callbacks.on_payload.is_some(),
+            callbacks.on_response.is_some(),
+            callbacks.transform_headers.is_some(),
+            callbacks.fetch.is_some(),
+        );
+        if !callbacks.is_empty() {
+            *stream.callbacks.lock().unwrap() = Some((model.clone(), callbacks));
+        }
+        self.streams
+            .lock()
+            .unwrap()
+            .insert(id.clone(), stream.clone());
+        let conn = self.conn.clone();
+        let parent = self.request_id.clone();
+        let request_parent = self.request_parent.clone();
+        let streams = self.streams.clone();
+        let output = stream.clone();
+        thread::spawn(move || {
+            let mut merged = request.as_object().cloned().unwrap_or_default();
+            if let Some(values) = options.as_object() {
+                for (key, value) in values {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+            let error_model = model.clone();
+            let result = conn.call_for_scope(
+                request_parent.as_deref(),
+                (!parent.is_empty()).then_some(parent.as_str()),
+                "modelStream",
+                {
+                    let mut call = serde_json::json!({"streamId": id, "model": model, "request": merged, "simple":simple});
+                    if let Some(runtime) = &runtime {
+                        call["runtime"] = serde_json::Value::String(runtime.handle().to_string());
+                    }
+                    for (set, name) in [(flags.0, "onPayload"), (flags.1, "onResponse"), (flags.2, "transformHeaders"), (flags.3, "fetch")] {
+                        if set {
+                            call[name] = serde_json::Value::Bool(true);
+                        }
+                    }
+                    Some(call)
+                },
+            );
+            let error = match result {
+                Err(error) => Some(error.to_string()),
+                Ok(result) => result.error.map(host_error_message),
+            };
+            if let Some(error) = error {
+                output.push(model_stream_error_event(&error, &error_model));
+            }
+            streams.lock().unwrap().remove(&id);
+            // The stream's fetches end with it: their signals are cancelled and the bodies the host did not close are released.
+            if let Some((_, callbacks)) = output.callbacks.lock().unwrap().as_ref() {
+                callbacks.dispose_fetches();
+            }
+        });
+        stream
+    }
+    pub fn stream_simple(
+        &self,
+        model: serde_json::Value,
+        request: serde_json::Value,
+        options: serde_json::Value,
+    ) -> Arc<ModelEventStream> {
+        self.stream_with_method(
+            model,
+            request,
+            options,
+            true,
+            ModelStreamCallbacks::default(),
+            None,
+        )
+    }
+    pub fn complete(
+        &self,
+        model: serde_json::Value,
+        request: serde_json::Value,
+        options: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        self.stream(model, request, options).result()
+    }
+}
+
+/// The Session's identity as the host's state snapshots replicate it: Pi's `ctx.model` (the id and provider every read of the model takes, and the
+/// model object `get_model_info` decodes per call) and `ctx.sessionManager`'s `getSessionId()`, `getSessionName()` and `getSessionFile()`. The ready state and every
+/// `state_update` pass through [`SessionIdentity::apply_state`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionIdentity {
+    pub(crate) model: String,
+    pub(crate) model_provider: String,
+    /// The session object's members, `""` for none. They are known once `session_id` is.
+    pub(crate) session_name: String,
+    pub(crate) session_file: String,
+    /// The snapshot's model object, `null` for a Session without a model; `None` until a snapshot carried the `model` key.
+    pub(crate) model_wire: Option<serde_json::Value>,
+    /// `model_wire` decoded once when it changes (the error is the decode error of the host reply, as its message), so a read clones it instead of decoding under the lock the reader thread needs to apply a push.
+    pub(crate) model_info: Option<Result<Option<ModelInfo>, String>>,
+    /// The snapshot's session id, `""` for none; `None` until a snapshot carried the `session` object.
+    pub(crate) session_id: Option<String>,
+}
+
+impl SessionIdentity {
+    /// Applies a state snapshot. An absent `model` keeps the replica and an explicit null clears it (the Session holds no model); the model object is copied and its
+    /// identity derived only when it differs from the held one. Every session object replaces the name, the file (`""` for a session with no name or no file, an in-memory
+    /// session) and the id (omitted when empty).
+    pub(crate) fn apply_state(&mut self, state: &serde_json::Map<String, serde_json::Value>) {
+        if let Some(model) = state.get("model")
+            && self.model_wire.as_ref() != Some(model)
+        {
+            (self.model, self.model_provider) = model_identity(model);
+            self.model_info = Some(ModelInfo::from_wire(model).map_err(|error| error.to_string()));
+            self.model_wire = Some(model.clone());
+        }
+        if let Some(session) = state.get("session").and_then(serde_json::Value::as_object) {
+            let member = |key: &str| {
+                session
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            self.session_name = member("sessionName");
+            self.session_file = member("sessionFile");
+            self.session_id = Some(member("sessionId"));
+        }
+    }
+}
+
+/// The id (the name when the model has no id) and the provider id of a state snapshot's model; both empty for no model.
+pub(crate) fn model_identity(model: &serde_json::Value) -> (String, String) {
+    let Some(model) = model.as_object() else {
+        return (String::new(), String::new());
+    };
+    let id = model
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .or_else(|| model.get("name").and_then(serde_json::Value::as_str))
+        .unwrap_or_default();
+    let provider = match model.get("provider") {
+        Some(serde_json::Value::String(provider)) => provider.as_str(),
+        Some(serde_json::Value::Object(provider)) => provider
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        _ => "",
+    };
+    (id.to_string(), provider.to_string())
+}
+
+/// Context provides access to the host's UI and session state.
+/// It has no method that continues a turn or appends a compaction at a turn's end: a `turn_end` or `agent_before_settle` handler does both with its result,
+/// `entries` (custom, custom_message, context_edit and compaction drafts) and `continue` (one more provider request, no new user message). See "Own compaction
+/// and continue after an overflow" in the extensions guide.
+/// Passed to every handler function. Clones share the connection, cancellation and live session state, so retained callbacks can own a context without copying that state.
+#[derive(Clone)]
+pub struct Context {
+    pub(crate) request_parent: Option<Arc<crate::protocol::RequestParent>>,
+    pub(crate) conn: Arc<Connection>,
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) request_id: String,
+    pub(crate) cwd: String,
+    pub(crate) mode: String,
+    pub(crate) shared_width: Arc<AtomicU32>,
+    pub(crate) shared_height: Arc<AtomicU32>,
+    pub(crate) shared_identity: Arc<Mutex<SessionIdentity>>,
+    pub(crate) flag_defaults: Arc<HashMap<String, serde_json::Value>>,
+    pub(crate) shared_session: Arc<Mutex<SessionMirror>>,
+    /// Serializes the one-time session-log subscribe so concurrent first
+    /// readers make a single host call.
+    pub(crate) session_sub_lock: Arc<Mutex<()>>,
+    pub(crate) cancel_flag: Arc<AtomicBool>,
+    pub(crate) cancel_reason: Arc<Mutex<Option<String>>>,
+    pub(crate) overlay_seq: Arc<AtomicU64>,
+    pub(crate) overlays: RemoteComponents,
+    pub(crate) editor_slot: crate::editor_component::EditorSlot,
+    pub(crate) terminal_input: TerminalInputSubs,
+    pub(crate) terminal_input_seq: Arc<AtomicU64>,
+    pub(crate) width_change: WidthChangeSubs,
+    pub(crate) width_change_seq: Arc<AtomicU64>,
+    pub(crate) model_streams: ModelStreams,
+    pub(crate) model_stream_seq: Arc<AtomicU64>,
+    /// Replicated `hasUI` and theme palette.
+    pub(crate) shared_ui: Arc<Mutex<UiState>>,
+    pub(crate) bus: Arc<crate::event_bus::BusRegistry>,
+    /// Subscriptions to the host's theme and tool-expansion changes, and the extension's source (host_subscriptions.rs).
+    pub(crate) host_subs: Arc<crate::host_subscriptions::HostSubscriptions>,
+    /// Set for a tool_call request: the call's position in its assistant message's batch, and the JSON text of its arguments.
+    pub(crate) tool_call_index: Option<u32>,
+    pub(crate) tool_input: Option<Arc<str>>,
+    /// Footer, header and widget renderers, keyed by the host method that installs them (a widget's by the method and its key).
+    pub(crate) surfaces: Surfaces,
+    /// Whether this is a withSession context, whose session log is the replacement Session's.
+    pub(crate) replacement: bool,
+    /// Set for a before_agent_start request: the prompt its shared options rendered when last read (runner.ts:1430-1433).
+    pub(crate) system_prompt: Option<Arc<SystemPromptState>>,
+}
+
+/// A before_agent_start emission's shared options and the prompt they last rendered to (Pi's one `systemPromptOptions` object, runner.ts:1426-1450). The
+/// [`crate::BeforeAgentStartEvent`] a handler edits and the [`Context`] it reads share this cell, so a read sees an edit made before it. It starts as the options the
+/// handler received and the prompt the host rendered for them.
+pub(crate) struct SystemPromptState {
+    cell: Mutex<PromptCell>,
+}
+
+struct PromptCell {
+    options: serde_json::Value,
+    /// The options as JSON text when `prompt` was rendered for them, and that prompt.
+    rendered: (String, String),
+}
+
+impl SystemPromptState {
+    pub(crate) fn new(event: &serde_json::Value) -> Self {
+        let options = event
+            .get("systemPromptOptions")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let prompt = event
+            .get("systemPrompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Self {
+            cell: Mutex::new(PromptCell {
+                rendered: (options.to_string(), prompt),
+                options,
+            }),
+        }
+    }
+
+    pub(crate) fn options(&self) -> serde_json::Value {
+        self.lock().options.clone()
+    }
+
+    pub(crate) fn set_options(&self, options: serde_json::Value) {
+        self.lock().options = options;
+    }
+
+    /// Runs `edit` on a copy of the options and stores the result, so the closure holds no lock and may read the prompt through the context.
+    pub(crate) fn edit_options<R>(&self, edit: impl FnOnce(&mut serde_json::Value) -> R) -> R {
+        let mut options = self.options();
+        let result = edit(&mut options);
+        self.set_options(options);
+        result
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PromptCell> {
+        self.cell
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Local session mirror kept in sync by incremental appends from state_update.
+/// Eliminates the need to fetch the full session log over IPC on every
+/// GetBranch/GetEntries call.
+#[derive(Default)]
+pub struct SessionMirror {
+    /// Whether this extension has asked the host for the session log. The host
+    /// sends none until it does, so that the majority of extensions, which
+    /// never inspect the session, do not each hold a full copy of it resident.
+    /// Atomic so the reader thread can test it while a subscribe is in flight
+    /// on another thread.
+    pub(crate) subscribed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The outcome of the one subscription attempt. A failed attempt is not retried, so every read reports it.
+    subscribe_error: Option<(io::ErrorKind, String)>,
+    session_id: String,
+    entries: Vec<std::sync::Arc<serde_json::Value>>,
+    leaf_id: String,
+    index: std::collections::HashMap<String, EntryMeta>,
+    /// Increments on every change to the log or the leaf. Both caches below are served only while the mirror is still at the revision they were built at.
+    revision: u64,
+    /// Increments whenever the log is replaced rather than extended (session switch, resync, seed, a repeated entry id). A branch is extended in place only while it is unchanged.
+    reset_gen: u64,
+    /// The root→leaf path as of `branch_cache_for`. After a miss it is extended with the entries appended since when the new leaf descends from the old one, and rebuilt otherwise (leaf move, fork, rewind). `branch_tail` is the id of its last entry, empty when it holds the whole log because there is no leaf; `branch_gen` is the `reset_gen` it was built under; `branch_scanned` is the log length when it was built; `branch_build` counts rebuilds.
+    branch_cache: Option<Vec<std::sync::Arc<serde_json::Value>>>,
+    branch_cache_for: u64,
+    branch_tail: String,
+    branch_gen: u64,
+    branch_scanned: usize,
+    branch_build: u64,
+    /// The decoded form of the same path; `branch_decoded_raw` entries of the cache have been decoded, under rebuild `branch_decoded_build`, so an extended cache decodes only its new tail.
+    branch_decoded: Option<Vec<std::sync::Arc<BranchEntry>>>,
+    branch_decoded_for: u64,
+    branch_decoded_raw: usize,
+    branch_decoded_build: u64,
+}
+
+struct EntryMeta {
+    pos: usize,
+    parent_id: String,
+}
+
+impl SessionMirror {
+    pub fn apply_update(&mut self, session: &serde_json::Value) -> bool {
+        let leaf_id = session.get("leafId").and_then(|v| v.as_str()).unwrap_or("");
+        let appended = session.get("entriesAppended").and_then(|v| v.as_array());
+        let entry_count = session
+            .get("entryCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let append_len = appended.map(|a| a.len()).unwrap_or(0);
+        let expected_base = entry_count.saturating_sub(append_len);
+        let mut changed = false;
+        if let Some(id) = session.get("sessionId").and_then(|v| v.as_str())
+            && !id.is_empty()
+            && id != self.session_id
+        {
+            self.session_id = id.to_string();
+            self.entries.clear();
+            self.index.clear();
+            self.leaf_id.clear();
+            self.branch_cache = None;
+            self.branch_decoded = None;
+            self.reset_gen += 1;
+            changed = true;
+        }
+
+        // The leaf is small and always tracked. The log itself is applied only
+        // once subscribed, and never from a push carrying no entries and a zero
+        // count: that is the shape sent to an unsubscribed extension, and
+        // reading it as an empty session would discard a mirror a concurrent
+        // subscribe had just filled.
+        let subscribed = self.subscribed.load(std::sync::atomic::Ordering::Acquire);
+        if !subscribed || (entry_count == 0 && append_len == 0) {
+            if !leaf_id.is_empty() && leaf_id != self.leaf_id {
+                self.leaf_id = leaf_id.to_string();
+                changed = true;
+            }
+            if changed {
+                self.revision += 1;
+            }
+            return changed;
+        }
+
+        if expected_base != self.entries.len() {
+            self.entries.clear();
+            self.index.clear();
+            self.entries.reserve(entry_count);
+            self.reset_gen += 1;
+            changed = true;
+        }
+
+        if let Some(arr) = appended {
+            for entry in arr {
+                let pos = self.entries.len();
+                let id = entry
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let parent_id = entry
+                    .get("parentId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.entries.push(std::sync::Arc::new(entry.clone()));
+                if !id.is_empty()
+                    && self
+                        .index
+                        .insert(id, EntryMeta { pos, parent_id })
+                        .is_some()
+                {
+                    self.reset_gen += 1;
+                }
+                changed = true;
+            }
+        }
+
+        if !leaf_id.is_empty() && leaf_id != self.leaf_id {
+            self.leaf_id = leaf_id.to_string();
+            changed = true;
+        }
+
+        if changed {
+            self.revision += 1;
+        }
+        changed
+    }
+
+    /// Installs the log returned by the host at subscribe time so the first
+    /// read need not wait for a push. A no-op once the push stream has
+    /// delivered anything, which keeps the two paths from fighting.
+    pub fn seed(&mut self, entries: Vec<serde_json::Value>, leaf_id: &str) {
+        if !leaf_id.is_empty() {
+            self.leaf_id = leaf_id.to_string();
+        }
+        if !self.entries.is_empty() {
+            return;
+        }
+        self.index.clear();
+        for (pos, entry) in entries.iter().enumerate() {
+            if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                let parent_id = entry
+                    .get("parentId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if self
+                    .index
+                    .insert(id.to_string(), EntryMeta { pos, parent_id })
+                    .is_some()
+                {
+                    self.reset_gen += 1;
+                }
+            }
+        }
+        self.entries = entries.into_iter().map(std::sync::Arc::new).collect();
+        self.branch_cache = None;
+        self.branch_decoded = None;
+        self.reset_gen += 1;
+        self.revision += 1;
+    }
+
+    pub fn get_entries(&self) -> Vec<std::sync::Arc<serde_json::Value>> {
+        self.entries.clone()
+    }
+
+    /// The cached path, brought up to date first. Callers copy before the next mutation.
+    pub(crate) fn branch(&mut self) -> &[std::sync::Arc<serde_json::Value>] {
+        if self.branch_cache.is_none() || self.branch_cache_for != self.revision {
+            if !self.extend_branch() {
+                self.rebuild_branch();
+            }
+            self.branch_cache_for = self.revision;
+        }
+        self.branch_cache.as_deref().unwrap_or(&[])
+    }
+
+    /// Brings the cached path up to the current leaf by walking parent links from the leaf back to the cached tail, visiting only entries appended since the cache was built. Reports false, leaving the cache untouched, when the leaf does not descend from the cached tail.
+    fn extend_branch(&mut self) -> bool {
+        if self.branch_tail.is_empty()
+            || self.branch_gen != self.reset_gen
+            || self.leaf_id.is_empty()
+        {
+            return false;
+        }
+        let Some(cache) = self.branch_cache.as_mut() else {
+            return false;
+        };
+        if cache.is_empty() {
+            return false;
+        }
+        let budget = self.entries.len().saturating_sub(self.branch_scanned);
+        let mut fresh = Vec::new();
+        let mut current = self.leaf_id.as_str();
+        while current != self.branch_tail {
+            let Some(meta) = self.index.get(current) else {
+                return false;
+            };
+            if meta.pos < self.branch_scanned || fresh.len() >= budget {
+                return false;
+            }
+            fresh.push(self.entries[meta.pos].clone());
+            current = meta.parent_id.as_str();
+        }
+        if !fresh.is_empty() {
+            cache.extend(fresh.into_iter().rev());
+            self.branch_tail = self.leaf_id.clone();
+        }
+        self.branch_scanned = self.entries.len();
+        true
+    }
+
+    /// Walks parent links from the leaf to the root.
+    fn rebuild_branch(&mut self) {
+        self.branch_build += 1;
+        self.branch_gen = self.reset_gen;
+        self.branch_scanned = self.entries.len();
+        self.branch_tail.clear();
+        if self.leaf_id.is_empty() || self.index.is_empty() {
+            self.branch_cache = Some(self.entries.clone());
+            return;
+        }
+        let mut path = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut current = self.leaf_id.as_str();
+        while !current.is_empty() && seen.insert(current) {
+            let Some(meta) = self.index.get(current) else {
+                break;
+            };
+            path.push(self.entries[meta.pos].clone());
+            current = meta.parent_id.as_str();
+        }
+        path.reverse();
+        if !path.is_empty() {
+            self.branch_tail = self.leaf_id.clone();
+        }
+        self.branch_cache = Some(path);
+    }
+
+    pub fn get_branch_entries(&mut self) -> Vec<std::sync::Arc<BranchEntry>> {
+        if let Some(ref cache) = self.branch_decoded
+            && self.branch_decoded_for == self.revision
+        {
+            return cache.clone();
+        }
+        self.branch();
+        let raw = self.branch_cache.as_deref().unwrap_or(&[]);
+        let (mut decoded, from) = match self.branch_decoded.take() {
+            Some(decoded)
+                if self.branch_decoded_build == self.branch_build
+                    && self.branch_decoded_raw <= raw.len() =>
+            {
+                (decoded, self.branch_decoded_raw)
+            }
+            _ => (Vec::with_capacity(raw.len()), 0),
+        };
+        decoded.extend(
+            raw[from..]
+                .iter()
+                .filter_map(|entry| BranchEntry::from_wire(entry))
+                .map(std::sync::Arc::new),
+        );
+        self.branch_decoded_raw = raw.len();
+        self.branch_decoded_build = self.branch_build;
+        self.branch_decoded_for = self.revision;
+        self.branch_decoded = Some(decoded.clone());
+        decoded
+    }
+}
+
+/// The UI calls Pi's RPC mode applies at once, inside the handler's synchronous part (rpc-mode.ts createExtensionUIContext:
+/// notify, setStatus, setWidget, setTitle and setEditorText write their request; the rest do nothing). The host applies a
+/// handler's calls before it acts on a suspension the handler reports after them, so in RPC mode such a call reports none, as
+/// the Node runtime sends it: a suspension reported before the call lets the host go on, answering the call that started a
+/// nested handler or writing a command's response, while the effect is still on its way.
+const RPC_SYNCHRONOUS_UI_EFFECTS: &[&str] = &[
+    "ui.notify",
+    "ui.setStatus",
+    "ui.setWidget",
+    "ui.setTitle",
+    "ui.setEditorText",
+    "ui.pasteToEditor",
+    "ui.setWorkingMessage",
+    "ui.setWorkingVisible",
+    "ui.setWorkingIndicator",
+    "ui.setHiddenThinkingLabel",
+    "ui.setToolsExpanded",
+    "ui.setFooter",
+    "ui.setHeader",
+];
+
+/// The model [`Context::set_model`] takes: a Pi model object, or the `provider/id` name of one. Both convert into it, so
+/// `ctx.set_model(&object)` and `ctx.set_model("provider/id")` compile.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetModelArg {
+    /// A Pi model object.
+    Object(serde_json::Value),
+    /// A `provider/id` name.
+    Named(String),
+}
+
+impl From<serde_json::Value> for SetModelArg {
+    fn from(object: serde_json::Value) -> Self {
+        SetModelArg::Object(object)
+    }
+}
+
+impl From<&serde_json::Value> for SetModelArg {
+    fn from(object: &serde_json::Value) -> Self {
+        SetModelArg::Object(object.clone())
+    }
+}
+
+impl From<&str> for SetModelArg {
+    fn from(spec: &str) -> Self {
+        SetModelArg::Named(spec.to_string())
+    }
+}
+
+impl From<String> for SetModelArg {
+    fn from(spec: String) -> Self {
+        SetModelArg::Named(spec)
+    }
+}
+
+impl From<&String> for SetModelArg {
+    fn from(spec: &String) -> Self {
+        SetModelArg::Named(spec.clone())
+    }
+}
+
+impl Context {
+    pub fn model_registry(&self) -> ModelRegistry {
+        ModelRegistry {
+            runtime: None,
+            conn: self.conn.clone(),
+            request_parent: self.request_parent.clone(),
+            request_id: self.request_id.clone(),
+            streams: self.model_streams.clone(),
+            sequence: self.model_stream_seq.clone(),
+        }
+    }
+
+    // ─── Read-only session state ─────────────────────────────────────────
+
+    /// Panics with the Host's stale message once the session was replaced or reloaded, as Pi's ExtensionContext getters throw it (runner.ts:571-600). A replacement context belongs to the new session and is not stale. The handler dispatcher reports the panic as the handler's error.
+    fn assert_active(&self) {
+        if self.replacement {
+            return;
+        }
+        // Copy the message out before panicking: a panic with the guard held would poison the lock for every later read.
+        let message = self.conn.stale_message.lock().unwrap().clone();
+        if let Some(message) = message {
+            panic!("{message}");
+        }
+    }
+
+    /// The stale message as an error once the session was replaced or reloaded: what a call that has an error result returns where a getter panics (see [`Self::assert_active`]). A replacement context is not stale.
+    fn stale_error(&self) -> io::Result<()> {
+        if self.replacement {
+            return Ok(());
+        }
+        // Copy the message out so the lock is not held while the error is built.
+        let message = self.conn.stale_message.lock().unwrap().clone();
+        match message {
+            Some(message) => Err(io::Error::other(message)),
+            None => Ok(()),
+        }
+    }
+
+    /// Returns the working directory. Panics with the stale message after the session was replaced or reloaded.
+    pub fn cwd(&self) -> &str {
+        self.assert_active();
+        &self.cwd
+    }
+
+    /// Returns the run mode pi is operating in: "tui", "rpc", "json", or
+    /// "print". Guard terminal-only UI on "tui". Defaults to "print".
+    pub fn mode(&self) -> &str {
+        self.assert_active();
+        if self.mode.is_empty() {
+            "print"
+        } else {
+            &self.mode
+        }
+    }
+
+    /// Returns the terminal width. Panics with the stale message after the session was replaced or reloaded.
+    pub fn width(&self) -> u32 {
+        self.assert_active();
+        self.terminal_width()
+    }
+
+    /// The width the host last reported, without the stale check: the SDK's own renders and pushes read it, and a push from a stale context fails with the host's error, never with a panic on a thread of the SDK.
+    pub(crate) fn terminal_width(&self) -> u32 {
+        self.shared_width.load(Ordering::Relaxed)
+    }
+
+    /// Returns the terminal height in rows, or 0 when the host has not
+    /// reported one. Updated by `height_change` notifications. Panics with the stale message after the session was replaced or reloaded.
+    pub fn height(&self) -> u32 {
+        self.assert_active();
+        self.shared_height.load(Ordering::Relaxed)
+    }
+
+    /// The model's id and provider id. A replacement context asks the host, since this process replicates only the requesting Session's model.
+    fn current_model(&self) -> (String, String) {
+        if self.replacement
+            && let Ok(info) = self.get_model_info()
+        {
+            return info
+                .map(|info| (info.id, info.provider))
+                .unwrap_or_default();
+        }
+        let identity = self.shared_identity.lock().unwrap();
+        (identity.model.clone(), identity.model_provider.clone())
+    }
+
+    /// Returns the active model's id: Pi's `ctx.model.id`, the identity every SDK reports (Go `Model()` and Python `ctx.model` return the same
+    /// id). Empty while the Session has no model.
+    pub fn model(&self) -> String {
+        self.assert_active();
+        self.current_model().0
+    }
+
+    /// Returns the active model's provider id (Pi's `ctx.model.provider`); empty while the Session has no model.
+    pub fn model_provider(&self) -> String {
+        self.assert_active();
+        self.current_model().1
+    }
+
+    /// Returns the `provider/id` string `set_model` takes; just the id when the provider is unknown.
+    pub fn model_qualified(&self) -> String {
+        self.assert_active();
+        let (id, provider) = self.current_model();
+        if provider.is_empty() {
+            id
+        } else {
+            format!("{provider}/{id}")
+        }
+    }
+
+    /// Returns the session's name, empty while it has none: the replicated value behind Pi's `ctx.sessionManager.getSessionName()`. State
+    /// updates keep it current and `set_session_name` is visible to the next read. A replacement Session's name comes from the host.
+    pub fn session_name(&self) -> String {
+        self.assert_active();
+        if self.replacement
+            && let Ok(name) = self.get_session_name()
+        {
+            return name.unwrap_or_default();
+        }
+        self.shared_identity.lock().unwrap().session_name.clone()
+    }
+
+    /// Streams a partial result of the running tool, as upstream's `onUpdate`
+    /// does. The host shows updates in order, before the tool's final result.
+    pub fn on_update(&self, partial: crate::ToolResult) -> io::Result<()> {
+        self.stale_error()?;
+        if self.tool_call_id.is_none() || self.request_id.is_empty() {
+            return Err(io::Error::other(
+                "on_update is only available while a tool runs",
+            ));
+        }
+        let result = match partial {
+            crate::ToolResult::Text(text) => serde_json::json!({"content": text}),
+            crate::ToolResult::Json(value) => value,
+            crate::ToolResult::Error(text) => {
+                serde_json::json!({"content": text, "is_error": true})
+            }
+        };
+        self.conn.notify(
+            "tool_update",
+            Some(serde_json::json!({"request_id": self.request_id, "result": result})),
+        )
+    }
+
+    /// Keeps a [`crate::BashOperations`] in the extension and returns the `user_bash` reply that names it: return the value from the handler, as Pi's handler returns `{ operations }`. The host runs commands through the object until it drops it.
+    pub fn bash_operations(&self, operations: crate::BashOperations) -> serde_json::Value {
+        let handle = self.conn.bash_operations.register(operations);
+        serde_json::json!({"operations": {"handle": handle}})
+    }
+
+    /// Upstream's `ctx.signal`: the cancellation of the run in progress, or `None` while no run is active. Every read during one run returns the same signal, and aborting the run cancels it, including for a handler still in flight. It is the run's, not the request's: [`Context::is_cancelled`] reports the request.
+    pub fn signal(&self) -> Option<crate::provider::ProviderSignal> {
+        self.conn
+            .run_signal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, signal)| signal.clone())
+    }
+
+    /// Returns true when the host has cancelled this request.
+    pub fn is_cancelled(&self) -> bool {
+        if let Some(parent) = self.request_parent.as_ref() {
+            if parent.completed() {
+                return self.conn.is_closed();
+            }
+            if parent.cancelled() {
+                return true;
+            }
+        }
+        self.cancel_flag.load(Ordering::Relaxed)
+    }
+
+    /// Returns the host-provided cancellation reason, if any.
+    pub fn cancellation_reason(&self) -> Option<String> {
+        self.cancel_reason.lock().unwrap().clone()
+    }
+
+    /// Returns the tool call ID (only valid inside tool handlers).
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
+    /// Returns the pig config root: `PIG_HOME`, else `XDG_CONFIG_HOME/pig`, else `~/.pig`. An empty variable falls through to the next choice, a
+    /// leading `~` or `~/` expands to the home directory, and any other value stays literal. It fails, and never returns a relative path, when the
+    /// home directory is needed and cannot be found. The host's `internal/configroot` and the Go, Python and Node SDKs follow the same policy.
+    pub fn config_home(&self) -> io::Result<String> {
+        config_home_from(|name| std::env::var(name).ok())
+    }
+
+    pub(crate) fn call_wire(
+        &self,
+        method: &str,
+        args: Option<serde_json::Value>,
+    ) -> io::Result<crate::protocol::CallResultMsg> {
+        self.call_wire_typed(method, args)
+    }
+
+    fn call_wire_typed<A: serde::Serialize, R: serde::de::DeserializeOwned + Send>(
+        &self,
+        method: &str,
+        args: Option<A>,
+    ) -> io::Result<crate::protocol::CallResultMsg<R>> {
+        // An RPC UI effect is no suspension of the handler, as the Node runtime sends it.
+        let reports = !self.request_id.is_empty()
+            && !(self.mode == "rpc" && RPC_SYNCHRONOUS_UI_EFFECTS.contains(&method));
+        if reports
+            && !matches!(
+                method,
+                "ui.select" | "ui.confirm" | "ui.input" | "ui.editor" | "ui.custom"
+            )
+        {
+            let _ = self.conn.request_state_for(
+                self.request_parent.as_deref(),
+                &self.request_id,
+                "blocked",
+                Some("host_call"),
+            );
+        }
+        let parent_request_id = (!self.request_id.is_empty()).then_some(self.request_id.as_str());
+        let result = self.conn.call_typed(
+            self.request_parent.as_deref(),
+            parent_request_id,
+            method,
+            args,
+        );
+        if reports {
+            let _ = self.conn.request_state_for(
+                self.request_parent.as_deref(),
+                &self.request_id,
+                "progress",
+                None,
+            );
+        }
+        result
+    }
+
+    fn block_for_user(&self) {
+        if !self.request_id.is_empty() {
+            let _ = self.conn.request_state_for(
+                self.request_parent.as_deref(),
+                &self.request_id,
+                "blocked",
+                Some("user"),
+            );
+        }
+    }
+
+    /// A host call that carries no request id (`conn.call`) is still an await of a tool handler: a handler whose dialog was answered gives up
+    /// its place in the batch's response order, as `Connection::begin_call_with_scope` does for the calls that carry one.
+    fn yield_batch_turn(&self) {
+        if let Some(start) = self
+            .request_parent
+            .as_deref()
+            .and_then(crate::protocol::RequestParent::tool_start)
+        {
+            start.yield_turn();
+        }
+    }
+
+    /// Register or replace a tool in the running Session. Validation precedes replacement; the host refresh completes before returning.
+    pub fn register_tool(&self, definition: crate::ToolDefinition) -> io::Result<()> {
+        let declaration = tool_declaration(&definition)?;
+        let _registration = self.conn.tool_registration_lock.lock().unwrap();
+        self.conn
+            .registered_tools
+            .lock()
+            .unwrap()
+            .insert(definition.name.clone(), Arc::new(definition));
+        self.call_host("registerTool", Some(declaration))?;
+        Ok(())
+    }
+
+    /// Pi's `createAgentSession`: create a child agent session in the host and return once it is ready.
+    ///
+    /// The session belongs to this extension's connection and is disposed with it; see the `child_session` module for the async contract.
+    pub fn create_agent_session(
+        &self,
+        options: crate::CreateAgentSessionOptions,
+    ) -> io::Result<crate::AgentSession> {
+        crate::child_session::create(self, options)
+    }
+
+    /// Register a slash command after load, as `pi.registerCommand` does when a handler calls it: it replaces a command with the same name and is visible to the host before this returns.
+    pub fn register_command(
+        &self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        handler: impl Fn(&Context, &str) -> crate::CommandResult + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        let name = name.into();
+        let declaration =
+            serde_json::json!({"commands": [{"name": name, "description": description.into()}]});
+        let _registration = self.conn.tool_registration_lock.lock().unwrap();
+        self.conn
+            .late_declarations
+            .set_command(name, Box::new(handler));
+        self.call_host("registerDeclaration", Some(declaration))?;
+        Ok(())
+    }
+
+    /// Register a keyboard shortcut after load, as `pi.registerShortcut` does when a handler calls it.
+    pub fn register_shortcut(
+        &self,
+        key: impl Into<String>,
+        description: impl Into<String>,
+        handler: impl Fn(&Context) -> crate::CommandResult + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        let key = key.into();
+        let declaration =
+            serde_json::json!({"shortcuts": [{"key": key, "description": description.into()}]});
+        let _registration = self.conn.tool_registration_lock.lock().unwrap();
+        self.conn
+            .late_declarations
+            .set_shortcut(key, Box::new(handler));
+        self.call_host("registerDeclaration", Some(declaration))?;
+        Ok(())
+    }
+
+    /// Declare a CLI flag after load, as `pi.registerFlag` does when a handler calls it.
+    pub fn register_flag(
+        &self,
+        name: impl Into<String>,
+        options: crate::FlagOptions,
+    ) -> io::Result<()> {
+        let name = name.into();
+        let default = options.default.clone();
+        let flag = crate::protocol::FlagDef {
+            name: name.clone(),
+            description: options.description,
+            flag_type: options.flag_type.as_str().to_string(),
+            default: options.default,
+        };
+        let declaration = serde_json::json!({"flags": [flag]});
+        let _registration = self.conn.tool_registration_lock.lock().unwrap();
+        self.call_host("registerDeclaration", Some(declaration))?;
+        // The host answers a late flag nothing until it holds a value, so the extension keeps the default itself, as Pi's registerFlag keeps it in the extension's own Map.
+        if let Some(default) = default {
+            self.conn.late_declarations.set_flag_default(name, default);
+        }
+        Ok(())
+    }
+
+    /// Register a custom message renderer after load, as `pi.registerMessageRenderer` does when a handler calls it.
+    pub fn register_message_renderer(
+        &self,
+        custom_type: impl Into<String>,
+        handler: impl Fn(
+            &Context,
+            serde_json::Value,
+            crate::extension::MessageRenderOptions,
+            u32,
+        ) -> Result<Vec<String>, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> io::Result<()> {
+        let custom_type = custom_type.into();
+        let declaration = serde_json::json!({"message_renderers": [{"custom_type": custom_type}]});
+        let _registration = self.conn.tool_registration_lock.lock().unwrap();
+        self.conn.late_declarations.set_message_renderer(
+            custom_type,
+            Box::new(move |ctx, message, options, width| {
+                handler(ctx, message, options, width).map(crate::kit::Rendered::Lines)
+            }),
+        );
+        self.call_host("registerDeclaration", Some(declaration))?;
+        Ok(())
+    }
+
+    /// Register a custom session-entry renderer after load, as `pi.registerEntryRenderer` does when a handler calls it.
+    pub fn register_entry_renderer(
+        &self,
+        custom_type: impl Into<String>,
+        handler: impl Fn(
+            &Context,
+            serde_json::Value,
+            crate::extension::EntryRenderOptions,
+            u32,
+        ) -> Result<Vec<String>, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> io::Result<()> {
+        let custom_type = custom_type.into();
+        let declaration = serde_json::json!({"entry_renderers": [{"custom_type": custom_type}]});
+        let _registration = self.conn.tool_registration_lock.lock().unwrap();
+        self.conn.late_declarations.set_entry_renderer(
+            custom_type,
+            Box::new(move |ctx, entry, options, width| {
+                handler(ctx, entry, options, width).map(crate::kit::Rendered::Lines)
+            }),
+        );
+        self.call_host("registerDeclaration", Some(declaration))?;
+        Ok(())
+    }
+
+    /// The host's reply object for a getter. A missing result is a protocol error, not an empty value.
+    fn host_reply(
+        &self,
+        method: &str,
+        args: Option<serde_json::Value>,
+    ) -> io::Result<serde_json::Value> {
+        self.call_host(method, args)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("host returned no result for {method}"),
+            )
+        })
+    }
+
+    /// One field of a getter's reply; a missing or null field is `None`.
+    fn reply_field<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Option<serde_json::Value>,
+        field: &str,
+    ) -> io::Result<Option<T>> {
+        let mut reply = self.host_reply(method, args)?;
+        match reply.get_mut(field).map(serde_json::Value::take) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value(value).map(Some).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("host reply to {method} field {field:?}: {error}"),
+                )
+            }),
+        }
+    }
+
+    /// A field every reply of the method carries; its absence is a protocol error, not an empty value.
+    fn required_field<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Option<serde_json::Value>,
+        field: &str,
+    ) -> io::Result<T> {
+        self.reply_field(method, args, field)?
+            .ok_or_else(|| invalid_reply(method, field))
+    }
+
+    /// Pi's `string | undefined` getters carry an empty string for absent state on the wire.
+    fn optional_string_field(&self, method: &str, field: &str) -> io::Result<Option<String>> {
+        Ok(self
+            .reply_field::<String>(method, None, field)?
+            .filter(|value| !value.is_empty()))
+    }
+
+    /// Upstream's `pi.events` for calls made from this request.
+    pub fn events(&self) -> crate::EventBus {
+        crate::EventBus::new(self.bus.clone(), Some(self.clone()))
+    }
+
+    /// Pi's `parseFrontmatter` over this handler's own connection; see [`crate::parse_frontmatter`].
+    pub fn parse_frontmatter(&self, content: &str) -> io::Result<crate::ParsedFrontmatter> {
+        let (method, args) = crate::host_helpers::frontmatter_args(content);
+        crate::host_helpers::decode_frontmatter(self.call_host(method, Some(args))?)
+    }
+
+    /// Pi's `stripFrontmatter` over this handler's own connection.
+    pub fn strip_frontmatter(&self, content: &str) -> io::Result<String> {
+        Ok(self.parse_frontmatter(content)?.body)
+    }
+
+    /// `Date.parse(text)` over this handler's own connection; see [`crate::parse_date`].
+    pub fn parse_date(&self, text: &str) -> io::Result<Option<f64>> {
+        if let Some(ms) = crate::host_helpers::parse_iso_date(text) {
+            return Ok(Some(ms));
+        }
+        let (method, args) = crate::host_helpers::date_args(text);
+        crate::host_helpers::decode_date(self.call_host(method, Some(args))?)
+    }
+
+    /// Pi's `generateDiffString` over this handler's own connection; see [`crate::generate_diff_string`].
+    pub fn generate_diff_string(
+        &self,
+        old_content: &str,
+        new_content: &str,
+        context_lines: Option<i64>,
+    ) -> io::Result<crate::DiffString> {
+        let (method, args) =
+            crate::host_helpers::generate_diff_string_args(old_content, new_content, context_lines);
+        crate::host_helpers::decode_diff_string(self.call_host(method, Some(args))?)
+    }
+
+    /// Pi's `generateUnifiedPatch` over this handler's own connection; see [`crate::generate_unified_patch`].
+    pub fn generate_unified_patch(
+        &self,
+        path: &str,
+        old_content: &str,
+        new_content: &str,
+        context_lines: Option<i64>,
+    ) -> io::Result<String> {
+        let (method, args) = crate::host_helpers::generate_unified_patch_args(
+            path,
+            old_content,
+            new_content,
+            context_lines,
+        );
+        crate::host_helpers::decode_patch(self.call_host(method, Some(args))?)
+    }
+
+    /// Pi's `copyToClipboard` over this handler's own connection; see [`crate::copy_to_clipboard`].
+    pub fn copy_to_clipboard(&self, text: &str) -> io::Result<()> {
+        let (method, args) = crate::host_helpers::copy_to_clipboard_args(text);
+        self.call_host(method, Some(args)).map(|_| ())
+    }
+
+    /// Pi's `convertToPng` over this handler's own connection; see [`crate::convert_to_png`].
+    pub fn convert_to_png(
+        &self,
+        base64_data: &str,
+        mime_type: &str,
+    ) -> io::Result<Option<crate::ConvertedImage>> {
+        let (method, args) = crate::host_helpers::convert_to_png_args(base64_data, mime_type);
+        crate::host_helpers::decode_converted(self.call_host(method, Some(args))?)
+    }
+
+    /// Pi's `resizeImage` over this handler's own connection; see [`crate::resize_image`].
+    pub fn resize_image(
+        &self,
+        input: &[u8],
+        mime_type: &str,
+        options: Option<&crate::ImageResizeOptions>,
+    ) -> io::Result<Option<crate::ResizedImage>> {
+        let (method, args) = crate::host_helpers::resize_image_args(input, mime_type, options);
+        crate::host_helpers::decode_resized(self.call_host(method, Some(args))?)
+    }
+
+    /// Pi's `withFileMutationQueue` for a handler that has its context: run `f` in the host's file mutation queue for `file_path` and return its result. A tool
+    /// that takes the queue through its context registers in the order Pi's one thread runs the batch's tools (D187); the free
+    /// [`crate::with_file_mutation_queue`] registers in the order the calls reach the host. See `file_mutation_queue::with_context`.
+    pub fn with_file_mutation_queue<T>(
+        &self,
+        file_path: impl AsRef<std::path::Path>,
+        f: impl FnOnce() -> T,
+    ) -> io::Result<T> {
+        crate::file_mutation_queue::with_context(self, file_path.as_ref(), f)
+    }
+
+    /// Low-level host call escape hatch. Prefer typed methods when available.
+    pub fn call_host(
+        &self,
+        method: &str,
+        args: Option<serde_json::Value>,
+    ) -> io::Result<Option<serde_json::Value>> {
+        let result = self.call_wire(method, args)?;
+        if let Some(err) = result.error {
+            return Err(io::Error::other(host_error_message(err)));
+        }
+        Ok(result.result)
+    }
+
+    // ─── Notifications & Status ──────────────────────────────────────────
+
+    /// Show a notification to the user.
+    pub fn notify(&self, message: &str, level: &str) {
+        let _ = self.call_wire(
+            "ui.notify",
+            Some(serde_json::json!({"message": message, "level": level})),
+        );
+    }
+
+    /// Set status text in the footer. An empty text is a text, as in Pi (RPC mode writes it); [`Context::clear_status`] removes the entry, as Pi's
+    /// `setStatus(key, undefined)` does.
+    pub fn set_status(&self, key: &str, text: &str) {
+        let _ = self.call_wire(
+            "ui.setStatus",
+            Some(serde_json::json!({"key": key, "text": text})),
+        );
+    }
+
+    /// Remove the status entry for `key`: Pi's `setStatus(key, undefined)`.
+    pub fn clear_status(&self, key: &str) {
+        let _ = self.call_wire("ui.setStatus", Some(serde_json::json!({"key": key})));
+    }
+
+    /// Set the working/loading message shown during tool execution. An empty string is a message, shown as an empty label, as in
+    /// Pi (`message ?? defaultWorkingMessage`); [`Context::clear_working_message`] restores the default label.
+    pub fn set_working_message(&self, message: &str) {
+        let _ = self.call_wire(
+            "ui.setWorkingMessage",
+            Some(serde_json::json!({"message": message})),
+        );
+    }
+
+    /// Restore the default working label: Pi's `setWorkingMessage()` with no argument.
+    pub fn clear_working_message(&self) {
+        let _ = self.call_wire("ui.setWorkingMessage", Some(serde_json::json!({})));
+    }
+
+    /// Toggle whether the working/loading indicator is visible.
+    pub fn set_working_visible(&self, visible: bool) {
+        let _ = self.call_wire(
+            "ui.setWorkingVisible",
+            Some(serde_json::json!({"visible": visible})),
+        );
+    }
+
+    /// Configure the working/loading indicator with an opaque option object.
+    pub fn set_working_indicator(&self, options: serde_json::Value) -> io::Result<()> {
+        call_result_to_io(self.call_wire("ui.setWorkingIndicator", Some(options))?)
+    }
+
+    /// Set the label shown for hidden thinking blocks. An empty string is a label, shown as an empty one, as in Pi (`label ?? defaultHiddenThinkingLabel`);
+    /// [`Context::clear_hidden_thinking_label`] restores the default label.
+    pub fn set_hidden_thinking_label(&self, label: &str) -> io::Result<()> {
+        call_result_to_io(self.call_wire(
+            "ui.setHiddenThinkingLabel",
+            Some(serde_json::json!({"label": label})),
+        )?)
+    }
+
+    /// PiG-only: set whether this extension owns the thinking runs of assistant messages (see [`Extension::own_thinking_runs`](crate::Extension::own_thinking_runs)).
+    /// The host ORs the flag across extensions; the last write of an extension wins.
+    /// pig additive (D214)
+    pub fn own_thinking_runs(&self, enabled: bool) -> io::Result<()> {
+        call_result_to_io(self.call_wire(
+            "ownThinkingRuns",
+            Some(serde_json::json!({"enabled": enabled})),
+        )?)
+    }
+
+    /// Restore the default hidden-thinking label: Pi's `setHiddenThinkingLabel()` with no argument.
+    pub fn clear_hidden_thinking_label(&self) -> io::Result<()> {
+        call_result_to_io(self.call_wire("ui.setHiddenThinkingLabel", Some(serde_json::json!({})))?)
+    }
+
+    /// Set the terminal title.
+    pub fn set_title(&self, title: &str) {
+        let _ = self.call_wire("ui.setTitle", Some(serde_json::json!({"title": title})));
+    }
+
+    // ─── User Interaction ────────────────────────────────────────────────
+
+    /// Show a selection list. Returns Pi's result and whether it was defined.
+    ///
+    /// The value is the JSON the user's client answered with, as Pi's `select()`
+    /// resolves it: a string for every client that follows Pi's protocol, and in
+    /// RPC mode whatever JSON the client sent (a number, `null`, a boolean, an
+    /// object or an array). The flag is false when Pi's result is `undefined`
+    /// (cancelled, timed out, an answer without a value), with `Value::Null` as
+    /// the value; a `null` answer is `(Value::Null, true)`.
+    pub fn select(&self, title: &str, options: &[&str]) -> io::Result<(serde_json::Value, bool)> {
+        self.block_for_user();
+        let v = call_result_value(self.call_wire(
+            "ui.select",
+            Some(serde_json::json!({"title": title, "options": options})),
+        )?)?;
+        Ok(dialog_value(&v, "selected"))
+    }
+
+    /// Show a yes/no confirmation dialog. Returns the JSON the client answered
+    /// with in `confirmed`, as Pi's `confirm()` resolves it: a boolean for every
+    /// client that follows Pi's protocol, `false` when cancelled or unanswered,
+    /// and in RPC mode whatever JSON the client sent.
+    pub fn confirm(&self, title: &str, message: &str) -> io::Result<serde_json::Value> {
+        self.block_for_user();
+        let v = call_result_value(self.call_wire(
+            "ui.confirm",
+            Some(serde_json::json!({"title": title, "message": message})),
+        )?)?;
+        Ok(v.get("confirmed")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)))
+    }
+
+    /// Show a text input prompt. The placeholder is sent as given, the empty string included (Pi's `input(title, "")`, which RPC mode
+    /// writes as `placeholder: ""`); [`Context::input_without_placeholder`] is Pi's `input(title)`. The result is typed as for
+    /// [`Context::select`].
+    pub fn input(&self, title: &str, placeholder: &str) -> io::Result<(serde_json::Value, bool)> {
+        self.input_wire(serde_json::json!({"title": title, "placeholder": placeholder}))
+    }
+
+    /// Pi's `input(title)`: the placeholder is undefined, not the empty string [`Context::input`] sends, so an RPC client's request
+    /// has no `placeholder` member (rpc-mode.ts input). A Rust `&str` cannot be undefined, hence the second spelling, as
+    /// [`Context::clear_status`] is for [`Context::set_status`].
+    pub fn input_without_placeholder(&self, title: &str) -> io::Result<(serde_json::Value, bool)> {
+        self.input_wire(serde_json::json!({"title": title}))
+    }
+
+    fn input_wire(&self, args: serde_json::Value) -> io::Result<(serde_json::Value, bool)> {
+        self.block_for_user();
+        let v = call_result_value(self.call_wire("ui.input", Some(args))?)?;
+        Ok(dialog_value(&v, "text"))
+    }
+
+    /// Show a multi-line editor. The prefill is sent as given, the empty string included (Pi's `editor(title, "")`, which RPC mode
+    /// writes as `prefill: ""`); [`Context::editor_without_prefill`] is Pi's `editor(title)`. The result is typed as for
+    /// [`Context::select`].
+    pub fn editor(&self, title: &str, prefill: &str) -> io::Result<(serde_json::Value, bool)> {
+        self.editor_wire(serde_json::json!({"title": title, "prefill": prefill}))
+    }
+
+    /// Pi's `editor(title)`: the prefill is undefined, not the empty string [`Context::editor`] sends, so an RPC client's request
+    /// has no `prefill` member (rpc-mode.ts editor). A Rust `&str` cannot be undefined, hence the second spelling, as
+    /// [`Context::clear_status`] is for [`Context::set_status`].
+    pub fn editor_without_prefill(&self, title: &str) -> io::Result<(serde_json::Value, bool)> {
+        self.editor_wire(serde_json::json!({"title": title}))
+    }
+
+    fn editor_wire(&self, args: serde_json::Value) -> io::Result<(serde_json::Value, bool)> {
+        self.block_for_user();
+        let v = call_result_value(self.call_wire("ui.editor", Some(args))?)?;
+        Ok(dialog_value(&v, "text"))
+    }
+
+    // ─── Message injection ───────────────────────────────────────────────
+
+    /// Send a custom message into the conversation. With `trigger_turn = Some(true)` the session is
+    /// busy (`is_idle` is false) until this handler yields; to wait for the run, poll `is_idle`
+    /// with `sleep`/`yield_now`, not a raw sleep.
+    pub fn send_message(
+        &self,
+        custom_type: &str,
+        content: &str,
+        display: bool,
+        trigger_turn: Option<bool>,
+        deliver_as: Option<&str>,
+    ) -> io::Result<()> {
+        self.send_message_with_details(
+            custom_type,
+            content,
+            display,
+            trigger_turn,
+            deliver_as,
+            None,
+        )
+    }
+
+    /// [`Context::send_message`] with upstream's message `details`, extension data kept with the
+    /// message and not sent to the model: `None` leaves the member out and `Some(Value::Null)`
+    /// writes it as null.
+    pub fn send_message_with_details(
+        &self,
+        custom_type: &str,
+        content: &str,
+        display: bool,
+        trigger_turn: Option<bool>,
+        deliver_as: Option<&str>,
+        details: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        // Both options are optional upstream: None is sent as unset and the
+        // host applies upstream's default for the session's state.
+        let mut options = serde_json::Map::new();
+        if let Some(trigger_turn) = trigger_turn {
+            options.insert("triggerTurn".into(), serde_json::Value::Bool(trigger_turn));
+        }
+        if let Some(deliver_as) = deliver_as.filter(|value| !value.is_empty()) {
+            options.insert(
+                "deliverAs".into(),
+                serde_json::Value::String(deliver_as.to_string()),
+            );
+        }
+        let mut message = serde_json::json!({
+            "customType": custom_type,
+            "content": content,
+            "display": display,
+        });
+        if let Some(details) = details {
+            message["details"] = details;
+        }
+        call_result_to_io(self.call_wire(
+            "sendMessage",
+            Some(serde_json::json!({"message": message, "options": options})),
+        )?)
+    }
+
+    /// Send a user message containing a string or text/image content blocks. `deliver_as` is `"steer"` or `"followUp"`; the empty
+    /// string sends no `deliverAs`, as `pi.sendUserMessage(content)` does: an idle agent runs the message at once and a streaming
+    /// agent refuses it with Pi's error (`Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue
+    /// the message.`, an extension error event `send_user_message`; the call itself returns).
+    pub fn send_user_message(
+        &self,
+        content: impl serde::Serialize,
+        deliver_as: &str,
+    ) -> io::Result<()> {
+        self.send_user_message_with(content, deliver_as, None)
+    }
+
+    /// `send_user_message` with Pi's `expandPromptTemplates` option (types.ts:1792): `Some(true)` dispatches an extension
+    /// command and expands a skill command or prompt template in the text as typed input would; `None` is Pi's default,
+    /// false. On a withSession context the call runs on the replacement Session and returns after it.
+    pub fn send_user_message_with(
+        &self,
+        content: impl serde::Serialize,
+        deliver_as: &str,
+        expand_prompt_templates: Option<bool>,
+    ) -> io::Result<()> {
+        let mut options = serde_json::json!({});
+        if !deliver_as.is_empty() {
+            options["deliverAs"] = serde_json::json!(deliver_as);
+        }
+        if let Some(expand) = expand_prompt_templates {
+            options["expandPromptTemplates"] = serde_json::json!(expand);
+        }
+        call_result_to_io(self.call_wire(
+            "sendUserMessage",
+            Some(serde_json::json!({
+                "content": content,
+                "options": options,
+            })),
+        )?)
+    }
+
+    /// Return the resolved session scope in selection order.
+    pub fn scoped_models(&self) -> io::Result<Vec<serde_json::Value>> {
+        let result = self
+            .call_wire("getScopedModels", None)
+            .and_then(call_result_value)?;
+        serde_json::from_value(result)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    /// Append a custom persistent entry to the session. `Value::Null` leaves the entry without a
+    /// `data` member, as Pi's `appendEntry(customType)` does; [`Context::append_entry_opt`] writes
+    /// an explicit null.
+    pub fn append_entry(&self, custom_type: &str, data: serde_json::Value) -> io::Result<()> {
+        self.append_entry_opt(custom_type, if data.is_null() { None } else { Some(data) })
+    }
+
+    /// Append a custom persistent entry whose `data` member is left out (`None`, Pi's
+    /// `appendEntry(customType)`), written as null (`Some(Value::Null)`, Pi's
+    /// `appendEntry(customType, null)`) or a value.
+    pub fn append_entry_opt(
+        &self,
+        custom_type: &str,
+        data: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "customType".into(),
+            serde_json::Value::String(custom_type.to_string()),
+        );
+        if let Some(data) = data {
+            args.insert("data".into(), data);
+        }
+        call_result_to_io(self.call_wire("appendEntry", Some(serde_json::Value::Object(args)))?)
+    }
+
+    // ─── Editor access ───────────────────────────────────────────────────
+
+    /// Get the current editor text without replacing lone UTF-16 units. A host failure is an error, never empty text.
+    pub fn get_editor_text(&self) -> io::Result<crate::JsString> {
+        #[derive(serde::Deserialize)]
+        struct Text {
+            text: crate::JsString,
+        }
+        let reply = self.call_wire_typed::<serde_json::Value, Text>("ui.getEditorText", None)?;
+        if let Some(err) = reply.error {
+            return Err(io::Error::other(host_error_message(err)));
+        }
+        reply
+            .result
+            .map(|text| text.text)
+            .ok_or_else(|| invalid_reply("ui.getEditorText", "text"))
+    }
+
+    /// Set the editor input text, preserving JavaScript UTF-16 units.
+    pub fn set_editor_text(&self, text: impl Into<crate::JsString>) {
+        self.editor_text_call("ui.setEditorText", text.into());
+    }
+
+    /// Paste text into the editor at cursor position.
+    pub fn paste_to_editor(&self, text: impl Into<crate::JsString>) {
+        self.editor_text_call("ui.pasteToEditor", text.into());
+    }
+
+    fn editor_text_call(&self, method: &str, text: crate::JsString) {
+        #[derive(serde::Serialize)]
+        struct Text {
+            text: crate::JsString,
+        }
+        let _: io::Result<crate::protocol::CallResultMsg> =
+            self.call_wire_typed(method, Some(Text { text }));
+    }
+
+    // ─── Session state ───────────────────────────────────────────────────
+
+    /// Get the session name. Pi's `getSessionName` is `string | undefined`: `None` means the session has no name. The state snapshots replicate it, so the read
+    /// costs no host call once one arrived; a replacement context asks the host.
+    pub fn get_session_name(&self) -> io::Result<Option<String>> {
+        if let Some(name) = self.replicated_session(|identity| &identity.session_name)? {
+            return Ok(Some(name).filter(|name| !name.is_empty()));
+        }
+        self.optional_string_field("getSessionName", "name")
+    }
+
+    /// Set the session name.
+    pub fn set_session_name(&self, name: &str) -> io::Result<()> {
+        call_result_to_io(
+            self.call_wire("setSessionName", Some(serde_json::json!({"name": name})))?,
+        )
+    }
+
+    /// Sets or clears an entry label. The label is written as given: an empty one clears the label
+    /// and its entry holds `"label":""`, as Pi's `setLabel(entryId, "")` writes it. The host's
+    /// failure is returned, as upstream's setLabel throws when the session cannot record the label.
+    pub fn set_label(&self, entry_id: &str, label: &str) -> io::Result<()> {
+        self.set_label_opt(entry_id, Some(serde_json::Value::String(label.to_string())))
+    }
+
+    /// Sets or clears an entry label in every form Pi's `setLabel(entryId, label?)` takes: `None`
+    /// is the call without a label, whose entry has no `label` member; `Some(Value::Null)` is a
+    /// null label, written as null; a string is written as given. All but a string that is not
+    /// empty clear the label.
+    pub fn set_label_opt(
+        &self,
+        entry_id: &str,
+        label: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "entryId".into(),
+            serde_json::Value::String(entry_id.to_string()),
+        );
+        if let Some(label) = label {
+            args.insert("label".into(), label);
+        }
+        call_result_to_io(self.call_wire("setLabel", Some(serde_json::Value::Object(args)))?)
+    }
+
+    /// Return the host flag value or its first registered default; false and empty strings remain values. `None` is Pi's undefined; a host failure is an error, not the default.
+    pub fn get_flag(&self, name: &str) -> io::Result<Option<serde_json::Value>> {
+        let value =
+            self.reply_field("getFlag", Some(serde_json::json!({"name": name})), "value")?;
+        Ok(value
+            .or_else(|| self.flag_defaults.get(name).cloned())
+            .or_else(|| self.conn.late_declarations.flag_default(name)))
+    }
+
+    /// Get the current thinking level.
+    pub fn get_thinking_level(&self) -> io::Result<String> {
+        self.required_field("getThinkingLevel", None, "level")
+    }
+
+    /// Set the thinking level ("off", "brief", "verbose").
+    pub fn set_thinking_level(&self, level: &str) {
+        let _ = self.call_wire(
+            "setThinkingLevel",
+            Some(serde_json::json!({"level": level})),
+        );
+    }
+
+    /// Pi's `pi.setModel(model)`: make `model`, a Pi model object, the Session's model. Returns (switched, error_message).
+    ///
+    /// `switched` is false, and nothing changes, when the model's provider has no configured auth. The Session uses the object as given, with
+    /// the members the caller left on it (its context window, limits, base URL, compat): a model taken from the model registry and edited, or
+    /// one built by hand for a provider the host knows. The `model_select` handlers have run when it returns.
+    ///
+    /// A `provider/id` string stands for the registry's model of that name. An id no catalog lists names no model: the error is
+    /// `Model not found: provider/id`, as for Pi's RPC set_model, and nothing is set; a name with no slash is an openai model. The string form asks the host for the model object and then sets it, two
+    /// calls: the object the first call returned is the one set, whatever the registry became in between, and an error of the first call is
+    /// returned without setting.
+    pub fn set_model(&self, model: impl Into<SetModelArg>) -> (bool, String) {
+        let model = match model.into() {
+            SetModelArg::Object(object) => object,
+            SetModelArg::Named(spec) => {
+                match self.call_wire("resolveModel", Some(serde_json::json!({"spec": spec}))) {
+                    Ok(result) => {
+                        if let Some(error) = result.error {
+                            return (false, error.message);
+                        }
+                        let mut v = result.result.unwrap_or_default();
+                        let err = v.get("error").and_then(|s| s.as_str()).unwrap_or("");
+                        if !err.is_empty() {
+                            return (false, err.to_string());
+                        }
+                        v.get_mut("model")
+                            .map(serde_json::Value::take)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    Err(e) => return (false, e.to_string()),
+                }
+            }
+        };
+        match self.call_wire("setModel", Some(serde_json::json!({"model": model}))) {
+            Ok(result) => {
+                // The host rejects a value that is not a chat model object; Pi's Promise rejects.
+                if let Some(error) = result.error {
+                    return (false, error.message);
+                }
+                let v = result.result.unwrap_or_default();
+                let ok = v
+                    .get("success")
+                    .or_else(|| v.get("ok"))
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                let err = v
+                    .get("error")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (ok, err)
+            }
+            Err(e) => (false, e.to_string()),
+        }
+    }
+
+    // ─── Tool state ─────────────────────────────────────────────────────
+
+    /// Get the list of active (enabled) tools.
+    pub fn get_active_tools(&self) -> io::Result<Vec<String>> {
+        self.required_field("getActiveTools", None, "tools")
+    }
+
+    /// Set the list of active (enabled) tools.
+    pub fn set_active_tools(&self, tools: &[&str]) {
+        let _ = self.call_wire("setActiveTools", Some(serde_json::json!({"tools": tools})));
+    }
+
+    /// Refresh tool definitions from the host.
+    pub fn refresh_tools(&self) {
+        let _ = self.call_wire("refreshTools", None);
+    }
+
+    /// Get whether tool outputs are expanded.
+    pub fn get_tools_expanded(&self) -> io::Result<bool> {
+        self.required_field("ui.getToolsExpanded", None, "expanded")
+    }
+
+    /// Set whether tool outputs are expanded.
+    pub fn set_tools_expanded(&self, expanded: bool) {
+        let _ = self.call_wire(
+            "ui.setToolsExpanded",
+            Some(serde_json::json!({"expanded": expanded})),
+        );
+    }
+
+    // ─── Theme ───────────────────────────────────────────────────────────
+
+    /// Get all available themes.
+    pub fn get_all_themes(&self) -> io::Result<Vec<serde_json::Value>> {
+        self.required_field("ui.getAllThemes", None, "themes")
+    }
+
+    /// Load a theme by name without switching to it.
+    pub fn get_theme(&self, name: &str) -> io::Result<Option<serde_json::Value>> {
+        self.call_host("ui.getTheme", Some(serde_json::json!({"name": name})))
+            .map(|v| v.and_then(|raw| raw.get("theme").filter(|theme| !theme.is_null()).cloned()))
+    }
+
+    /// Set the theme. Returns (success, error_message).
+    pub fn set_theme(&self, name: &str) -> (bool, String) {
+        match self.call_wire("ui.setTheme", Some(serde_json::json!({"theme": name}))) {
+            Ok(result) => {
+                let v = result.result.unwrap_or_default();
+                let ok = v
+                    .get("success")
+                    .or_else(|| v.get("ok"))
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                let err = v
+                    .get("error")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (ok, err)
+            }
+            Err(e) => (false, e.to_string()),
+        }
+    }
+
+    // ─── Widget ──────────────────────────────────────────────────────────
+
+    /// Sets a widget from a list of strings, as Pi's `ctx.ui.setWidget(key,
+    /// string[])`. The host lays the list out at its own width: each entry
+    /// becomes `Text(line, 1, 0)`, the first ten entries are shown, and a muted
+    /// "... (widget truncated)" row follows a longer list
+    /// (interactive-mode.ts:2321-2336). A row wider than the pane wraps.
+    ///
+    /// The list goes out as a `widget_push` frame without a width, which the
+    /// host applies in arrival order and never answers: Pi's `setWidget`
+    /// returns nothing, so it may be called from an
+    /// [`Self::on_width_change`] handler, and the error reports only a failure
+    /// to send. In RPC mode, where the width never changes and Pi writes one
+    /// request per call, in call order and before the handler's response, the
+    /// list waits for the host like [`Self::set_widget_value`]: an unanswered
+    /// frame has no place in that order.
+    pub fn set_widget(&self, key: &str, lines: Vec<String>) -> io::Result<()> {
+        self.stale_error()?;
+        if self.mode == "rpc" {
+            return self.set_widget_value(key, serde_json::json!(lines), None);
+        }
+        self.conn.views.widgets.lock().unwrap().remove(key);
+        self.replace_surface_id(widget_renderer_id(key), None);
+        self.conn.push_widget(key, lines)
+    }
+
+    /// Sets a widget to a kit view (D107), which the host renders at the
+    /// widget's width; the subprocess form of Pi's `setWidget(key, factory)`
+    /// for a tree of Pi's components. With no options it goes out as a
+    /// `widget_push` frame, which the host never answers, as
+    /// [`Self::set_widget`] does; with options (upstream
+    /// `ExtensionWidgetOptions`) it waits for the host.
+    pub fn set_widget_view(
+        &self,
+        key: &str,
+        view: crate::kit::View,
+        options: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        self.stale_error()?;
+        let encoded = self.conn.views.encode(&view).map_err(io::Error::other)?;
+        self.replace_surface_id(widget_renderer_id(key), None);
+        // Held across the send, so an eviction's resend and this frame keep their order.
+        let mut widgets = self.conn.views.widgets.lock().unwrap();
+        let wire = self.conn.views.wire(&encoded);
+        widgets.insert(key.to_string(), (encoded, options.clone()));
+        self.send_widget_view(key, wire, options)
+    }
+
+    fn send_widget_view(
+        &self,
+        key: &str,
+        view: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        match options {
+            None => self.conn.push_widget_view(key, view),
+            Some(options) => call_result_to_io(self.call_wire(
+                "ui.setWidget",
+                Some(serde_json::json!({"key": key, "view": view, "options": options})),
+            )?),
+        }
+    }
+
+    /// Set or clear a widget using the full host-call shape.
+    pub fn set_widget_value(
+        &self,
+        key: &str,
+        content: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        self.conn.views.widgets.lock().unwrap().remove(key);
+        self.replace_surface_id(widget_renderer_id(key), None);
+        call_result_to_io(self.call_wire("ui.setWidget", Some(serde_json::json!({"key": key, "content": content, "options": options.unwrap_or_default()})))?)
+    }
+
+    /// Installs the widget `key` with a renderer that lays its rows out at the host's terminal width, the subprocess form of the component factory Pi's `ctx.ui.setWidget(key, factory, options)` takes.
+    ///
+    /// It follows the contract of [`Self::set_footer_renderer`]: the SDK renders at the width the host reports and again after every width change, sends each set of rows with the width it was rendered for, and the host paints them only at that width, so a widget never shows rows laid out for the old width. `options` is the placement (`{"placement": "aboveEditor" | "belowEditor"}`). `None` clears the widget. A panic in `render` is reported as "widget render failed: ..." and leaves the previous rows. [`Self::set_widget`] with the same key replaces the renderer.
+    pub fn set_widget_renderer<F>(
+        &self,
+        key: &str,
+        render: Option<F>,
+        options: Option<serde_json::Value>,
+    ) -> io::Result<()>
+    where
+        F: Fn(u32) -> Vec<String> + Send + Sync + 'static,
+    {
+        self.stale_error()?;
+        let Some(render) = render else {
+            return self.set_widget_value(key, serde_json::Value::Null, options);
+        };
+        let renderer = Arc::new(SurfaceRenderer {
+            method: "ui.setWidget",
+            widget: Some((key.to_string(), options)),
+            render: Box::new(render),
+            stopped: Mutex::new(false),
+            refresh: Mutex::new((false, false)),
+        });
+        self.conn.views.widgets.lock().unwrap().remove(key);
+        self.replace_surface_id(widget_renderer_id(key), Some(renderer.clone()));
+        renderer.push(self)
+    }
+
+    /// Clear a custom footer. Passing live component factories is intentionally unsupported by the subprocess bridge.
+    pub fn clear_footer(&self) -> io::Result<()> {
+        self.set_surface("ui.setFooter", None)
+    }
+
+    /// Set the semantic login rendered by Pig's fixed native template.
+    /// Validation is performed by the host.
+    pub fn set_login(&self, definition: &LoginDefinition) -> io::Result<()> {
+        let args = serde_json::to_value(definition)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        self.yield_batch_turn();
+        call_result_to_io(self.conn.call("ui.setLogin", Some(args))?)
+    }
+
+    /// Add a sprite to /sprite, where the user can choose and save it. Validation is performed
+    /// by the host; registering the same ID again replaces this extension's sprite, and the
+    /// sprite leaves /sprite when the extension unloads.
+    pub fn register_sprite(&self, definition: &SpriteDefinition) -> io::Result<()> {
+        let args = serde_json::to_value(definition)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        self.yield_batch_turn();
+        call_result_to_io(self.conn.call("ui.registerSprite", Some(args))?)
+    }
+
+    /// Clear a custom header. Passing live component factories is intentionally unsupported by the subprocess bridge.
+    pub fn clear_header(&self) -> io::Result<()> {
+        self.set_surface("ui.setHeader", None)
+    }
+
+    /// Install an editor in place of the host's, as Pi's `ctx.ui.setEditorComponent` does. The factory receives
+    /// the host's default editor, the component's `super`; see [`crate::EditorComponent`]. It is re-callable, as Pi's is,
+    /// and [`Context::get_editor_component`] returns it. With no UI, or in RPC mode, it is ignored, as in Pi.
+    pub fn set_editor_component(
+        &self,
+        factory: impl Fn(crate::EditorBase) -> Box<dyn crate::EditorComponent> + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        // upstream: modes/rpc/rpc-mode.ts setEditorComponent is a no-op, so the factory never runs there.
+        if !self.has_ui() || self.mode() == "rpc" {
+            return Ok(());
+        }
+        let seq = self.overlay_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::editor_component::install_editor(
+            &self.conn,
+            &self.editor_slot,
+            &self.shared_width,
+            seq,
+            std::sync::Arc::new(factory),
+        )
+    }
+
+    /// The factory this extension installed with [`Context::set_editor_component`] while that editor is the host's, as
+    /// Pi's `ctx.ui.getEditorComponent` returns the configured factory (interactive-mode.ts:2664). `None` before an
+    /// install, once this or another extension restored the host's editor, and with no UI or in RPC mode, where
+    /// installing does nothing (rpc-mode.ts:281). Another extension's factory lives in that extension's process, so
+    /// after another extension installs its editor the result is `None` where Pi returns that factory.
+    pub fn get_editor_component(&self) -> Option<crate::EditorFactory> {
+        self.editor_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|session| session.factory.clone())
+    }
+
+    /// Restore the host's editor.
+    pub fn clear_editor_component(&self) -> io::Result<()> {
+        if let Some(previous) = self.editor_slot.lock().unwrap().take() {
+            previous.close();
+        }
+        call_result_to_io(self.call_wire(
+            "ui.setEditorComponent",
+            Some(serde_json::json!({"clear": true})),
+        )?)
+    }
+
+    /// Invoke the host custom UI bridge with raw options, or return None when no UI is bound.
+    pub fn custom(&self, options: serde_json::Value) -> io::Result<Option<serde_json::Value>> {
+        if !self.has_ui() {
+            return Ok(None);
+        }
+        if self.mode() == "rpc" {
+            return self.custom_ignored_in_rpc();
+        }
+        self.block_for_user();
+        self.call_host("ui.custom", Some(options))
+    }
+
+    /// rpc-mode.ts custom() resolves undefined and never runs the component. The host call keeps the dialog scope, as the Node runtime's does.
+    fn custom_ignored_in_rpc(&self) -> io::Result<Option<serde_json::Value>> {
+        let key = format!(
+            "custom-{}",
+            self.overlay_seq.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        self.call_host("ui.custom", Some(serde_json::json!({ "key": key })))?;
+        Ok(None)
+    }
+
+    /// Open a focused subprocess component. Input reaches the component only
+    /// while the host overlay owns focus. Render requests are coalesced on one
+    /// component worker, and cleanup detaches invalidation before disposal. With no UI, returns None without invoking component callbacks.
+    pub fn custom_component(
+        &self,
+        component: impl RemoteComponent + 'static,
+        options: serde_json::Value,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.open_overlay(OverlayComponent::Lines(Box::new(component)), options)
+    }
+
+    /// Open a focused component whose frames are kit views (D107), which the
+    /// host renders: [`Self::custom_component`] for a [`ViewComponent`]. The
+    /// host owns the state of the view's lists; their callbacks reach
+    /// [`ViewComponent::handle_view_event`] in order with the input. With no
+    /// UI, returns None without invoking component callbacks.
+    pub fn custom_view(
+        &self,
+        component: impl ViewComponent + 'static,
+        options: serde_json::Value,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.open_overlay(OverlayComponent::View(Box::new(component)), options)
+    }
+
+    /// [`Self::custom_component`] with Pi's `onHandle`: `on_handle` receives the mounted overlay's [`OverlayHandle`] (the options must set
+    /// `"overlay": true`).
+    pub fn custom_component_with_handle(
+        &self,
+        component: impl RemoteComponent + 'static,
+        options: serde_json::Value,
+        on_handle: impl Fn(OverlayHandle) + Send + Sync + 'static,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.open_overlay_with_handle(
+            OverlayComponent::Lines(Box::new(component)),
+            options,
+            Some(Arc::new(on_handle)),
+        )
+    }
+
+    fn open_overlay(
+        &self,
+        component: OverlayComponent,
+        options: serde_json::Value,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.open_overlay_with_handle(component, options, None)
+    }
+
+    fn open_overlay_with_handle(
+        &self,
+        component: OverlayComponent,
+        options: serde_json::Value,
+        on_handle: Option<OnHandleFn>,
+    ) -> io::Result<Option<serde_json::Value>> {
+        if !self.has_ui() {
+            return Ok(None);
+        }
+        if self.mode() == "rpc" {
+            return self.custom_ignored_in_rpc();
+        }
+        self.block_for_user();
+        let mut args = options.as_object().cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "custom overlay options must be an object",
+            )
+        })?;
+        let key = format!(
+            "custom-{}",
+            self.overlay_seq.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        args.insert("key".to_string(), serde_json::Value::String(key.clone()));
+
+        let (events_tx, events_rx) = sync_channel(64);
+        let overlay: RemoteComponentRef = Arc::new(RemoteOverlay {
+            state: Mutex::new(RemoteComponentState {
+                component,
+                last_lines: Vec::new(),
+                last_captures: false,
+                last_view: None,
+                seq: 0,
+                last_render: None,
+                layout: overlay_render_layout(&args),
+            }),
+            events: events_tx,
+            active: AtomicBool::new(true),
+            render_pending: AtomicBool::new(false),
+            view_refs: Mutex::new(Vec::new()),
+            force_view: AtomicBool::new(false),
+            on_handle: Mutex::new(
+                on_handle.filter(|_| args.get("overlay") == Some(&serde_json::Value::Bool(true))),
+            ),
+            handle_state: Mutex::new(OverlayState::default()),
+        });
+        if overlay.on_handle.lock().unwrap().is_some() {
+            args.insert("hasHandle".to_string(), serde_json::Value::Bool(true));
+        }
+        let weak_overlay = Arc::downgrade(&overlay);
+        let attach_result = crate::diagnostic::recover(|| {
+            overlay
+                .state
+                .lock()
+                .unwrap()
+                .component
+                .set_invalidate(Some(Arc::new(move || {
+                    if let Some(overlay) = weak_overlay.upgrade() {
+                        overlay.request_render();
+                    }
+                })));
+        });
+        if attach_result.is_err() {
+            overlay.active.store(false, Ordering::Release);
+            dispose_remote_component(&overlay);
+            return Err(io::Error::other("attach focused invalidation panicked"));
+        }
+        self.overlays
+            .lock()
+            .unwrap()
+            .insert(key.clone(), overlay.clone());
+
+        let pending = match self.conn.begin_call_with_scope(
+            self.request_parent.as_deref(),
+            Some(&self.request_id),
+            "ui.custom",
+            Some(serde_json::Value::Object(args)),
+        ) {
+            Ok(pending) => pending,
+            Err(err) => {
+                self.overlays.lock().unwrap().remove(&key);
+                overlay.stop();
+                dispose_remote_component(&overlay);
+                return Err(err);
+            }
+        };
+
+        let (worker_done_tx, worker_done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let conn = self.conn.clone();
+            let worker_key = key.clone();
+            let worker_overlay = overlay.clone();
+            let width = self.shared_width.clone();
+            let worker_request_parent = self.request_parent.clone();
+            let worker_request_id = self.request_id.clone();
+            thread::Builder::new()
+                .name(format!("pig-overlay-{key}"))
+                .spawn(move || {
+                    run_remote_component_worker(RemoteComponentWorker {
+                        conn,
+                        key: worker_key,
+                        overlay: worker_overlay,
+                        width,
+                        events: events_rx,
+                        done: worker_done_tx,
+                        request_parent: worker_request_parent,
+                        request_id: worker_request_id,
+                    })
+                })
+        };
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(err) => {
+                let message = format!("start focused component worker: {err}");
+                let _ = self.conn.notify(
+                    "ui.custom.close",
+                    Some(serde_json::json!({"key": key, "error": &message})),
+                );
+                let _ = self.conn.wait_call(pending);
+                self.overlays.lock().unwrap().remove(&key);
+                overlay.stop();
+                dispose_remote_component(&overlay);
+                return Err(io::Error::other(message));
+            }
+        };
+        overlay.request_render();
+
+        let call_result = self.conn.wait_call(pending);
+        let _ = self.conn.request_state_for(
+            self.request_parent.as_deref(),
+            &self.request_id,
+            "progress",
+            None,
+        );
+        self.overlays.lock().unwrap().remove(&key);
+        overlay.stop();
+        if worker_done_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "focused component did not stop before the cleanup deadline",
+            ));
+        }
+        let _ = worker.join();
+        dispose_remote_component(&overlay);
+
+        let result = call_result?;
+        let value = call_result_value(result)?;
+        if !value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false) {
+            return Ok(None);
+        }
+        Ok(value.get("result").cloned())
+    }
+
+    /// Subscribes to raw terminal input, receiving every chunk before the
+    /// editor does.
+    ///
+    /// The host is told to start forwarding only on the first subscription and
+    /// to stop on the last, so an extension that never subscribes costs the
+    /// input loop nothing. With no UI, no subscription is retained. The returned guard unsubscribes when dropped.
+    pub fn on_terminal_input<F>(&self, handler: F) -> io::Result<TerminalInputSubscription>
+    where
+        F: Fn(&crate::JsString) -> TerminalInputResult + Send + Sync + 'static,
+    {
+        if !self.has_ui() {
+            return Ok(TerminalInputSubscription {
+                id: 0,
+                subs: self.terminal_input.clone(),
+                conn: self.conn.clone(),
+                released: true,
+            });
+        }
+        let id = self.terminal_input_seq.fetch_add(1, Ordering::SeqCst);
+        let boxed: TerminalInputHandler = Box::new(handler);
+        let first = {
+            let mut subs = self.terminal_input.lock().unwrap();
+            subs.push((id, Arc::new(boxed)));
+            subs.len() == 1
+        };
+
+        let subscription = TerminalInputSubscription {
+            id,
+            subs: self.terminal_input.clone(),
+            conn: self.conn.clone(),
+            released: false,
+        };
+
+        if !first {
+            return Ok(subscription);
+        }
+        match call_result_to_io(self.call_wire("ui.onTerminalInput", Some(serde_json::json!({})))?)
+        {
+            Ok(()) => Ok(subscription),
+            Err(err) => Err(err),
+        }
+    }
+
+    // ─── Context & Model Info ────────────────────────────────────────────
+
+    /// Get every tool in the session's registry, active or not: built-in
+    /// tools, then extension tools. Mirrors upstream `pi.getAllTools()`.
+    pub fn get_all_tools(&self) -> io::Result<Vec<ToolInfo>> {
+        let listed: Vec<serde_json::Value> = self.required_field("getAllTools", None, "tools")?;
+        listed
+            .into_iter()
+            .map(|entry| {
+                // A function cannot cross the wire: the host marks a tool whose definition has reachesTools (agent-session.ts:1507).
+                let reaches = entry.get("reachesTools") == Some(&serde_json::Value::Bool(true));
+                let mut info: ToolInfo = serde_json::from_value(entry).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("host reply to getAllTools field \"tools\": {error}"),
+                    )
+                })?;
+                if reaches {
+                    info.reaches_tools = Some(ToolInfoReachesTools::through_host(
+                        self.clone(),
+                        info.name.clone(),
+                    ));
+                }
+                Ok(info)
+            })
+            .collect()
+    }
+
+    /// Upstream `pi.getSettings()` (`types.ts:1711`): a copy of the effective settings, global and project settings merged with overrides. Answered from the state the host replicates, as upstream's call is synchronous.
+    ///
+    /// Fails until the host has sent settings, as upstream's getter throws before the runtime is bound (`loader.ts:157-177`).
+    pub fn get_settings(&self) -> io::Result<serde_json::Value> {
+        self.stale_error()?;
+        self.conn
+            .api_state
+            .lock()
+            .unwrap()
+            .settings
+            .clone()
+            .ok_or_else(|| io::Error::other("the host sent no settings"))
+    }
+
+    /// Upstream `pi.getMcpServers()` (`types.ts:1839`): every MCP server registered by extensions, in registration order, from the replicated state.
+    pub fn get_mcp_servers(&self) -> Vec<crate::RegisteredMcpServer> {
+        self.conn.api_state.lock().unwrap().mcp_servers.clone()
+    }
+
+    /// Upstream `pi.registerMcpServer(name, config)` after load (`types.ts:1833`). The server connects right away. Registering a name again replaces this extension's earlier registration.
+    ///
+    /// Fails, as upstream throws, for an invalid config and for a name another extension registered; the error carries the host's message. The registration is not saved; register again on every load. During load, use [`crate::Extension::register_mcp_server`].
+    pub fn register_mcp_server(&self, name: &str, config: serde_json::Value) -> io::Result<()> {
+        let servers = self.mcp_servers_call(
+            "registerMcpServer",
+            serde_json::json!({"name": name, "config": config}),
+        )?;
+        self.conn.api_state.lock().unwrap().mcp_servers = servers;
+        Ok(())
+    }
+
+    /// Upstream `pi.registerToolRenderer(resolver)` after load: the resolver runs after the extension's earlier
+    /// resolvers, and the host asks the extension's resolvers again for every tool. During load, use
+    /// [`crate::Extension::tool_renderer`].
+    pub fn register_tool_renderer(
+        &self,
+        resolver: impl Fn(
+            &str,
+            &dyn Fn() -> Option<crate::ToolRendererSet>,
+        ) -> Option<crate::ToolRendererSet>
+        + Send
+        + Sync
+        + 'static,
+    ) -> io::Result<()> {
+        self.stale_error()?;
+        let late = &self.conn.late_tool_renderers;
+        let mut resolvers = late.resolvers.lock().unwrap();
+        resolvers.push(Arc::new(resolver));
+        let count = late.loaded.load(std::sync::atomic::Ordering::SeqCst) + resolvers.len();
+        // The count reaches the host in registration order.
+        self.conn.notify(
+            "tool_renderers",
+            Some(serde_json::json!({ "count": count })),
+        )
+    }
+
+    /// Upstream `pi.unregisterMcpServer(name)` (`types.ts:1836`): removes an MCP server this extension registered and closes its connection.
+    pub fn unregister_mcp_server(&self, name: &str) -> io::Result<()> {
+        let servers =
+            self.mcp_servers_call("unregisterMcpServer", serde_json::json!({"name": name}))?;
+        self.conn.api_state.lock().unwrap().mcp_servers = servers;
+        Ok(())
+    }
+
+    /// The reply of an MCP registration call: every registered server after it.
+    fn mcp_servers_call(
+        &self,
+        method: &str,
+        args: serde_json::Value,
+    ) -> io::Result<Vec<crate::RegisteredMcpServer>> {
+        let reply = self.host_reply(method, Some(args))?;
+        serde_json::from_value::<crate::extension_api::McpServersResult>(reply)
+            .map(|result| result.servers)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("host reply to {method}: {error}"),
+                )
+            })
+    }
+
+    /// Upstream `pi.registerVirtualModel(model)` after load (`types.ts:1852`). Registering the same provider and id again replaces the virtual model. During load, use [`crate::Extension::register_virtual_model`].
+    pub fn register_virtual_model(&self, model: crate::VirtualModel) -> io::Result<()> {
+        let declaration = serde_json::to_value(model.declaration()).map_err(io::Error::other)?;
+        install_virtual_model(&self.conn, model, || {
+            self.call_host("registerVirtualModel", Some(declaration))
+                .map(|_| ())
+        })
+    }
+
+    /// Upstream `pi.unregisterVirtualModel(provider, id)` (`types.ts:1855`).
+    pub fn unregister_virtual_model(&self, provider: &str, id: &str) -> io::Result<()> {
+        self.call_host(
+            "unregisterVirtualModel",
+            Some(serde_json::json!({"provider": provider, "id": id})),
+        )?;
+        self.conn
+            .virtual_models
+            .lock()
+            .unwrap()
+            .remove(&(provider.to_string(), id.to_string()));
+        Ok(())
+    }
+
+    /// Upstream `ExtensionToolContext.tools` (`types.ts:385`): the tools [`Context::execute_tool`] can call, as the host lists them when this is called (`runner.ts:958-961`): a read after [`Context::set_active_tools`] in the same handler sees the change.
+    ///
+    /// Fails outside a tool call: upstream defines `tools` only on the context of a tool's `execute` (`runner.ts:952-965`).
+    pub fn tools(&self) -> io::Result<Vec<crate::AgentTool>> {
+        if self.tool_call_id.is_none() || self.request_id.is_empty() {
+            return Err(io::Error::other(
+                "tools is only available while a tool runs",
+            ));
+        }
+        self.required_field("getCallableTools", None, "tools")
+    }
+
+    /// Upstream `ExtensionToolContext.executeTool(name, args, options)` (`types.ts:394`): runs another tool through the same validation, hooks and permission checks as a model-issued call. The call gets the id `<calling id>/<n>` and its events carry `parentToolCallId`.
+    ///
+    /// Tool failures (unknown tools, validation errors, blocked calls, thrown errors) come back as an outcome with `is_error` set, as upstream never rejects for them; an `Err` is a lost connection, a cancelled request or a call made outside a tool. The call is cancelled with `options.signal`, which defaults to this tool call's own cancellation (the host cancels the nested call with the calling request). Partial results reach `options.on_update` in order, before this returns.
+    pub fn execute_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        options: crate::ExecuteToolOptions,
+    ) -> io::Result<crate::AgentToolCallOutcome> {
+        let Some(caller_id) = self
+            .tool_call_id
+            .clone()
+            .filter(|_| !self.request_id.is_empty())
+        else {
+            return Err(io::Error::other(
+                "execute_tool is only available while a tool runs",
+            ));
+        };
+        let execute_id = format!("x{}", self.conn.execute_seq.fetch_add(1, Ordering::Relaxed));
+        // Updates and the outcome are read from one ordered socket; the dispatcher runs the callback off the reader and is joined
+        // after the outcome, so every update precedes the return.
+        // The host sends each update as a request and waits for the answer, so the callback's panic is that answer: upstream's callback throws and the call rejects with the first error once the tool returned (`nested-tool-calls.ts:219-248`).
+        let dispatcher = options.on_update.as_ref().map(|callback| {
+            let (sender, receiver) = std::sync::mpsc::channel::<crate::protocol::ExecuteUpdate>();
+            self.conn
+                .execute_updates
+                .lock()
+                .unwrap()
+                .insert(execute_id.clone(), sender);
+            let callback = callback.clone();
+            std::thread::spawn(move || {
+                for (update, answer) in receiver {
+                    let failure = crate::diagnostic::recover(|| callback(update))
+                        .err()
+                        .map(|payload| panic_message(payload.as_ref()));
+                    let _ = answer.send(failure);
+                }
+            })
+        });
+        let outcome = self.run_execute_tool(
+            &execute_id,
+            crate::extension_api::ExecuteToolArgs {
+                caller_id,
+                name: name.to_string(),
+                args,
+                execute_id: execute_id.clone(),
+                wants_updates: dispatcher.is_some(),
+                own_signal: options.signal.is_some(),
+            },
+            options.signal.as_ref(),
+        );
+        self.conn
+            .execute_updates
+            .lock()
+            .unwrap()
+            .remove(&execute_id);
+        if let Some(dispatcher) = dispatcher {
+            let _ = dispatcher.join();
+        }
+        outcome
+    }
+
+    fn run_execute_tool(
+        &self,
+        execute_id: &str,
+        args: crate::extension_api::ExecuteToolArgs,
+        signal: Option<&crate::provider::ProviderSignal>,
+    ) -> io::Result<crate::AgentToolCallOutcome> {
+        let _ = self.conn.request_state_for(
+            self.request_parent.as_deref(),
+            &self.request_id,
+            "blocked",
+            Some("host_call"),
+        );
+        let pending = self.conn.begin_call_with_scope(
+            self.request_parent.as_deref(),
+            Some(&self.request_id),
+            "executeTool",
+            Some(args),
+        )?;
+        // Subscribed after the call frame is written: the host applies the cancel after it started the call (runner.ts:979).
+        let _cancel = signal.map(|signal| {
+            let conn = self.conn.clone();
+            let execute_id = execute_id.to_string();
+            signal.subscribe(Arc::new(move || {
+                let _ = conn.begin_call_for(
+                    None,
+                    "executeTool.cancel",
+                    Some(serde_json::json!({"executeId": execute_id})),
+                );
+            }))
+        });
+        let reply = self
+            .conn
+            .wait_call_typed::<crate::AgentToolCallOutcome>(pending);
+        let _ = self.conn.request_state_for(
+            self.request_parent.as_deref(),
+            &self.request_id,
+            "progress",
+            None,
+        );
+        let reply = reply?;
+        if let Some(error) = reply.error {
+            return Err(io::Error::other(host_error_message(error)));
+        }
+        reply
+            .result
+            .ok_or_else(|| invalid_reply("executeTool", "result"))
+    }
+
+    /// Get the session's extension commands, prompt templates and skills.
+    /// Mirrors upstream `pi.getCommands()`.
+    pub fn get_commands(&self) -> io::Result<Vec<CommandInfo>> {
+        self.required_field("getCommands", None, "commands")
+    }
+
+    /// Get current context usage (token counts and context window percentage). Pi's `getContextUsage` is `ContextUsage | undefined`: `None` means no usable context window.
+    pub fn get_context_usage(&self) -> io::Result<Option<ContextUsage>> {
+        let Some(v) = self.call_host("getContextUsage", None)? else {
+            return Ok(None);
+        };
+        if v.is_null() {
+            return Ok(None);
+        }
+        let context_window = v
+            .get("contextWindow")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| invalid_reply("getContextUsage", "contextWindow"))?;
+        Ok(Some(ContextUsage {
+            tokens: v
+                .get("tokens")
+                .and_then(serde_json::Value::as_i64)
+                .map(|n| n as i32),
+            context_window: context_window as i32,
+            percent: v.get("percent").and_then(serde_json::Value::as_f64),
+        }))
+    }
+
+    /// Get the current system prompt text. In a `before_agent_start` handler it is Pi's `ctx.getSystemPrompt()` (runner.ts:1426-1450,
+    /// `renderCurrentSystemPrompt`): the prompt the emission's shared options render now, including the edits this handler and the
+    /// handlers before it made through [`crate::BeforeAgentStartEvent`]. Options unchanged since the last read return that prompt;
+    /// others are rendered by the host, and an invalid custom section is an error, as Pi's builder throws.
+    pub fn get_system_prompt(&self) -> io::Result<String> {
+        let Some(state) = &self.system_prompt else {
+            return self.required_field("getSystemPrompt", None, "prompt");
+        };
+        self.assert_active();
+        let (options, key) = {
+            let cell = state.lock();
+            // `rendered.0` is the options' JSON text; `String == Value` would compare it to a JSON string value instead.
+            #[allow(clippy::cmp_owned)]
+            if cell.rendered.0 == cell.options.to_string() {
+                return Ok(cell.rendered.1.clone());
+            }
+            (cell.options.clone(), cell.options.to_string())
+        };
+        let prompt: String = self.required_field(
+            "renderSystemPrompt",
+            Some(serde_json::json!({ "options": options })),
+            "prompt",
+        )?;
+        state.lock().rendered = (key, prompt.clone());
+        Ok(prompt)
+    }
+
+    /// Get the base inputs pi currently uses to build the system prompt
+    /// (customPrompt, selectedTools, hiddenTools, toolSnippets, promptGuidelines,
+    /// appendSystemPrompt, cwd, contextFiles, skills). Reports current
+    /// base inputs only, not per-turn before_agent_start changes. May
+    /// include full context-file contents; treat as sensitive.
+    pub fn get_system_prompt_options(&self) -> io::Result<serde_json::Value> {
+        self.host_reply("getSystemPromptOptions", None)
+    }
+
+    /// Get structured metadata about the active model. Pi's model is `Model | undefined`: `None` means no model is set. The state snapshots replicate the model, so
+    /// the read costs no host call once one arrived and decodes the model per call; a replacement context asks the host.
+    pub fn get_model_info(&self) -> io::Result<Option<ModelInfo>> {
+        if let Some(identity) = self.replica()?
+            && let Some(info) = &identity.model_info
+        {
+            return info
+                .clone()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message));
+        }
+        let Some(v) = self.call_host("getModelInfo", None)? else {
+            return Ok(None);
+        };
+        ModelInfo::from_wire(&v)
+    }
+
+    /// The JSON text of every persisted session entry, an array in log order, exactly as the host sent it. A JavaScript string may hold an unpaired surrogate, which
+    /// `JSON.stringify` writes as an escape; this text keeps it where [`Context::get_entries`] (a `serde_json::Value`, whose strings are UTF-8) reads it as U+FFFD. Pass
+    /// it to [`crate::prepare_branch_entries_json`] or take its messages to [`crate::serialize_conversation_json`].
+    pub fn get_entries_json(&self) -> io::Result<String> {
+        self.session_read_json("getEntries", serde_json::Value::Null)
+    }
+
+    /// The JSON text of the entries from the root to the current leaf, as [`Context::get_entries_json`] gives the whole log.
+    pub fn get_branch_json(&self) -> io::Result<String> {
+        self.session_read_json(
+            "getBranch",
+            serde_json::json!({"fromId": serde_json::Value::Null}),
+        )
+    }
+
+    fn session_read_json(&self, method: &str, args: serde_json::Value) -> io::Result<String> {
+        let reply = self.call_wire_typed::<_, Box<serde_json::value::RawValue>>(
+            "sessionRead",
+            Some(serde_json::json!({"method": method, "args": args})),
+        )?;
+        if let Some(err) = reply.error {
+            return Err(io::Error::other(host_error_message(err)));
+        }
+        Ok(reply
+            .result
+            .map_or_else(|| "null".to_string(), |raw| raw.get().to_string()))
+    }
+
+    /// Get all persisted session entries as shared raw JSON values.
+    pub fn get_entries(&self) -> io::Result<Vec<std::sync::Arc<serde_json::Value>>> {
+        if self.replacement {
+            // The local mirror replicates the Session that requested the replacement.
+            let entries = self.session_manager().get_entries()?;
+            return Ok(entries
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect());
+        }
+        self.ensure_session_log()?;
+        Ok(self.shared_session.lock().unwrap().get_entries())
+    }
+
+    pub(crate) fn read_session_entries(path: &str) -> Vec<serde_json::Value> {
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let Ok(file) = File::open(path) else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else { return Vec::new() };
+            if line.len() > MAX_FRAME_SIZE as usize {
+                return Vec::new();
+            }
+            let Ok(entry) = crate::protocol::value_from_str_lossy(&line) else {
+                return Vec::new();
+            };
+            if entry.get("type").and_then(|value| value.as_str()) != Some("session") {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    /// Enrol this extension in session-log replication on its first read, and
+    /// install the log before returning so readers stay synchronous.
+    ///
+    /// The host withholds the log until asked, because replicating a large
+    /// session into every loaded extension costs each of them the whole log in
+    /// resident memory for data most never inspect.
+    fn ensure_session_log(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let _guard = self.session_sub_lock.lock().unwrap();
+        let subscribed = {
+            let mirror = self.shared_session.lock().unwrap();
+            mirror.subscribed.clone()
+        };
+        if subscribed.load(Ordering::Acquire) {
+            return match &self.shared_session.lock().unwrap().subscribe_error {
+                Some((kind, message)) => Err(io::Error::new(*kind, message.clone())),
+                None => Ok(()),
+            };
+        }
+        // Set before the call: the host starts sending the log as soon as it
+        // registers the subscription, and those pushes must be applied. The
+        // mirror lock is not held across the call, which the reader thread
+        // needs in order to deliver the response.
+        subscribed.store(true, Ordering::Release);
+        let outcome = self.subscribe_session_log();
+        if let Err(error) = &outcome {
+            self.shared_session.lock().unwrap().subscribe_error =
+                Some((error.kind(), error.to_string()));
+        }
+        outcome
+    }
+
+    fn subscribe_session_log(&self) -> io::Result<()> {
+        let mut entries = Self::read_session_entries(&self.get_session_file()?.unwrap_or_default());
+        let mut cursor = entries.len();
+        let mut leaf = String::new();
+        loop {
+            let requested_cursor = cursor;
+            let value = self.watch_session_log(serde_json::json!({"cursor": cursor}))?;
+            let page = value
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let next_cursor = value
+                .get("entryCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(cursor as u64) as usize;
+            if next_cursor.saturating_sub(page.len()) != requested_cursor {
+                entries.clear();
+            }
+            entries.extend(page);
+            cursor = next_cursor;
+            if let Some(next_leaf) = value.get("leafId").and_then(|v| v.as_str()) {
+                leaf = next_leaf.to_string();
+            }
+            if !value
+                .get("hasMore")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        self.shared_session.lock().unwrap().seed(entries, &leaf);
+
+        loop {
+            let value =
+                self.watch_session_log(serde_json::json!({"cursor": cursor, "complete": true}))?;
+            let page = value
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            cursor = value
+                .get("entryCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(cursor as u64) as usize;
+            if let Some(next_leaf) = value.get("leafId").and_then(|v| v.as_str()) {
+                leaf = next_leaf.to_string();
+            }
+            let page_empty = page.is_empty();
+            self.shared_session
+                .lock()
+                .unwrap()
+                .apply_update(&serde_json::json!({
+                    "entriesAppended": page,
+                    "entryCount": cursor,
+                    "leafId": leaf,
+                }));
+            let has_more = value
+                .get("hasMore")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !has_more && page_empty {
+                return Ok(());
+            }
+        }
+    }
+
+    fn watch_session_log(&self, args: serde_json::Value) -> io::Result<serde_json::Value> {
+        self.host_reply("watchSessionLog", Some(args))
+    }
+
+    /// Get model auth metadata from the host. A host failure is an error; `None` is an empty reply.
+    pub fn get_model_auth(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.call_host(
+            "getModelAuth",
+            Some(serde_json::json!({"provider": provider_id, "modelId": model_id})),
+        )
+    }
+
+    /// Perform a one-shot LLM completion through the host.
+    pub fn complete(
+        &self,
+        model: serde_json::Value,
+        request: serde_json::Value,
+        auth: serde_json::Value,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.call_host(
+            "complete",
+            Some(serde_json::json!({"model": model, "request": request, "auth": auth})),
+        )
+    }
+
+    /// Get a shallow vector copy of the current branch. Entry values are shared
+    /// and must be treated as read-only.
+    pub fn get_branch(&self) -> io::Result<Vec<std::sync::Arc<BranchEntry>>> {
+        if self.replacement {
+            let branch = self.session_manager().get_branch(None)?;
+            return Ok(branch
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+                .map(std::sync::Arc::new)
+                .collect());
+        }
+        self.ensure_session_log()?;
+        Ok(self.shared_session.lock().unwrap().get_branch_entries())
+    }
+
+    // ─── Session identity ────────────────────────────────────────────────
+
+    /// The current session's id, including for in-memory sessions. The state snapshots replicate it, so the read costs no host call once one arrived; a replacement
+    /// context asks the host.
+    pub fn get_session_id(&self) -> io::Result<String> {
+        if let Some(id) = self.replicated_session_id()? {
+            return Ok(id);
+        }
+        self.required_field("getSessionID", None, "sessionId")
+    }
+
+    /// The replicated session id, or `None` when the host must answer: a replacement context (this process replicates only the requesting Session) or before the
+    /// first snapshot carried the session.
+    pub(crate) fn replicated_session_id(&self) -> io::Result<Option<String>> {
+        self.replicated_session(|identity| identity.session_id.as_deref().unwrap_or_default())
+    }
+
+    /// One member of the replicated session object (`""` for none), or `None` when the host must answer, as for [`Context::replicated_session_id`].
+    pub(crate) fn replicated_session(
+        &self,
+        member: impl FnOnce(&SessionIdentity) -> &str,
+    ) -> io::Result<Option<String>> {
+        Ok(self
+            .replica()?
+            .filter(|identity| identity.session_id.is_some())
+            .map(|identity| member(&identity).to_string()))
+    }
+
+    /// The replicated state, or `None` for a replacement context. A stale context fails as the host answers every call of a replaced runtime.
+    fn replica(&self) -> io::Result<Option<std::sync::MutexGuard<'_, SessionIdentity>>> {
+        if self.replacement {
+            return Ok(None);
+        }
+        // Copy the message out so the guard is not held while the error is built.
+        let message = self.conn.stale_message.lock().unwrap().clone();
+        if let Some(message) = message {
+            return Err(io::Error::other(message));
+        }
+        Ok(Some(self.shared_identity.lock().unwrap()))
+    }
+
+    /// The current session file path. Pi's `getSessionFile` is `string | undefined`: `None` means an in-memory session. Replicated like [`Context::get_session_name`].
+    pub fn get_session_file(&self) -> io::Result<Option<String>> {
+        if let Some(file) = self.replicated_session(|identity| &identity.session_file)? {
+            return Ok(Some(file).filter(|file| !file.is_empty()));
+        }
+        self.optional_string_field("getSessionFile", "sessionFile")
+    }
+
+    /// The current leaf entry id. Pi's `getLeafId` is `string | null`: `None` means an empty session.
+    pub fn get_leaf_id(&self) -> io::Result<Option<String>> {
+        self.optional_string_field("getLeafID", "leafId")
+    }
+
+    // ─── Shell ───────────────────────────────────────────────────────────
+
+    /// Run a command through the host's executor.
+    ///
+    /// Returns `Err` when the host reports a failure, so a caller sees the
+    /// reason rather than an exit code of zero it never produced.
+    pub fn exec(&self, command: &str, args: &[&str]) -> Result<ExecResult, String> {
+        self.exec_call(serde_json::json!({ "command": command, "args": args }))
+    }
+
+    /// Run a command through the host's executor with upstream `ExecOptions`
+    /// (timeout in milliseconds, working directory, signal). Errors as [`Self::exec`].
+    ///
+    /// When `options.signal` is cancelled the host terminates the command, as Pi does: the command alone receives SIGTERM (the
+    /// process is killed on Windows), no descendant is signalled, and the call returns the output written so far with `killed`
+    /// set and `exit_code` 143 (128 + SIGTERM), which is what a command that a signal ended reports. A signal that is cancelled before the call
+    /// starts the command and ends it at once. SIGKILL follows the SIGTERM five seconds later if the command has not exited, for a
+    /// timeout and a `max_buffer` overflow too. Without a signal the command ends when the calling request is cancelled; a signal replaces that
+    /// cancellation, so cancelling the request then leaves the command running and the call waits for its result.
+    pub fn exec_with_options(
+        &self,
+        command: &str,
+        args: &[&str],
+        options: &ExecOptions,
+    ) -> Result<ExecResult, String> {
+        let mut opts = serde_json::Map::new();
+        if let Some(timeout) = options.timeout {
+            opts.insert("timeout".into(), serde_json::Value::from(timeout));
+        }
+        if let Some(cwd) = options.cwd.as_deref() {
+            opts.insert("cwd".into(), serde_json::Value::String(cwd.to_string()));
+        }
+        if let Some(max_buffer) = options.max_buffer {
+            if !max_buffer.is_finite() {
+                return Err(
+                    "maxBuffer must be an integer between 0 and the runtime string limit"
+                        .to_string(),
+                );
+            }
+            opts.insert("maxBuffer".into(), serde_json::Value::from(max_buffer));
+        }
+        let mut call = serde_json::json!({ "command": command, "args": args, "options": opts });
+        let Some(signal) = options.signal.as_ref() else {
+            return self.exec_call(call);
+        };
+        let exec_id = format!(
+            "exec-{}",
+            self.conn.execute_seq.fetch_add(1, Ordering::Relaxed)
+        );
+        call["execId"] = serde_json::Value::String(exec_id.clone());
+        call["ownSignal"] = serde_json::Value::Bool(true);
+        let reports = !self.request_id.is_empty();
+        if reports {
+            let _ = self.conn.request_state_for(
+                self.request_parent.as_deref(),
+                &self.request_id,
+                "blocked",
+                Some("host_call"),
+            );
+        }
+        // The signal replaces the request's cancellation (core/exec.ts has no other), so the call is not tied to the request.
+        let reply = self
+            .conn
+            .begin_call_for(None, "exec", Some(call))
+            .and_then(|pending| {
+                // Subscribed after the call frame is written: the host applies the cancel after it started the command.
+                let _cancel = signal.subscribe({
+                    let conn = self.conn.clone();
+                    Arc::new(move || {
+                        let _ = conn.begin_call_for(
+                            None,
+                            "exec.cancel",
+                            Some(serde_json::json!({ "execId": exec_id })),
+                        );
+                    })
+                });
+                self.conn.wait_call(pending)
+            });
+        if reports {
+            let _ = self.conn.request_state_for(
+                self.request_parent.as_deref(),
+                &self.request_id,
+                "progress",
+                None,
+            );
+        }
+        Self::exec_result(reply.map_err(|e| e.to_string())?)
+    }
+
+    fn exec_call(&self, args: serde_json::Value) -> Result<ExecResult, String> {
+        let result = self
+            .call_wire("exec", Some(args))
+            .map_err(|e| e.to_string())?;
+        Self::exec_result(result)
+    }
+
+    fn exec_result(result: crate::protocol::CallResultMsg) -> Result<ExecResult, String> {
+        if let Some(error) = result.error {
+            return Err(host_error_message(error));
+        }
+        let value = result.result.unwrap_or(serde_json::Value::Null);
+        Ok(ExecResult {
+            stdout: value
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            stderr: value
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            exit_code: value.get("code").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            killed: value
+                .get("killed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            truncated: value
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        })
+    }
+
+    // ─── Agent/session control ───────────────────────────────────────────
+
+    /// Whether the current project is trusted. Untrusted projects have
+    /// project-scoped settings and hooks disabled. A host failure is an error, not an assumed trust.
+    pub fn is_project_trusted(&self) -> io::Result<bool> {
+        self.required_field("isProjectTrusted", None, "trusted")
+    }
+
+    /// Whether the agent is idle. A host failure is an error, not an assumed idle state. After a
+    /// `send_message` that triggers a turn this stays busy until the sending handler yields: a handler
+    /// that polls `while !is_idle` must wait with `sleep` or `yield_now`, since a raw sleep keeps the
+    /// hold until the handler returns.
+    pub fn is_idle(&self) -> io::Result<bool> {
+        self.required_field("isIdle", None, "idle")
+    }
+
+    pub fn abort(&self) {
+        let _ = self.call_wire("abort", None);
+    }
+
+    /// Whether messages are queued. A host failure is an error.
+    pub fn has_pending_messages(&self) -> io::Result<bool> {
+        self.required_field("hasPendingMessages", None, "pending")
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.call_wire("shutdown", None);
+    }
+
+    pub fn compact(&self, opts: serde_json::Value) {
+        let _ = self.call_wire("compact", Some(opts));
+    }
+
+    pub fn wait_for_idle(&self) -> io::Result<()> {
+        call_result_to_io(self.call_wire("waitForIdle", None)?)
+    }
+
+    /// Pi's first `await`: tells the host this handler has yielded, which ends the busy hold that
+    /// `send_message(.., trigger_turn = Some(true))` put on `is_idle`. A thread cannot express
+    /// `await`, so a handler that waits for the run it started (a poll `while !is_idle: sleep`) must
+    /// call this or `sleep`; a raw `std::thread::sleep` keeps the hold until the handler returns.
+    pub fn yield_now(&self) -> io::Result<()> {
+        call_result_to_io(self.call_wire("yield", Some(serde_json::json!({})))?)
+    }
+
+    /// `yield_now`, then blocks the thread for `duration`. Use it instead of `std::thread::sleep`
+    /// in a poll on `is_idle`. Like Pi's `setTimeout` it does not return early when the request is
+    /// cancelled: check `is_cancelled()` to stop earlier.
+    pub fn sleep(&self, duration: Duration) -> io::Result<()> {
+        self.yield_now()?;
+        thread::sleep(duration);
+        Ok(())
+    }
+
+    pub fn new_session(&self, opts: serde_json::Value) -> io::Result<Option<serde_json::Value>> {
+        self.call_replacement("newSession", opts, None)
+    }
+
+    /// `new_session` with Pi's `withSession` callback, which runs with the replacement Session's context before the
+    /// call returns.
+    pub fn new_session_with(
+        &self,
+        opts: serde_json::Value,
+        with_session: impl FnOnce(&crate::ReplacedSessionContext) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.call_replacement("newSession", opts, Some(Box::new(with_session)))
+    }
+
+    pub fn fork(
+        &self,
+        entry_id: &str,
+        opts: serde_json::Value,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.call_replacement("fork", with_field(opts, "entryId", entry_id), None)
+    }
+
+    /// `fork` with Pi's `withSession` callback, which runs with the replacement Session's context before the call
+    /// returns.
+    pub fn fork_with(
+        &self,
+        entry_id: &str,
+        opts: serde_json::Value,
+        with_session: impl FnOnce(&crate::ReplacedSessionContext) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.call_replacement(
+            "fork",
+            with_field(opts, "entryId", entry_id),
+            Some(Box::new(with_session)),
+        )
+    }
+
+    pub fn navigate_tree(
+        &self,
+        target_id: &str,
+        opts: serde_json::Value,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.call_host(
+            "navigateTree",
+            Some(with_field(opts, "targetId", target_id)),
+        )
+    }
+
+    pub fn switch_session(
+        &self,
+        session_path: &str,
+        opts: serde_json::Value,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.call_replacement(
+            "switchSession",
+            with_field(opts, "sessionPath", session_path),
+            None,
+        )
+    }
+
+    /// `switch_session` with Pi's `withSession` callback, which runs with the replacement Session's context before
+    /// the call returns.
+    pub fn switch_session_with(
+        &self,
+        session_path: &str,
+        opts: serde_json::Value,
+        with_session: impl FnOnce(&crate::ReplacedSessionContext) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Option<serde_json::Value>> {
+        self.call_replacement(
+            "switchSession",
+            with_field(opts, "sessionPath", session_path),
+            Some(Box::new(with_session)),
+        )
+    }
+
+    pub fn reload(&self) -> io::Result<()> {
+        call_result_to_io(self.call_wire("reload", None)?)
+    }
+}
+
+impl Context {
+    // ─── Upstream-shaped variants of existing calls ─────────────────────
+
+    /// Upstream `pi.sendMessage(message, options)`: injects a custom message
+    /// whose content may be a string or content blocks, with optional
+    /// details. With `trigger_turn` the run it starts keeps `is_idle` busy until this
+    /// handler yields (`yield_now`, `sleep`, a call Pi awaits, or its return): a handler that
+    /// polls `is_idle` for that run must use `sleep`, not `std::thread::sleep` (D225).
+    pub fn send_custom_message(
+        &self,
+        message: &CustomMessage,
+        options: &SendMessageOptions,
+    ) -> io::Result<()> {
+        let mut msg = serde_json::Map::new();
+        msg.insert(
+            "customType".into(),
+            serde_json::Value::String(message.custom_type.clone()),
+        );
+        msg.insert("content".into(), message.content.clone());
+        msg.insert("display".into(), serde_json::Value::Bool(message.display));
+        if let Some(details) = &message.details {
+            msg.insert("details".into(), details.clone());
+        }
+        let mut opts = serde_json::Map::new();
+        if let Some(trigger_turn) = options.trigger_turn {
+            opts.insert("triggerTurn".into(), serde_json::Value::Bool(trigger_turn));
+        }
+        if let Some(deliver_as) = options.deliver_as.as_deref().filter(|v| !v.is_empty()) {
+            opts.insert(
+                "deliverAs".into(),
+                serde_json::Value::String(deliver_as.to_string()),
+            );
+        }
+        call_result_to_io(self.call_wire(
+            "sendMessage",
+            Some(serde_json::json!({"message": msg, "options": opts})),
+        )?)
+    }
+
+    fn dialog_opts(options: &DialogOptions) -> serde_json::Value {
+        let mut opts = serde_json::Map::new();
+        if let Some(timeout) = options.timeout {
+            opts.insert("timeout".into(), serde_json::Value::from(timeout));
+        }
+        serde_json::Value::Object(opts)
+    }
+
+    /// [`Self::select`] with upstream dialog options.
+    pub fn select_with_options(
+        &self,
+        title: &str,
+        options: &[&str],
+        opts: &DialogOptions,
+    ) -> io::Result<(String, bool)> {
+        self.block_for_user();
+        let v = call_result_value(self.call_wire(
+            "ui.select",
+            Some(serde_json::json!({
+                "title": title,
+                "options": options,
+                "opts": Self::dialog_opts(opts),
+            })),
+        )?)?;
+        let selected = v
+            .get("selected")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+        Ok((selected, ok))
+    }
+
+    /// [`Self::confirm`] with upstream dialog options.
+    pub fn confirm_with_options(
+        &self,
+        title: &str,
+        message: &str,
+        opts: &DialogOptions,
+    ) -> io::Result<bool> {
+        self.block_for_user();
+        let v = call_result_value(self.call_wire(
+            "ui.confirm",
+            Some(serde_json::json!({
+                "title": title,
+                "message": message,
+                "opts": Self::dialog_opts(opts),
+            })),
+        )?)?;
+        Ok(v.get("confirmed")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// [`Self::input`] with upstream dialog options.
+    pub fn input_with_options(
+        &self,
+        title: &str,
+        placeholder: &str,
+        opts: &DialogOptions,
+    ) -> io::Result<(String, bool)> {
+        self.input_with_options_wire(serde_json::json!({
+            "title": title,
+            "placeholder": placeholder,
+            "opts": Self::dialog_opts(opts),
+        }))
+    }
+
+    /// [`Self::input_without_placeholder`] with upstream dialog options: Pi's `input(title, undefined, opts)`.
+    pub fn input_without_placeholder_with_options(
+        &self,
+        title: &str,
+        opts: &DialogOptions,
+    ) -> io::Result<(String, bool)> {
+        self.input_with_options_wire(
+            serde_json::json!({"title": title, "opts": Self::dialog_opts(opts)}),
+        )
+    }
+
+    fn input_with_options_wire(&self, args: serde_json::Value) -> io::Result<(String, bool)> {
+        self.block_for_user();
+        let v = call_result_value(self.call_wire("ui.input", Some(args))?)?;
+        let text = v
+            .get("text")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+        Ok((text, ok))
+    }
+
+    /// Replaces the footer with pre-rendered lines (upstream
+    /// `ctx.ui.setFooter`; a component factory cannot cross the process
+    /// boundary). [`Self::clear_footer`] restores the default.
+    ///
+    /// Pi renders a footer component at the current width every frame, so it
+    /// never paints rows laid out for another width. The rows sent here carry
+    /// the width the SDK holds when they are sent, and the host paints them
+    /// only at that width: after a resize they stay hidden until the extension
+    /// sends rows for the new width (see [`Self::on_width_change`] for where to
+    /// send them from). A footer
+    /// that must never be wrong renders through [`Self::set_footer_renderer`].
+    /// Setting rows replaces any footer renderer.
+    pub fn set_footer(&self, lines: Vec<String>) -> io::Result<()> {
+        self.set_surface("ui.setFooter", Some(lines))
+    }
+
+    /// Replaces the header with pre-rendered lines (upstream
+    /// `ctx.ui.setHeader`). [`Self::clear_header`] restores the default. The
+    /// rows carry the width the SDK holds when they are sent, as described at
+    /// [`Self::set_footer`].
+    pub fn set_header(&self, lines: Vec<String>) -> io::Result<()> {
+        self.set_surface("ui.setHeader", Some(lines))
+    }
+
+    /// Replaces the footer with a kit view (D107), which the host renders at
+    /// its width every frame, as Pi renders a footer component. It replaces
+    /// any footer rows or renderer; [`Self::clear_footer`] restores the
+    /// default.
+    pub fn set_footer_view(&self, view: crate::kit::View) -> io::Result<()> {
+        self.set_surface_view("ui.setFooter", view)
+    }
+
+    /// Replaces the header with a kit view (D107), as
+    /// [`Self::set_footer_view`] does for the footer.
+    pub fn set_header_view(&self, view: crate::kit::View) -> io::Result<()> {
+        self.set_surface_view("ui.setHeader", view)
+    }
+
+    /// Installs a footer that `render` lays out at the host's terminal width,
+    /// the subprocess form of the component factory Pi's `ctx.ui.setFooter`
+    /// takes. The SDK renders at the width the host reports and again after
+    /// every width change, and sends each set of rows with the width it was
+    /// rendered for, so the host never paints rows laid out for another width.
+    /// `None` restores the built-in footer. A panic in `render` is reported to
+    /// the user as "footer render failed: ..." and leaves the previous rows.
+    pub fn set_footer_renderer<F>(&self, render: Option<F>) -> io::Result<()>
+    where
+        F: Fn(u32) -> Vec<String> + Send + Sync + 'static,
+    {
+        self.set_surface_renderer("ui.setFooter", render)
+    }
+
+    /// Installs a header that `render` lays out at the host's terminal width;
+    /// it follows the contract of [`Self::set_footer_renderer`].
+    pub fn set_header_renderer<F>(&self, render: Option<F>) -> io::Result<()>
+    where
+        F: Fn(u32) -> Vec<String> + Send + Sync + 'static,
+    {
+        self.set_surface_renderer("ui.setHeader", render)
+    }
+
+    /// Upstream `ctx.hasUI`, from the host's replicated state.
+    pub fn has_ui(&self) -> bool {
+        self.assert_active();
+        self.shared_ui.lock().unwrap().has_ui
+    }
+
+    /// Upstream `ctx.ui.theme`: a snapshot of the host's active theme, kept
+    /// current by the host's state and `theme_change` notifies.
+    pub fn theme(&self) -> Theme {
+        self.assert_active();
+        self.shared_ui.lock().unwrap().theme.clone()
+    }
+
+    /// Upstream `ctx.compact(options)`. Returns immediately. Without
+    /// callbacks it asks the host to compact, as [`Self::compact`] does. With
+    /// either callback, a background thread waits for compaction to finish
+    /// and runs `on_complete` with upstream's `CompactionResult` or
+    /// `on_error` with the failure text. That wait is not tied to the
+    /// current request, so it outlives the handler that started it.
+    pub fn compact_with_options(&self, options: CompactOptions) {
+        let CompactOptions {
+            custom_instructions,
+            on_complete,
+            on_error,
+        } = options;
+        let mut args = serde_json::Map::new();
+        if let Some(instructions) = custom_instructions {
+            args.insert(
+                "customInstructions".into(),
+                serde_json::Value::String(instructions),
+            );
+        }
+        if on_complete.is_none() && on_error.is_none() {
+            self.compact(serde_json::Value::Object(args));
+            return;
+        }
+        args.insert("awaitCompletion".into(), serde_json::Value::Bool(true));
+        self.yield_batch_turn();
+        let conn = self.conn.clone();
+        thread::spawn(move || {
+            let outcome = match conn.call("compact", Some(serde_json::Value::Object(args))) {
+                Err(err) => Err(err.to_string()),
+                Ok(result) => match result.error {
+                    Some(error) => Err(error.message),
+                    None => Ok(result.result.unwrap_or(serde_json::Value::Null)),
+                },
+            };
+            match outcome {
+                Ok(result) => {
+                    if let Some(on_complete) = on_complete {
+                        on_complete(result);
+                    }
+                }
+                Err(message) => {
+                    if let Some(on_error) = on_error {
+                        on_error(message);
+                    }
+                }
+            }
+        });
+    }
+}
+
+// ─── Event payload helpers ───────────────────────────────────────────────
+
+/// Role of an event's message payload, or `None` when the event carries no
+/// message or its role is not a string.
+///
+/// Message-shaped events carry upstream's flat role-discriminated union:
+/// `{"type": "message_end", "message": {"role": "assistant", "content": [...]}}`
+/// where content is a block array, or a string for a user message.
+pub fn message_role(data: &serde_json::Value) -> Option<String> {
+    data.get("message")?
+        .get("role")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn tool_result_named(data: &serde_json::Value, name: &str) -> bool {
+    data.get("toolName").and_then(serde_json::Value::as_str) == Some(name)
+}
+
+/// Pi's `isToolCallEventType` (core/extensions/types.ts): whether a `tool_call` event is a call of the named tool, built-in or custom. It
+/// compares the event's `toolName` with `tool_name`; a payload without a string `toolName` is a call of no tool.
+pub fn is_tool_call_event_type(tool_name: &str, data: &serde_json::Value) -> bool {
+    data.get("toolName").and_then(serde_json::Value::as_str) == Some(tool_name)
+}
+
+/// Whether a `tool_result` event is the result of the bash tool (Pi core/extensions/types.ts:1315
+/// `isBashToolResult`, `e.toolName === "bash"`). A payload without a string `toolName` is the result of no built-in tool.
+pub fn is_bash_tool_result(data: &serde_json::Value) -> bool {
+    tool_result_named(data, "bash")
+}
+
+/// Whether a `tool_result` event is the result of the powershell tool (Pi core/extensions/types.ts:1318
+/// `isPowerShellToolResult`, `e.toolName === "powershell"`). A payload without a string `toolName` is the result of no built-in tool.
+pub fn is_powershell_tool_result(data: &serde_json::Value) -> bool {
+    tool_result_named(data, "powershell")
+}
+
+/// Whether a `tool_result` event is the result of the read tool (Pi core/extensions/types.ts:1321
+/// `isReadToolResult`, `e.toolName === "read"`). A payload without a string `toolName` is the result of no built-in tool.
+pub fn is_read_tool_result(data: &serde_json::Value) -> bool {
+    tool_result_named(data, "read")
+}
+
+/// Whether a `tool_result` event is the result of the edit tool (Pi core/extensions/types.ts:1324
+/// `isEditToolResult`, `e.toolName === "edit"`). A payload without a string `toolName` is the result of no built-in tool.
+pub fn is_edit_tool_result(data: &serde_json::Value) -> bool {
+    tool_result_named(data, "edit")
+}
+
+/// Whether a `tool_result` event is the result of the write tool (Pi core/extensions/types.ts:1327
+/// `isWriteToolResult`, `e.toolName === "write"`). A payload without a string `toolName` is the result of no built-in tool.
+pub fn is_write_tool_result(data: &serde_json::Value) -> bool {
+    tool_result_named(data, "write")
+}
+
+/// Whether a `tool_result` event is the result of the grep tool (Pi core/extensions/types.ts:1330
+/// `isGrepToolResult`, `e.toolName === "grep"`). A payload without a string `toolName` is the result of no built-in tool.
+pub fn is_grep_tool_result(data: &serde_json::Value) -> bool {
+    tool_result_named(data, "grep")
+}
+
+/// Whether a `tool_result` event is the result of the find tool (Pi core/extensions/types.ts:1333
+/// `isFindToolResult`, `e.toolName === "find"`). A payload without a string `toolName` is the result of no built-in tool.
+pub fn is_find_tool_result(data: &serde_json::Value) -> bool {
+    tool_result_named(data, "find")
+}
+
+/// Whether a `tool_result` event is the result of the ls tool (Pi core/extensions/types.ts:1336
+/// `isLsToolResult`, `e.toolName === "ls"`). A payload without a string `toolName` is the result of no built-in tool.
+pub fn is_ls_tool_result(data: &serde_json::Value) -> bool {
+    tool_result_named(data, "ls")
+}
+
+/// Concatenated text blocks of an event's message payload. Non-text blocks
+/// (tool calls, images, thinking) are skipped. Returns an empty string when the
+/// event carries no message or the message has no text.
+pub fn message_text(data: &serde_json::Value) -> String {
+    let Some(content) = data.get("message").and_then(|m| m.get("content")) else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_owned();
+    }
+    let Some(blocks) = content.as_array() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for block in blocks {
+        if block.get("type").and_then(|t| t.as_str()) != Some("text") {
+            continue;
+        }
+        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+// ─── Data Types ──────────────────────────────────────────────────────────
+
+/// Outcome of a host-executed command, returned by `exec()`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExecResult {
+    pub stdout: String,
+    pub stderr: String,
+    /// The host's `code`.
+    pub exit_code: i32,
+    /// Whether pi terminated the command (timeout, cancellation, or output over `max_buffer`).
+    #[serde(default)]
+    pub killed: bool,
+    /// Whether the output exceeded `max_buffer`: `stdout` and `stderr` are incomplete and `exit_code` is nonzero.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Upstream `ExecOptions` for [`Context::exec_with_options`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExecOptions {
+    /// Timeout in milliseconds. Pi's `timeout` is a JavaScript number: fractional and very large values are meaningful, and only a positive one starts a timer.
+    pub timeout: Option<f64>,
+    /// Working directory; the session's when unset.
+    pub cwd: Option<String>,
+    /// Upstream's `maxBuffer`: the byte limit of stdout and stderr together. Output past it terminates the command and the result has `truncated` and `killed` set and a nonzero `exit_code`; a character the limit cuts is dropped whole. Unset: 256 MiB, capped by the runtime string limit. It is a JavaScript number that must be an integer from 0 to that limit: the host fails the call for a fraction, a negative value or one above it, and the call fails here for NaN or an infinity, which cannot cross the wire.
+    pub max_buffer: Option<f64>,
+    /// Upstream's `signal`: cancelling it terminates the command (see [`Context::exec_with_options`]). Unset, the command ends when the calling request is cancelled.
+    pub signal: Option<crate::ProviderSignal>,
+}
+
+/// Upstream `ExtensionUIDialogOptions` for the `*_with_options` dialogs.
+/// Cancellation (upstream's `signal`) is the request's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DialogOptions {
+    /// Dismisses the dialog after this many milliseconds. Pi's `timeout` is a JavaScript number: fractional and very large values are meaningful, and only a positive one starts a countdown.
+    pub timeout: Option<f64>,
+}
+
+/// The message of upstream `pi.sendMessage`: `CustomMessage`'s `customType`,
+/// `content` (a string or text/image content blocks), `display` and
+/// `details`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomMessage {
+    pub custom_type: String,
+    pub content: serde_json::Value,
+    pub display: bool,
+    pub details: Option<serde_json::Value>,
+}
+
+/// Upstream `pi.sendMessage` options. `None` leaves an option unset so the
+/// host applies upstream's default for the session's state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SendMessageOptions {
+    pub trigger_turn: Option<bool>,
+    /// `"steer"`, `"followUp"` or `"nextTurn"`.
+    pub deliver_as: Option<String>,
+}
+
+/// Called with upstream's `CompactionResult` when compaction finishes.
+pub type CompactCompleteHandler = Box<dyn FnOnce(serde_json::Value) + Send>;
+/// Called with the failure text when compaction fails.
+pub type CompactErrorHandler = Box<dyn FnOnce(String) + Send>;
+
+/// Upstream `CompactOptions` for [`Context::compact_with_options`].
+#[derive(Default)]
+pub struct CompactOptions {
+    pub custom_instructions: Option<String>,
+    pub on_complete: Option<CompactCompleteHandler>,
+    pub on_error: Option<CompactErrorHandler>,
+}
+
+/// Upstream `SourceInfo`: where a tool, command, prompt template or skill
+/// came from.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceInfo {
+    pub path: String,
+    pub source: String,
+    pub scope: String,
+    pub origin: String,
+    #[serde(default, rename = "baseDir", skip_serializing_if = "Option::is_none")]
+    pub base_dir: Option<String>,
+    /// The changelog file of the package that supplied the resource, when it has one (`SourceInfo.changelogPath`).
+    #[serde(
+        default,
+        rename = "changelogPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub changelog_path: Option<String>,
+}
+
+/// Upstream `ToolInfo`, one entry of `get_all_tools()`: a tool definition's
+/// name, description, parameter schema and prompt guidelines, and the
+/// `SourceInfo` of what registered it (`builtin` for built-in tools).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub parameters: serde_json::Value,
+    /// `None` when the definition has no prompt guidelines.
+    #[serde(
+        default,
+        rename = "promptGuidelines",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prompt_guidelines: Option<Vec<String>>,
+    #[serde(default, rename = "sourceInfo")]
+    pub source_info: SourceInfo,
+    /// How the model reaches the tool (`types.ts:2063`); `direct` when the host omits it.
+    #[serde(default)]
+    pub exposure: crate::ToolExposure,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<crate::ToolNamespace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<crate::ToolAnnotations>,
+    /// The definition's `reachesTools` (`types.ts:2122-2130`), `None` for a tool that reaches no other tools.
+    #[serde(skip)]
+    pub reaches_tools: Option<ToolInfoReachesTools>,
+}
+
+/// A `ToolInfo`'s `reachesTools` (upstream `types.ts:621`): which tools a call with the given input may reach, `ToolReach::All` or the
+/// words of the input that may name them. It runs the hook through the host, wherever the tool is defined, so a `tool_call` handler can
+/// ask before the call runs; the host's error, including the hook's throw, is the call's error.
+#[derive(Clone)]
+pub struct ToolInfoReachesTools {
+    tool: String,
+    ask: ReachesToolsFn,
+}
+
+type ReachesToolsFn = Arc<dyn Fn(&serde_json::Value) -> io::Result<crate::ToolReach> + Send + Sync>;
+
+impl ToolInfoReachesTools {
+    /// Which tools a call with `input` may reach.
+    pub fn call(&self, input: &serde_json::Value) -> io::Result<crate::ToolReach> {
+        (self.ask)(input)
+    }
+
+    /// The hook of the tool `get_all_tools` listed as `tool`, which the host runs with the `tool.reachesTools` call.
+    fn through_host(ctx: Context, tool: String) -> Self {
+        let name = tool.clone();
+        let ask = move |input: &serde_json::Value| {
+            let input = if input.is_null() {
+                serde_json::json!({})
+            } else {
+                input.clone()
+            };
+            match ctx.call_host(
+                "tool.reachesTools",
+                Some(serde_json::json!({"tool": name, "input": input})),
+            )? {
+                Some(serde_json::Value::String(all)) if all == "all" => Ok(crate::ToolReach::All),
+                answer => serde_json::from_value(answer.unwrap_or_default())
+                    .map(crate::ToolReach::Words)
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("host reply to tool.reachesTools: {error}"),
+                        )
+                    }),
+            }
+        };
+        Self {
+            tool,
+            ask: Arc::new(ask),
+        }
+    }
+}
+
+impl std::fmt::Debug for ToolInfoReachesTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolInfoReachesTools")
+            .field("tool", &self.tool)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Two hooks are equal when they are the same function, as two of upstream's ToolInfo objects share their definition's hook.
+impl PartialEq for ToolInfoReachesTools {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ask, &other.ask)
+    }
+}
+
+/// Upstream `SlashCommandInfo`, one entry of `get_commands()`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CommandInfo {
+    pub name: String,
+    /// Empty when the command has no description.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// `extension`, `prompt` or `skill`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, rename = "sourceInfo")]
+    pub source_info: SourceInfo,
+}
+
+/// Context usage data returned by `get_context_usage()`. Tokens and percent are None while usage is unknown after compaction.
+#[derive(Debug, Clone)]
+pub struct ContextUsage {
+    pub tokens: Option<i32>,
+    pub context_window: i32,
+    pub percent: Option<f64>,
+}
+
+/// Structured model metadata returned by `get_model_info()`.
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    /// Provider input limits and cache-safe image preprocessing metadata.
+    pub input_limits: Option<serde_json::Value>,
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub context_window: i32,
+    pub max_output_tokens: i32,
+    pub reasoning: bool,
+    pub input_cost_per_1m: f64,
+    pub output_cost_per_1m: f64,
+    pub cache_read_cost_per_1m: f64,
+    pub cache_write_cost_per_1m: f64,
+}
+
+impl ModelInfo {
+    /// The host answers with Pi's `Model` (`packages/ai/src/types.ts`): `maxTokens` is the output limit and `cost` holds the per-million-token prices. The
+    /// older flat keys (`maxOutputTokens`, `inputCostPer1M`, ...) and `modelId`, `displayName` and an object `provider` are read as the Go SDK reads them; a
+    /// flat key that is zero or absent falls back to the Pi one. `None` when the reply names no model, an error when a field has the wrong type.
+    pub(crate) fn from_wire(v: &serde_json::Value) -> io::Result<Option<Self>> {
+        let bad = |key: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("host reply to getModelInfo: field {key:?} has the wrong type"),
+            )
+        };
+        // Go decodes the reply into a struct, so a reply other than an object or null is an error there.
+        let object = match v {
+            serde_json::Value::Null => None,
+            serde_json::Value::Object(object) => Some(object),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "host reply to getModelInfo is not an object",
+                ));
+            }
+        };
+        let field = |key: &str| {
+            object
+                .and_then(|o| o.get(key))
+                .filter(|value| !value.is_null())
+        };
+        let text = |key: &str| -> io::Result<String> {
+            match field(key) {
+                None => Ok(String::new()),
+                Some(serde_json::Value::String(text)) => Ok(text.clone()),
+                Some(_) => Err(bad(key)),
+            }
+        };
+        let float = |value: Option<&serde_json::Value>, key: &str| -> io::Result<f64> {
+            match value {
+                None => Ok(0.0),
+                Some(number) => number.as_f64().ok_or_else(|| bad(key)),
+            }
+        };
+        // Go's int field takes only an integer literal: 1.0, 1e3 and a value past the field's range are errors, not a rounded or wrapped number.
+        let whole = |key: &str| -> io::Result<i32> {
+            match field(key) {
+                None => Ok(0),
+                Some(number) => number
+                    .as_i64()
+                    .and_then(|number| i32::try_from(number).ok())
+                    .ok_or_else(|| bad(key)),
+            }
+        };
+        let id = Some(text("id")?)
+            .filter(|id| !id.is_empty())
+            .or(Some(text("modelId")?).filter(|id| !id.is_empty()));
+        let cost = |flat: &str, nested: &str| -> io::Result<f64> {
+            let flat_price = float(field(flat), flat)?;
+            let nested_price = match field("cost") {
+                None => 0.0,
+                Some(serde_json::Value::Object(cost)) => {
+                    float(cost.get(nested).filter(|value| !value.is_null()), nested)?
+                }
+                Some(_) => return Err(bad("cost")),
+            };
+            Ok(if flat_price != 0.0 {
+                flat_price
+            } else {
+                nested_price
+            })
+        };
+        let (name, display_name) = (text("name")?, text("displayName")?);
+        let name = if name.is_empty() { display_name } else { name };
+        let provider = match field("provider") {
+            Some(serde_json::Value::String(provider)) => provider.clone(),
+            Some(serde_json::Value::Object(object)) => object
+                .get("id")
+                .and_then(|id| id.as_str())
+                .unwrap_or("")
+                .to_string(),
+            _ => String::new(),
+        };
+        let (output_limit, max_tokens) = (whole("maxOutputTokens")?, whole("maxTokens")?);
+        let max_output_tokens = if output_limit == 0 {
+            max_tokens
+        } else {
+            output_limit
+        };
+        let reasoning = match field("reasoning") {
+            None => false,
+            Some(serde_json::Value::Bool(flag)) => *flag,
+            Some(_) => return Err(bad("reasoning")),
+        };
+        let input_limits = match field("inputLimits") {
+            None => None,
+            Some(limits @ serde_json::Value::Object(_)) => Some(limits.clone()),
+            Some(_) => return Err(bad("inputLimits")),
+        };
+        let Some(id) = id else { return Ok(None) };
+        Ok(Some(ModelInfo {
+            input_limits,
+            id,
+            name,
+            provider,
+            context_window: whole("contextWindow")?,
+            max_output_tokens,
+            reasoning,
+            input_cost_per_1m: cost("inputCostPer1M", "input")?,
+            output_cost_per_1m: cost("outputCostPer1M", "output")?,
+            cache_read_cost_per_1m: cost("cacheReadCostPer1M", "cacheRead")?,
+            cache_write_cost_per_1m: cost("cacheWriteCostPer1M", "cacheWrite")?,
+        }))
+    }
+}
+
+/// A single entry in the session conversation history.
+///
+/// The host sends each entry in Pi's session-entry shape: `{"type":"message","message":{...}}` for a message and `{"type":"compaction","summary":...}` for the others.
+/// Decoding flattens it as the Go SDK's `BranchEntry` does: a message's role, text, thinking, tool calls, provider, model, usage and tool-result fields move to the top
+/// level, and a compaction, branch summary or custom message takes its `content` or, failing that, its `summary` as the text.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BranchEntry {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub role: String,
+    pub content: String,
+    #[serde(
+        default,
+        rename = "firstKeptEntryId",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub first_kept_entry_id: String,
+    pub thinking: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    #[serde(rename = "isError")]
+    pub is_error: bool,
+    pub usage: Option<UsageInfo>,
+    #[serde(rename = "toolCalls")]
+    pub tool_calls: Vec<ToolCallInfo>,
+}
+
+/// `Some(text)` for a string, `Some("")` when absent or null, `None` for any other type, which fails the surrounding decode as a type mismatch does in Go.
+fn wire_string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    match object.get(key) {
+        None | Some(serde_json::Value::Null) => Some(String::new()),
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(_) => None,
+    }
+}
+
+/// A tool call's arguments as the text a tool call carries: Pi's `ToolCall.arguments` is an object (its JSON text), a provider that streams a string keeps it.
+fn tool_call_arguments(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+impl BranchEntry {
+    fn from_wire(entry: &serde_json::Value) -> Option<Self> {
+        let object = entry.as_object()?;
+        let mut out = BranchEntry {
+            id: wire_string(object, "id")?,
+            entry_type: wire_string(object, "type")?,
+            role: String::new(),
+            content: String::new(),
+            first_kept_entry_id: wire_string(object, "firstKeptEntryId")?,
+            thinking: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            tool_name: String::new(),
+            tool_call_id: String::new(),
+            is_error: false,
+            usage: None,
+            tool_calls: Vec::new(),
+        };
+        let summary = wire_string(object, "summary")?;
+        match object.get("message") {
+            Some(serde_json::Value::Object(message)) => {
+                // A message whose fields do not decode leaves the rest of the entry empty, as it does in Go.
+                let _ = out.read_message(message);
+            }
+            _ => {
+                // Pi's custom_message content is `string | (TextContent | ImageContent)[]`.
+                match object.get("content") {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::String(text)) => out.content = text.clone(),
+                    Some(serde_json::Value::Array(blocks)) => out.read_blocks(blocks),
+                    Some(_) => return None,
+                }
+                if out.content.is_empty() {
+                    out.content = summary;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn read_message(&mut self, message: &serde_json::Map<String, serde_json::Value>) -> Option<()> {
+        let role = wire_string(message, "role")?;
+        let provider = wire_string(message, "provider")?;
+        let model = wire_string(message, "model")?;
+        let tool_name = wire_string(message, "toolName")?;
+        let tool_call_id = wire_string(message, "toolCallId")?;
+        let is_error = match message.get("isError") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(flag)) => *flag,
+            Some(_) => return None,
+        };
+        let usage = match message.get("usage") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(serde_json::from_value::<UsageInfo>(value.clone()).ok()?),
+        };
+        self.role = role;
+        self.provider = provider;
+        self.model = model;
+        self.tool_name = tool_name;
+        self.tool_call_id = tool_call_id;
+        self.is_error = is_error;
+        self.usage = usage;
+        match message.get("content") {
+            Some(serde_json::Value::String(text)) => self.content = text.clone(),
+            Some(serde_json::Value::Array(blocks)) => self.read_blocks(blocks),
+            _ => {}
+        }
+        Some(())
+    }
+
+    /// Text, thinking and tool calls of a content block array. A block list that does not decode (a field of the wrong type) contributes nothing, as in Go.
+    fn read_blocks(&mut self, blocks: &[serde_json::Value]) {
+        struct Block {
+            kind: String,
+            text: String,
+            thinking: String,
+            name: String,
+            id: String,
+            arguments: Option<serde_json::Value>,
+            input: Option<serde_json::Value>,
+        }
+        let mut decoded = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            // Go decodes a null block as an empty one, which contributes nothing.
+            if block.is_null() {
+                continue;
+            }
+            let Some(object) = block.as_object() else {
+                return;
+            };
+            let (Some(kind), Some(text), Some(thinking), Some(name), Some(id)) = (
+                wire_string(object, "type"),
+                wire_string(object, "text"),
+                wire_string(object, "thinking"),
+                wire_string(object, "name"),
+                wire_string(object, "id"),
+            ) else {
+                return;
+            };
+            decoded.push(Block {
+                kind,
+                text,
+                thinking,
+                name,
+                id,
+                arguments: object.get("arguments").cloned(),
+                input: object.get("input").cloned(),
+            });
+        }
+        let mut text_parts = String::new();
+        for block in decoded {
+            match block.kind.as_str() {
+                "text" | "tool_result" => text_parts.push_str(&block.text),
+                "thinking" => self.thinking.push_str(&block.thinking),
+                "tool_use" | "toolCall" => {
+                    let mut args = tool_call_arguments(block.arguments.as_ref());
+                    if args.is_empty() {
+                        args = tool_call_arguments(block.input.as_ref());
+                    }
+                    self.tool_calls.push(ToolCallInfo {
+                        name: block.name,
+                        id: block.id,
+                        args,
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.content = text_parts;
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BranchEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        BranchEntry::from_wire(&value).ok_or_else(|| {
+            serde::de::Error::custom(
+                "a session entry is an object whose id, type and text fields are strings",
+            )
+        })
+    }
+}
+
+/// Token usage data for an assistant message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UsageInfo {
+    #[serde(default)]
+    pub input: i32,
+    #[serde(default)]
+    pub output: i32,
+    #[serde(default, rename = "cacheRead")]
+    pub cache_read: i32,
+    #[serde(default, rename = "cacheWrite")]
+    pub cache_write: i32,
+    #[serde(default, rename = "totalTokens")]
+    pub total_tokens: i32,
+}
+
+/// A tool invocation within an assistant message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallInfo {
+    pub name: String,
+    pub id: String,
+    pub args: String,
+}
+
+/// Guard returned by [`Context::on_terminal_input`]. Dropping it, or calling
+/// [`TerminalInputSubscription::unsubscribe`], releases the subscription and
+/// tells the host to stop forwarding once no handlers remain.
+pub struct TerminalInputSubscription {
+    id: u64,
+    subs: TerminalInputSubs,
+    conn: Arc<Connection>,
+    released: bool,
+}
+
+impl TerminalInputSubscription {
+    /// Releases the subscription. Idempotent.
+    pub fn unsubscribe(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let last = {
+            let mut subs = self.subs.lock().unwrap();
+            subs.retain(|(id, _)| *id != self.id);
+            subs.is_empty()
+        };
+        if last {
+            // A subscription guard can outlive the request that created it.
+            // Drop has no request context, so this is the one context API path
+            // that intentionally uses an unparented connection call.
+            let _ = self
+                .conn
+                .call("ui.offTerminalInput", Some(serde_json::json!({})));
+        }
+    }
+}
+
+impl Drop for TerminalInputSubscription {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A footer or header renderer, the subprocess form of Pi's component factory.
+///
+/// pig additive (D19): Pi's TUI renders the in-process component every frame; a
+/// subprocess SDK renders at the host width itself and sends the width with the rows.
+///
+/// The TUI calls `render(width)` for every frame (interactive-mode.ts:2418-2480).
+/// The SDK renders at the width the host reported, sends the rows with that
+/// width so the host never paints them at another, and renders again after each
+/// `width_change`. Only the newest width is rendered when several arrive together.
+pub(crate) struct SurfaceRenderer {
+    method: &'static str,
+    /// The widget a renderer of `ui.setWidget` lays out, and its placement options.
+    widget: Option<(String, Option<serde_json::Value>)>,
+    render: Box<dyn Fn(u32) -> Vec<String> + Send + Sync>,
+    /// True once superseded. Held while a push is in flight, so a superseded
+    /// renderer never overwrites the rows that replaced it.
+    stopped: Mutex<bool>,
+    /// (a refresh is queued, a refresh thread is running)
+    refresh: Mutex<(bool, bool)>,
+}
+
+pub(crate) type Surfaces = Arc<Mutex<HashMap<String, Arc<SurfaceRenderer>>>>;
+
+/// The key of the renderer installed for the widget `key` in [`Surfaces`].
+fn widget_renderer_id(key: &str) -> String {
+    format!("ui.setWidget:{key}")
+}
+
+fn surface_args(lines: Vec<String>, width: u32) -> serde_json::Value {
+    if width > 0 {
+        serde_json::json!({"lines": lines, "width": width})
+    } else {
+        serde_json::json!({"lines": lines})
+    }
+}
+
+impl SurfaceRenderer {
+    fn kind(&self) -> &'static str {
+        match self.method {
+            "ui.setHeader" => "header",
+            "ui.setWidget" => "widget",
+            _ => "footer",
+        }
+    }
+
+    /// The host call's argument for rows rendered at `width`.
+    fn args(&self, lines: Vec<String>, width: u32) -> serde_json::Value {
+        let mut args = surface_args(lines, width);
+        if let Some((key, options)) = &self.widget {
+            args["key"] = serde_json::json!(key);
+            if let Some(options) = options {
+                args["options"] = options.clone();
+            }
+        }
+        args
+    }
+
+    /// Renders at the current host width and sends the rows tagged with it. A
+    /// panicking renderer is reported as the Node runtime reports a failing
+    /// component (runtime.mjs renderSpecialSurface) and leaves the previous rows.
+    fn push(&self, ctx: &Context) -> io::Result<()> {
+        let stopped = self.stopped.lock().unwrap();
+        if *stopped {
+            return Ok(());
+        }
+        let width = ctx.terminal_width();
+        let lines = match crate::diagnostic::recover(|| (self.render)(width)) {
+            Ok(lines) => lines,
+            Err(payload) => {
+                ctx.notify(
+                    &format!(
+                        "{} render failed: {}",
+                        self.kind(),
+                        panic_message(payload.as_ref())
+                    ),
+                    "error",
+                );
+                return Ok(());
+            }
+        };
+        call_result_to_io(ctx.call_wire(self.method, Some(self.args(lines, width)))?)
+    }
+
+    fn stop(&self) {
+        *self.stopped.lock().unwrap() = true;
+    }
+
+    /// Renders again off the message loop, coalescing calls that arrive while a
+    /// push is in flight into one more push at the newest width.
+    fn refresh(self: &Arc<Self>, ctx: Context) {
+        {
+            let mut state = self.refresh.lock().unwrap();
+            state.0 = true;
+            if state.1 {
+                return;
+            }
+            state.1 = true;
+        }
+        let renderer = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                {
+                    let mut state = renderer.refresh.lock().unwrap();
+                    if !state.0 {
+                        state.1 = false;
+                        return;
+                    }
+                    state.0 = false;
+                }
+                let _ = renderer.push(&ctx);
+            }
+        });
+    }
+}
+
+impl Context {
+    /// Retires the renderer installed for `method` and installs `next`.
+    fn replace_surface(&self, method: &'static str, next: Option<Arc<SurfaceRenderer>>) {
+        self.conn.views.surfaces.lock().unwrap().remove(method);
+        self.replace_surface_id(method.to_string(), next);
+    }
+
+    /// Retires the renderer installed under `id` and installs `next`.
+    fn replace_surface_id(&self, id: String, next: Option<Arc<SurfaceRenderer>>) {
+        let previous = {
+            let mut surfaces = self.surfaces.lock().unwrap();
+            let previous = match &next {
+                Some(renderer) => surfaces.insert(id, renderer.clone()),
+                None => surfaces.remove(&id),
+            };
+            drop(surfaces);
+            previous
+        };
+        if let Some(previous) = previous {
+            previous.stop();
+        }
+    }
+
+    fn set_surface(&self, method: &'static str, lines: Option<Vec<String>>) -> io::Result<()> {
+        self.replace_surface(method, None);
+        let args = match lines {
+            Some(lines) => surface_args(lines, self.terminal_width()),
+            None => serde_json::json!({"clear": true}),
+        };
+        call_result_to_io(self.call_wire(method, Some(args))?)
+    }
+
+    /// Installs an authoritative view: no rows and no width, since the host
+    /// renders it at its own width (D107).
+    fn set_surface_view(&self, method: &'static str, view: crate::kit::View) -> io::Result<()> {
+        let encoded = self.conn.views.encode(&view).map_err(io::Error::other)?;
+        self.replace_surface(method, None);
+        // Held across the send, so an eviction's resend and this frame keep their order.
+        let mut surfaces = self.conn.views.surfaces.lock().unwrap();
+        let wire = self.conn.views.wire(&encoded);
+        surfaces.insert(method, encoded);
+        call_result_to_io(self.call_wire(method, Some(serde_json::json!({"view": wire})))?)
+    }
+
+    /// Handles `ui.view.evicted`: forgets the refs, and sends again, with the
+    /// image data, the latest frame of every live surface that names one.
+    /// Called on the thread that reads host frames, so the widget, header and
+    /// footer sends, which may wait for the host, run on a thread of their
+    /// own, each holding its registry so a newer frame the author sends goes
+    /// out after it.
+    pub(crate) fn resend_evicted_views(&self, refs: std::collections::HashSet<String>) {
+        self.conn.views.forget(&refs);
+        let overlays: Vec<_> = self.overlays.lock().unwrap().values().cloned().collect();
+        for overlay in overlays {
+            overlay.resend_if_references(&refs);
+        }
+        let ctx = self.clone();
+        thread::spawn(move || {
+            let views = &ctx.conn.views;
+            {
+                let widgets = views.widgets.lock().unwrap();
+                for (key, (encoded, options)) in widgets.iter() {
+                    if encoded.references(&refs) {
+                        let _ = ctx.send_widget_view(key, views.wire(encoded), options.clone());
+                    }
+                }
+            }
+            let surfaces = views.surfaces.lock().unwrap();
+            for (method, encoded) in surfaces.iter() {
+                if encoded.references(&refs) {
+                    let _ = ctx.call_wire(
+                        method,
+                        Some(serde_json::json!({"view": views.wire(encoded)})),
+                    );
+                }
+            }
+        });
+    }
+
+    fn set_surface_renderer<F>(&self, method: &'static str, render: Option<F>) -> io::Result<()>
+    where
+        F: Fn(u32) -> Vec<String> + Send + Sync + 'static,
+    {
+        let Some(render) = render else {
+            return self.set_surface(method, None);
+        };
+        // upstream: rpc-mode.ts setFooter/setHeader ignore the factory and runner.ts noOpUIContext does too: Pi calls a footer or header factory only in the TUI.
+        if !self.has_ui() || self.mode() == "rpc" {
+            return Ok(());
+        }
+        let renderer = Arc::new(SurfaceRenderer {
+            method,
+            widget: None,
+            render: Box::new(render),
+            stopped: Mutex::new(false),
+            refresh: Mutex::new((false, false)),
+        });
+        self.replace_surface(method, Some(renderer.clone()));
+        renderer.push(self)
+    }
+
+    /// Renders every installed footer and header renderer again at the host's width.
+    /// Render the footer again: the host's footer data it reads changed.
+    pub(crate) fn refresh_footer(&self) {
+        let footer = self.surfaces.lock().unwrap().get("ui.setFooter").cloned();
+        if let Some(renderer) = footer {
+            renderer.refresh(self.clone());
+        }
+    }
+
+    /// Pi's `ReadonlyFooterDataProvider`, the third argument of a `ui.setFooter` factory: the host's Git branch, extension statuses and available provider count, which follow the host. A footer renderer reads it from the context it was installed with.
+    pub fn footer_data(&self) -> crate::footer_data::FooterData {
+        crate::footer_data::FooterData {
+            state: self.conn.clone(),
+        }
+    }
+
+    pub(crate) fn refresh_surfaces(&self) {
+        let renderers: Vec<_> = self.surfaces.lock().unwrap().values().cloned().collect();
+        for renderer in renderers {
+            renderer.refresh(self.clone());
+        }
+    }
+}
+
+/// Unsubscribes a width handler when dropped.
+pub struct WidthChangeSubscription {
+    id: u64,
+    subs: WidthChangeSubs,
+    released: bool,
+}
+
+impl WidthChangeSubscription {
+    /// Unsubscribe now. Idempotent; dropping the guard afterwards does nothing.
+    pub fn unsubscribe(mut self) {
+        self.release();
+        self.released = true;
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Ok(mut subs) = self.subs.lock() {
+            subs.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+impl Drop for WidthChangeSubscription {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl Context {
+    /// Subscribe to terminal resizes, receiving the new width after
+    /// [`Context::width`] has been updated (a handler that reads it sees that
+    /// width or a newer one).
+    ///
+    /// Upstream Pi installs headers and footers as component factories whose
+    /// `render(width)` runs every frame, so they follow a resize with no work
+    /// from the extension. Rows sent with [`Self::set_footer`] or
+    /// [`Self::set_header`] are painted only at the width they carry, so after
+    /// a resize they stay hidden until the extension sends rows for the new
+    /// width; this is that trigger. [`Self::set_footer_renderer`] and
+    /// [`Self::set_header_renderer`] follow a resize with no handler.
+    ///
+    /// Handlers run on a worker thread, one at a time in the order the host
+    /// sent the widths, never on the thread that reads the host's replies, so
+    /// a handler can make a blocking host call such as [`Context::set_footer`].
+    /// A slow handler delays the later deliveries, not the extension's other
+    /// handlers. A handler that panics does not stop the others. The returned
+    /// guard unsubscribes when dropped; a delivery already queued still
+    /// reaches the handlers that were subscribed when the width arrived.
+    pub fn on_width_change<F>(&self, handler: F) -> WidthChangeSubscription
+    where
+        F: Fn(u32) + Send + Sync + 'static,
+    {
+        let id = self.width_change_seq.fetch_add(1, Ordering::SeqCst);
+        let boxed: WidthChangeHandler = Box::new(handler);
+        if let Ok(mut subs) = self.width_change.lock() {
+            subs.push((id, Arc::new(boxed)));
+        }
+        WidthChangeSubscription {
+            id,
+            subs: self.width_change.clone(),
+            released: false,
+        }
+    }
+}
+
+/// The config root policy over an environment lookup; `get` returns `None` for an unset variable.
+fn config_home_from(get: impl Fn(&str) -> Option<String>) -> io::Result<String> {
+    let var = |name: &str| get(name).filter(|value| !value.is_empty());
+    let home = || {
+        var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "locate home directory: home environment variable is not defined",
+            )
+        })
+    };
+    let expand = |path: String| -> io::Result<String> {
+        if path == "~" {
+            return home();
+        }
+        match path.strip_prefix("~/") {
+            Some(rest) => Ok(join_clean(&home()?, rest)),
+            None => Ok(path),
+        }
+    };
+    if let Some(root) = var("PIG_HOME") {
+        return expand(root);
+    }
+    if let Some(root) = var("XDG_CONFIG_HOME") {
+        return Ok(join_clean(&expand(root)?, "pig"));
+    }
+    Ok(join_clean(&home()?, ".pig"))
+}
+
+/// Go's `filepath.Join(base, rest)` as the host's `internal/configroot` uses it: the elements joined by the separator, then lexically cleaned
+/// (repeated and trailing separators and `.` dropped, `name/..` removed, `..` at the root dropped). `Path::join` would instead replace `base` when
+/// `rest` is absolute (`~//p` must stay under the home directory) and keep `..`.
+fn join_clean(base: &str, rest: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+    let joined = format!("{base}{}{rest}", std::path::MAIN_SEPARATOR);
+    let mut out: Vec<Component> = Vec::new();
+    for component in Path::new(&joined).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ => out.push(component),
+            },
+            _ => out.push(component),
+        }
+    }
+    if out.is_empty() {
+        return ".".to_string();
+    }
+    out.iter()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(test)]
+mod config_home_tests {
+    use super::config_home_from;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    fn matrix() -> Vec<Value> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test/extension-conformance/testdata/configroot-matrix.json"
+        );
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        doc["cases"].as_array().unwrap().clone()
+    }
+
+    fn home_key() -> &'static str {
+        if cfg!(windows) { "USERPROFILE" } else { "HOME" }
+    }
+
+    // The shared env matrix (test/extension-conformance/testdata/configroot-matrix.json): the same answers as the host and the Go, Python and Node SDKs.
+    #[test]
+    fn config_home_matches_the_shared_matrix() {
+        let cases = matrix();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let mut env: HashMap<String, String> = HashMap::new();
+            env.insert(home_key().to_string(), "/home/probe".to_string());
+            for (key, value) in case["env"].as_object().unwrap() {
+                let key = if key == "HOME" {
+                    home_key()
+                } else {
+                    key.as_str()
+                };
+                match value.as_str() {
+                    Some(value) => env.insert(key.to_string(), value.to_string()),
+                    None => env.remove(key),
+                };
+            }
+            let got = config_home_from(|key| env.get(key).cloned());
+            match case["want"].as_str() {
+                None => assert!(got.is_err(), "{name}: got {got:?}, want an error"),
+                Some(want) => assert_eq!(
+                    got.unwrap(),
+                    want.replace("<HOME>", "/home/probe"),
+                    "{name}"
+                ),
+            }
+        }
+    }
+
+    // Prints the getter's answer under the process environment, for test/extension-conformance's cross-language comparison.
+    #[test]
+    #[ignore = "driven by the cross-language comparison, which sets the environment"]
+    fn probe_config_home() {
+        match super::config_home_from(|name| std::env::var(name).ok()) {
+            Ok(path) => println!("CONFIG_HOME_OK={path}"),
+            Err(error) => println!("CONFIG_HOME_ERR={error}"),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod width_change_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicU32;
+
+    // Exercises the subscription bookkeeping directly. The notify path that
+    // drives these handlers is covered by the conformance fixture, which is what
+    // proves this SDK agrees with the Go reference.
+    fn subs() -> (WidthChangeSubs, Arc<AtomicU64>) {
+        (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    fn ctx_with(subs: WidthChangeSubs, seq: Arc<AtomicU64>, width: Arc<AtomicU32>) -> Context {
+        Context {
+            // A connected socketpair: these tests never write to it, but
+            // Context owns a real Connection rather than a test-only shim.
+            conn: Arc::new(Connection::new(UnixStream::pair().unwrap().0)),
+            request_parent: None,
+            tool_call_id: None,
+            request_id: String::new(),
+            cwd: String::new(),
+            mode: String::new(),
+            shared_width: width,
+            flag_defaults: Arc::new(HashMap::new()),
+            shared_height: Arc::new(AtomicU32::new(0)),
+            shared_identity: Arc::new(Mutex::new(SessionIdentity::default())),
+            shared_session: Arc::new(Mutex::new(SessionMirror::default())),
+            session_sub_lock: Arc::new(Mutex::new(())),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel_reason: Arc::new(Mutex::new(None)),
+            overlay_seq: Arc::new(AtomicU64::new(0)),
+            overlays: Arc::new(Mutex::new(Default::default())),
+            editor_slot: Arc::new(Mutex::new(None)),
+            terminal_input: Arc::new(Mutex::new(Vec::new())),
+            terminal_input_seq: Arc::new(AtomicU64::new(0)),
+            width_change: subs,
+            width_change_seq: seq,
+            model_streams: Arc::new(Mutex::new(HashMap::new())),
+            model_stream_seq: Arc::new(AtomicU64::new(0)),
+            shared_ui: Arc::new(Mutex::new(UiState::default())),
+            bus: Arc::new(crate::event_bus::BusRegistry::default()),
+            host_subs: Arc::new(crate::host_subscriptions::HostSubscriptions::new(Arc::new(
+                crate::extension::RequestThreads::default(),
+            ))),
+            tool_call_index: None,
+            tool_input: None,
+            surfaces: Arc::new(Mutex::new(HashMap::new())),
+            replacement: false,
+            system_prompt: None,
+        }
+    }
+
+    #[test]
+    fn retained_context_shares_state_and_releases_with_its_subscription() {
+        let (s, q) = subs();
+        let ctx = ctx_with(s, q, Arc::new(AtomicU32::new(0)));
+        let retained = ctx.clone();
+        assert!(Arc::ptr_eq(&ctx.conn, &retained.conn));
+        assert!(Arc::ptr_eq(&ctx.shared_session, &retained.shared_session));
+        let connection = Arc::downgrade(&ctx.conn);
+        ctx.cancel_flag.store(true, Ordering::SeqCst);
+        assert!(retained.is_cancelled());
+        let guard = ctx.on_width_change(move |_| {
+            assert!(retained.is_cancelled());
+        });
+        drop(ctx);
+        assert!(connection.upgrade().is_some());
+        drop(guard);
+        assert!(connection.upgrade().is_none());
+    }
+
+    #[test]
+    fn registers_a_handler() {
+        let (s, q) = subs();
+        let ctx = ctx_with(s.clone(), q, Arc::new(AtomicU32::new(0)));
+        let _guard = ctx.on_width_change(|_| {});
+        assert_eq!(s.lock().unwrap().len(), 1, "handler was not registered");
+    }
+
+    #[test]
+    fn dropping_the_guard_unsubscribes() {
+        let (s, q) = subs();
+        let ctx = ctx_with(s.clone(), q, Arc::new(AtomicU32::new(0)));
+        {
+            let _guard = ctx.on_width_change(|_| {});
+            assert_eq!(s.lock().unwrap().len(), 1);
+        }
+        assert!(
+            s.lock().unwrap().is_empty(),
+            "handler outlived its guard, so delivery would continue after unsubscribe"
+        );
+    }
+
+    #[test]
+    fn explicit_unsubscribe_is_not_double_removed() {
+        let (s, q) = subs();
+        let ctx = ctx_with(s.clone(), q, Arc::new(AtomicU32::new(0)));
+        let keep = ctx.on_width_change(|_| {});
+        let drop_me = ctx.on_width_change(|_| {});
+        assert_eq!(s.lock().unwrap().len(), 2);
+        drop_me.unsubscribe();
+        assert_eq!(
+            s.lock().unwrap().len(),
+            1,
+            "unsubscribe removed the wrong handler or removed more than one"
+        );
+        drop(keep);
+        assert!(s.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn each_subscription_gets_a_distinct_id() {
+        let (s, q) = subs();
+        let ctx = ctx_with(s.clone(), q, Arc::new(AtomicU32::new(0)));
+        let _a = ctx.on_width_change(|_| {});
+        let _b = ctx.on_width_change(|_| {});
+        let ids: Vec<u64> = s.lock().unwrap().iter().map(|(id, _)| *id).collect();
+        assert_ne!(
+            ids[0], ids[1],
+            "shared ids would make one unsubscribe drop both handlers"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn apply(identity: &mut SessionIdentity, state: serde_json::Value) {
+        identity.apply_state(state.as_object().unwrap());
+    }
+
+    fn read(identity: &SessionIdentity) -> (&str, &str, &str) {
+        (
+            &identity.model,
+            &identity.model_provider,
+            &identity.session_name,
+        )
+    }
+
+    // A state snapshot replicates Pi's ctx.model.id, ctx.model.provider and ctx.sessionManager.getSessionName(): the id (the name only when the model has no id), an
+    // explicit null clears the model, an absent member keeps it, and every session snapshot carries the name with "" for no name. The Go and Python SDKs read the same
+    // members (test/extension-conformance/replicated_accessors_test.go).
+    #[test]
+    fn state_snapshots_replicate_the_model_identity_and_the_session_name() {
+        let mut identity = SessionIdentity::default();
+        assert_eq!(read(&identity), ("", "", ""));
+        apply(
+            &mut identity,
+            json!({"model": {"id": "id-sentinel", "name": "Name Sentinel", "provider": {"id": "prov-sentinel"}}, "session": {"sessionName": "s-sentinel"}}),
+        );
+        assert_eq!(
+            read(&identity),
+            ("id-sentinel", "prov-sentinel", "s-sentinel")
+        );
+        apply(&mut identity, json!({"isIdle": true}));
+        assert_eq!(
+            read(&identity),
+            ("id-sentinel", "prov-sentinel", "s-sentinel")
+        );
+        apply(
+            &mut identity,
+            json!({"model": {"id": "", "name": "Only Name", "provider": "flat-provider"}, "session": {"sessionName": ""}}),
+        );
+        assert_eq!(read(&identity), ("Only Name", "flat-provider", ""));
+        apply(&mut identity, json!({"model": null}));
+        assert_eq!(read(&identity), ("", "", ""));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod login_call_tests {
+    use super::*;
+    use crate::protocol::{CallResultMsg, Envelope};
+    use std::os::unix::net::UnixStream;
+
+    fn context(stream: UnixStream) -> Arc<Context> {
+        Arc::new(Context {
+            request_parent: None,
+            conn: Arc::new(Connection::new(stream)),
+            request_id: String::new(),
+            tool_call_id: None,
+            cwd: String::new(),
+            mode: String::new(),
+            shared_width: Arc::new(AtomicU32::new(0)),
+            flag_defaults: Arc::new(HashMap::new()),
+            shared_height: Arc::new(AtomicU32::new(0)),
+            shared_identity: Arc::new(Mutex::new(SessionIdentity::default())),
+            shared_session: Arc::new(Mutex::new(SessionMirror::default())),
+            session_sub_lock: Arc::new(Mutex::new(())),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel_reason: Arc::new(Mutex::new(None)),
+            overlay_seq: Arc::new(AtomicU64::new(0)),
+            overlays: Arc::new(Mutex::new(Default::default())),
+            editor_slot: Arc::new(Mutex::new(None)),
+            terminal_input: Arc::new(Mutex::new(Vec::new())),
+            terminal_input_seq: Arc::new(AtomicU64::new(0)),
+            width_change: Arc::new(Mutex::new(Vec::new())),
+            width_change_seq: Arc::new(AtomicU64::new(0)),
+            model_streams: Arc::new(Mutex::new(HashMap::new())),
+            model_stream_seq: Arc::new(AtomicU64::new(0)),
+            shared_ui: Arc::new(Mutex::new(UiState::default())),
+            bus: Arc::new(crate::event_bus::BusRegistry::default()),
+            host_subs: Arc::new(crate::host_subscriptions::HostSubscriptions::new(Arc::new(
+                crate::extension::RequestThreads::default(),
+            ))),
+            tool_call_index: None,
+            tool_input: None,
+            surfaces: Arc::new(Mutex::new(HashMap::new())),
+            replacement: false,
+            system_prompt: None,
+        })
+    }
+
+    // runner.ts:571-600 throws the stale message from cwd, mode, hasUI and model once the runtime is invalidated; the first message wins (runner.ts:725-727).
+    #[test]
+    fn local_members_panic_with_the_stale_message_after_invalidate() {
+        let (extension_stream, _host_stream) = UnixStream::pair().unwrap();
+        let mut ctx = Arc::try_unwrap(context(extension_stream)).ok().unwrap();
+        ctx.cwd = "/work".into();
+        ctx.mode = "tui".into();
+        ctx.shared_identity.lock().unwrap().model = "m".into();
+        ctx.shared_ui.lock().unwrap().has_ui = true;
+        assert_eq!(
+            (ctx.cwd(), ctx.mode(), ctx.model().as_str(), ctx.has_ui()),
+            ("/work", "tui", "m", true)
+        );
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        ctx.conn
+            .apply_invalidate(&serde_json::json!({ "message": STALE }));
+        ctx.conn
+            .apply_invalidate(&serde_json::json!({ "message": "second" }));
+        type Read<'a> = Box<dyn Fn() + 'a>;
+        let reads: [(&str, Read<'_>); 4] = [
+            (
+                "cwd",
+                Box::new(|| {
+                    let _ = ctx.cwd();
+                }),
+            ),
+            (
+                "mode",
+                Box::new(|| {
+                    let _ = ctx.mode();
+                }),
+            ),
+            (
+                "model",
+                Box::new(|| {
+                    let _ = ctx.model();
+                }),
+            ),
+            (
+                "has_ui",
+                Box::new(|| {
+                    let _ = ctx.has_ui();
+                }),
+            ),
+        ];
+        for (name, read) in reads {
+            let panic =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).expect_err(name);
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()));
+            assert_eq!(message.as_deref(), Some(STALE), "{name}");
+        }
+        // A replacement context belongs to the new session.
+        let mut replacement = Arc::try_unwrap(context(UnixStream::pair().unwrap().0))
+            .ok()
+            .unwrap();
+        replacement.replacement = true;
+        replacement
+            .conn
+            .apply_invalidate(&serde_json::json!({ "message": STALE }));
+        replacement.cwd = "/new".into();
+        assert_eq!(replacement.cwd(), "/new");
+    }
+
+    // Pi guards every context member (runner.ts:883-1037). After the session was replaced the members that have no error result panic with the stale
+    // message, the calls that have one return it, and a call that fails changes nothing: the installed widget renderer is still there.
+    #[test]
+    fn a_stale_context_fails_the_theme_size_widget_update_settings_and_renderer_members_with_the_stale_message()
+     {
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        let (extension_stream, _host_stream) = UnixStream::pair().unwrap();
+        let mut ctx = Arc::try_unwrap(context(extension_stream)).ok().unwrap();
+        ctx.tool_call_id = Some("tool".into());
+        ctx.request_id = "request".into();
+        ctx.shared_width.store(90, Ordering::Relaxed);
+        ctx.shared_height.store(30, Ordering::Relaxed);
+        assert_eq!((ctx.width(), ctx.height()), (90, 30));
+        let _ = ctx.theme();
+        ctx.replace_surface_id(
+            widget_renderer_id("kept"),
+            Some(Arc::new(SurfaceRenderer {
+                method: "ui.setWidget",
+                widget: Some(("kept".into(), None)),
+                render: Box::new(|_| vec!["row".into()]),
+                stopped: Mutex::new(false),
+                refresh: Mutex::new((false, false)),
+            })),
+        );
+        ctx.conn
+            .apply_invalidate(&serde_json::json!({ "message": STALE }));
+        type Read<'a> = Box<dyn Fn() + 'a>;
+        let reads: [(&str, Read<'_>); 3] = [
+            ("theme", Box::new(|| drop(ctx.theme()))),
+            ("width", Box::new(|| assert_ne!(ctx.width(), u32::MAX))),
+            ("height", Box::new(|| assert_ne!(ctx.height(), u32::MAX))),
+        ];
+        for (name, read) in reads {
+            let panic =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).expect_err(name);
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()));
+            assert_eq!(message.as_deref(), Some(STALE), "{name}");
+        }
+        let view = || crate::kit::View::new(crate::kit::Text::new("x", 0, 0));
+        let calls: Vec<(&str, io::Result<()>)> = vec![
+            ("set_widget", ctx.set_widget("kept", vec!["x".into()])),
+            ("set_widget_view", ctx.set_widget_view("kept", view(), None)),
+            (
+                "set_widget_renderer",
+                ctx.set_widget_renderer("kept", Some(|_: u32| vec!["y".to_string()]), None),
+            ),
+            (
+                "set_widget_renderer clear",
+                ctx.set_widget_renderer("kept", None::<fn(u32) -> Vec<String>>, None),
+            ),
+            ("on_update", ctx.on_update(crate::ToolResult::text("x"))),
+            ("get_settings", ctx.get_settings().map(|_| ())),
+            (
+                "register_tool_renderer",
+                ctx.register_tool_renderer(|_, _| None),
+            ),
+        ];
+        for (name, result) in calls {
+            let error = result.expect_err(name);
+            assert_eq!(error.to_string(), STALE, "{name}");
+        }
+        assert!(
+            ctx.surfaces
+                .lock()
+                .unwrap()
+                .contains_key(&widget_renderer_id("kept")),
+            "a failed widget call retired the installed renderer"
+        );
+    }
+
+    // The SDK renders a footer, header or widget again on a thread of its own after a width change. That read of the width is not the context's
+    // `width()`: a context the session replaced would panic there. The refresh still renders at the reported width and the push fails with the
+    // host's error.
+    #[test]
+    fn a_stale_surface_refresh_reads_the_width_without_panicking() {
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        let (extension_stream, host_stream) = UnixStream::pair().unwrap();
+        drop(host_stream);
+        let ctx = context(extension_stream);
+        ctx.shared_width.store(77, Ordering::Relaxed);
+        let (widths, seen) = std::sync::mpsc::channel();
+        let renderer = Arc::new(SurfaceRenderer {
+            method: "ui.setFooter",
+            widget: None,
+            render: Box::new(move |width| {
+                let _ = widths.send(width);
+                vec!["row".into()]
+            }),
+            stopped: Mutex::new(false),
+            refresh: Mutex::new((false, false)),
+        });
+        ctx.replace_surface("ui.setFooter", Some(renderer.clone()));
+        ctx.conn
+            .apply_invalidate(&serde_json::json!({ "message": STALE }));
+        ctx.refresh_surfaces();
+        assert_eq!(
+            seen.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(77)
+        );
+        assert!(renderer.push(&ctx).is_err());
+        assert!(ctx.set_footer(vec!["x".into()]).is_err());
+    }
+
+    // Pi's loader appends a resolver registered after loading; the host learns the extension's new resolver count
+    // and asks the late resolver after the loaded ones.
+    #[test]
+    fn register_tool_renderer_after_loading_reports_the_count_and_runs_after_the_loaded_resolvers()
+    {
+        let (extension_stream, host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(extension_stream);
+        ctx.conn
+            .late_tool_renderers
+            .loaded
+            .store(2, Ordering::SeqCst);
+        ctx.register_tool_renderer(|tool, next| {
+            if tool == "late" {
+                Some(crate::ToolRendererSet::default())
+            } else {
+                next()
+            }
+        })
+        .unwrap();
+        let host = Connection::new(host_stream);
+        let notify = host.read_envelope().unwrap().notify.unwrap();
+        assert_eq!(notify.method, "tool_renderers");
+        assert_eq!(notify.args, Some(serde_json::json!({ "count": 3 })));
+
+        let renderers = crate::tool_render::ToolRenderers::default();
+        let next = serde_json::json!({ "render_shell": "self" });
+        let late = renderers.resolve(
+            &ctx.conn,
+            Some(&serde_json::json!({ "tool": "late", "next": next })),
+        );
+        assert_eq!(late["use"], "own");
+        let other = renderers.resolve(
+            &ctx.conn,
+            Some(&serde_json::json!({ "tool": "other", "next": next })),
+        );
+        assert_eq!(other, serde_json::json!({ "use": "next" }));
+    }
+
+    #[test]
+    fn set_login_sends_the_definition_directly_as_call_args() {
+        let (extension_stream, host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(extension_stream);
+        let definition = LoginDefinition {
+            brand: vec!["brand".to_string()],
+            hero: vec!["hero".to_string()],
+            mascot: vec!["mascot".to_string()],
+            palette: HashMap::from([("A".to_string(), "#112233".to_string())]),
+            name: "name".to_string(),
+            description: "description".to_string(),
+            tagline: "tagline".to_string(),
+        };
+
+        let caller = {
+            let ctx = ctx.clone();
+            let definition = definition.clone();
+            std::thread::spawn(move || ctx.set_login(&definition))
+        };
+        let host = Connection::new(host_stream);
+        let envelope = host.read_envelope().unwrap();
+        let call = envelope.call.unwrap();
+        assert_eq!(call.method, "ui.setLogin");
+        assert_eq!(call.args, Some(serde_json::to_value(&definition).unwrap()));
+        assert_eq!(
+            call.args
+                .unwrap()
+                .get("name")
+                .and_then(|value| value.as_str()),
+            Some("name"),
+            "the definition must be Args itself, not nested under another key"
+        );
+
+        assert!(ctx.conn.complete_call(&Envelope::<serde_json::Value> {
+            msg_type: "call_result".to_string(),
+            id: envelope.id,
+            call_result: Some(CallResultMsg {
+                result: None,
+                error: None
+            }),
+            ..Default::default()
+        }));
+        caller.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn register_sprite_sends_the_definition_directly_as_call_args() {
+        let (extension_stream, host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(extension_stream);
+        let definition = SpriteDefinition {
+            id: "blue-pig".to_string(),
+            name: "Blue PiG".to_string(),
+            tagline: "From an extension.".to_string(),
+            mascot: vec!["mascot".to_string()],
+            palette: HashMap::from([("P".to_string(), "#5B8DEF".to_string())]),
+        };
+        let caller = {
+            let ctx = ctx.clone();
+            let definition = definition.clone();
+            std::thread::spawn(move || ctx.register_sprite(&definition))
+        };
+        let host = Connection::new(host_stream);
+        let envelope = host.read_envelope().unwrap();
+        let call = envelope.call.unwrap();
+        assert_eq!(call.method, "ui.registerSprite");
+        assert_eq!(call.args, Some(serde_json::to_value(&definition).unwrap()));
+        assert!(
+            ctx.conn.complete_call(&Envelope::<serde_json::Value> {
+                msg_type: "call_result".to_string(),
+                id: envelope.id,
+                call_result: Some(CallResultMsg {
+                    result: None,
+                    error: Some(crate::protocol::ErrorInfo {
+                        code: Some("invalid_sprite".to_string()),
+                        message: "invalid sprite definition mascot: must contain exactly 14 rows"
+                            .to_string(),
+                        shell_exit: None,
+                    }),
+                }),
+                ..Default::default()
+            })
+        );
+        let err = caller.join().unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid sprite definition mascot"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_stream_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_order_and_terminal_result() {
+        let stream = ModelEventStream::new();
+        stream.push(serde_json::json!({"type":"start"}));
+        stream.push(serde_json::json!({"type":"text_delta","delta":"ok"}));
+        stream.push(serde_json::json!({"type":"done","message":{"stopReason":"stop"}}));
+        assert_eq!(stream.next().unwrap()["type"], "start");
+        assert_eq!(stream.next().unwrap()["type"], "text_delta");
+        assert_eq!(stream.next().unwrap()["type"], "done");
+        assert!(stream.next().is_none());
+        assert_eq!(stream.result().unwrap()["stopReason"], "stop");
+    }
+
+    #[test]
+    fn transport_error_shape_is_complete() {
+        let event = model_stream_error_event(
+            "transport boom",
+            &serde_json::json!({"api":"openai-responses","provider":"conformance","modelId":"transport-error"}),
+        );
+        let error = &event["error"];
+        assert_eq!(error["role"], "assistant");
+        assert_eq!(error["api"], "openai-responses");
+        assert_eq!(error["provider"], "conformance");
+        assert_eq!(error["model"], "transport-error");
+        assert_eq!(error["stopReason"], "error");
+        assert_eq!(error["errorMessage"], "transport boom");
+        assert!(error["timestamp"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(error["usage"]["totalTokens"], 0);
+        assert_eq!(error["usage"]["cost"]["total"], 0);
+    }
+
+    #[test]
+    fn competing_consumers_drain_one_fifo_without_retention() {
+        let stream = Arc::new(ModelEventStream::new());
+        for sequence in 0..1000 {
+            stream.push(serde_json::json!({"type":"text_delta","sequence":sequence}));
+        }
+        stream.push(serde_json::json!({"type":"done","message":{"stopReason":"stop"}}));
+        stream.push(serde_json::json!({"type":"text_delta","sequence":"ignored"}));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let stream = stream.clone();
+            let seen = seen.clone();
+            workers.push(thread::spawn(move || {
+                while let Some(event) = stream.next() {
+                    if let Some(sequence) = event.get("sequence").and_then(|value| value.as_u64()) {
+                        seen.lock().unwrap().push(sequence);
+                    }
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let mut got = seen.lock().unwrap().clone();
+        got.sort_unstable();
+        assert_eq!(got, (0..1000).collect::<Vec<_>>());
+        let state = stream.state.lock().unwrap();
+        assert!(
+            state.events.is_empty(),
+            "drained stream retained {} events",
+            state.events.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_and_command_info_tests {
+    use super::*;
+
+    // The host answers getAllTools and getCommands with upstream's ToolInfo
+    // and SlashCommandInfo objects.
+    #[test]
+    fn decodes_upstream_tool_and_command_info() {
+        let result = serde_json::json!({"tools": [
+            {"name": "read", "description": "Read a file", "parameters": {"type": "object"},
+             "promptGuidelines": ["Use read."],
+             "sourceInfo": {"path": "<builtin:read>", "source": "builtin", "scope": "temporary", "origin": "top-level"}},
+            {"name": "probe", "description": "Probe", "parameters": {"type": "object", "properties": {}},
+             "sourceInfo": {"path": "/x/probe.ts", "source": "cli", "scope": "temporary", "origin": "top-level"}}
+        ]});
+        let tools: Vec<ToolInfo> = serde_json::from_value(result["tools"].clone()).unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            tools[0].prompt_guidelines.as_deref(),
+            Some(&["Use read.".to_string()][..])
+        );
+        assert_eq!(tools[0].source_info.source, "builtin");
+        assert_eq!(tools[1].prompt_guidelines, None);
+        assert_eq!(
+            tools[1].parameters,
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(tools[1].source_info.path, "/x/probe.ts");
+
+        let result = serde_json::json!({"commands": [
+            {"name": "probe", "description": "Probe command", "source": "extension",
+             "sourceInfo": {"path": "/x/probe.ts", "source": "cli", "scope": "temporary", "origin": "top-level"}},
+            {"name": "skill:review", "source": "skill",
+             "sourceInfo": {"path": "/s/SKILL.md", "source": "local", "scope": "user", "origin": "top-level", "baseDir": "/s"}}
+        ]});
+        let commands: Vec<CommandInfo> =
+            serde_json::from_value(result["commands"].clone()).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].source, "extension");
+        assert_eq!(commands[1].description, "");
+        assert_eq!(commands[1].source_info.base_dir.as_deref(), Some("/s"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sdk_surface_call_tests {
+    use super::*;
+    use crate::protocol::{CallMsg, CallResultMsg, Envelope, ErrorInfo};
+    use serde_json::json;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+
+    fn context(stream: UnixStream, request_id: &str) -> Arc<Context> {
+        Arc::new(Context {
+            conn: Arc::new(Connection::new(stream)),
+            request_id: request_id.to_string(),
+            request_parent: None,
+            flag_defaults: Arc::new(HashMap::new()),
+            tool_call_id: None,
+            cwd: String::new(),
+            mode: String::new(),
+            shared_width: Arc::new(AtomicU32::new(0)),
+            shared_height: Arc::new(AtomicU32::new(0)),
+            shared_identity: Arc::new(Mutex::new(SessionIdentity::default())),
+            shared_session: Arc::new(Mutex::new(SessionMirror::default())),
+            session_sub_lock: Arc::new(Mutex::new(())),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel_reason: Arc::new(Mutex::new(None)),
+            overlay_seq: Arc::new(AtomicU64::new(0)),
+            overlays: Arc::new(Mutex::new(Default::default())),
+            editor_slot: Arc::new(Mutex::new(None)),
+            terminal_input: Arc::new(Mutex::new(Vec::new())),
+            terminal_input_seq: Arc::new(AtomicU64::new(0)),
+            width_change: Arc::new(Mutex::new(Vec::new())),
+            width_change_seq: Arc::new(AtomicU64::new(0)),
+            model_streams: Arc::new(Mutex::new(HashMap::new())),
+            model_stream_seq: Arc::new(AtomicU64::new(0)),
+            shared_ui: Arc::new(Mutex::new(UiState::default())),
+            bus: Arc::new(crate::event_bus::BusRegistry::default()),
+            host_subs: Arc::new(crate::host_subscriptions::HostSubscriptions::new(Arc::new(
+                crate::extension::RequestThreads::default(),
+            ))),
+            tool_call_index: None,
+            tool_input: None,
+            surfaces: Arc::new(Mutex::new(HashMap::new())),
+            replacement: false,
+            system_prompt: None,
+        })
+    }
+
+    /// Reads the next call frame the extension wrote, skipping request_state.
+    fn next_call(host: &Connection) -> (Option<String>, CallMsg) {
+        loop {
+            let env = host.read_envelope().unwrap();
+            if env.msg_type == "call" {
+                return (env.id, env.call.unwrap());
+            }
+            assert_eq!(env.msg_type, "request_state", "unexpected frame");
+        }
+    }
+
+    fn reply(ctx: &Context, id: Option<String>, result: CallResultMsg) {
+        assert!(ctx.conn.complete_call(&Envelope {
+            msg_type: "call_result".to_string(),
+            id,
+            call_result: Some(result),
+            ..Default::default()
+        }));
+    }
+
+    fn ok(result: Option<serde_json::Value>) -> CallResultMsg {
+        CallResultMsg {
+            result,
+            error: None,
+        }
+    }
+
+    /// Runs `f` against a context whose host answers its one call with
+    /// `answer`, returning the call the host saw and `f`'s result.
+    fn roundtrip<T: Send + 'static>(
+        f: impl FnOnce(&Context) -> T + Send + 'static,
+        answer: CallResultMsg,
+    ) -> (CallMsg, T) {
+        let (ext_stream, host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(ext_stream, "req-1");
+        let caller = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || f(&ctx))
+        };
+        let host = Connection::new(host_stream);
+        let (id, call) = next_call(&host);
+        reply(&ctx, id, answer);
+        (call, caller.join().unwrap())
+    }
+
+    #[test]
+    fn yield_now_sends_the_yield_call_with_the_request_parent() {
+        let (call, result) = roundtrip(|ctx| ctx.yield_now(), ok(Some(json!({}))));
+        result.unwrap();
+        assert_eq!(call.method, "yield");
+        assert_eq!(call.parent_request_id.as_deref(), Some("req-1"));
+        assert_eq!(call.args.unwrap_or_else(|| json!({})), json!({}));
+    }
+
+    #[test]
+    fn yield_now_propagates_a_host_error() {
+        let (_, result) = roundtrip(
+            |ctx| ctx.yield_now(),
+            CallResultMsg {
+                result: None,
+                error: Some(ErrorInfo {
+                    code: None,
+                    message: "yield failed".to_string(),
+                    shell_exit: None,
+                }),
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("yield failed"));
+    }
+
+    #[test]
+    fn sleep_yields_before_it_sleeps() {
+        let (ext_stream, host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(ext_stream, "req-1");
+        let (tx, rx) = mpsc::channel();
+        let caller = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let result = ctx.sleep(Duration::from_millis(200));
+                let _ = tx.send(());
+                result
+            })
+        };
+        let host = Connection::new(host_stream);
+        let (id, call) = next_call(&host);
+        assert_eq!(call.method, "yield");
+        assert_eq!(call.parent_request_id.as_deref(), Some("req-1"));
+        // The call is on the wire while the sleep has not run yet.
+        assert!(rx.try_recv().is_err());
+        reply(&ctx, id, ok(Some(json!({}))));
+        let started = std::time::Instant::now();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        caller.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn sleep_propagates_a_yield_error_without_sleeping() {
+        let started = std::time::Instant::now();
+        let (_, result) = roundtrip(
+            |ctx| ctx.sleep(Duration::from_secs(30)),
+            CallResultMsg {
+                result: None,
+                error: Some(ErrorInfo {
+                    code: None,
+                    message: "yield failed".to_string(),
+                    shell_exit: None,
+                }),
+            },
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn send_custom_message_sends_content_blocks_details_and_options() {
+        let (call, result) = roundtrip(
+            |ctx| {
+                ctx.send_custom_message(
+                    &CustomMessage {
+                        custom_type: "note".to_string(),
+                        content: json!([{"type": "text", "text": "hi"}]),
+                        display: true,
+                        details: Some(json!({"k": 1})),
+                    },
+                    &SendMessageOptions {
+                        trigger_turn: Some(false),
+                        deliver_as: Some("nextTurn".to_string()),
+                    },
+                )
+            },
+            ok(None),
+        );
+        result.unwrap();
+        assert_eq!(call.method, "sendMessage");
+        assert_eq!(
+            call.args.unwrap(),
+            json!({
+                "message": {"customType": "note", "content": [{"type": "text", "text": "hi"}],
+                            "display": true, "details": {"k": 1}},
+                "options": {"triggerTurn": false, "deliverAs": "nextTurn"}
+            })
+        );
+    }
+
+    #[test]
+    fn exec_with_options_sends_options_and_decodes_code_and_killed() {
+        let (call, result) = roundtrip(
+            |ctx| {
+                ctx.exec_with_options(
+                    "sleep",
+                    &["10"],
+                    &ExecOptions {
+                        timeout: Some(250.0),
+                        cwd: Some("/work".to_string()),
+                        max_buffer: None,
+                        signal: None,
+                    },
+                )
+            },
+            ok(Some(
+                json!({"stdout": "out", "stderr": "err", "code": 137, "killed": true}),
+            )),
+        );
+        assert_eq!(call.method, "exec");
+        assert_eq!(
+            call.args.unwrap(),
+            json!({"command": "sleep", "args": ["10"], "options": {"timeout": 250.0, "cwd": "/work"}})
+        );
+        let result = result.unwrap();
+        assert_eq!(result.stdout, "out");
+        assert_eq!(result.stderr, "err");
+        assert_eq!(result.exit_code, 137);
+        assert!(result.killed);
+    }
+
+    // exec.ts rejects a maxBuffer that is not an integer; NaN and the infinities cannot cross the wire, so the call fails here and sends nothing.
+    #[test]
+    fn exec_with_a_non_finite_max_buffer_fails_without_a_call() {
+        let (ext_stream, _host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(ext_stream, "req-1");
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = ctx
+                .exec_with_options(
+                    "true",
+                    &[],
+                    &ExecOptions {
+                        max_buffer: Some(value),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                error.contains("maxBuffer must be an integer between 0 and"),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dialogs_with_options_send_the_timeout() {
+        let opts = DialogOptions {
+            timeout: Some(1500.0),
+        };
+        let (call, result) = roundtrip(
+            move |ctx| ctx.select_with_options("Pick", &["a", "b"], &opts),
+            ok(Some(json!({"selected": "b", "ok": true}))),
+        );
+        assert_eq!(call.method, "ui.select");
+        assert_eq!(
+            call.args.unwrap(),
+            json!({"title": "Pick", "options": ["a", "b"], "opts": {"timeout": 1500.0}})
+        );
+        assert_eq!(result.unwrap(), ("b".to_string(), true));
+
+        let (call, result) = roundtrip(
+            move |ctx| ctx.confirm_with_options("Sure?", "Really", &opts),
+            ok(Some(json!({"confirmed": true}))),
+        );
+        assert_eq!(call.method, "ui.confirm");
+        assert_eq!(
+            call.args.unwrap(),
+            json!({"title": "Sure?", "message": "Really", "opts": {"timeout": 1500.0}})
+        );
+        assert!(result.unwrap());
+
+        let (call, result) = roundtrip(
+            move |ctx| ctx.input_with_options("Name", "type", &opts),
+            ok(Some(json!({"text": "", "ok": false}))),
+        );
+        assert_eq!(call.method, "ui.input");
+        assert_eq!(
+            call.args.unwrap(),
+            json!({"title": "Name", "placeholder": "type", "opts": {"timeout": 1500.0}})
+        );
+        assert_eq!(result.unwrap(), (String::new(), false));
+    }
+
+    #[test]
+    fn empty_and_unset_ui_members_stay_distinct_on_the_wire() {
+        // Pi's rpc-mode writes "" where an extension passes it and omits `undefined`: set_status("") and clear_status differ, and so do input/editor with an
+        // empty placeholder/prefill and input_without_placeholder/editor_without_prefill, as no Rust string is undefined.
+        let (call, ()) = roundtrip(|ctx| ctx.set_status("k", ""), ok(None));
+        assert_eq!(call.method, "ui.setStatus");
+        assert_eq!(call.args.unwrap(), json!({"key": "k", "text": ""}));
+
+        let (call, ()) = roundtrip(|ctx| ctx.clear_status("k"), ok(None));
+        assert_eq!(call.method, "ui.setStatus");
+        assert_eq!(call.args.unwrap(), json!({"key": "k"}));
+
+        let (call, result) = roundtrip(
+            |ctx| ctx.input("T", ""),
+            ok(Some(json!({"text": "", "ok": false}))),
+        );
+        result.unwrap();
+        assert_eq!(call.method, "ui.input");
+        assert_eq!(call.args.unwrap(), json!({"title": "T", "placeholder": ""}));
+
+        let (call, result) = roundtrip(
+            |ctx| ctx.input_without_placeholder("T"),
+            ok(Some(json!({"text": "", "ok": false}))),
+        );
+        result.unwrap();
+        assert_eq!(call.method, "ui.input");
+        assert_eq!(call.args.unwrap(), json!({"title": "T"}));
+
+        let (call, result) = roundtrip(
+            |ctx| ctx.editor("E", ""),
+            ok(Some(json!({"text": "", "ok": false}))),
+        );
+        result.unwrap();
+        assert_eq!(call.method, "ui.editor");
+        assert_eq!(call.args.unwrap(), json!({"title": "E", "prefill": ""}));
+
+        let (call, result) = roundtrip(
+            |ctx| ctx.editor_without_prefill("E"),
+            ok(Some(json!({"text": "", "ok": false}))),
+        );
+        result.unwrap();
+        assert_eq!(call.method, "ui.editor");
+        assert_eq!(call.args.unwrap(), json!({"title": "E"}));
+
+        let (call, result) = roundtrip(
+            |ctx| ctx.select("T", &[]),
+            ok(Some(json!({"selected": "", "ok": false}))),
+        );
+        result.unwrap();
+        assert_eq!(call.method, "ui.select");
+        assert_eq!(call.args.unwrap(), json!({"title": "T", "options": []}));
+    }
+
+    #[test]
+    fn set_footer_and_header_send_lines() {
+        let (call, result) = roundtrip(
+            |ctx| ctx.set_footer(vec!["f1".to_string(), "f2".to_string()]),
+            ok(None),
+        );
+        result.unwrap();
+        assert_eq!(call.method, "ui.setFooter");
+        assert_eq!(call.args.unwrap(), json!({"lines": ["f1", "f2"]}));
+
+        let (call, result) = roundtrip(|ctx| ctx.set_header(vec!["h".to_string()]), ok(None));
+        result.unwrap();
+        assert_eq!(call.method, "ui.setHeader");
+        assert_eq!(call.args.unwrap(), json!({"lines": ["h"]}));
+    }
+
+    fn compact_roundtrip(answer: CallResultMsg) -> (CallMsg, Result<serde_json::Value, String>) {
+        let (ext_stream, host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(ext_stream, "req-1");
+        let (tx, rx) = mpsc::channel();
+        let err_tx = tx.clone();
+        ctx.compact_with_options(CompactOptions {
+            custom_instructions: Some("focus".to_string()),
+            on_complete: Some(Box::new(move |result| {
+                let _ = tx.send(Ok(result));
+            })),
+            on_error: Some(Box::new(move |message| {
+                let _ = err_tx.send(Err(message));
+            })),
+        });
+        let host = Connection::new(host_stream);
+        let (id, call) = next_call(&host);
+        reply(&ctx, id, answer);
+        let outcome = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        (call, outcome)
+    }
+
+    #[test]
+    fn compact_with_options_awaits_completion_outside_the_request() {
+        let (call, outcome) = compact_roundtrip(ok(Some(
+            json!({"summary": "s", "firstKeptEntryId": "e1", "tokensBefore": 100}),
+        )));
+        assert_eq!(call.method, "compact");
+        assert_eq!(call.parent_request_id, None);
+        assert_eq!(
+            call.args.unwrap(),
+            json!({"customInstructions": "focus", "awaitCompletion": true})
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            json!({"summary": "s", "firstKeptEntryId": "e1", "tokensBefore": 100})
+        );
+
+        let (call, outcome) = compact_roundtrip(CallResultMsg {
+            result: None,
+            error: Some(ErrorInfo {
+                code: None,
+                message: "Nothing to compact".to_string(),
+                shell_exit: None,
+            }),
+        });
+        assert_eq!(call.parent_request_id, None);
+        assert_eq!(outcome.unwrap_err(), "Nothing to compact");
+    }
+
+    // The Node runtime rejects a failed host call with the host's message and
+    // prefixes "code: " only when the host names a code, so pi.exec rejects
+    // with "spawn EINVAL", not "call_failed: spawn EINVAL".
+    #[test]
+    fn host_errors_keep_the_message_without_a_code() {
+        fn bare() -> CallResultMsg {
+            CallResultMsg {
+                result: None,
+                error: Some(ErrorInfo {
+                    code: None,
+                    message: "spawn EINVAL".to_string(),
+                    shell_exit: None,
+                }),
+            }
+        }
+        let Err(message) = roundtrip(|c| c.exec("tool.cmd", &[]), bare()).1 else {
+            panic!("exec resolved")
+        };
+        assert_eq!(message, "spawn EINVAL");
+        let Err(message) = roundtrip(|c| c.exec("tool.cmd", &[]), failed()).1 else {
+            panic!("exec resolved")
+        };
+        assert_eq!(message, "host_failed: boom");
+        let Err(error) = roundtrip(|c| c.call_host("x", None), bare()).1 else {
+            panic!("call resolved")
+        };
+        assert_eq!(error.to_string(), "spawn EINVAL");
+        let Err(error) = roundtrip(|c| c.get_editor_text(), bare()).1 else {
+            panic!("call resolved")
+        };
+        assert_eq!(error.to_string(), "spawn EINVAL");
+    }
+    fn failed() -> CallResultMsg {
+        CallResultMsg {
+            result: None,
+            error: Some(ErrorInfo {
+                code: Some("host_failed".to_string()),
+                message: "boom".to_string(),
+                shell_exit: None,
+            }),
+        }
+    }
+
+    // Pi's getters return undefined for absent state and throw for a failed
+    // host call. The Rust getters return `None` for the first and `Err` for the
+    // second, never an empty value, a cached name or a default.
+    #[test]
+    fn getters_distinguish_absent_empty_and_failure() {
+        let (call, name) = roundtrip(|c| c.get_session_name(), ok(Some(json!({"name": "named"}))));
+        assert_eq!(call.method, "getSessionName");
+        assert_eq!(name.unwrap().as_deref(), Some("named"));
+        assert_eq!(
+            roundtrip(|c| c.get_session_name(), ok(Some(json!({"name": ""}))))
+                .1
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            roundtrip(
+                |c| c.get_session_file(),
+                ok(Some(json!({"sessionFile": ""})))
+            )
+            .1
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            roundtrip(|c| c.get_leaf_id(), ok(Some(json!({"leafId": null}))))
+                .1
+                .unwrap(),
+            None
+        );
+        assert!(
+            roundtrip(|c| c.get_context_usage(), ok(Some(json!(null))))
+                .1
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            roundtrip(|c| c.get_model_info(), ok(Some(json!({}))))
+                .1
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            roundtrip(|c| c.get_editor_text(), ok(Some(json!({"text": ""}))))
+                .1
+                .unwrap()
+                .to_string()
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            roundtrip(|c| c.get_flag("f"), ok(Some(json!({"value": false}))))
+                .1
+                .unwrap(),
+            Some(json!(false))
+        );
+        assert_eq!(
+            roundtrip(|c| c.get_flag("f"), ok(Some(json!({}))))
+                .1
+                .unwrap(),
+            None
+        );
+        assert!(
+            !roundtrip(|c| c.is_idle(), ok(Some(json!({"idle": false}))))
+                .1
+                .unwrap()
+        );
+        // SetActiveTools([]) narrows the session to no tools: an empty list is a value, a null one a protocol error.
+        assert_eq!(
+            roundtrip(|c| c.get_active_tools(), ok(Some(json!({"tools": []}))))
+                .1
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            roundtrip(
+                |c| c.get_active_tools(),
+                ok(Some(json!({"tools": ["read"]})))
+            )
+            .1
+            .unwrap(),
+            vec!["read".to_string()]
+        );
+        assert!(
+            roundtrip(|c| c.get_active_tools(), ok(Some(json!({"tools": null}))))
+                .1
+                .is_err()
+        );
+
+        assert!(
+            roundtrip(|c| c.get_session_name(), failed())
+                .1
+                .unwrap_err()
+                .to_string()
+                .contains("boom")
+        );
+        assert!(roundtrip(|c| c.get_editor_text(), failed()).1.is_err());
+        assert!(roundtrip(|c| c.get_flag("f"), failed()).1.is_err());
+        assert!(roundtrip(|c| c.get_active_tools(), failed()).1.is_err());
+        assert!(roundtrip(|c| c.get_context_usage(), failed()).1.is_err());
+        assert!(roundtrip(|c| c.is_idle(), failed()).1.is_err());
+        assert!(roundtrip(|c| c.is_project_trusted(), failed()).1.is_err());
+        assert!(
+            roundtrip(
+                |c| c.get_thinking_level(),
+                ok(Some(json!({"unrelated": 1})))
+            )
+            .1
+            .is_err()
+        );
+    }
+    // The text accessors keep an unpaired surrogate that a Value would read as U+FFFD, and name the host call whose reply they return as it is.
+    #[test]
+    fn entries_json_keeps_an_unpaired_surrogate_the_host_sent() {
+        let (ext_stream, host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(ext_stream, "req-1");
+        let caller = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || (ctx.get_entries_json(), ctx.get_branch_json()))
+        };
+        let host = Connection::new(host_stream);
+        let answers = [
+            r#"[{"id":"a","message":{"content":"x\ud83dy"}}]"#,
+            r#"[{"id":"b","message":{"content":"\udc00"}}]"#,
+        ];
+        let mut methods = Vec::new();
+        for answer in answers {
+            let (id, call) = next_call(&host);
+            assert_eq!(call.method, "sessionRead");
+            methods.push(call.args.unwrap()["method"].as_str().unwrap().to_string());
+            let raw = serde_json::value::RawValue::from_string(answer.to_string()).unwrap();
+            assert!(
+                ctx.conn
+                    .complete_call(&Envelope::<Box<serde_json::value::RawValue>> {
+                        msg_type: "call_result".to_string(),
+                        id,
+                        call_result: Some(CallResultMsg {
+                            result: Some(raw),
+                            error: None
+                        }),
+                        ..Default::default()
+                    })
+            );
+        }
+        assert_eq!(methods, ["getEntries", "getBranch"]);
+        let (entries, branch) = caller.join().unwrap();
+        assert_eq!(entries.unwrap(), answers[0]);
+        assert_eq!(branch.unwrap(), answers[1]);
+    }
+
+    // A failed session-log subscription is returned by every mirror read, not hidden as an empty or partial mirror.
+    #[test]
+    fn session_log_getters_report_subscription_failure() {
+        let (ext_stream, host_stream) = UnixStream::pair().unwrap();
+        let ctx = context(ext_stream, "req-1");
+        let caller = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                (
+                    ctx.get_entries().map(|entries| entries.len()),
+                    ctx.get_branch().map(|branch| branch.len()),
+                )
+            })
+        };
+        let host = Connection::new(host_stream);
+        let (id, call) = next_call(&host);
+        assert_eq!(
+            call.method, "getSessionFile",
+            "the seed read reports its own failure instead of an empty path"
+        );
+        reply(&ctx, id, failed());
+        let (entries, branch) = caller.join().unwrap();
+        assert!(entries.unwrap_err().to_string().contains("boom"));
+        assert!(
+            branch.unwrap_err().to_string().contains("boom"),
+            "the second read must report the same failure without a second call"
+        );
+    }
+
+    // ─── Replicated model and session id reads ───────────────────────────
+
+    fn model_object() -> serde_json::Value {
+        json!({
+            "id": "m-1", "name": "Model One", "provider": "prov-1", "contextWindow": 200000,
+            "maxTokens": 8192, "reasoning": true,
+            "cost": {"input": 1.5, "output": 2.5, "cacheRead": 0.5, "cacheWrite": 3.0},
+            "inputLimits": {"maxImageBytes": 9}
+        })
+    }
+
+    fn snapshot(ctx: &Context, state: serde_json::Value) {
+        ctx.shared_identity
+            .lock()
+            .unwrap()
+            .apply_state(state.as_object().unwrap());
+    }
+
+    fn bench() -> (Arc<Context>, UnixStream) {
+        let (ext_stream, host_stream) = UnixStream::pair().unwrap();
+        (context(ext_stream, "req-1"), host_stream)
+    }
+
+    /// A context of the replacement Session: it never answers from this process's replica.
+    fn replacement_of(ctx: &Arc<Context>) -> Arc<Context> {
+        let mut replacement = (**ctx).clone();
+        replacement.replacement = true;
+        Arc::new(replacement)
+    }
+
+    /// Runs `reads` on a thread; a host call it sends fails the test, naming the method, instead of blocking it.
+    fn without_a_host_call<T: Send + 'static>(
+        ctx: &Arc<Context>,
+        host_stream: &UnixStream,
+        reads: impl FnOnce(&Context) -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        let caller = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reads(&caller));
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(value) => value,
+            Err(_) => {
+                let host = Connection::new(host_stream.try_clone().unwrap());
+                let (_, call) = next_call(&host);
+                panic!("a replicated read sent the host call {}", call.method);
+            }
+        }
+    }
+
+    /// Runs `f` on `ctx`, whose host answers its one call with `answer`.
+    fn one_call<T: Send + 'static>(
+        ctx: &Arc<Context>,
+        host_stream: UnixStream,
+        f: impl FnOnce(&Context) -> T + Send + 'static,
+        answer: CallResultMsg,
+    ) -> (CallMsg, T) {
+        let caller = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || f(&ctx))
+        };
+        let host = Connection::new(host_stream);
+        let (id, call) = next_call(&host);
+        reply(ctx, id, answer);
+        (call, caller.join().unwrap())
+    }
+
+    type Reads = (
+        io::Result<Option<ModelInfo>>,
+        io::Result<String>,
+        io::Result<serde_json::Value>,
+    );
+
+    fn all_three(ctx: &Context) -> Reads {
+        (
+            ctx.get_model_info(),
+            ctx.get_session_id(),
+            ctx.session_manager().get_session_id(),
+        )
+    }
+
+    #[test]
+    fn replicated_reads_answer_from_the_state_snapshot_without_a_host_call() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"model": model_object(), "session": {"sessionId": "sess-1"}}),
+        );
+        let (info, session_id, manager_id) = without_a_host_call(&ctx, &host, all_three);
+        let info = info.unwrap().unwrap();
+        assert_eq!(
+            (info.id.as_str(), info.name.as_str(), info.provider.as_str()),
+            ("m-1", "Model One", "prov-1")
+        );
+        assert_eq!(
+            (info.context_window, info.max_output_tokens),
+            (200000, 8192)
+        );
+        assert!(info.reasoning);
+        assert_eq!(
+            (
+                info.input_cost_per_1m,
+                info.output_cost_per_1m,
+                info.cache_read_cost_per_1m,
+                info.cache_write_cost_per_1m
+            ),
+            (1.5, 2.5, 0.5, 3.0)
+        );
+        assert_eq!(info.input_limits, Some(json!({"maxImageBytes": 9})));
+        assert_eq!(session_id.unwrap(), "sess-1");
+        assert_eq!(manager_id.unwrap(), json!("sess-1"));
+    }
+
+    #[test]
+    fn later_snapshots_replace_the_replica_and_an_absent_key_keeps_it() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"model": model_object(), "session": {"sessionId": "sess-1"}}),
+        );
+        snapshot(&ctx, json!({"isIdle": true}));
+        let (info, session_id, _) = without_a_host_call(&ctx, &host, all_three);
+        assert_eq!(info.unwrap().unwrap().id, "m-1");
+        assert_eq!(session_id.unwrap(), "sess-1");
+
+        // The same model again, a different model, and a different session.
+        snapshot(&ctx, json!({"model": model_object()}));
+        snapshot(
+            &ctx,
+            json!({"model": {"id": "m-2", "name": "Model Two", "provider": {"id": "prov-2"}}, "session": {"sessionId": "sess-2"}}),
+        );
+        let (info, session_id, manager_id) = without_a_host_call(&ctx, &host, all_three);
+        let info = info.unwrap().unwrap();
+        assert_eq!(
+            (info.id.as_str(), info.name.as_str(), info.provider.as_str()),
+            ("m-2", "Model Two", "prov-2")
+        );
+        assert_eq!(session_id.unwrap(), "sess-2");
+        assert_eq!(manager_id.unwrap(), json!("sess-2"));
+
+        // A null model clears the model only; a session object without sessionId carries the empty id.
+        snapshot(&ctx, json!({"model": null}));
+        let (info, session_id, _) = without_a_host_call(&ctx, &host, all_three);
+        assert!(info.unwrap().is_none());
+        assert_eq!(session_id.unwrap(), "sess-2");
+        snapshot(&ctx, json!({"session": {"sessionName": "named"}}));
+        let (info, session_id, manager_id) = without_a_host_call(&ctx, &host, all_three);
+        assert!(info.unwrap().is_none());
+        assert_eq!(session_id.unwrap(), "");
+        assert_eq!(manager_id.unwrap(), json!(""));
+
+        // A model object with an empty id names no model.
+        snapshot(&ctx, json!({"model": {"id": "", "name": "only a name"}}));
+        assert!(
+            without_a_host_call(&ctx, &host, |c| c.get_model_info())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reads_ask_the_host_until_a_snapshot_carried_them() {
+        let answer = || ok(Some(model_object()));
+        let (ctx, host) = bench();
+        let (call, info) = one_call(&ctx, host, |c| c.get_model_info(), answer());
+        assert_eq!(call.method, "getModelInfo");
+        assert_eq!(info.unwrap().unwrap().id, "m-1");
+        let (ctx, host) = bench();
+        let (call, id) = one_call(
+            &ctx,
+            host,
+            |c| c.get_session_id(),
+            ok(Some(json!({"sessionId": "host-id"}))),
+        );
+        assert_eq!(call.method, "getSessionID");
+        assert_eq!(id.unwrap(), "host-id");
+        let (ctx, host) = bench();
+        let (call, id) = one_call(
+            &ctx,
+            host,
+            |c| c.session_manager().get_session_id(),
+            ok(Some(json!("host-id"))),
+        );
+        assert_eq!(call.method, "sessionRead");
+        assert_eq!(call.args.unwrap()["method"], "getSessionId");
+        assert_eq!(id.unwrap(), json!("host-id"));
+
+        // The model and the session id are known independently: a snapshot without the other member leaves it to the host.
+        let (ctx, host) = bench();
+        snapshot(&ctx, json!({"model": model_object()}));
+        let (call, id) = one_call(
+            &ctx,
+            host,
+            |c| c.get_session_id(),
+            ok(Some(json!({"sessionId": "host-id"}))),
+        );
+        assert_eq!(
+            (call.method.as_str(), id.unwrap().as_str()),
+            ("getSessionID", "host-id")
+        );
+        let (ctx, host) = bench();
+        snapshot(&ctx, json!({"session": {"sessionId": "sess-1"}}));
+        let (call, _) = one_call(&ctx, host, |c| c.get_model_info(), ok(Some(json!(null))));
+        assert_eq!(call.method, "getModelInfo");
+    }
+
+    #[test]
+    fn a_replacement_context_keeps_asking_the_host() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"model": model_object(), "session": {"sessionId": "sess-1"}}),
+        );
+        let replacement = replacement_of(&ctx);
+        let (call, info) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.get_model_info(),
+            ok(Some(json!({"id": "other", "provider": "p"}))),
+        );
+        assert_eq!(call.method, "getModelInfo");
+        assert_eq!(info.unwrap().unwrap().id, "other");
+        let (call, id) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.get_session_id(),
+            ok(Some(json!({"sessionId": "other-id"}))),
+        );
+        assert_eq!(call.method, "getSessionID");
+        assert_eq!(id.unwrap(), "other-id");
+        let (call, id) = one_call(
+            &replacement,
+            host,
+            |c| c.session_manager().get_session_id(),
+            ok(Some(json!("other-id"))),
+        );
+        assert_eq!(call.method, "sessionRead");
+        assert_eq!(id.unwrap(), json!("other-id"));
+    }
+
+    // The host answers every call of a replaced runtime with the stale error; the local read fails the same way.
+    #[test]
+    fn a_stale_context_fails_the_replicated_reads_with_the_stale_message() {
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        for snapshotted in [true, false] {
+            let (ctx, host) = bench();
+            if snapshotted {
+                snapshot(
+                    &ctx,
+                    json!({"model": model_object(), "session": {"sessionId": "sess-1"}}),
+                );
+            }
+            ctx.conn.apply_invalidate(&json!({"message": STALE}));
+            let (info, session_id, manager_id) = without_a_host_call(&ctx, &host, all_three);
+            for message in [
+                info.unwrap_err().to_string(),
+                session_id.unwrap_err().to_string(),
+                manager_id.unwrap_err().to_string(),
+            ] {
+                assert_eq!(message, STALE, "snapshotted: {snapshotted}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_returned_model_is_not_an_alias_of_the_replica() {
+        let (ctx, host) = bench();
+        snapshot(&ctx, json!({"model": model_object()}));
+        let mut first = without_a_host_call(&ctx, &host, |c| c.get_model_info())
+            .unwrap()
+            .unwrap();
+        first.name.push_str(" mutated");
+        first.context_window = 1;
+        first.input_limits.as_mut().unwrap()["maxImageBytes"] = json!(1);
+        let second = without_a_host_call(&ctx, &host, |c| c.get_model_info())
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.name, "Model One");
+        assert_eq!(second.context_window, 200000);
+        assert_eq!(second.input_limits, Some(json!({"maxImageBytes": 9})));
+    }
+
+    // A model the typed decode rejects fails with the message the host reply's decode gave.
+    #[test]
+    fn an_undecodable_replicated_model_fails_like_the_host_reply_did() {
+        for model in [
+            json!({"id": "m", "contextWindow": "big"}),
+            json!({"id": "m", "reasoning": "yes"}),
+            json!("not an object"),
+        ] {
+            let (ctx, host) = bench();
+            snapshot(&ctx, json!({"model": model.clone()}));
+            let local = without_a_host_call(&ctx, &host, |c| c.get_model_info());
+            let (ask, host) = bench();
+            let (_, reply) = one_call(&ask, host, |c| c.get_model_info(), ok(Some(model.clone())));
+            let (local, reply) = (local.unwrap_err(), reply.unwrap_err());
+            assert_eq!(local.to_string(), reply.to_string(), "{model}");
+            assert_eq!(local.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    // ─── Replicated session name and file reads ──────────────────────────
+
+    type NameAndFile = (
+        io::Result<Option<String>>,
+        io::Result<Option<String>>,
+        io::Result<serde_json::Value>,
+        io::Result<serde_json::Value>,
+    );
+
+    fn name_and_file(ctx: &Context) -> NameAndFile {
+        (
+            ctx.get_session_name(),
+            ctx.get_session_file(),
+            ctx.session_manager().get_session_name(),
+            ctx.session_manager().get_session_file(),
+        )
+    }
+
+    #[test]
+    fn session_name_and_file_answer_from_the_state_snapshot_without_a_host_call() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "named", "sessionFile": "/s/f.jsonl"}}),
+        );
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap().as_deref(), Some("named"));
+        assert_eq!(file.unwrap().as_deref(), Some("/s/f.jsonl"));
+        assert_eq!(manager_name.unwrap(), json!("named"));
+        assert_eq!(manager_file.unwrap(), json!("/s/f.jsonl"));
+    }
+
+    // Both members of a session object replace the held ones: "" is none and clears, as the host's own "" reply read as none.
+    #[test]
+    fn later_snapshots_replace_the_name_and_the_file_and_empty_clears_them() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "named", "sessionFile": "/s/f.jsonl"}}),
+        );
+        snapshot(&ctx, json!({"isIdle": true}));
+        let (name, file, _, _) = without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap().as_deref(), Some("named"));
+        assert_eq!(file.unwrap().as_deref(), Some("/s/f.jsonl"));
+
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "renamed", "sessionFile": "/s/g.jsonl"}}),
+        );
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap().as_deref(), Some("renamed"));
+        assert_eq!(file.unwrap().as_deref(), Some("/s/g.jsonl"));
+        assert_eq!(manager_name.unwrap(), json!("renamed"));
+        assert_eq!(manager_file.unwrap(), json!("/s/g.jsonl"));
+
+        // The name cleared, the file kept by the snapshot that names it.
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "", "sessionFile": "/s/g.jsonl"}}),
+        );
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap(), None);
+        assert_eq!(file.unwrap().as_deref(), Some("/s/g.jsonl"));
+        assert_eq!(manager_name.unwrap(), serde_json::Value::Null);
+        assert_eq!(manager_file.unwrap(), json!("/s/g.jsonl"));
+
+        // An in-memory session: the empty file clears the held one and a missing key is the empty value.
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "again", "sessionFile": ""}}),
+        );
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!(name.unwrap().as_deref(), Some("again"));
+        assert_eq!(file.unwrap(), None);
+        assert_eq!(manager_name.unwrap(), json!("again"));
+        assert_eq!(manager_file.unwrap(), serde_json::Value::Null);
+        snapshot(&ctx, json!({"session": {"sessionId": "s"}}));
+        let (name, file, manager_name, manager_file) =
+            without_a_host_call(&ctx, &host, name_and_file);
+        assert_eq!((name.unwrap(), file.unwrap()), (None, None));
+        assert_eq!(
+            (manager_name.unwrap(), manager_file.unwrap()),
+            (serde_json::Value::Null, serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn session_name_and_file_ask_the_host_until_a_snapshot_carried_the_session() {
+        // A snapshot without a session object leaves every session read to the host.
+        type Read = (
+            &'static str,
+            fn(&Context) -> io::Result<serde_json::Value>,
+            &'static str,
+            serde_json::Value,
+        );
+        let reads: [Read; 4] = [
+            (
+                "getSessionName",
+                |c| Ok(json!(c.get_session_name()?)),
+                "getSessionName",
+                json!({"name": "host-name"}),
+            ),
+            (
+                "getSessionFile",
+                |c| Ok(json!(c.get_session_file()?)),
+                "getSessionFile",
+                json!({"sessionFile": "/host/f"}),
+            ),
+            (
+                "sessionRead",
+                |c| c.session_manager().get_session_name(),
+                "getSessionName",
+                json!("host-name"),
+            ),
+            (
+                "sessionRead",
+                |c| c.session_manager().get_session_file(),
+                "getSessionFile",
+                json!("/host/f"),
+            ),
+        ];
+        for (method, read, manager_method, answer) in reads {
+            let (ctx, host) = bench();
+            snapshot(&ctx, json!({"model": model_object()}));
+            let (call, value) = one_call(&ctx, host, read, ok(Some(answer)));
+            assert_eq!(call.method, method);
+            if method == "sessionRead" {
+                assert_eq!(call.args.unwrap()["method"], manager_method);
+            }
+            assert!(value.unwrap().is_string());
+        }
+        // The host's empty reply reads as none.
+        let (ctx, host) = bench();
+        let (_, name) = one_call(
+            &ctx,
+            host,
+            |c| c.get_session_name(),
+            ok(Some(json!({"name": ""}))),
+        );
+        assert_eq!(name.unwrap(), None);
+    }
+
+    #[test]
+    fn a_replacement_context_asks_the_host_for_the_session_name_and_file() {
+        let (ctx, host) = bench();
+        snapshot(
+            &ctx,
+            json!({"session": {"sessionId": "s", "sessionName": "named", "sessionFile": "/s/f.jsonl"}}),
+        );
+        let replacement = replacement_of(&ctx);
+        let (call, name) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.get_session_name(),
+            ok(Some(json!({"name": "other"}))),
+        );
+        assert_eq!(call.method, "getSessionName");
+        assert_eq!(name.unwrap().as_deref(), Some("other"));
+        let (call, file) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.get_session_file(),
+            ok(Some(json!({"sessionFile": "/other"}))),
+        );
+        assert_eq!(call.method, "getSessionFile");
+        assert_eq!(file.unwrap().as_deref(), Some("/other"));
+        let (call, name) = one_call(
+            &replacement,
+            host.try_clone().unwrap(),
+            |c| c.session_manager().get_session_name(),
+            ok(Some(json!("other"))),
+        );
+        assert_eq!(call.method, "sessionRead");
+        assert_eq!(call.args.unwrap()["method"], "getSessionName");
+        assert_eq!(name.unwrap(), json!("other"));
+        let (call, file) = one_call(
+            &replacement,
+            host,
+            |c| c.session_manager().get_session_file(),
+            ok(Some(json!("/other"))),
+        );
+        assert_eq!(call.method, "sessionRead");
+        assert_eq!(call.args.unwrap()["method"], "getSessionFile");
+        assert_eq!(file.unwrap(), json!("/other"));
+    }
+
+    #[test]
+    fn a_stale_context_fails_the_session_name_and_file_reads_with_the_stale_message() {
+        const STALE: &str = "This extension ctx is stale after session replacement or reload.";
+        for snapshotted in [true, false] {
+            let (ctx, host) = bench();
+            if snapshotted {
+                snapshot(
+                    &ctx,
+                    json!({"session": {"sessionId": "s", "sessionName": "named", "sessionFile": "/s/f.jsonl"}}),
+                );
+            }
+            ctx.conn.apply_invalidate(&json!({"message": STALE}));
+            let (name, file, manager_name, manager_file) =
+                without_a_host_call(&ctx, &host, name_and_file);
+            for message in [
+                name.unwrap_err().to_string(),
+                file.unwrap_err().to_string(),
+                manager_name.unwrap_err().to_string(),
+                manager_file.unwrap_err().to_string(),
+            ] {
+                assert_eq!(message, STALE, "snapshotted: {snapshotted}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod overlay_width_tests {
+    use super::{overlay_render_layout, resolve_overlay_width};
+    use serde_json::json;
+
+    /// A focused overlay component renders at the width Pi's `TUI.resolveOverlayLayout` resolves (tui.ts:1212-1233); the
+    /// table matches the Node runtime's (runtime_node_overlay_sizing_test.go). Inline components and the legacy titled
+    /// modal render at the terminal width.
+    #[test]
+    fn overlay_render_width_follows_upstream_layout() {
+        let cases = [
+            ("default", json!({"overlay": true}), 80),
+            (
+                "empty layout",
+                json!({"overlay": true, "overlayOptions": {}}),
+                80,
+            ),
+            (
+                "percent width",
+                json!({"overlay": true, "overlayOptions": {"width": "75%", "maxHeight": "95%", "margin": {"top": 1}}}),
+                90,
+            ),
+            (
+                "minWidth clamped after margins",
+                json!({"overlay": true, "overlayOptions": {"width": 20, "minWidth": 200, "margin": 2}}),
+                116,
+            ),
+            (
+                "percentage before margin",
+                json!({"overlay": true, "overlayOptions": {"width": "50%", "margin": {"left": 10, "right": 10}}}),
+                60,
+            ),
+            (
+                "zero width",
+                json!({"overlay": true, "overlayOptions": {"width": 0}}),
+                1,
+            ),
+            (
+                "invalid width",
+                json!({"overlay": true, "overlayOptions": {"width": "oops"}}),
+                80,
+            ),
+            (
+                "legacy titled modal",
+                json!({"overlay": true, "title": "Picker"}),
+                120,
+            ),
+            (
+                "titled overlay with layout",
+                json!({"overlay": true, "title": "Picker", "overlayOptions": {"width": 30}}),
+                30,
+            ),
+            ("inline", json!({}), 120),
+        ];
+        for (name, options, want) in cases {
+            let layout = overlay_render_layout(options.as_object().unwrap());
+            let got = layout
+                .as_ref()
+                .map_or(120, |layout| resolve_overlay_width(layout, 120));
+            assert_eq!(got, want, "{name}");
+        }
+    }
+}
+
+// The reference is runtime-node/model-fetch.mjs (Pi's ProviderRequestOptions.fetch, packages/ai/src/types.ts): the fetch's init.signal is
+// cancelled when the host cancels the fetch callback or a fetchRead, when the host closes the response, and when the stream ends; a
+// response that arrives after the stream ended is dropped and the fetch fails.
+#[cfg(test)]
+mod model_fetch_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    fn call(id: &str) -> serde_json::Value {
+        serde_json::json!({"id": id, "url": "https://fetch.invalid/v1", "method": "POST", "headers": {"X-Host": ["1"]}, "body": crate::user_bash::base64(b"ping")})
+    }
+
+    fn response(body: impl std::io::Read + Send + 'static) -> ModelFetchResponse {
+        ModelFetchResponse {
+            status: 200,
+            status_text: String::new(),
+            headers: Vec::new(),
+            body: Some(Box::new(body)),
+        }
+    }
+
+    /// A body whose read blocks until its signal is cancelled; drop reports itself.
+    struct SignalledBody(
+        crate::ProviderSignal,
+        Option<std::sync::mpsc::Sender<()>>,
+        Option<std::sync::mpsc::Sender<()>>,
+    );
+    impl std::io::Read for SignalledBody {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(reading) = self.2.take() {
+                let _ = reading.send(());
+            }
+            self.0.wait();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "read cancelled",
+            ))
+        }
+    }
+    impl Drop for SignalledBody {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.1.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_has_no_model_argument_and_streams_the_body() {
+        let seen = Arc::new(Mutex::new(None));
+        let recorded = seen.clone();
+        let callbacks = ModelStreamCallbacks::new().fetch(move |request| {
+            *recorded.lock().unwrap() =
+                Some((request.url, request.method, request.headers, request.body));
+            Ok(response(std::io::Cursor::new(b"abc".to_vec())))
+        });
+        let none = crate::ProviderSignal::new();
+        let answer = serve_model_fetch(&callbacks, "fetch", &call("1"), &none).unwrap();
+        assert_eq!(answer["body"], true);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((
+                "https://fetch.invalid/v1".to_string(),
+                "POST".to_string(),
+                vec![("X-Host".to_string(), "1".to_string())],
+                Some(b"ping".to_vec())
+            ))
+        );
+        let read = serve_model_fetch(
+            &callbacks,
+            "fetchRead",
+            &serde_json::json!({"id": "1", "size": 2}),
+            &none,
+        )
+        .unwrap();
+        assert_eq!(
+            read,
+            serde_json::json!({"data": crate::user_bash::base64(b"ab"), "done": false})
+        );
+        assert_eq!(
+            serve_model_fetch(
+                &callbacks,
+                "fetchRead",
+                &serde_json::json!({"id": "1", "size": 65537}),
+                &none
+            )
+            .unwrap_err(),
+            "invalid model fetch read size"
+        );
+    }
+
+    #[test]
+    fn host_cancellation_of_the_fetch_cancels_its_signal() {
+        let cancel = crate::ProviderSignal::new();
+        let host = cancel.clone();
+        let callbacks = ModelStreamCallbacks::new().fetch(move |request| {
+            host.cancel(); // the host cancels the fetch callback while the fetch runs
+            assert!(
+                request.signal.is_cancelled(),
+                "the fetch's signal was not cancelled"
+            );
+            Err("aborted".to_string())
+        });
+        assert_eq!(
+            serve_model_fetch(&callbacks, "fetch", &call("1"), &cancel).unwrap_err(),
+            "aborted"
+        );
+        assert!(callbacks.fetches.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn host_cancellation_of_a_read_cancels_the_fetch_signal() {
+        let callbacks = ModelStreamCallbacks::new()
+            .fetch(|request| Ok(response(SignalledBody(request.signal.clone(), None, None))));
+        serve_model_fetch(
+            &callbacks,
+            "fetch",
+            &call("1"),
+            &crate::ProviderSignal::new(),
+        )
+        .unwrap();
+        let cancel = crate::ProviderSignal::new();
+        cancel.cancel();
+        assert_eq!(
+            serve_model_fetch(
+                &callbacks,
+                "fetchRead",
+                &serde_json::json!({"id": "1", "size": 4}),
+                &cancel
+            )
+            .unwrap_err(),
+            "read cancelled"
+        );
+    }
+
+    #[test]
+    fn a_blocked_read_does_not_block_closing_another_response() {
+        let (reading_tx, reading) = channel();
+        let reading_tx = Mutex::new(Some(reading_tx));
+        let callbacks = ModelStreamCallbacks::new().fetch(move |request| {
+            Ok(response(SignalledBody(
+                request.signal.clone(),
+                None,
+                reading_tx.lock().unwrap().take(),
+            )))
+        });
+        let none = crate::ProviderSignal::new();
+        serve_model_fetch(&callbacks, "fetch", &call("1"), &none).unwrap();
+        serve_model_fetch(&callbacks, "fetch", &call("2"), &none).unwrap();
+        let reader = callbacks.clone();
+        let (done, read) = channel();
+        let worker = thread::spawn(move || {
+            let _ = done.send(serve_model_fetch(
+                &reader,
+                "fetchRead",
+                &serde_json::json!({"id": "1", "size": 4}),
+                &crate::ProviderSignal::new(),
+            ));
+        });
+        reading.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Closing response 2 while response 1's read blocks must not wait for that read.
+        serve_model_fetch(
+            &callbacks,
+            "fetchClose",
+            &serde_json::json!({"id": "2"}),
+            &none,
+        )
+        .unwrap();
+        assert!(
+            read.try_recv().is_err(),
+            "the read of response 1 ended early"
+        );
+        serve_model_fetch(
+            &callbacks,
+            "fetchClose",
+            &serde_json::json!({"id": "1"}),
+            &none,
+        )
+        .unwrap();
+        assert_eq!(
+            read.recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap_err(),
+            "read cancelled"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn stream_end_cancels_a_fetch_in_flight_and_drops_its_late_body() {
+        let (started_tx, started) = channel();
+        let (release_tx, release) = channel::<()>();
+        let release = Mutex::new(release);
+        let (dropped_tx, dropped) = channel();
+        let dropped_tx = Mutex::new(Some(dropped_tx));
+        let seen = Arc::new(Mutex::new(None));
+        let recorded = seen.clone();
+        let callbacks = ModelStreamCallbacks::new().fetch(move |request| {
+            *recorded.lock().unwrap() = Some(request.signal.clone());
+            started_tx.send(()).unwrap();
+            release.lock().unwrap().recv().unwrap(); // a fetch that ignores its signal and answers after the stream ended
+            Ok(response(SignalledBody(
+                crate::ProviderSignal::new(),
+                dropped_tx.lock().unwrap().take(),
+                None,
+            )))
+        });
+        let fetcher = callbacks.clone();
+        let worker = thread::spawn(move || {
+            serve_model_fetch(&fetcher, "fetch", &call("1"), &crate::ProviderSignal::new())
+        });
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        callbacks.dispose_fetches();
+        assert!(
+            seen.lock().unwrap().as_ref().unwrap().is_cancelled(),
+            "the stream ended and the fetch's signal is not cancelled"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err(),
+            "model fetch transport is closed"
+        );
+        dropped
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the late body is retained");
+        assert!(callbacks.fetches.lock().unwrap().entries.is_empty());
+        assert_eq!(
+            serve_model_fetch(
+                &callbacks,
+                "fetch",
+                &call("2"),
+                &crate::ProviderSignal::new()
+            )
+            .unwrap_err(),
+            "model fetch transport is closed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_call_guard_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Pi core/extensions/types.ts:1372-1374: `isToolCallEventType(toolName, event)` is `event.toolName === toolName`; a prefix, a case
+    /// variant or an empty name does not match, and a payload without a string `toolName` is a call of no tool.
+    #[test]
+    fn accepts_exactly_the_events_own_tool_name() {
+        let names = ["bash", "read", "my_tool", "bashful", "Bash", ""];
+        for tool in names {
+            let event =
+                json!({"type": "tool_call", "toolCallId": "c1", "toolName": tool, "input": {}});
+            for name in names {
+                assert_eq!(
+                    is_tool_call_event_type(name, &event),
+                    name == tool,
+                    "{name} on a {tool} call"
+                );
+            }
+        }
+        for name in names {
+            for payload in [
+                json!({"type": "tool_call"}),
+                json!({"toolName": 7}),
+                json!({"toolName": null}),
+                json!(null),
+            ] {
+                assert!(
+                    !is_tool_call_event_type(name, &payload),
+                    "{name} accepted {payload}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_result_guard_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Pi core/extensions/types.ts:1315-1338: each tool_result guard is `e.toolName === "<tool>"`.
+    #[test]
+    fn each_guard_is_true_for_its_own_tool_only() {
+        type Guard = fn(&serde_json::Value) -> bool;
+        let guards: [(&str, Guard); 8] = [
+            ("bash", is_bash_tool_result),
+            ("powershell", is_powershell_tool_result),
+            ("read", is_read_tool_result),
+            ("edit", is_edit_tool_result),
+            ("write", is_write_tool_result),
+            ("grep", is_grep_tool_result),
+            ("find", is_find_tool_result),
+            ("ls", is_ls_tool_result),
+        ];
+        for (tool, _) in guards {
+            let event = json!({"type": "tool_result", "toolName": tool});
+            for (other, guard) in guards {
+                assert_eq!(
+                    guard(&event),
+                    other == tool,
+                    "guard {other} on a {tool} result"
+                );
+            }
+        }
+        for (other, guard) in guards {
+            for payload in [
+                json!({"toolName": "my-tool"}),
+                json!({"type": "tool_result"}),
+                json!({"toolName": 7}),
+                json!(null),
+            ] {
+                assert!(!guard(&payload), "guard {other} accepted {payload}");
+            }
+        }
+    }
+}
+
+/// The member of a select, input or editor reply as Pi's result: the JSON value and whether it was defined.
+fn dialog_value(reply: &serde_json::Value, member: &str) -> (serde_json::Value, bool) {
+    if reply.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        return (serde_json::Value::Null, false);
+    }
+    (
+        reply
+            .get(member)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        true,
+    )
+}
+
+#[cfg(test)]
+mod dialog_value_tests {
+    use super::dialog_value;
+    use serde_json::{Value, json};
+
+    /// Pi's RPC mode resolves a dialog with whatever JSON the client sent: the member is returned unchanged, and undefined (ok false) stays apart from `null`.
+    #[test]
+    fn dialog_value_keeps_the_clients_json_and_tells_undefined_from_null() {
+        assert_eq!(
+            dialog_value(&json!({"selected": 5, "ok": true}), "selected"),
+            (json!(5), true)
+        );
+        assert_eq!(
+            dialog_value(&json!({"selected": null, "ok": true}), "selected"),
+            (Value::Null, true)
+        );
+        assert_eq!(
+            dialog_value(&json!({"text": {"a": [1, "x"]}, "ok": true}), "text"),
+            (json!({"a": [1, "x"]}), true)
+        );
+        assert_eq!(
+            dialog_value(&json!({"selected": "", "ok": false}), "selected"),
+            (Value::Null, false)
+        );
+        assert_eq!(dialog_value(&json!({}), "text"), (Value::Null, false));
+    }
+}
+
+// Uses UnixStream::pair as a socket transport double; Windows transport is connect-only.
+#[cfg(all(test, unix))]
+mod overlay_invalidate_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Probe {
+        invalidations: Arc<AtomicUsize>,
+        renders: Arc<AtomicUsize>,
+    }
+
+    impl RemoteComponent for Probe {
+        fn render(&self, _width: u32) -> Vec<String> {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            vec!["row".to_string()]
+        }
+        fn handle_input(
+            &mut self,
+            _data: &crate::JsString,
+        ) -> Result<RemoteComponentResult, String> {
+            Ok(RemoteComponentResult::pending())
+        }
+        fn invalidate(&mut self) {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The host's `ui.custom.invalidate` is one event of the component's serial queue. A component that closed while the event
+    /// was queued is not invalidated and not rendered, and nothing is sent: the event is dropped without an error.
+    #[test]
+    fn an_invalidate_queued_for_a_closed_component_is_dropped() {
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let renders = Arc::new(AtomicUsize::new(0));
+        let (events_tx, events_rx) = sync_channel(64);
+        let overlay: RemoteComponentRef = Arc::new(RemoteOverlay {
+            state: Mutex::new(RemoteComponentState {
+                component: OverlayComponent::Lines(Box::new(Probe {
+                    invalidations: invalidations.clone(),
+                    renders: renders.clone(),
+                })),
+                last_lines: Vec::new(),
+                last_captures: false,
+                last_view: None,
+                seq: 0,
+                last_render: None,
+                layout: None,
+            }),
+            events: events_tx,
+            active: AtomicBool::new(true),
+            render_pending: AtomicBool::new(false),
+            view_refs: Mutex::new(Vec::new()),
+            force_view: AtomicBool::new(false),
+            on_handle: Mutex::new(None),
+            handle_state: Mutex::new(OverlayState::default()),
+        });
+        overlay
+            .send_invalidate(2)
+            .expect("queued while the component is mounted");
+        // The component closed before its worker took the event.
+        overlay.stop();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        run_remote_component_worker(RemoteComponentWorker {
+            conn: Arc::new(Connection::new(stream)),
+            key: "custom-1".to_string(),
+            overlay: overlay.clone(),
+            width: Arc::new(AtomicU32::new(80)),
+            events: events_rx,
+            done: done_tx,
+            request_parent: None,
+            request_id: String::new(),
+        });
+        done_rx.recv().expect("the worker ended");
+        assert_eq!(
+            invalidations.load(Ordering::SeqCst),
+            0,
+            "no invalidate after the close"
+        );
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            0,
+            "no render after the close"
+        );
+        let mut byte = [0u8; 1];
+        assert!(
+            !matches!(peer.read(&mut byte), Ok(read) if read > 0),
+            "nothing is sent for the dropped event"
+        );
+    }
+}

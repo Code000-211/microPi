@@ -1,0 +1,452 @@
+# SPDX-License-Identifier: MIT
+
+name: Security and supply chain
+
+# Security result is a required check, so every event that can land a change
+# reports it: a pull request, and the merge queue's merge_group run.
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 4 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The big caches (Go modules and build output, Cargo, npm, the Durable Cloudflare host's TinyGo) are saved only from main (the weekly run and a dispatch there, and cache-warm.yml)
+  # and from a dispatch on a release branch. A pull request restores main's and saves none: its own copies are visible to that pull request alone, a handful of them filled
+  # the repository's cache limit and evicted main's. Every save step tests this.
+  CACHE_SAVE: ${{ (github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/release/')) }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      product: ${{ steps.classify.outputs.product }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the change
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        shell: bash
+        # Source analysis skips pull requests and merge groups that change only
+        # project prose and repository metadata. Secret scanning always runs.
+        run: automation/ci/classify-changes.sh "$EVENT" "$BASE_SHA" "$HEAD_SHA" | tee -a "$GITHUB_OUTPUT"
+
+  source-assurance:
+    name: Source assurance
+    needs: [changes]
+    if: needs.changes.outputs.product == 'true'
+    runs-on: ubuntu-24.04
+    # Three dispatched runs (45131684796, 45123321834, 45061944784): 20:09, 18:28, 12:53 (worst 20:09, 67% of 30; 3x = 60:27 -> 65).
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .go-version
+          cache: false
+      - name: Restore the Go module cache
+        id: cache-gomod
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            gomod-${{ runner.os }}-
+      # A pull request restores the newest build cache of main (cache-warm.yml and the weekly run save it) and saves none.
+      - name: Restore the Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: gocache-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            gocache-${{ runner.os }}-${{ hashFiles('go.sum') }}-
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Restore the npm cache
+        id: cache-npm
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('test/parity/interface-extractor/package-lock.json', 'automation/images/ci-parity/package-lock.json', 'automation/images/npm-runtime/package-lock.json') }}
+          restore-keys: |
+            node-cache-${{ runner.os }}-${{ runner.arch }}-npm-
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Restore the pinned ShellCheck download
+        id: cache-shellcheck
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pig-ci-downloads
+          key: ci-downloads-shellcheck-${{ hashFiles('automation/ci/install-shellcheck.sh') }}
+      - name: Install source-analysis tools
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            -r automation/ci/security-tools.txt
+          automation/ci/install-shellcheck.sh
+      - name: Check compliance evidence (REUSE, govulncheck, pins, workflow hardening)
+        run: make compliance
+      - name: Run Go static analysis
+        run: |
+          automation/ci/go-vet.sh
+          # golangci-lint owns style and Pi-compatible naming checks. This pass
+          # runs Staticcheck's correctness analyzers without conflicting rules.
+          # Vendored upstream source under third_party keeps upstream's code
+          # (see each FORK.md), as golangci-lint's exclusion does.
+          go tool staticcheck -checks='SA*' $(go list ./... | grep -v '/third_party/')
+      - name: Audit npm lock files
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -u
+          mkdir -p evidence
+          # A high or critical finding blocks on push to main, on the schedule, and on a manual run.
+          # On a pull request or merge group it blocks only when the change touches an npm manifest or
+          # lock file; otherwise it warns, so an advisory published for an untouched dependency does
+          # not stop an unrelated change.
+          block=true
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; then
+            block=false
+            if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '(^|/)(package-lock\.json|pnpm-lock\.yaml|package\.json)$'; then
+              block=true
+            fi
+          fi
+          echo "npm audit blocks: $block (event $EVENT)"
+          status=0
+          # Shipped or product-path manifests gate on high and critical.
+          for directory in extensions/sdk-ts durable/core/host/cf test/parity/interface-extractor automation/images/ci-parity; do
+            name=${directory//\//-}
+            if ! npm audit --prefix "$directory" --omit=dev --audit-level=high --json > "evidence/npm-audit-$name.json"; then
+              if [ "$block" = true ]; then
+                echo "::error file=$directory/package-lock.json::npm audit reported high or critical findings"
+                status=1
+              else
+                echo "::warning file=$directory/package-lock.json::npm audit reported high or critical findings; no npm manifest changed, so this does not block"
+              fi
+            fi
+          done
+          # Advisory: the CI image npm runtime. Its only finding is in the dependencies that npm
+          # itself bundles, which an override cannot reach. It never ships in a product.
+          directory=automation/images/npm-runtime
+          if ! npm audit --prefix "$directory" --omit=dev --json > "evidence/npm-audit-${directory//\//-}.json"; then
+            echo "::warning file=$directory/package-lock.json::npm audit reported findings in the CI npm runtime; review the uploaded evidence"
+          fi
+          exit "$status"
+      - name: Analyze Python SDK
+        run: |
+          make lint-sdk-py
+          bandit -q -r extensions/sdk-py/pig_sdk
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path('extensions/sdk-py/pyproject.toml').read_text())
+          dependencies = data.get('project', {}).get('dependencies', [])
+          if dependencies:
+              raise SystemExit(f'run pip-audit for declared dependencies: {dependencies}')
+          print('Python SDK declares no runtime dependencies')
+          PY
+        shell: bash
+      - name: Analyze shell scripts
+        run: make lint-shell
+      - name: Generate source SBOMs
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: evidence/source.spdx.json
+          upload-artifact: false
+      - name: Generate source CycloneDX inventory
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: evidence/source.cyclonedx.json
+          upload-artifact: false
+      - name: Scan source inventory with Grype
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: evidence/source.spdx.json
+          fail-build: false
+          output-format: sarif
+          output-file: evidence/grype-report.sarif
+          severity-cutoff: high
+          only-fixed: false
+      - name: Validate and summarize source inventory
+        run: |
+          python automation/release/validate-sbom.py \
+            --spdx evidence/source.spdx.json \
+            --cyclonedx evidence/source.cyclonedx.json \
+            --licenses evidence/licenses.csv \
+            --out evidence/inventory-validation.json
+      - name: Upload source evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: source-assurance-evidence
+          path: evidence/
+          retention-days: 30
+      - name: Save the Go module cache
+        if: ${{ env.CACHE_SAVE == 'true' && steps.cache-gomod.outcome == 'success' && steps.cache-gomod.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+      - name: Save the npm cache
+        if: ${{ env.CACHE_SAVE == 'true' && steps.cache-npm.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('test/parity/interface-extractor/package-lock.json', 'automation/images/ci-parity/package-lock.json', 'automation/images/npm-runtime/package-lock.json') }}
+      - name: Save the pinned ShellCheck download
+        if: ${{ env.CACHE_SAVE == 'true' && steps.cache-shellcheck.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pig-ci-downloads
+          key: ci-downloads-shellcheck-${{ hashFiles('automation/ci/install-shellcheck.sh') }}
+
+  # Gitleaks (the whole history) and TruffleHog (the pull request range) each take several minutes, so they run as two jobs in
+  # parallel, each under its own timeout.
+  secret-scan-gitleaks:
+    name: Secret scanning (Gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # fetch-depth 0 also fetches every branch and tag of the repository, and gitleaks without --log-opts scans every ref. A scheduled
+      # or push run on main would then report commits that exist only on pushed fix/* and release/* branches. Keep the checked-out
+      # commit (a pull request's merge commit, or the ref the event names) and drop the other refs: the scan covers the history that
+      # commit reaches, which is the history the event is about.
+      - name: Scan only the checked-out history
+        shell: bash
+        run: git for-each-ref --format='delete %(refname)' refs/remotes refs/tags | git update-ref --no-deref --stdin
+      # gitleaks-action supports only push, pull_request, workflow_dispatch and schedule; on merge_group it exits with an
+      # error. The commits a merge group adds are the queued pull request's own, which the pull_request run scanned.
+      # It also scans a pull request over "<its oldest commit>^..<its newest commit>" with --first-parent, which is wrong for
+      # a branch that merges member branches cut from an older main: the range reaches back into main's own history, and
+      # --first-parent hides the member commits behind the merge. The pull request is scanned by the next step instead.
+      - name: Gitleaks
+        if: github.event_name != 'merge_group' && github.event_name != 'pull_request'
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # A pull request is scanned over what it adds to its base (secret-scan-range.sh, tested in test_secret_scan_range.py),
+      # every commit of it including those of merged member branches: no --first-parent. gitleaks is the release gitleaks-action
+      # installs (8.24.3), pinned by checksum.
+      - name: Gitleaks (pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITLEAKS_VERSION: 8.24.3
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$archive"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --status
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+          # The script fails closed (non-zero, nothing on stdout), and set -e ends this step on it, so the scan never runs on a
+          # partial range. A range whose two shas are equal is empty: the pull request adds nothing over its base.
+          range=$(automation/ci/secret-scan-range.sh "$BASE_SHA" "$HEAD_SHA")
+          echo "gitleaks range: $range"
+          if [ "${range%..*}" = "${range#*..}" ]; then
+            echo "the pull request adds no commit over its base: nothing to scan"
+            exit 0
+          fi
+          "$RUNNER_TEMP/gitleaks" detect --redact -v --exit-code=2 --log-opts="--no-merges $range"
+
+  secret-scan-trufflehog:
+    name: Secret scanning (TruffleHog)
+    runs-on: ubuntu-24.04
+    # On workflow_dispatch (base and head empty) TruffleHog scans the whole git history; on pull_request
+    # and merge_group it scans the event range. Last seven dispatched runs: 13:54, 14:10, 14:34, 14:33,
+    # 14:37, 12:28, 14:40 (worst 14:40); run 45258673606 was cancelled at 15:15 under a 15-minute limit.
+    # Rule: a job limit is at least three times its worst measured time (3 x 14:40 = 44:00, rounded up to 45).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # base and head are empty outside a merge group, which keeps the action's per-event range there; in a merge group
+      # they scan the commits the queue added to the base branch.
+      - name: TruffleHog verified findings
+        uses: trufflesecurity/trufflehog@ea68ca03c865c5f324e86e849ced20ed3cf9dbbb # v3.99.8
+        with:
+          path: ./
+          base: ${{ github.event.merge_group.base_sha }}
+          head: ${{ github.event.merge_group.head_sha }}
+          extra_args: --only-verified
+
+  dependency-review:
+    name: Dependency review
+    needs: [changes]
+    if: github.event_name == 'pull_request' && github.event.repository.private == false && needs.changes.outputs.product == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          license-check: true
+          # GHSA-vxpw-j846-p89q and GHSA-rfgv-xxqx-mfg5 (undici) appear only in the lockfile of Pi's example
+          # extension "gondolin" (with GHSA-86w9-cpqp-85rv for node-forge, which has no
+          # patched release), and GHSA-w7jw-789q-3m8p and GHSA-395f-4hp3-45gv
+          # (shell-quote) only in the lockfile of Pi's example extension "sandbox".
+          # Both are vendored verbatim under runtime-node/shims/pi-dist; PiG neither
+          # installs nor bundles those examples' dependencies.
+          allow-ghsas: GHSA-vxpw-j846-p89q, GHSA-rfgv-xxqx-mfg5, GHSA-86w9-cpqp-85rv, GHSA-w7jw-789q-3m8p, GHSA-395f-4hp3-45gv
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    needs: [changes]
+    if: github.event.repository.private == false && needs.changes.outputs.product == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: manual
+            config: '{}'
+          - language: javascript-typescript
+            build-mode: none
+            config: |
+              paths:
+                - extensions/sdk-ts
+                - coding/extension/host/subprocess/runtime-node
+              paths-ignore:
+                # Vendored upstream copies (Pi's own dist, cross-spawn,
+                # lovely-mermaid): shipped byte-exact so extensions run Pi's
+                # code; findings belong upstream, not in local patches.
+                - coding/extension/host/subprocess/runtime-node/shims
+          - language: python
+            build-mode: none
+            config: |
+              paths:
+                - extensions/sdk-py
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.language == 'go'
+        with:
+          go-version-file: .go-version
+          cache: false
+      - name: Restore the Go module cache
+        if: matrix.language == 'go'
+        id: cache-gomod
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            gomod-${{ runner.os }}-
+      # A pull request restores the newest build cache of main (cache-warm.yml and the weekly run save it) and saves none.
+      - name: Restore the Go build cache
+        if: matrix.language == 'go'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: gocache-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            gocache-${{ runner.os }}-${{ hashFiles('go.sum') }}-
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config: ${{ matrix.config }}
+      - if: matrix.build-mode == 'manual'
+        run: go build ./...
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}
+      - name: Save the Go module cache
+        if: ${{ env.CACHE_SAVE == 'true' && steps.cache-gomod.outcome == 'success' && steps.cache-gomod.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+
+  result:
+    name: Security result
+    # The one required check for this workflow; see CI result in ci.yml.
+    needs: [changes, source-assurance, secret-scan-gitleaks, secret-scan-trufflehog, dependency-review, codeql]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every security job this event runs
+        env:
+          EVENT: ${{ github.event_name }}
+          PRIVATE: ${{ github.event.repository.private }}
+          PRODUCT: ${{ needs.changes.outputs.product }}
+          CHANGES: ${{ needs.changes.result }}
+          SOURCE: ${{ needs.source-assurance.result }}
+          GITLEAKS: ${{ needs.secret-scan-gitleaks.result }}
+          TRUFFLEHOG: ${{ needs.secret-scan-trufflehog.result }}
+          REVIEW: ${{ needs.dependency-review.result }}
+          CODEQL: ${{ needs.codeql.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          expect() { # job result allowed-skip
+            if [ "$2" = success ] || { [ "$2" = skipped ] && [ "$3" = true ]; }; then
+              echo "$1: $2"
+            else
+              echo "::error::$1: $2"
+              status=1
+            fi
+          }
+          # Docs-only changes (the changes classifier) skip the product scans.
+          product_skip=false; review_skip=false; codeql_skip=false
+          [ "$PRODUCT" = false ] && product_skip=true
+          { [ "$EVENT" != pull_request ] || [ "$PRIVATE" = true ] || [ "$product_skip" = true ]; } && review_skip=true
+          { [ "$PRIVATE" = true ] || [ "$product_skip" = true ]; } && codeql_skip=true
+          expect "Changed paths" "$CHANGES" false
+          expect "Source assurance" "$SOURCE" "$product_skip"
+          expect "Secret scanning (Gitleaks)" "$GITLEAKS" false
+          expect "Secret scanning (TruffleHog)" "$TRUFFLEHOG" false
+          expect "Dependency review" "$REVIEW" "$review_skip"
+          expect "CodeQL" "$CODEQL" "$codeql_skip"
+          exit "$status"

@@ -1,0 +1,585 @@
+// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
+// SPDX-License-Identifier: MIT
+
+package turn
+
+import (
+	"errors"
+
+	"github.com/MichaelKinsy/PiG/durable/core/jv"
+	"github.com/MichaelKinsy/PiG/durable/core/session"
+)
+
+// request is the request phase: it clears a stale partial and marks the attempt, runs the beforeRequest hooks, streams
+// the response and classifies it.
+func (r *run) request(cp *jv.Object) {
+	// Charging the attempt may itself be what keeps failing, such as converting a huge partial: the limit ends it.
+	if r.cutOffTooOften(r.task) {
+		r.endCutOff(cp)
+		return
+	}
+	// The host stopped while this request was in flight: a failed attempt, not a resend (spec section 8.3).
+	if r.task.Has("restarts") {
+		r.interrupted(cp)
+		return
+	}
+	q := &requestRun{r: r, cp: cp, attempt: num(cp, "attempt"), compacted: idField(cp, "compacted"), ref: modelRefOf(objField(cp, "model")),
+		thinking: str(cp, "thinkingLevel"), cutoff: idField(cp, "cutoff")}
+	// The attempt shown is presentation, stored like progress; converting a partial left by an interrupted attempt appends an entry,
+	// which makes the commit immediate.
+	r.commitProgress(q.showAttempt, q.shown)
+}
+
+// requestRun is one request phase.
+type requestRun struct {
+	r         *run
+	cp        *jv.Object
+	attempt   float64
+	compacted ID
+	ref       ModelRef
+	thinking  string
+	cutoff    ID
+	view      RequestContext
+	// The hooks see every message; they are parsed only when a handler is registered, and each handler sees the messages as the
+	// one before replaced them.
+	replaced []*jv.Object
+	messages []*jv.Object
+	parsed   bool
+	// The beforeProviderRequest chain of the request body being built: the walk, the body the next handler sees, whether the
+	// chain's last result had a payload, and the answer.
+	walk    hookWalk
+	body    any
+	sent    bool
+	replied func(payload any, sent bool, err error)
+}
+
+func (q *requestRun) showAttempt(tx *session.Tx) error {
+	live, err := tx.Doc(LiveDef, session.DocArgs{Owner: q.r.conv})
+	if err != nil {
+		return err
+	}
+	if err := convertPartial(tx, live, q.r.conv); err != nil {
+		return err
+	}
+	return live.Set("generation", jobj("attempt", q.attempt))
+}
+
+func (q *requestRun) shown() {
+	if _, ok := q.r.g.Host.ContextWindow(q.ref); !ok {
+		q.r.failNoModel(&q.ref)
+		return
+	}
+	q.r.requestContext(q.cutoff, q.context)
+}
+
+func (q *requestRun) context(view RequestContext) {
+	q.view = view
+	q.r.eachHook("beforeRequest", q.payload, q.hookResult, q.hooked)
+}
+
+func (q *requestRun) payload() *jv.Object {
+	if !q.parsed {
+		q.messages, q.parsed = q.view.Messages(), true
+	}
+	return jobj("messages", toAny(q.messages))
+}
+
+func (q *requestRun) hookResult(result any) bool {
+	if o, ok := result.(*jv.Object); ok {
+		if list, ok := arrayField(o, "messages"); ok {
+			q.replaced = objectsOf(list)
+			q.messages = q.replaced
+		}
+	}
+	return false
+}
+
+func (q *requestRun) hooked(err error) {
+	if err != nil {
+		q.r.fail(err)
+		return
+	}
+	q.r.provider(q.provided)
+}
+
+func (q *requestRun) provided(sessionID string, err error) {
+	r := q.r
+	if err != nil {
+		r.fail(err)
+		return
+	}
+	options := streamOrEmpty(objField(q.cp, "streamOptions"))
+	options.Set("sessionId", sessionID)
+	if q.thinking != "off" {
+		options.Set("reasoning", q.thinking)
+	}
+	req := &StreamRequest{Conversation: r.conv, Model: q.ref, Context: q.view, Replaced: q.replaced, Options: options, PayloadHook: q}
+	r.streamResponse(req, q.attempt, q.streamed)
+}
+
+// BeforeProviderRequest is generation.ts providerPayload: the replacement chain of beforeProviderRequest over one body. A handler's
+// result replaces the body with its `payload` member, which a result without one leaves undefined; a throw is reported and the
+// chain continues. The request is the walk's sink: the provider calls one body at a time.
+func (q *requestRun) BeforeProviderRequest(body any, then func(payload any, sent bool, err error)) {
+	q.body, q.sent, q.replied = body, true, then
+	q.walk = hookWalk{name: "beforeProviderRequest", sink: q}
+	q.r.walkHooks(&q.walk)
+}
+
+func (q *requestRun) hookPayload() *jv.Object {
+	return jobj("model", q.ref.object(), "payload", q.body)
+}
+
+func (q *requestRun) hookEach(result any) bool {
+	if o, ok := result.(*jv.Object); ok {
+		q.body, q.sent = o.Get("payload")
+	}
+	return false
+}
+
+func (q *requestRun) hookEnd(err error) { q.replied(q.body, q.sent, err) }
+
+func (q *requestRun) streamed(message *jv.Object, err error) {
+	if err != nil {
+		q.r.fail(err)
+		return
+	}
+	q.r.classify(requestInfo{attempt: q.attempt, compacted: q.compacted, model: q.ref, thinking: thinkingOf(q.cp), cutoff: q.cutoff, messages: q.view.SystemMessages()}, message)
+}
+
+func toAny(list []*jv.Object) []any {
+	out := make([]any, len(list))
+	for i, o := range list {
+		out[i] = o
+	}
+	return out
+}
+
+func objectsOf(list []any) []*jv.Object {
+	out := make([]*jv.Object, 0, len(list))
+	for _, v := range list {
+		if o, ok := v.(*jv.Object); ok {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// eachHook is runtime.hooks.each (scheduler.ts): it calls every registered handler of the hook in order with a payload,
+// passing each result to handle; handle returns true to stop early. A handler that throws is reported and the next one
+// runs, unless the invocation was aborted, which ends the walk with that error. then runs after the last handler.
+func (r *run) eachHook(name string, payload func() *jv.Object, handle func(result any) (stop bool), then func(error)) {
+	r.walkHooks(&hookWalk{name: name, payload: payload, each: handle, then: then})
+}
+
+// hookSink is a walk's callbacks as the methods of one value, for a walk that must not allocate a closure for each.
+type hookSink interface {
+	hookPayload() *jv.Object
+	hookEach(result any) (stop bool)
+	hookEnd(err error)
+}
+
+// hookWalk is one walk of the handlers of a hook (eachHook, eachHookRaw): either each or handle is set, or sink serves all three.
+type hookWalk struct {
+	name    string
+	payload func() *jv.Object
+	each    func(result any) (stop bool)
+	handle  func(result any, err error) (stop bool, fail error)
+	then    func(error)
+	sink    hookSink
+	r       *run
+	n       int
+	i       int
+	stop    bool
+	fail    error
+}
+
+// hookExtension is the extension of the handler eachHookRaw is calling.
+func (r *run) hookExtension(name string) string {
+	if h := r.g.Host; h.HookExtension != nil {
+		return h.HookExtension(name, r.hookIndex, r.conv)
+	}
+	return ""
+}
+
+// eachHookRaw walks the handlers like eachHook but hands a handler's error to handle, for hooks whose callback decides
+// what a throw means (beforeTool blocks the call). handle returns whether to stop the walk and the error then ends
+// with (nil: the walk ended normally).
+func (r *run) eachHookRaw(name string, payload func() *jv.Object, handle func(result any, err error) (stop bool, fail error), then func(error)) {
+	r.walkHooks(&hookWalk{name: name, payload: payload, handle: handle, then: then})
+}
+
+func (r *run) walkHooks(w *hookWalk) {
+	h := r.g.Host
+	w.r = r
+	if h.Hooks == nil {
+		w.finish(nil)
+		return
+	}
+	if r.agentSeen && h.Hooks(w.name, r.conv) == 0 {
+		// hooks.each walks the handlers of the phase's resolved agent (scheduler.ts :1973 agentHooks(await agent())), which does not
+		// change once resolved: with none the walk is `await agent()` of a settled resolution (one tick) and the caller's await of
+		// the async function (one tick), nothing between them to run, so one chain carries both.
+		r.hops(eachHookNoHandlerHops, w.thenNil)
+		return
+	}
+	r.withAgent(w.start)
+}
+
+func (w *hookWalk) thenNil() { w.finish(nil) }
+
+func (w *hookWalk) start() {
+	w.n = w.r.g.Host.Hooks(w.name, w.r.conv)
+	w.next(0)
+}
+
+// end: hooks.each is an async function: its caller's `await` resumes one tick after it returns, or after it throws.
+func (w *hookWalk) end(err error) {
+	w.fail = err
+	w.r.hops(1, w.thenFail)
+}
+
+func (w *hookWalk) thenFail() { w.finish(w.fail) }
+
+func (w *hookWalk) finish(err error) {
+	if w.sink != nil {
+		w.sink.hookEnd(err)
+		return
+	}
+	w.then(err)
+}
+
+func (w *hookWalk) payloadOf() *jv.Object {
+	if w.sink != nil {
+		return w.sink.hookPayload()
+	}
+	return w.payload()
+}
+
+func (w *hookWalk) eachOf(result any) bool {
+	if w.sink != nil {
+		return w.sink.hookEach(result)
+	}
+	return w.each(result)
+}
+
+func (w *hookWalk) next(i int) {
+	r := w.r
+	if i >= w.n {
+		w.end(nil)
+		return
+	}
+	w.i = i
+	r.hookIndex = i
+	r.g.Host.Hook(w.name, i, r.conv, r.rt.TaskID(), w.payloadOf(), w.answer)
+}
+
+func (w *hookWalk) answer(result any, err error) {
+	r := w.r
+	switch {
+	case w.handle != nil:
+		w.stop, w.fail = w.handle(result, err)
+	case err != nil:
+		if r.rt.Signal().Aborted() || errors.Is(err, session.ErrAborted) {
+			w.stop, w.fail = true, err
+		} else {
+			_ = r.rt.Report(err, session.ReportFrom{Extension: r.hookExtension(w.name)})
+			w.stop, w.fail = false, nil
+		}
+	default:
+		w.stop, w.fail = w.eachOf(result), nil
+	}
+	// The caller's invoke callback is an async arrow that awaits the handler (the host's answer) and settles a tick before
+	// hooks.each's `await invoke(...)` resumes; a plain callback hands back the handler's promise itself.
+	if asyncInvoke(w.name) {
+		r.hops(invokeSettleHops, w.cont)
+		return
+	}
+	w.cont()
+}
+
+func (w *hookWalk) cont() {
+	if w.stop {
+		w.end(w.fail)
+		return
+	}
+	w.next(w.i + 1)
+}
+
+// invokeSettleHops is the hop between an async invoke callback's settlement and hooks.each resuming from `await invoke(...)`.
+const invokeSettleHops = 1
+
+// asyncInvoke reports whether Pi's caller of hooks.each(name, invoke) passes an async arrow that awaits the handler
+// (tool.ts beforeTool and afterTool, generation.ts beforeRequest and onYield, compaction.ts beforeCompact), rather than one
+// that returns the handler's promise (afterResponse, afterTools).
+func asyncInvoke(name string) bool {
+	switch name {
+	case "beforeTool", "afterTool", "beforeRequest", "beforeProviderRequest", "onYield", "beforeCompact", "afterRun":
+		return true
+	}
+	return false
+}
+
+// provider is ensureProviderSessionId: the persisted identity without writing in the normal path; a legacy conversation
+// without pi.provider gets one migration commit before the provider request starts.
+func (r *run) provider(then func(sessionID string, err error)) {
+	// ensureProviderSessionId reads pi.provider through runtime.snapshot: a line job only on a cache miss.
+	// The function is async and its caller awaits it: the caller resumes one tick after it returns or throws (provider.ts :20-35, awaited at generation.ts :204).
+	done := func(id string, err error) { r.hops(1, func() { then(id, err) }) }
+	if existing, err, hit := r.snapshotCached(ProviderDef); hit {
+		if err != nil || existing != nil {
+			// The cached answer reaches its caller after snapshotHitHops, and the function returns it after one tick more, with
+			// nothing between them to run: one chain.
+			r.hops(snapshotHitHops+1, func() {
+				if err != nil {
+					then("", err)
+					return
+				}
+				then(str(existing, "sessionId"), nil)
+			})
+			return
+		}
+		r.hops(snapshotHitHops, func() { r.providerWith(nil, done) })
+		return
+	}
+	r.snapshotResult(ProviderDef, func(existing *jv.Object, err error) {
+		if err != nil {
+			done("", err)
+			return
+		}
+		r.providerWith(existing, done)
+	})
+}
+
+func (r *run) providerWith(existing *jv.Object, then func(sessionID string, err error)) {
+	h := r.g.Host
+	if existing != nil {
+		then(str(existing, "sessionId"), nil)
+		return
+	}
+	var created string
+	r.rt.Commit(func(tx *session.Tx, _ *jv.Object) (*jv.Object, error) {
+		doc, err := tx.Doc(ProviderDef, session.DocArgs{Owner: r.conv, Seed: nil})
+		if err != nil {
+			return nil, err
+		}
+		if s, _ := doc.Get("sessionId").(string); s != "" {
+			created = s
+			return nil, nil
+		}
+		created = h.NewSessionID()
+		return nil, doc.Set("sessionId", created)
+	}, func(err error) {
+		if err == nil && created == "" {
+			err = errors.New("Conversation " + itoa(int64(r.conv)) + " has no provider session ID")
+		}
+		then(created, err)
+	})
+}
+
+// requestInfo is what classification needs from the request that produced a message.
+type requestInfo struct {
+	attempt   float64
+	compacted ID
+	model     ModelRef
+	thinking  any // the checkpoint's thinkingLevel string kept boxed (a Set of a string would allocate on TinyGo); nil when it has none (a record of an earlier version)
+	cutoff    ID
+	messages  []*jv.Object // committed model context through cutoff, when the phase already derived it
+	pollAt    *float64     // set when the message came from polling, so a still deferred result polls strictly later
+}
+
+// streamResponse streams one request and returns the terminal message. Partials commit as trailing writes at most every
+// progress.partialIntervalMs with one commit in flight; the cleanup stops the throttle and waits for that commit, so no
+// stale partial lands after the outcome.
+func (r *run) streamResponse(req *StreamRequest, attempt float64, then func(*jv.Object, error)) {
+	h := r.g.Host
+	interval := h.Settings().PartialIntervalMs
+	// The state the closures share is one variable: each variable they capture is an allocation of its own.
+	var st struct {
+		acc      partialAcc
+		cancel   func()
+		inFlight bool
+		stopped  bool
+		waiting  func()
+	}
+	var flush func()
+	arm := func() { st.cancel = h.After(interval, flush) }
+	flush = func() {
+		st.cancel = nil
+		if !st.acc.dirty || st.stopped {
+			return
+		}
+		st.acc.dirty = false
+		st.inFlight = true
+		message := st.acc.message()
+		r.rt.CommitDeferred(func(tx *session.Tx, _ *jv.Object) (*jv.Object, error) {
+			live, err := tx.Doc(LiveDef, session.DocArgs{Owner: r.conv})
+			if err != nil {
+				return nil, err
+			}
+			generation := live.Obj("generation")
+			if generation == nil {
+				if err := live.Set("generation", jobj("attempt", attempt)); err != nil {
+					return nil, err
+				}
+				generation = live.Obj("generation")
+			}
+			return nil, assignObj(generation, "message", jv.Clone(message))
+		}, func(err error) {
+			// Rejections after an abort mark or close are expected; the committed state stays consistent.
+			if err != nil && !r.rt.Signal().Aborted() {
+				_ = r.rt.Report(err)
+			}
+			st.inFlight = false
+			if st.acc.dirty && !st.stopped {
+				arm()
+			}
+			if st.waiting != nil {
+				w := st.waiting
+				st.waiting = nil
+				w()
+			}
+		})
+	}
+	onPartial := func(partial jv.Raw) {
+		// A partial without content, such as pi-ai's opening start event, shows nothing.
+		if !hasContent(partial) {
+			return
+		}
+		// The partials of a throttle window add up: each is a patch of the one before (partial_patch.go).
+		st.acc.apply(parseObjectText(partial))
+		st.acc.dirty = true
+		if st.cancel == nil && !st.inFlight {
+			arm()
+		}
+	}
+	h.Stream(req, onPartial, r.rt.Signal(), func(message *jv.Object, err error) {
+		// generation.ts :364-416. The terminal event reaches the loop; `for await` then ends (1), `await events.result()` resumes (1), and
+		// the finally block awaits st.inFlight: undefined resumes one tick later, the in-flight partial commit's promise chain
+		// (the IIFE's await, .catch, .finally with its thenable adoption) settles five ticks after the commit resolves and its await
+		// resumes one more. The async function's return and its caller's await take one tick (:207).
+		st.stopped = true
+		if st.cancel != nil {
+			st.cancel()
+			st.cancel = nil
+		}
+		resulted, flushed := false, !st.inFlight
+		if flushed {
+			// No partial commit is in flight: the loop's two ticks and the return's two follow each other with nothing between.
+			r.hops(2+2, func() { then(message, err) })
+			return
+		}
+		join := func() {
+			if resulted && flushed {
+				r.hops(2, func() { then(message, err) })
+			}
+		}
+		r.hops(2, func() { resulted = true; join() })
+		if !flushed {
+			st.waiting = func() { r.hops(inFlightSettleHops, func() { flushed = true; join() }) }
+		}
+	})
+}
+
+// hasContent reports whether the partial message, the text of a JSON object that the host's batch holds and that was validated
+// with it, has content: its content member, the last of the name, is an array with an element.
+func hasContent(partial jv.Raw) bool {
+	return jv.IsNonEmptyArray(jv.MemberText(partial, "content"))
+}
+
+// parseObjectText parses the text of a partial message, a JSON object that was validated with its batch.
+func parseObjectText(text jv.Raw) *jv.Object {
+	v, _ := jv.Parse(text)
+	o, _ := v.(*jv.Object)
+	return o
+}
+
+// inFlightSettleHops is the ticks from the resolution of the partial commit's promise to the resolution of the `inFlight` chain
+// `(async () => { await runtime.commit(...) })().catch(...).finally(...)` (generation.ts :382-399): the IIFE's await resumes and its
+// promise resolves (1), `.catch` passes it on (1), `.finally`'s callback runs (1) and the promise it returns is adopted through a
+// thenable job and a reaction (2).
+const inFlightSettleHops = 5
+
+// retry is the retry phase: sleep until the backoff ends, then prepare the next attempt, or poll the deferred response a host
+// death interrupted the poll of again.
+func (r *run) retry(cp *jv.Object) {
+	attempt := num(cp, "attempt")
+	until := num(cp, "until")
+	if r.cutOffTooOften(r.task) {
+		r.endCutOff(cp)
+		return
+	}
+	// After the backoff's sleep; a run before until (an early wake, or a record of an earlier version) sleeps again.
+	if until > r.now() {
+		r.rt.SleepUntil(until, cp, func(err error) { r.done(err) })
+		return
+	}
+	poll := objField(cp, "poll")
+	r.commitDone(func(tx *session.Tx, _ *jv.Object) (*jv.Object, error) {
+		live, err := tx.Doc(LiveDef, session.DocArgs{Owner: r.conv})
+		if err != nil {
+			return nil, err
+		}
+		next := any(attempt + 1)
+		generation := jobj("attempt", next)
+		checkpoint := jobj("phase", phasePrepare, "attempt", next)
+		if compacted, ok := cp.Get("compacted"); ok {
+			checkpoint.Set("compacted", compacted)
+		}
+		// A poll the host died during polls its response again, as the next attempt.
+		if poll != nil {
+			pollAt := any(r.now())
+			generation.Set("deferred", jobj("pollAt", pollAt))
+			checkpoint.Set("phase", phasePoll)
+			poll.Members(func(key string, value any) bool { checkpoint.Set(key, value); return true })
+			checkpoint.Set("pollAt", pollAt)
+		}
+		if err := live.Set("generation", generation); err != nil {
+			return nil, err
+		}
+		return jobj("status", "running", "checkpoint", checkpoint), nil
+	})
+}
+
+// poll is the poll phase: wait for the deferred response's poll time, fetch it and classify it.
+func (r *run) poll(cp *jv.Object) {
+	h := r.g.Host
+	ref := modelRefOf(objField(cp, "model"))
+	pollAt := num(cp, "pollAt")
+	if r.cutOffTooOften(r.task) {
+		r.endCutOff(cp)
+		return
+	}
+	// The host stopped while the poll's fetch was in flight: a failed attempt, as for a request. Checked before the time, which
+	// may have moved backwards on a replacement host; a sleeping poll is never cut off.
+	if r.task.Has("restarts") {
+		r.interrupted(cp)
+		return
+	}
+	// After the sleep until pollAt; a run before it (an early wake, or a record of an earlier version) sleeps again.
+	if pollAt > r.now() {
+		r.rt.SleepUntil(pollAt, cp, func(err error) { r.done(err) })
+		return
+	}
+	if _, ok := h.ContextWindow(ref); !ok {
+		r.failNoModel(&ref)
+		return
+	}
+	h.FetchDeferred(ref, objField(cp, "handle"), r.rt.Signal(), func(message *jv.Object, err error) {
+		if err != nil {
+			r.fail(err)
+			return
+		}
+		r.classify(requestInfo{attempt: num(cp, "attempt"), compacted: idField(cp, "compacted"), model: ref, thinking: thinkingOf(cp), cutoff: idField(cp, "cutoff"), pollAt: &pollAt}, message)
+	})
+}
+
+// thinkingOf is the checkpoint's non-empty thinkingLevel string as the stored value, so recording it again does not box it anew.
+func thinkingOf(cp *jv.Object) any {
+	if v, _ := cp.Get("thinkingLevel"); v != nil {
+		if s, ok := v.(string); ok && s != "" {
+			return v
+		}
+	}
+	return nil
+}

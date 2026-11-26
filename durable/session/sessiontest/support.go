@@ -1,0 +1,409 @@
+// Package sessiontest holds the shared Session test support: a controlled
+// memory storage and an opened Session kernel with its publications.
+//
+// Ports packages/durable/test/session-support.ts
+package sessiontest
+
+import (
+	"context"
+	"runtime"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/durable"
+	"github.com/MichaelKinsy/PiG/durable/session"
+	"github.com/MichaelKinsy/PiG/durable/storage"
+)
+
+// Gate holds calls until released and reports when the first held call arrives.
+type Gate struct {
+	entered     chan struct{}
+	enteredOnce sync.Once
+	gate        chan struct{}
+	releaseOnce sync.Once
+	clear       func(*Gate)
+}
+
+func newGate(clear func(*Gate)) *Gate {
+	return &Gate{entered: make(chan struct{}), gate: make(chan struct{}), clear: clear}
+}
+
+// Entered is closed when the first held call arrives.
+func (gate *Gate) Entered() <-chan struct{} { return gate.entered }
+
+// Release lets every held call proceed and stops holding later calls.
+func (gate *Gate) Release() {
+	gate.releaseOnce.Do(func() {
+		gate.clear(gate)
+		close(gate.gate)
+	})
+}
+
+func (gate *Gate) hold() {
+	gate.enteredOnce.Do(func() { close(gate.entered) })
+	<-gate.gate
+}
+
+// ControlledStorage is memory storage with observable commits, held calls, and injected commit failures.
+type ControlledStorage struct {
+	*storage.MemoryStorage
+
+	mu                sync.Mutex
+	admittedCommits   [][]durable.StorageWrite
+	commits           [][]durable.StorageWrite
+	mintCount         int
+	documentReadCount int
+	commitGate        *Gate
+	findGate          *Gate
+	commitFailure     error
+	// adopting is set while a receipt runs, the storage's synchronous step: code that sees it set runs inside
+	// Storage.Commit's receive.
+	adopting atomic.Bool
+	// afterAdopt runs once, in the next commit's synchronous step right after its first receipt returned.
+	afterAdopt func()
+}
+
+// NewControlledStorage returns an empty controlled memory storage.
+func NewControlledStorage() *ControlledStorage {
+	return &ControlledStorage{MemoryStorage: storage.NewMemoryStorage()}
+}
+
+// AdmittedCommits returns the exact batches the Session admitted.
+func (controlled *ControlledStorage) AdmittedCommits() [][]durable.StorageWrite {
+	controlled.mu.Lock()
+	defer controlled.mu.Unlock()
+	return slices.Clone(controlled.admittedCommits)
+}
+
+// Commits returns detached copies of the admitted batches for value assertions.
+func (controlled *ControlledStorage) Commits() [][]durable.StorageWrite {
+	controlled.mu.Lock()
+	defer controlled.mu.Unlock()
+	return slices.Clone(controlled.commits)
+}
+
+// LastCommit returns the newest admitted batch.
+func (controlled *ControlledStorage) LastCommit() []durable.StorageWrite {
+	commits := controlled.Commits()
+	if len(commits) == 0 {
+		return nil
+	}
+	return commits[len(commits)-1]
+}
+
+// MintCount returns the number of minted IDs.
+func (controlled *ControlledStorage) MintCount() int {
+	controlled.mu.Lock()
+	defer controlled.mu.Unlock()
+	return controlled.mintCount
+}
+
+// DocumentReadCount returns the number of document materializations.
+func (controlled *ControlledStorage) DocumentReadCount() int {
+	controlled.mu.Lock()
+	defer controlled.mu.Unlock()
+	return controlled.documentReadCount
+}
+
+// HoldCommits holds every commit until the returned gate is released.
+func (controlled *ControlledStorage) HoldCommits() *Gate {
+	gate := newGate(func(gate *Gate) {
+		controlled.mu.Lock()
+		if controlled.commitGate == gate {
+			controlled.commitGate = nil
+		}
+		controlled.mu.Unlock()
+	})
+	controlled.mu.Lock()
+	controlled.commitGate = gate
+	controlled.mu.Unlock()
+	return gate
+}
+
+// HoldFindDocument holds every document lookup until the returned gate is released.
+func (controlled *ControlledStorage) HoldFindDocument() *Gate {
+	gate := newGate(func(gate *Gate) {
+		controlled.mu.Lock()
+		if controlled.findGate == gate {
+			controlled.findGate = nil
+		}
+		controlled.mu.Unlock()
+	})
+	controlled.mu.Lock()
+	controlled.findGate = gate
+	controlled.mu.Unlock()
+	return gate
+}
+
+// Crash simulates a crash during the held commit: it never reaches storage, and later commits proceed.
+func (controlled *ControlledStorage) Crash() {
+	controlled.mu.Lock()
+	controlled.commitGate = nil
+	controlled.mu.Unlock()
+}
+
+// FailNextCommit makes the next commit fail with err.
+func (controlled *ControlledStorage) FailNextCommit(err error) {
+	controlled.mu.Lock()
+	controlled.commitFailure = err
+	controlled.mu.Unlock()
+}
+
+// Adopting reports whether the caller runs inside a receipt callback of a Storage.Commit, the storage's synchronous step.
+func (controlled *ControlledStorage) Adopting() bool { return controlled.adopting.Load() }
+
+// AfterAdopt makes the next commit run after, once, in its synchronous step right after its first receipt returned.
+func (controlled *ControlledStorage) AfterAdopt(after func()) {
+	controlled.mu.Lock()
+	controlled.afterAdopt = after
+	controlled.mu.Unlock()
+}
+
+// RefusingAt commits batches through commit up to the first one refuses matches, which it refuses with err: what a
+// storage does whose own check refuses that batch.
+func RefusingAt(
+	commit func(ctx context.Context, batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq)) (durable.CommitResult, error),
+	ctx context.Context,
+	batches [][]durable.StorageWrite,
+	receive func(index int, seq durable.Seq),
+	refuses func(writes []durable.StorageWrite) bool,
+	err error,
+) (durable.CommitResult, error) {
+	at := slices.IndexFunc(batches, refuses)
+	if at < 0 {
+		return commit(ctx, batches, receive)
+	}
+	result, commitErr := commit(ctx, batches[:at], receive)
+	if commitErr != nil || result.Stored < at {
+		return result, commitErr
+	}
+	return durable.CommitResult{Stored: at, Refused: err}, nil
+}
+
+// Commit records and holds the call, then fails its first batch if a failure is set (a refusal: nothing stored), or commits
+// it in memory, Adopting set while each receipt runs and AfterAdopt run after the first one.
+func (controlled *ControlledStorage) Commit(ctx context.Context, batches [][]durable.StorageWrite, receive func(index int, seq durable.Seq)) (durable.CommitResult, error) {
+	controlled.mu.Lock()
+	held := controlled.commitGate
+	controlled.mu.Unlock()
+	if held != nil {
+		held.hold()
+	}
+	controlled.mu.Lock()
+	failure := controlled.commitFailure
+	controlled.commitFailure = nil
+	recorded := batches
+	if failure != nil {
+		recorded = batches[:1]
+	}
+	for _, writes := range recorded {
+		controlled.admittedCommits = append(controlled.admittedCommits, writes)
+		controlled.commits = append(controlled.commits, slices.Clone(writes))
+	}
+	controlled.mu.Unlock()
+	if failure != nil {
+		return durable.CommitResult{Refused: failure}, nil
+	}
+	first := true
+	return controlled.MemoryStorage.Commit(ctx, batches, func(index int, seq durable.Seq) {
+		controlled.adopting.Store(true)
+		func() {
+			defer controlled.adopting.Store(false)
+			receive(index, seq)
+		}()
+		if !first {
+			return
+		}
+		first = false
+		controlled.mu.Lock()
+		after := controlled.afterAdopt
+		controlled.afterAdopt = nil
+		controlled.mu.Unlock()
+		if after != nil {
+			after()
+		}
+	})
+}
+
+// MintId counts and mints.
+func (controlled *ControlledStorage) MintId() (int64, error) {
+	controlled.mu.Lock()
+	controlled.mintCount++
+	controlled.mu.Unlock()
+	return controlled.MemoryStorage.MintId()
+}
+
+// Document counts and materializes.
+func (controlled *ControlledStorage) Document(ctx context.Context, id durable.DocumentId, at durable.DocumentPoint) (*durable.StoredDocument, error) {
+	controlled.mu.Lock()
+	controlled.documentReadCount++
+	controlled.mu.Unlock()
+	return controlled.MemoryStorage.Document(ctx, id, at)
+}
+
+// FindDocument honors a held gate, then resolves.
+func (controlled *ControlledStorage) FindDocument(ctx context.Context, address durable.DocumentAddress, at durable.DocumentPoint) (*durable.DocumentRecord, error) {
+	controlled.mu.Lock()
+	held := controlled.findGate
+	controlled.mu.Unlock()
+	if held != nil {
+		held.hold()
+	}
+	return controlled.MemoryStorage.FindDocument(ctx, address, at)
+}
+
+// Publications collects every committed publication.
+type Publications struct {
+	mu    sync.Mutex
+	items []durable.CommitPublication
+}
+
+// All returns the publications so far.
+func (publications *Publications) All() []durable.CommitPublication {
+	publications.mu.Lock()
+	defer publications.mu.Unlock()
+	return slices.Clone(publications.items)
+}
+
+// Len returns the number of publications.
+func (publications *Publications) Len() int { return len(publications.All()) }
+
+// Last returns the newest publication.
+func (publications *Publications) Last() durable.CommitPublication {
+	all := publications.All()
+	return all[len(all)-1]
+}
+
+// Harness is a Session kernel plus its controlled storage and every committed publication.
+type Harness struct {
+	Storage      *ControlledStorage
+	Session      *session.SessionImpl
+	Publications *Publications
+}
+
+// OpenTestSession opens a Session kernel over a controlled storage.
+func OpenTestSession() Harness { return OpenReportingTestSession(nil) }
+
+// OpenReportingTestSession is OpenTestSession with a Session that hands its failure, and the errors of its listeners, to
+// report.
+func OpenReportingTestSession(report func(error)) Harness {
+	controlled := NewControlledStorage()
+	var hooks session.Hooks
+	if report != nil {
+		hooks.Report = func(_ context.Context, err error, _ durable.ReportInfo) { report(err) }
+	}
+	kernel := session.NewSessionImpl(controlled, hooks, nil, nil)
+	publications := &Publications{}
+	ObserveCommitsFunc(kernel, func(_ context.Context, publication durable.CommitPublication) {
+		publications.mu.Lock()
+		publications.items = append(publications.items, publication)
+		publications.mu.Unlock()
+	})
+	return Harness{Storage: controlled, Session: kernel, Publications: publications}
+}
+
+// CommitFunc is a CommitObserver that runs a function for each publication and ignores its end.
+type CommitFunc func(ctx context.Context, publication durable.CommitPublication)
+
+// Advance runs the function.
+func (f CommitFunc) Advance(ctx context.Context, publication durable.CommitPublication) {
+	f(ctx, publication)
+}
+
+// End ignores the end.
+func (CommitFunc) End(durable.WatchEnd) {}
+
+// ObserveCommitsFunc observes the commits of s (a Session or a Harness) with f and returns the observation's Detach.
+func ObserveCommitsFunc(s interface {
+	ObserveCommits(durable.CommitObserver) durable.CommitObservation
+}, f func(ctx context.Context, publication durable.CommitPublication)) func() {
+	return s.ObserveCommits(CommitFunc(f)).Detach
+}
+
+// DocumentChanges returns the document changes of a publication that carry a value: creations and updates, no retirements.
+func DocumentChanges(publication durable.CommitPublication) []durable.DocumentChange {
+	var changes []durable.DocumentChange
+	for _, change := range publication.Changes {
+		if document, ok := change.(durable.DocumentChange); ok {
+			changes = append(changes, document)
+		}
+	}
+	return changes
+}
+
+// DocumentRetireChanges returns the document retirements of a publication.
+func DocumentRetireChanges(publication durable.CommitPublication) []durable.DocumentRetireChange {
+	var changes []durable.DocumentRetireChange
+	for _, change := range publication.Changes {
+		if document, ok := change.(durable.DocumentRetireChange); ok {
+			changes = append(changes, document)
+		}
+	}
+	return changes
+}
+
+// DocumentCopyChanges returns the document copy changes of a publication.
+func DocumentCopyChanges(publication durable.CommitPublication) []durable.DocumentCopyChange {
+	var changes []durable.DocumentCopyChange
+	for _, change := range publication.Changes {
+		if document, ok := change.(durable.DocumentCopyChange); ok {
+			changes = append(changes, document)
+		}
+	}
+	return changes
+}
+
+// CreateConversation creates one ownerless conversation and returns its ID.
+func CreateConversation(t testing.TB, kernel *session.SessionImpl) durable.ConversationId {
+	t.Helper()
+	id, err := durable.Commit(context.Background(), kernel, func(tx durable.Tx) (durable.ConversationId, error) {
+		record, err := tx.CreateConversation(durable.CreateConversationOptions{Ownership: durable.ConversationOwnership{Kind: durable.ConversationOwnerless}})
+		return record.Id, err
+	})
+	if err != nil {
+		t.Fatalf("create conversation: %v", err)
+	}
+	return id
+}
+
+// Flush waits until every scheduled watch and state delivery drained, as upstream's flush waits one macrotask.
+func Flush(kernel *session.SessionImpl) { kernel.WaitDeliveries() }
+
+// Frame is a function of a goroutine's stack: where a test stood when it took the frame with Here.
+type Frame string
+
+// Here is the frame of the function that calls it.
+func Here() Frame {
+	var pc [1]uintptr
+	runtime.Callers(2, pc[:])
+	frame, _ := runtime.CallersFrames(pc[:]).Next()
+	return Frame(frame.Function)
+}
+
+// OnStack reports whether the calling goroutine's stack holds a frame of f. A callback a call made from f ran on that call's
+// own stack (inline) has it, whichever goroutine order the scheduler gave the rest; a callback a delivery goroutine ran
+// does not, however early that goroutine started it. A test that checks "never inline" with a flag the caller sets after
+// the call returns misreads a delivery that starts before the caller does: this check does not.
+func (f Frame) OnStack() bool {
+	pcs := make([]uintptr, 64)
+	for {
+		n := runtime.Callers(2, pcs)
+		if n < len(pcs) {
+			pcs = pcs[:n]
+			break
+		}
+		pcs = make([]uintptr, 2*len(pcs))
+	}
+	frames := runtime.CallersFrames(pcs)
+	for {
+		frame, more := frames.Next()
+		if frame.Function == string(f) {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}

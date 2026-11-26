@@ -1,0 +1,70 @@
+# `microPi` (`upi`) E2E Test Infrastructure
+
+## Overview & Opaque-Box Contract
+
+`tests/e2e/` is a standalone, stdlib-only Go test suite (`module github.com/Code000-211/microPi/tests/e2e`) with **zero external dependencies** and **zero imports** of internal repository packages. Every test interacts with `upi` strictly through its external interfaces:
+- CLI invocations (`upi`, `upi -p`, `upi --mode json`, `upi --mode rpc`, `upi version`, `upi doctor`, `upi update`)
+- Environment variables (`MICROPI_HOME`, `PI_CODING_AGENT_DIR`, `PI_SESSION_DIR`, `PI_SSH_COMMAND`, `PI_CHECKS`, `PI_CHECKS_WAIT`, `PI_PROJECT_SNAPSHOT`, `MELIOUS_API_KEY`, etc.)
+- Filesystem state in an isolated `WorkDir` / `RemoteDir`
+- Outgoing HTTP requests captured by `MockLLM`
+
+No real provider API keys, paid tokens, or external network calls are ever used.
+
+## Harness Components (`tests/e2e/harness.go`)
+
+1. **`ResolveUPIBinary(t *testing.T)`**:
+   - Checks `UPI_BIN` environment variable first.
+   - Falls back to `../../upi` if present.
+   - Falls back to `go build -o <temp>/upi ./cmd/upi` if `../../cmd/upi` exists.
+   - If none exist: calls `t.Fatalf(...)` when `E2E_REQUIRE_BIN=1`, otherwise calls `t.Skip(...)`.
+2. **`NewTestEnv(t *testing.T)`**:
+   - Creates isolated `t.TempDir()` directories for `Home`, `MicropiHome` (`MICROPI_HOME`), `AgentDir` (`PI_CODING_AGENT_DIR`), `SessionDir` (`PI_SESSION_DIR`), `WorkDir`, `FakeSSHDir`, and `RemoteDir`.
+   - Strips real provider API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `MELIOUS_API_KEY`, `GEMINI_API_KEY`, etc.) from child environments and injects dummy test keys.
+   - Writes `models.json` pointing `mock` and `melious` providers to the local `MockLLM` server.
+3. **`MockLLM`**:
+   - Hermetic `httptest.Server` implementing:
+     - `POST /v1/chat/completions` (OpenAI SSE streaming: text chunks, `tool_calls` chunks, `reasoning_content` + `finish_reason: "length"`, HTTP 429 / `"Failed to create energy hold"` error injection, and full request capture).
+     - `GET /v1/models` and `GET /v1/models?include_meta=true` (Melious catalog personalization).
+4. **`FakeSSH`**:
+   - Executable fake `ssh` script in `FakeSSHDir` wired via `PI_SSH_COMMAND` that handles `ControlMaster` flags (`-O check`, `-O exit`, `-M`, `-N`) and executes remote commands inside `RemoteDir` while logging invocations to `SSHLogPath`.
+5. **CLI & RPC Helpers**:
+   - `RunUPI(args...)`, `RunUPIInDir(dir, args...)`, `RunUPIJSON(args...)`, and `StartRPCSession(args...)` with timeouts and automatic cleanup.
+
+## Running the Suite
+
+```bash
+# Run harness self-tests (always pass, no upi binary required)
+cd tests/e2e
+GOWORK=off go test -v -run TestHarness ./...
+
+# Run full suite (skips live-binary tests if upi is not built yet)
+GOWORK=off go test ./...
+
+# Enforce live-binary execution against a built upi binary
+UPI_BIN=/path/to/upi E2E_REQUIRE_BIN=1 GOWORK=off go test -v ./...
+```
+
+*(Note: `GOWORK=off` ensures `tests/e2e` runs cleanly as a standalone module regardless of root `go.work` membership.)*
+
+## Feature-to-Test Traceability Matrix
+
+| # | Feature (`PROJECT.md`) | Tier 1 (Happy Path) | Tier 2 (Boundaries) | Tier 3 (Combinations) | Tier 4 (Scenarios) |
+|---|---|---|---|---|---|
+| 0 | Harness Self-Tests | `TestHarness_*` (6 tests in `harness_test.go`) | — | — | — |
+| 1 | PiG Base & Build | `TestT1_F01_BinaryExecutesAndPrintsHelp`, `TestT1_F01_PrintModeBasicPrompt`, `TestT1_F01_JSONModeEmitsValidJSONL`, `TestT1_F01_RPCModePromptAndResponse`, `TestT1_F01_StaticBinaryNoRuntimeDeps` | `TestT2_F01_InvalidModeFlagExitsNonZero`, `TestT2_F01_MissingModelReturnsErrorCleanly`, `TestT2_F01_EmptyPromptInPrintMode`, `TestT2_F01_MissingExtensionPathFailsEarly`, `TestT2_F01_NonExistentSessionPathErrors` | `TestT3_PrintModePlusBackgroundJobs` | `TestT4_Scenario_BugFixWithGoDiagnosticsAndTestRun` |
+| 2 | `upi` CLI & Branding | `TestT1_F02_VersionSubcommand`, `TestT1_F02_DoctorSubcommand`, `TestT1_F02_MicropiHomeIsolation`, `TestT1_F02_VersionFlagShortAndLong`, `TestT1_F02_UpdateSubcommandHelpOrCheck` | `TestT2_F02_UnknownFlagExitsNonZero`, `TestT2_F02_MicropiHomeCreatedIfMissing`, `TestT2_F02_DoctorHandlesMissingOptionalTools`, `TestT2_F02_EnvOverrideTakesPrecedenceOverDefaultHome`, `TestT2_F02_NoSessionFlagSkipsSessionPersistence` | `TestT3_PrintModePlusBackgroundJobs` | `TestT4_Scenario_BugFixWithGoDiagnosticsAndTestRun` |
+| 3 | `docsearch` (`project_search` & `/docs`) | `TestT1_F03_ProjectSearchFindsFunctionDefinition`, `TestT1_F03_ProjectSearchFindsDocSection`, `TestT1_F03_ProjectSearchEnabledAbove150Files`, `TestT1_F03_DocsSlashCommandViaRPC`, `TestT1_F03_ProjectSearchIncrementalUpdate` | `TestT2_F03_ProjectSearchAutoDisabledAt150OrFewerFiles`, `TestT2_F03_ProjectSearchEmptyQueryHandled`, `TestT2_F03_ProjectSearchNoMatchesReturnsCleanMessage`, `TestT2_F03_DocsSlashCommandEmptyArgsHandled`, `TestT2_F03_ProjectSearchIgnoresGitignoredDirs` | `TestT3_DocsearchPlusFileTracking` | `TestT4_Scenario_LargeRepoSearchAndRefactor` |
+| 4 | Cached `grep`/`find` & `fff` | `TestT1_F04_GrepLiteralCaseSensitive`, `TestT1_F04_GrepCaseInsensitive`, `TestT1_F04_GrepWithGlobFilter`, `TestT1_F04_FindExactGlob`, `TestT1_F04_FindFuzzyFallback` | `TestT2_F04_GrepNoMatchesReturnsCleanResult`, `TestT2_F04_GrepLiteralSpecialChars`, `TestT2_F04_FindRespectsGitignore`, `TestT2_F04_CacheInvalidatedAfterBashCreatesFile`, `TestT2_F04_CacheInvalidatedAfterBashModifiesFile` | `TestT3_GrepFindPlusBashCacheInvalidation` | `TestT4_Scenario_LargeRepoSearchAndRefactor` |
+| 5 | File Tracking & Edit Ergonomics | `TestT1_F05_ReadThenEditHappyPath`, `TestT1_F05_EditUnreadFileWithUniqueOldText`, `TestT1_F05_EditResultShowsChangedLinesWithContext`, `TestT1_F05_EditPreservesCRLFAndBOM`, `TestT1_F05_ReadInjectsNestedAgentsMD` | `TestT2_F05_EditUnreadFileWithNonUniqueOldTextRefused`, `TestT2_F05_EditNoMatchShowsClosestLinesWithLineNumbers`, `TestT2_F05_WriteOverUnreadExistingFileRefusedWithContent`, `TestT2_F05_EditSeekSequenceReindentsTabsAndSpaces`, `TestT2_F05_TouchSameContentDoesNotTriggerStaleRefusal` | `TestT3_DocsearchPlusFileTracking`, `TestT3_CatInBashPlusUnreadEdit`, `TestT3_NestedAgentsMDPlusBatchedEditAndBash`, `TestT3_SeekSequencePlusBackgroundChecks` | `TestT4_Scenario_BugFixWithGoDiagnosticsAndTestRun` |
+| 6 | Bash File-Write Guard | `TestT1_F06_SedInPlaceSingleFileTracked`, `TestT1_F06_PerlInPlaceSingleFileTracked`, `TestT1_F06_EchoRedirectionToExistingFileTracked`, `TestT1_F06_HeredocCatToExistingFileTracked`, `TestT1_F06_TeeToExistingFileTracked` | `TestT2_F06_SedMultiFileGlobAllowedWithoutEditGuard`, `TestT2_F06_AppendRedirectionAllowedWithoutGuard`, `TestT2_F06_TmpFileWriteExemptFromGuard`, `TestT2_F06_ProgramStdoutRedirectExemptFromGuard`, `TestT2_F06_QuotedCommandOverSSHNotCaughtLocally` | `TestT3_BashFileWritesPlusFileTrackingPlusChecks`, `TestT3_BashFileWritesPlusRemote` | — |
+| 7 | Tool Argument Aliases | `TestT1_F07_ReadClaudeFilePathAlias`, `TestT1_F07_EditClaudeOldNewStringAlias`, `TestT1_F07_BashClaudeRunInBackgroundAlias`, `TestT1_F07_ReadQwenAbsolutePathAlias`, `TestT1_F07_GrepQwenIncludeAlias` | `TestT2_F07_CanonicalArgTakesPrecedenceOverAlias`, `TestT2_F07_WriteClaudeFilePathAlias`, `TestT2_F07_BashQwenIsBackgroundAlias`, `TestT2_F07_EditMissingRequiredArgsReturnsError`, `TestT2_F07_AliasWithEmptyValueHandledCleanly` | `TestT3_ArgumentAliasesPlusEditPlusChecks`, `TestT3_RemotePlusArgumentAliases` | — |
+| 8 | Background Compiler/Linter Checks | `TestT1_F08_GoSyntaxErrorReportedAfterEdit`, `TestT1_F08_ShellSyntaxErrorReportedAfterEdit`, `TestT1_F08_JSONSyntaxErrorReportedAfterWrite`, `TestT1_F08_PreExistingErrorsFilteredOut`, `TestT1_F08_PIChecksFilterAndOffSwitch` | `TestT2_F08_RapidSuccessiveEditsDebouncedToLatestCheck`, `TestT2_F08_PIChecksWaitZeroDoesNotBlockOnSlowCheck`, `TestT2_F08_DiagnosticCapAt15ErrorsWithAndNMore`, `TestT2_F08_FixedAndReintroducedErrorReportedAgain`, `TestT2_F08_PIChecksSubsetFilterIgnoresOtherLanguages` | `TestT3_ArgumentAliasesPlusEditPlusChecks`, `TestT3_BashFileWritesPlusFileTrackingPlusChecks`, `TestT3_SeekSequencePlusBackgroundChecks` | `TestT4_Scenario_BugFixWithGoDiagnosticsAndTestRun` |
+| 9 | Background Jobs & `wait` Tool | `TestT1_F09_BashExplicitBackgroundStartsImmediately`, `TestT1_F09_WaitToolBlocksUntilJobCompletes`, `TestT1_F09_JobCompletionWakesIdleAgent`, `TestT1_F09_ShortSleepShortensWhenJobFinishes`, `TestT1_F09_PrintModeWaitsForRunningJobs` | `TestT2_F09_WaitWithNoRunningJobsReturnsImmediately`, `TestT2_F09_ConsecutiveEmptyWaitsWarnModelToDoOtherWork`, `TestT2_F09_LongFixedSleepOutsideLoopRejected`, `TestT2_F09_ConditionLoopWithShortSleepAllowed`, `TestT2_F09_ExplicitBackgroundJobHonorsTimeout` | `TestT3_JobsPlusWaitPlusCompaction`, `TestT3_PrintModePlusBackgroundJobs`, `TestT3_RemotePlusBackgroundJobsAndWait`, `TestT3_JobHubPlusSleepShortening` | `TestT4_Scenario_BackgroundBuildWaitAndJobHub` |
+| 10 | Bash Speed & Output | `TestT1_F10_HeadAndTailTruncationLongOutput`, `TestT1_F10_ANSIAndControlCharsStripped`, `TestT1_F10_NoColorEnvInjectedByDefault`, `TestT1_F10_DirectExecWithoutShellSyntax`, `TestT1_F10_JSONAndPrintModeExitCleanlyAfterBash` | `TestT2_F10_LargeByteOutputOver32KBTruncatedWithLogFile`, `TestT2_F10_CarriageReturnProgressBarsCollapsed`, `TestT2_F10_UserForceColorPreservedOverDefaultNoColor`, `TestT2_F10_NonZeroExitCodeReportedInToolResult`, `TestT2_F10_EmptyCommandHandledWithoutPanic` | `TestT3_CatInBashPlusUnreadEdit` | `TestT4_Scenario_BugFixWithGoDiagnosticsAndTestRun` |
+| 11 | Interactive Job Hub | `TestT1_F11_JobsSlashCommandListsRunningAndEnded`, `TestT1_F11_JobsCommandShowsOutputLogPath`, `TestT1_F11_JobsCommandShowsExitCode`, `TestT1_F11_JobsCommandEmptyWhenNoJobs`, `TestT1_F11_RPCSessionSupportsJobsCommand` | `TestT2_F11_JobsCommandWithUnknownSubargHandled`, `TestT2_F11_JobsReflectsMultipleConcurrentJobs`, `TestT2_F11_RPCAgentsAbortTerminatesBackgroundJobsCleanly`, `TestT2_F11_JobsAfterRestartStartsClean`, `TestT2_F11_JobOutputFileExistsOnDisk` | `TestT3_JobHubPlusSleepShortening` | `TestT4_Scenario_BackgroundBuildWaitAndJobHub` |
+| 12 | Compaction-Ahead & Tool Pruning | `TestT1_F12_ToolResultPruningShortensOldLargeResults`, `TestT1_F12_ToolResultPruningKeepsRecent8Results`, `TestT1_F12_ManualCompactionPreservesUserTaskVerbatim`, `TestT1_F12_CompactionAheadUsesMaxContextTokensCap`, `TestT1_F12_PromptPrefixCacheStabilityAcrossTurns` | `TestT2_F12_ToolResultPruningDisabledViaSettings`, `TestT2_F12_SmallToolResultsUnderMinCharsNeverPruned`, `TestT2_F12_CompactOnEmptySessionHandledCleanly`, `TestT2_F12_MaxContextTokensRespectedBelowWindowSize`, `TestT2_F12_DuplicateUserTaskNotDuplicatedInCompactionPreservation` | `TestT3_JobsPlusWaitPlusCompaction`, `TestT3_CompactionAheadPlusToolResultPruning` | `TestT4_Scenario_LongSessionCompactionAndPruningPreservesTask` |
+| 13 | Project Snapshot & Cut-Off Recovery | `TestT1_F13_ProjectSnapshotIncludedInSystemPrompt`, `TestT1_F13_ProjectSnapshotDisabledViaEnvVar`, `TestT1_F13_ProjectSnapshotLargeRepoSummarizesDirs`, `TestT1_F13_CutOffResponseRetriesWithLowerThinking`, `TestT1_F13_CutOffResponseCapsAt3Retries` | `TestT2_F13_ProjectSnapshotNonGitDirHandledCleanly`, `TestT2_F13_ProjectSnapshotEmptyDirHandledCleanly`, `TestT2_F13_CutOffWithThinkingOffDoesNotLoopForever`, `TestT2_F13_CutOffWithToolCallDoesNotTriggerThinkingStepDown`, `TestT2_F13_ProjectSnapshotTakenOncePerSession` | `TestT3_ProjectSnapshotPlusCutOffResponse`, `TestT3_MeliousPlusCutOffResponse` | `TestT4_Scenario_MeliousEnergyHoldAndCutOffRecovery` |
+| 14 | System Prompt & Batched Execution | `TestT1_F14_SystemPromptIsTrimmedAndConcise`, `TestT1_F14_SystemPromptMentionsBatchedCallsAndBackgroundJobs`, `TestT1_F14_GrepFindOmittedFromDefaultToolSchemas`, `TestT1_F14_BatchedEditAndBashExecuteInOrder`, `TestT1_F14_BatchedMultipleEditsExecuteSequentially` | `TestT2_F14_BatchedToolCallsWithOneFailingReportsBothResults`, `TestT2_F14_CustomSystemPromptOverridesDefault`, `TestT2_F14_AppendSystemPromptPreservesDefault`, `TestT2_F14_NoToolsFlagOmitsAllTools`, `TestT2_F14_BatchedBashAndEditRespectsDependencyOrder` | `TestT3_NestedAgentsMDPlusBatchedEditAndBash` | `TestT4_Scenario_BugFixWithGoDiagnosticsAndTestRun`, `TestT4_Scenario_LargeRepoSearchAndRefactor` |
+| 15 | Remote SSH (`/remote`, `--remote`) | `TestT1_F15_RemoteCLIFlagRoutesReadToRemoteDir`, `TestT1_F15_RemoteCLIFlagRoutesEditAndWriteToRemoteDir`, `TestT1_F15_RemoteCLIFlagRoutesBashToRemoteDir`, `TestT1_F15_RemoteSlashCommandSwitchesAndReportsStatus`, `TestT1_F15_RemoteOffRestoresLocalTools` | `TestT2_F15_RemoteDisablesLocalGrepAndFindTools`, `TestT2_F15_RemoteRefusesLocalSedInPlaceGuard`, `TestT2_F15_RemoteReadNonExistentFileReturnsError`, `TestT2_F15_RemoteSSHFailureHandledWithoutPanic`, `TestT2_F15_RemoteDoesNotRunLocalCompilerChecks` | `TestT3_BashFileWritesPlusRemote`, `TestT3_RemotePlusBackgroundJobsAndWait`, `TestT3_RemotePlusArgumentAliases` | `TestT4_Scenario_RemoteWorkspaceEditTestAndReturnLocal` |
+| 16 | Melious Provider & Herdr | `TestT1_F16_MeliousBuiltInProviderAvailable`, `TestT1_F16_MeliousDefaultModelGLM53`, `TestT1_F16_MeliousCatalogMetadataFetchedWithKey`, `TestT1_F16_MeliousEnergyHoldErrorRetried`, `TestT1_F16_MeliousFallbackToBuiltInWithoutEndpoint` | `TestT2_F16_MeliousUnknownModelFailsCleanly`, `TestT2_F16_MeliousMultipleEnergyHoldRetriesSucceed`, `TestT2_F16_MeliousMissingAPIKeyHandledCleanly`, `TestT2_F16_Melious401UnauthorizedDoesNotInfiniteRetry`, `TestT2_F16_MeliousCatalogHTTP500FallsBackToBuiltIn` | `TestT3_MeliousPlusCutOffResponse` | `TestT4_Scenario_MeliousEnergyHoldAndCutOffRecovery` |
+| 17 | Pi-Bolt Retirement & CI/Installers | `TestT1_F17_HelpOutputHasNoPiBoltBranding`, `TestT1_F17_VersionOutputIdentifiesUpiGoBuild`, `TestT1_F17_NoNodeOrBunRequiredAtRuntime`, `TestT1_F17_ConfigDirDefaultsToMicropi`, `TestT1_F17_InstallScriptsExistAndReferenceUpi` | `TestT2_F17_LegacyPiboltEnvVarsDoNotBreakUpi`, `TestT2_F17_OfflineFlagPreventsExternalNetworkCalls`, `TestT2_F17_DoctorExitsCleanlyInReadOnlyWorkDir`, `TestT2_F17_InstallScriptRejectsUnknownArgsCleanly`, `TestT2_F17_GitHubWorkflowsExist` | — | — |

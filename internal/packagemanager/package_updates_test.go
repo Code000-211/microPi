@@ -1,0 +1,83 @@
+package packagemanager
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+)
+
+func TestParseNpmSpec(t *testing.T) {
+	cases := []struct {
+		spec        string
+		wantName    string
+		wantVersion string
+	}{
+		{"foo", "foo", ""},
+		{"foo@1.2.3", "foo", "1.2.3"},
+		{"foo@latest", "foo", "latest"},
+		{"@scope/foo", "@scope/foo", ""},
+		{"@scope/foo@2.0.0", "@scope/foo", "2.0.0"},
+	}
+	for _, tc := range cases {
+		gotName, gotVersion := parseNpmSpec(tc.spec)
+		if gotName != tc.wantName || gotVersion != tc.wantVersion {
+			t.Errorf("parseNpmSpec(%q) = (%q, %q), want (%q, %q)", tc.spec, gotName, gotVersion, tc.wantName, tc.wantVersion)
+		}
+	}
+}
+
+// Pi package-manager.ts:59-65 pins exact versions, not mutable dist tags or ranges.
+func TestIsPinnedNpm(t *testing.T) {
+	cases := []struct {
+		source string
+		want   bool
+	}{
+		{"npm:foo", false},
+		{"npm:foo@1.2.3", true},
+		{"npm:foo@latest", false},
+		{"npm:@scope/foo", false},
+		{"npm:@scope/foo@beta", false},
+		{"npm:foo@^1.2.0", false},
+		{"npm:foo@v1.2.3", true},
+	}
+	for _, tc := range cases {
+		if got := IsPinnedNpm(tc.source); got != tc.want {
+			t.Errorf("IsPinnedNpm(%q) = %v, want %v", tc.source, got, tc.want)
+		}
+	}
+}
+
+func TestInstallMissingTreatsProjectDeltaAsInherited(t *testing.T) {
+	root := t.TempDir()
+	cwd, agentDir, packageRoot := filepath.Join(root, "work"), filepath.Join(root, "agent"), filepath.Join(root, "pkg")
+	for _, dir := range []string{cwd, agentDir, packageRoot} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte(`{"name":"pkg"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	globalSource, err := filepath.Rel(agentDir, packageRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := codingagent.NewSettingsManager(cwd, agentDir)
+	if err := settings.SetPackages([]codingagent.PackageSource{{Source: filepath.ToSlash(globalSource)}}); err != nil {
+		t.Fatal(err)
+	}
+	projectSource, err := filepath.Rel(filepath.Join(cwd, ".pig"), packageRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.SetProjectPackages([]codingagent.PackageSource{{Source: filepath.ToSlash(projectSource), Autoload: new(false), Prompts: []string{"-prompts/one.md"}}}); err != nil {
+		t.Fatal(err)
+	}
+	settings.Reload()
+	failures, err := NewPackageManager(PackageManagerOptions{CWD: cwd, AgentDir: agentDir, SettingsManager: settings}).InstallMissing(nil)
+	if err != nil || len(failures) != 0 {
+		t.Fatalf("failures=%v err=%v", failures, err)
+	}
+}

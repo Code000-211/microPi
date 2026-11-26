@@ -1,0 +1,398 @@
+package tools
+
+// pi: packages/coding-agent/src/core/tools/bash.ts
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/agent"
+)
+
+type portBashOperations func(context.Context, string, string, BashOperationsExecOptions) (BashOperationsResult, error)
+
+func (f portBashOperations) Exec(ctx context.Context, command, cwd string, opts BashOperationsExecOptions) (BashOperationsResult, error) {
+	return f(ctx, command, cwd, opts)
+}
+
+func bashPort(t *testing.T, tool *BashTool, command string) agent.AgentToolResult {
+	t.Helper()
+	return runFileTool(t, tool, t.Context(), map[string]any{"command": command})
+}
+
+// structuredFields decodes the result's structuredContent object.
+func structuredFields(t *testing.T, result agent.AgentToolResult) map[string]any {
+	t.Helper()
+	if result.StructuredContent == nil {
+		t.Fatalf("result has no structuredContent: %+v", result)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(result.StructuredContent, &fields); err != nil {
+		t.Fatalf("structuredContent %s: %v", result.StructuredContent, err)
+	}
+	return fields
+}
+func assertBashPortError(t *testing.T, result agent.AgentToolResult, pattern string) {
+	t.Helper()
+	if !result.IsError || !regexp.MustCompile(pattern).MatchString(result.Text()) {
+		t.Fatalf("result = %+v; want error %q", result, pattern)
+	}
+}
+func assertFullBashOutput(t *testing.T, path string) {
+	t.Helper()
+	if path == "" {
+		t.Fatal("missing full output path")
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(path); err != nil {
+			t.Error(err)
+		}
+	})
+	requireUserOnlyFile(t, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range []string{"1\n2\n3", "2998\n2999\n3000"} {
+		if !strings.Contains(string(data), part) {
+			t.Fatalf("full output lacks %q", part)
+		}
+	}
+}
+
+// Pi: packages/coding-agent/src/core/tools/powershell.ts:35 (BashOperations.exec).
+func TestToolsBashPort(t *testing.T) {
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:486
+	t.Run("should execute simple commands", func(t *testing.T) {
+		result := bashPort(t, &BashTool{CWD: t.TempDir()}, "echo 'test output'")
+		requireTextParts(t, result, []string{"test output"}, nil)
+		if result.Details != nil {
+			t.Fatalf("details = %#v", result.Details)
+		}
+	})
+	// .upstream/v0.99.1/packages/coding-agent/test/tools.test.ts:493 (replaces v0.87.1 "should handle command errors")
+	t.Run("should report non-zero exit codes as error results with structured content", func(t *testing.T) {
+		result := bashPort(t, &BashTool{CWD: t.TempDir()}, "echo out; exit 3")
+		if !result.IsError || result.Text() != "out\n\n\nCommand exited with code 3" {
+			t.Fatalf("result = %+v", result)
+		}
+		fields := structuredFields(t, result)
+		if len(fields) != 4 || fields["output"] != "out\n" || fields["truncated"] != false || fields["exit_code"] != float64(3) {
+			t.Fatalf("structuredContent = %v", fields)
+		}
+		if _, ok := fields["wall_time_seconds"].(float64); !ok {
+			t.Fatalf("wall_time_seconds = %#v, want a number", fields["wall_time_seconds"])
+		}
+
+		ok := bashPort(t, &BashTool{CWD: t.TempDir()}, "echo fine")
+		if ok.IsError {
+			t.Fatalf("ok result is an error: %+v", ok)
+		}
+		if fields := structuredFields(t, ok); fields["output"] != "fine\n" || fields["exit_code"] != float64(0) {
+			t.Fatalf("ok structuredContent = %v", fields)
+		}
+
+		empty := bashPort(t, &BashTool{CWD: t.TempDir()}, "true")
+		if empty.Text() != "(no output)" {
+			t.Fatalf("empty text = %q", empty.Text())
+		}
+		if fields := structuredFields(t, empty); fields["output"] != "" || fields["truncated"] != false {
+			t.Fatalf("empty structuredContent = %v", fields)
+		}
+	})
+	// .upstream/v0.99.1/packages/coding-agent/test/tools.test.ts:513
+	t.Run("should return up to 1 MiB of output in structured content", func(t *testing.T) {
+		// 3000 lines exceed the model-facing 2000 line limit but not 1 MiB.
+		medium := bashPort(t, &BashTool{CWD: t.TempDir()}, "seq 1 3000")
+		details, isDetails := medium.Details.(*BashDetails)
+		if strings.Contains(medium.Text(), "\n1\n2\n") || !isDetails || details.Truncation == nil || !details.Truncation.Truncated {
+			t.Fatalf("medium result = %+v", medium)
+		}
+		t.Cleanup(func() { _ = os.Remove(details.FullOutputPath) })
+		fields := structuredFields(t, medium)
+		var want strings.Builder
+		for i := 1; i <= 3000; i++ {
+			fmt.Fprintf(&want, "%d\n", i)
+		}
+		if fields["truncated"] != false || fields["output"] != want.String() {
+			t.Fatalf("medium structured truncated=%v len(output)=%d", fields["truncated"], len(fmt.Sprint(fields["output"])))
+		}
+
+		// About 2 MB: keeps the first and last 512 KiB around an omission marker.
+		large := bashPort(t, &BashTool{CWD: t.TempDir()}, "seq 1 300000")
+		largeDetails, isDetails := large.Details.(*BashDetails)
+		if !isDetails {
+			t.Fatalf("large details = %#v", large.Details)
+		}
+		t.Cleanup(func() { _ = os.Remove(largeDetails.FullOutputPath) })
+		fields = structuredFields(t, large)
+		output, _ := fields["output"].(string)
+		if fields["truncated"] != true || !strings.HasPrefix(output, "1\n2\n3\n") || !strings.HasSuffix(output, "299999\n300000\n") {
+			t.Fatalf("large structured truncated=%v head=%q", fields["truncated"], output[:min(len(output), 12)])
+		}
+		if !regexp.MustCompile(`\n\n\[\.\.\. \d+ bytes omitted \.\.\.\]\n\n`).MatchString(output) {
+			t.Fatal("no omission marker")
+		}
+		if len(output) >= 1024*1024+100 {
+			t.Fatalf("output is %d bytes, want < 1 MiB + 100", len(output))
+		}
+		if fields["full_output_path"] != largeDetails.FullOutputPath {
+			t.Fatalf("full_output_path = %v, want %v", fields["full_output_path"], largeDetails.FullOutputPath)
+		}
+		data, err := os.ReadFile(fields["full_output_path"].(string))
+		if err != nil || !strings.HasSuffix(string(data), "300000\n") {
+			t.Fatalf("full output file: %v", err)
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:531
+	t.Run("should reject a null exit code from custom operations", func(t *testing.T) {
+		tool := &BashTool{CWD: t.TempDir(), Operations: portBashOperations(func(_ context.Context, _, _ string, opts BashOperationsExecOptions) (BashOperationsResult, error) {
+			opts.OnData([]byte("partial\n"))
+			return BashOperationsResult{}, nil
+		})}
+		assertBashPortError(t, bashPort(t, tool, "remote"), `partial\s+Command terminated without an exit code$`)
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:545
+	t.Run("should respect timeout", func(t *testing.T) {
+		node, err := exec.LookPath("node")
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := runFileTool(t, &BashTool{CWD: t.TempDir()}, t.Context(), map[string]any{"command": fmt.Sprintf("%q -e %q", node, "setInterval(() => {}, 1000)"), "timeout": 0.05})
+		assertBashPortError(t, result, `(?i)timed out`)
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:550
+	t.Run("should include full output path for truncated timeout and abort errors", func(t *testing.T) {
+		for _, tc := range []struct{ error, want string }{{"timeout:5", "Command timed out after 5 seconds"}, {"aborted", "Command aborted"}} {
+			t.Run(tc.error, func(t *testing.T) {
+				tool := &BashTool{CWD: t.TempDir(), Operations: portBashOperations(func(_ context.Context, _, _ string, opts BashOperationsExecOptions) (BashOperationsResult, error) {
+					for i := 1; i <= 3000; i++ {
+						opts.OnData(fmt.Appendf(nil, "%d\n", i))
+					}
+					return BashOperationsResult{}, errors.New(tc.error)
+				})}
+				result := bashPort(t, tool, "chatty-fail")
+				assertBashPortError(t, result, regexp.QuoteMeta(tc.want))
+				if !regexp.MustCompile(`\[Showing lines \d+-\d+ of \d+\. Full output: `).MatchString(result.Text()) || strings.Contains(result.Text(), "Full output: undefined") {
+					t.Fatal(result.Text())
+				}
+				match := regexp.MustCompile(`Full output: ([^\]\n]+)`).FindStringSubmatch(result.Text())
+				if len(match) != 2 {
+					t.Fatalf("no path in %q", result.Text())
+				}
+				assertFullBashOutput(t, match[1])
+			})
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:586
+	t.Run("should throw error when cwd does not exist", func(t *testing.T) {
+		assertBashPortError(t, bashPort(t, &BashTool{CWD: "/this/directory/definitely/does/not/exist/12345"}, "echo test"), `Working directory does not exist`)
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:596
+	t.Run("should handle process spawn errors", func(t *testing.T) {
+		cfg := posixShellConfig(t, "bash", "bash")
+		cfg.operations = &LocalShellOperations{ShellName: "bash", ResolveShell: func() (ShellConfig, error) {
+			return ShellConfig{Path: "/nonexistent-shell-path-xyz123", Args: []string{"-c"}}, nil
+		}}
+		result := runShell(t, t.Context(), t.TempDir(), cfg, bashParams{Command: "echo test"})
+		assertBashPortError(t, result, `ENOENT`)
+		fmt.Printf("BASH_SPAWN %s\n", result.Text())
+		_, err := cfg.operations.Exec(t.Context(), "echo test", t.TempDir(), BashOperationsExecOptions{})
+		if !errors.Is(err, os.ErrNotExist) || !result.IsError {
+			t.Fatalf("result = %+v, spawn = %v", result, err)
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:607
+	t.Run("should pass shellPath through to shell resolution", func(t *testing.T) {
+		settings := fakeSettings{path: "/custom/bash"}
+		tool := &BashTool{CWD: t.TempDir(), Settings: settings, Operations: portBashOperations(func(context.Context, string, string, BashOperationsExecOptions) (BashOperationsResult, error) {
+			return BashOperationsResult{ExitCode: new(0)}, nil
+		})}
+		result := bashPort(t, tool, "echo test")
+		if result.IsError {
+			t.Fatal(result.Text())
+		}
+		fmt.Printf("BASH_DELEGATE %s\n", result.Text())
+		_, err := CreateLocalBashOperations(&LocalBashOptions{ShellPath: settings.path}).Exec(t.Context(), "echo test", t.TempDir(), BashOperationsExecOptions{})
+		if err == nil || err.Error() != "Custom shell path not found: /custom/bash" {
+			t.Fatalf("local resolution = %v", err)
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:629
+	t.Run("should send commands over stdin when shell resolution requires it", func(t *testing.T) {
+		node, err := exec.LookPath("node")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ops := &LocalShellOperations{ShellName: "bash", ResolveShell: func() (ShellConfig, error) {
+			return ShellConfig{Path: node, Args: []string{"-e", `let input = ""; process.stdin.setEncoding("utf8"); process.stdin.on("data", (chunk) => { input += chunk; }); process.stdin.on("end", () => { process.stdout.write(input); });`}, CommandTransport: "stdin"}, nil
+		}}
+		command := `name='World'; echo "Hello, ${name}!"; count=3; for i in $(seq 1 ${count}); do echo "Iteration ${i} of ${count}"; done`
+		var output strings.Builder
+		result, err := ops.Exec(t.Context(), command, t.TempDir(), BashOperationsExecOptions{OnData: func(data []byte) { output.Write(data) }})
+		if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || output.String() != command {
+			t.Fatalf("result %+v, %v, output %q", result, err, output.String())
+		}
+	})
+	for _, tc := range []struct{ name, prefix, command, want string }{
+		// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:679
+		{"should prepend command prefix when configured", "export TEST_VAR=hello", "echo $TEST_VAR", "hello"},
+		// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:688
+		{"should include output from both prefix and command", "echo prefix-output", "echo command-output", "prefix-output\ncommand-output"},
+		// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:697
+		{"should work without command prefix", "", "echo no-prefix", "no-prefix"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := bashPort(t, &BashTool{CWD: t.TempDir(), CommandPrefix: tc.prefix}, tc.command)
+			if result.IsError || strings.TrimSpace(result.Text()) != tc.want {
+				t.Fatal(result)
+			}
+		})
+	}
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:704
+	t.Run("should coalesce streaming updates for chatty output", func(t *testing.T) {
+		// Node runs the 5000 synchronous onData calls before any throttle
+		// timer can fire. Hold the scheduler's clock still for the burst so
+		// the count reflects coalescing, not how fast this host appends.
+		frozen := time.Unix(1_700_000_000, 0)
+		previous := shellUpdateTime
+		shellUpdateTime = shellUpdateClock{now: func() time.Time { return frozen }, after: func(time.Duration) (<-chan time.Time, func()) { return nil, func() {} }}
+		t.Cleanup(func() { shellUpdateTime = previous })
+		tool := &BashTool{CWD: t.TempDir(), Operations: portBashOperations(func(_ context.Context, _, _ string, opts BashOperationsExecOptions) (BashOperationsResult, error) {
+			for i := range 5000 {
+				opts.OnData(fmt.Appendf(nil, "line %d\n", i))
+			}
+			return BashOperationsResult{ExitCode: new(0)}, nil
+		})}
+		var mu sync.Mutex
+		var updates []string
+		result, err := tool.Execute(t.Context(), "test-call-chatty-updates", json.RawMessage(`{"command":"chatty"}`), func(partial agent.AgentToolResult) { mu.Lock(); updates = append(updates, partial.Text()); mu.Unlock() })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(updates) >= 25 {
+			t.Fatalf("%d updates, want <25", len(updates))
+		}
+		requireTextParts(t, result, []string{"line 4999"}, nil)
+		if details, ok := result.Details.(*BashDetails); ok {
+			t.Cleanup(func() { _ = os.Remove(details.FullOutputPath) })
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:724
+	t.Run("should not count a trailing newline as an extra truncated bash output line", func(t *testing.T) {
+		// The notice ends with the random temp path of the full-output log; Pi asserts the whole output lacks "4001", which fails whenever that
+		// path happens to contain it. Put 4001 in the directory on purpose so the check below must exclude the path to pass.
+		spoofed := filepath.Join(t.TempDir(), "dir-4001")
+		if err := os.MkdirAll(spoofed, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+			t.Setenv(key, spoofed)
+		}
+		tool := &BashTool{CWD: t.TempDir(), Operations: portBashOperations(func(_ context.Context, _, _ string, opts BashOperationsExecOptions) (BashOperationsResult, error) {
+			for i := 1; i <= 4000; i++ {
+				opts.OnData(fmt.Appendf(nil, "line-%04d\n", i))
+			}
+			return BashOperationsResult{ExitCode: new(0)}, nil
+		})}
+		result := bashPort(t, tool, "many-lines")
+		details, ok := result.Details.(*BashDetails)
+		if !ok || details.Truncation == nil {
+			t.Fatalf("details = %+v", result.Details)
+		}
+		t.Cleanup(func() { _ = os.Remove(details.FullOutputPath) })
+		if details.Truncation.TotalLines != 4000 || details.Truncation.OutputLines != 2000 {
+			t.Fatal(details.Truncation)
+		}
+		if !strings.HasPrefix(details.FullOutputPath, spoofed) {
+			t.Fatalf("full output path %q is not under %q", details.FullOutputPath, spoofed)
+		}
+		// Only the path is excluded; every other character of the output is still checked.
+		text := strings.ReplaceAll(result.Text(), details.FullOutputPath, "<full-output-path>")
+		if result.IsError {
+			t.Fatalf("tool failed: %s", result.Text())
+		}
+		for _, want := range []string{"line-2001", "line-4000", "[Showing lines 2001-4000 of 4000. Full output: <full-output-path>]"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("output %q lacks %q", text, want)
+			}
+		}
+		if strings.Contains(text, "4001") {
+			t.Errorf("output %q contains %q", text, "4001")
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:746
+	t.Run("should decode UTF-8 characters split across output chunks", func(t *testing.T) {
+		tool := &BashTool{CWD: t.TempDir(), Operations: portBashOperations(func(_ context.Context, _, _ string, opts BashOperationsExecOptions) (BashOperationsResult, error) {
+			euro := []byte("€\n")
+			opts.OnData(euro[:1])
+			opts.OnData(euro[1:])
+			return BashOperationsResult{ExitCode: new(0)}, nil
+		})}
+		result := bashPort(t, tool, "split-utf8")
+		if result.IsError || strings.TrimSpace(result.Text()) != "€" {
+			t.Fatal(result)
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:762
+	t.Run("should expose local bash operations for extension reuse", func(t *testing.T) {
+		t.Setenv("TEST_LOCAL_BASH_OPS", "from-local-ops")
+		var output strings.Builder
+		result, err := CreateLocalBashOperations(nil).Exec(t.Context(), "echo $TEST_LOCAL_BASH_OPS", t.TempDir(), BashOperationsExecOptions{OnData: func(data []byte) { output.Write(data) }, Env: os.Environ()})
+		if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || strings.TrimSpace(output.String()) != "from-local-ops" {
+			t.Fatalf("result %+v, %v, output %q", result, err, output.String())
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:775
+	t.Run("should preserve executeBash sanitization when using local bash operations", func(t *testing.T) {
+		result, err := ExecuteBashWithOperations(t.Context(), `printf '\033[31mred\033[0m\r\n'`, t.TempDir(), CreateLocalBashOperations(nil), BashExecOptions{})
+		if err != nil || result.ExitCode == nil || *result.ExitCode != 0 || result.Output != "red\n" {
+			t.Fatalf("result %+v, %v", result, err)
+		}
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:786
+	t.Run("should persist full output when truncation happens by line count only", func(t *testing.T) {
+		result := bashPort(t, &BashTool{CWD: t.TempDir()}, "seq 3000")
+		details, ok := result.Details.(*BashDetails)
+		if !ok || details.Truncation == nil || !details.Truncation.Truncated || details.Truncation.TruncatedBy != "lines" {
+			t.Fatalf("details = %+v", result.Details)
+		}
+		if !regexp.MustCompile(`\[Showing lines \d+-\d+ of \d+\. Full output: `).MatchString(result.Text()) || strings.Contains(result.Text(), "Full output: undefined") {
+			t.Fatal(result.Text())
+		}
+		assertFullBashOutput(t, details.FullOutputPath)
+	})
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:809
+	t.Run("executeBash should persist full output when truncation happens by line count only", func(t *testing.T) {
+		result, err := ExecuteBashWithOperations(t.Context(), "seq 3000", t.TempDir(), CreateLocalBashOperations(nil), BashExecOptions{})
+		if err != nil || !result.Truncated {
+			t.Fatalf("result %+v, %v", result, err)
+		}
+		assertFullBashOutput(t, result.FullOutputPath)
+	})
+}
+
+func TestToolsLsPort(t *testing.T) {
+	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:937
+	t.Run("should list dotfiles and directories", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".hidden-file"), []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(dir, ".hidden-dir"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		result := runFileTool(t, &LsTool{CWD: dir}, t.Context(), map[string]any{"path": dir})
+		requireTextParts(t, result, []string{".hidden-file", ".hidden-dir/"}, nil)
+	})
+}

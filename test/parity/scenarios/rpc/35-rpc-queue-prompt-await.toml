@@ -1,0 +1,60 @@
+# Pi 0.87.1 rpc-mode.ts:393-424,786-811 and agent-session.ts:1634-1760,1823-1873 admit input before awaited preflight/queue continuations.
+# State queries snapshot idle/empty queues in the input callback, even though their response and the subsequent queue events are observed after that callback.
+name = "35-rpc-queue-prompt-await"
+description = "Prompt preflight and queue awaits preserve input-time state snapshots and continuation order"
+covers = ["packages/coding-agent/src/modes/rpc/rpc-mode.ts", "packages/coding-agent/src/core/agent-session.ts"]
+tags = ["hermetic", "fast"]
+driver = "rpc-mode"
+
+[rpc]
+timeout_seconds = 15
+[[rpc.steps]]
+line = '''{"id":"prompt","type":"prompt","message":""}
+{"id":"before-queues","type":"get_state"}
+{"id":"steer","type":"steer","message":""}
+{"id":"follow","type":"follow_up","message":""}
+{"id":"after-queues","type":"get_state"}'''
+wait_event = '{"type":"agent_settled","aborted":false}'
+wait_timeout_seconds = 10
+
+[env]
+pig = ["PIG_TEST_FAUX=1", "PIG_HOME=testdata/pig-home"]
+# Same explicit prompt avoids D2/D22 inputs without deleting captured sections; in-memory sessions omit generated filenames.
+pig_args = ["--model", "test-faux/faux-1", "--no-session", "--system-prompt", "RPC runtime values.", "--no-context-files", "--no-skills"]
+pi_extensions = ["../../testdata/test-faux-provider.ts"]
+pi_args = ["--model", "test-faux/faux-1", "--no-session", "--system-prompt", "RPC runtime values.", "--no-context-files", "--no-skills"]
+
+[assert]
+json_output_ordered_equal = true
+stderr_equal = true
+exit_code = 0
+runs = 3
+both_contain = [
+  '{"type":"queue_update","steering":[],"followUp":[""]}',
+  '{"type":"queue_update","steering":[],"followUp":[]}',
+]
+
+# Pi's agent-session.ts _handleAgentEvent (user message_start) matches a delivered message against the pending queue even when its text is empty since Pi main a63c4ec5c
+# (#8612, in the pin c23b9ec1; Pi 1.5.0 guarded the match with a truthy text and emitted nothing). The RPC stream therefore carries two queue_update records in both
+# engines, each before the message_start that caused it: the empty prompt's message_start removes the queued empty steering entry, and the delivery of the steer's message
+# removes the queued empty follow-up entry. They are compared like every other record; its divergence record is retired. both_contain pins both records so the scenario fails if either engine stops emitting them.
+
+[[assert.json_aliases]]
+paths = ["/**/sessionId"]
+kind = "id"
+group = "session"
+pattern = '^[0-9a-f-]{36}$'
+reason = "The in-memory session UUID varies per process. A bijection preserves identity across both snapshots."
+[[assert.json_aliases]]
+paths = ["/**/sections/cwd"]
+kind = "path"
+reason = "Only the exact isolated cwd varies in the explicit system prompt; retain section structure and all other text."
+[[assert.json_aliases]]
+paths = ["/**/timestamp"]
+kind = "timestamp"
+reason = "Independent entry and message clocks vary; preserve field presence, timestamp type and syntax."
+
+[[assert.json_aliases]]
+paths = ["/**/durationMs"]
+kind = "duration"
+reason = "Pi 1.1.0 measures each response and tool execution (#10549) with a monotonic clock; the value varies per run. Retain presence, type and position."

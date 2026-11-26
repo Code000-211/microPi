@@ -1,0 +1,2132 @@
+[[fields]]
+id = "ai/anthropic_client.go#const.claudeCodeVersion:go:-"
+path = "ai/anthropic_client.go"
+owner = "<package>"
+field = "claudeCodeVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact literal from pinned ai/api/anthropic-messages.ts's claudeCodeVersion, sent in the same user-agent header."
+
+[[fields]]
+id = "ai/azure_config.go#AzureConfig.APIVersion:go:-"
+path = "ai/azure_config.go"
+owner = "AzureConfig"
+field = "APIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Azure OpenAI API version is owned by the external provider contract."
+
+[[fields]]
+id = "ai/azure_config.go#const.defaultAzureAPIVersion:go:-"
+path = "ai/azure_config.go"
+owner = "<package>"
+field = "defaultAzureAPIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Azure OpenAI API version is owned by the external provider contract."
+
+[[fields]]
+id = "ai/githubcopilot.go#const.copilotAPIVersion:go:-"
+path = "ai/githubcopilot.go"
+owner = "<package>"
+field = "copilotAPIVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact literal from pinned ai/auth/oauth/github-copilot.ts's COPILOT_API_VERSION, sent in the same X-GitHub-Api-Version header."
+
+[[fields]]
+id = "ai/google.go#GoogleConfig.APIVersion:go:-"
+path = "ai/google.go"
+owner = "GoogleConfig"
+field = "APIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Google provider API path version is owned by the external provider contract."
+
+[[fields]]
+id = "ai/google_wire.go#const.geminiMirroredSDKVersion:go:-"
+path = "ai/google_wire.go"
+owner = "<package>"
+field = "geminiMirroredSDKVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Release version of the external @google/genai SDK whose converters' member order the Google wire tables mirror; Google owns it, no Pig format carries it and nothing sends it: the request-body oracle test and make pin-check compare it with the version the parity oracle installs."
+
+[[fields]]
+id = "ai/identity.go#ClientIdentity.Version:json:version"
+path = "ai/identity.go"
+owner = "ClientIdentity"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The product version a detailed User-Agent names (pi-ai's ClientIdentity.version); a request identity value, not a schema discriminator and not read to select a format."
+
+[[fields]]
+id = "ai/streaming_json_parser.go#StreamingJSONSnapshot.Version:go:-"
+path = "ai/streaming_json_parser.go"
+owner = "StreamingJSONSnapshot"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "Pi's StreamingJsonSnapshot.version (packages/ai/src/utils/streaming-json.ts): a counter that changes whenever snapshot() made a fresh copy, which a reader compares to tell whether the value it holds is current; it is never persisted or read to select a format."
+
+[[fields]]
+id = "automation/ci/bugledger/changelog.go#bullet.Version:go:-"
+path = "automation/ci/bugledger/changelog.go"
+owner = "bullet"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "The CHANGELOG heading (a release name or Unreleased) that holds a bullet; in-memory bug-ledger input, not a serialized format."
+
+[[fields]]
+id = "automation/ci/divguard/dependency_sources.go#const.nodeVersionFile:go:-"
+path = "automation/ci/divguard/dependency_sources.go"
+owner = "<package>"
+field = "nodeVersionFile"
+wire_name = "-"
+classification = "external"
+rationale = "File name of the repository's Node version pin (.node-version), which a Node dependency record cites as its manifest; not a format version."
+
+[[fields]]
+id = "automation/ci/divguard/dependency_sources.go#dependencySource.Version:json:version"
+path = "automation/ci/divguard/dependency_sources.go"
+owner = "dependencySource"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies the exact upstream npm dependency release whose source and archive hashes are verified; it does not select a Pig-owned schema reader."
+
+[[fields]]
+id = "automation/ci/preflight/config.go#tool.Version:yaml:version"
+path = "automation/ci/preflight/config.go"
+owner = "tool"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The release of a pinned external tool (shellcheck, a pip package and the like) that config.yaml downloads and verifies by SHA-256 or installs from a hash-locked requirements file; it identifies released content and selects no Pig schema reader."
+
+[[fields]]
+id = "automation/ci/preflight/content.go#const.versionsPath:go:-"
+path = "automation/ci/preflight/content.go"
+owner = "<package>"
+field = "versionsPath"
+wire_name = "-"
+classification = "release-content"
+rationale = "Repository path of the variables/versions.yaml pin file that the mandatory and forbidden content rules expand {{ versions.* }} references from; a file name, not a format version."
+
+[[fields]]
+id = "automation/ci/preflight/evaluate.go#evaluation.Version:json:version"
+path = "automation/ci/preflight/evaluate.go"
+owner = "evaluation"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The pre-flight's own definition hash (the engine revision plus every check's declared definition and the main-branch files it reads), stamped on the data, evaluation and state of a run. decideMode only compares it with the previous run's value to choose a full or reuse run; it selects no reader for the evaluation shape, and a mismatch re-runs instead of reading an older shape."
+
+[[fields]]
+id = "automation/ci/preflight/fetch.go#data.Version:json:version"
+path = "automation/ci/preflight/fetch.go"
+owner = "data"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The pre-flight's own definition hash (the engine revision plus every check's declared definition and the main-branch files it reads), stamped on the data, evaluation and state of a run. decideMode only compares it with the previous run's value to choose a full or reuse run; it selects no reader for the data shape, and a mismatch re-runs instead of reading an older shape."
+
+[[fields]]
+id = "automation/ci/preflight/fetch.go#state.Version:json:version"
+path = "automation/ci/preflight/fetch.go"
+owner = "state"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The pre-flight's own definition hash (the engine revision plus every check's declared definition and the main-branch files it reads), stamped on the data, evaluation and state of a run. decideMode only compares it with the previous run's value to choose a full or reuse run; it selects no reader for the state shape, and a mismatch re-runs instead of reading an older shape."
+
+[[fields]]
+id = "automation/ci/preflight/sources.go#dependencyChange.Version:json:version"
+path = "automation/ci/preflight/sources.go"
+owner = "dependencyChange"
+field = "Version"
+wire_name = "version"
+classification = "external"
+rationale = "The version of a changed dependency as GitHub's dependency-review compare API reports it; GitHub and the package ecosystem own the field, the pre-flight only reads and prints it."
+
+[[fields]]
+id = "automation/portlens/ledger.go#PinLedger.Version:go:-"
+path = "automation/portlens/ledger.go"
+owner = "PinLedger"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "The pinned upstream Pi version the PortLens report tool shows; it names the exact upstream release and is not a Pig-owned format."
+
+[[fields]]
+id = "automation/portlens/overview.go#LedgerSummary.Version:go:-"
+path = "automation/portlens/overview.go"
+owner = "LedgerSummary"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "The pinned upstream Pi version the PortLens report tool shows; it names the exact upstream release and is not a Pig-owned format."
+
+[[fields]]
+id = "automation/portlens/portmap.go#ledgerData.Version:json:version"
+path = "automation/portlens/portmap.go"
+owner = "ledgerData"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "The pinned upstream Pi version the PortLens report tool shows; it names the exact upstream release and is not a Pig-owned format."
+
+[[fields]]
+id = "automation/portlens/repo.go#Pin.Version:json:version"
+path = "automation/portlens/repo.go"
+owner = "Pin"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "The pinned upstream Pi version the PortLens report tool shows; it names the exact upstream release and is not a Pig-owned format."
+
+[[fields]]
+id = "bench/durableperf/main.go#result.Version:json:version"
+path = "bench/durableperf/main.go"
+owner = "result"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Names the runtime release that produced a durable-bench sample (\"pig\" here, the pi-durable release in durable/interop/bench.mjs); no reader selects a schema by it."
+
+[[fields]]
+id = "bench/k8s/cmd/k8sbench/arms.go#armPin.Version:json:version"
+path = "bench/k8s/cmd/k8sbench/arms.go"
+owner = "armPin"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The npm package version an arms.lock arm pins for an npm install; it identifies released content and does not select a Pig schema reader."
+
+[[fields]]
+id = "bench/k8s/cmd/k8sbench/bundle.go#const.nodeVersion:go:-"
+path = "bench/k8s/cmd/k8sbench/bundle.go"
+owner = "<package>"
+field = "nodeVersion"
+wire_name = "-"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "chord/next/contracts/accepts.go#AcceptedVersion.Version:go:-"
+path = "chord/next/contracts/accepts.go"
+owner = "AcceptedVersion"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/contracts/accepts.ts AcceptedVersion.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/contracts/contract.go#Contract.Version:go:-"
+path = "chord/next/contracts/contract.go"
+owner = "Contract"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/contracts/contract.ts Contract.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/contracts/contract.go#VersionData.Version:go:-"
+path = "chord/next/contracts/contract.go"
+owner = "VersionData"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/contracts/contract.ts VersionData.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/contracts/declare.go#LocalDeclaration.Version:go:-"
+path = "chord/next/contracts/declare.go"
+owner = "LocalDeclaration"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/contracts/declare.ts LocalDeclaration.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/contracts/declare.go#RemoteDeclaration.Version:go:-"
+path = "chord/next/contracts/declare.go"
+owner = "RemoteDeclaration"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/contracts/declare.ts RemoteDeclaration.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/contracts/fingerprint.go#const.NormalFormVersion:go:-"
+path = "chord/next/contracts/fingerprint.go"
+owner = "<package>"
+field = "NormalFormVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact value of NORMAL_FORM_VERSION in pinned packages/chord/src/contracts/fingerprint.ts: the fingerprint normal-form number hashed into every contract fingerprint; Pi owns it, a change there is a change of the fingerprint."
+
+[[fields]]
+id = "chord/next/data/errors.go#const.ProtocolVersion:go:-"
+path = "chord/next/data/errors.go"
+owner = "<package>"
+field = "ProtocolVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact value of PROTOCOL_VERSION in pinned packages/chord/src/data/errors.ts: the data protocol number; Pi owns it."
+
+[[fields]]
+id = "chord/next/data/errors.go#const.ReasonVersion:go:-"
+path = "chord/next/data/errors.go"
+owner = "<package>"
+field = "ReasonVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact literal of the `version` reason in pinned packages/chord/src/data/errors.ts: the reason string a stale-version handle or run carries; Pi owns it."
+
+[[fields]]
+id = "chord/next/documents/definition.go#StateDefinition.Version:go:-"
+path = "chord/next/documents/definition.go"
+owner = "StateDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/documents/definition.ts StateDefinition.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/documents/definition.go#StateOptions.Version:go:-"
+path = "chord/next/documents/definition.go"
+owner = "StateOptions"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/documents/definition.ts StateOptions.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/documents/handles.go#Keyed.Version:go:-"
+path = "chord/next/documents/handles.go"
+owner = "Keyed"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/documents/handles.ts Keyed.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/documents/handles.go#Singleton.Version:go:-"
+path = "chord/next/documents/handles.go"
+owner = "Singleton"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/documents/handles.ts Singleton.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/documents/keyed_slot.go#Access.Version:go:-"
+path = "chord/next/documents/keyed_slot.go"
+owner = "Access"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/documents/keyed-slot.ts Access.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/documents/persistence.go#Stored.Version:go:-"
+path = "chord/next/documents/persistence.go"
+owner = "Stored"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/documents/persistence.ts Stored.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/documents/persistence.go#StoredChange.Version:go:-"
+path = "chord/next/documents/persistence.go"
+owner = "StoredChange"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/documents/persistence.ts StoredChange.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/documents/residency.go#Resident.Version:go:-"
+path = "chord/next/documents/residency.go"
+owner = "Resident"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/documents/residency.ts Resident.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/host/host_error.go#HostError.Version:go:-"
+path = "chord/next/host/host_error.go"
+owner = "HostError"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/host/host.ts reports an event mapping that threw for an older consumer (`event_mapping_failed`, Pi 8d30e6306) with `version`, the contract version of the consumers whose mapping failed; the app's contract declares that number. The port carries it unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/host/host_host.go#UndeclaredRegistry.Version:go:-"
+path = "chord/next/host/host_host.go"
+owner = "UndeclaredRegistry"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/host/host.ts reports a registry that has contributions and no provider (`registry_undeclared`) with the newest registry version contributed; the number is the contribution's registry version, which Pi owns. The port carries it unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/host/jobs_definition.go#JobDefinition.Version:go:-"
+path = "chord/next/host/jobs_definition.go"
+owner = "JobDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/jobs/definition.ts JobDefinition.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/host/jobs_definition.go#JobOptions.Version:go:-"
+path = "chord/next/host/jobs_definition.go"
+owner = "JobOptions"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/jobs/definition.ts JobOptions.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/host/jobs_run.go#const.BlockedVersion:go:-"
+path = "chord/next/host/jobs_run.go"
+owner = "<package>"
+field = "BlockedVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact literal of the `version` reason in pinned packages/chord/src/jobs/run.ts: the reason string a stale-version handle or run carries; Pi owns it."
+
+[[fields]]
+id = "chord/next/host/jobs_stored.go#StoredRun.Version:go:-"
+path = "chord/next/host/jobs_stored.go"
+owner = "StoredRun"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/jobs/stored.ts StoredRun.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/host/remote_hold.go#holdRequest.Version:go:-"
+path = "chord/next/host/remote_hold.go"
+owner = "holdRequest"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/remote/hold.ts holdRequest.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/link/message.go#HoldMessage.Version:go:-"
+path = "chord/next/link/message.go"
+owner = "HoldMessage"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/link/message.ts HoldMessage.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/registries/contribution.go#RegistryContribution.Version:go:-"
+path = "chord/next/registries/contribution.go"
+owner = "RegistryContribution"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/registries/contribution.ts RegistryContribution.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/registries/record.go#RegistryError.Version:go:-"
+path = "chord/next/registries/record.go"
+owner = "RegistryError"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/registries/record.ts RegistryError.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/registries/registry.go#DefineRegistryOptions.Version:go:-"
+path = "chord/next/registries/registry.go"
+owner = "DefineRegistryOptions"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/registries/registry.ts DefineRegistryOptions.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/registries/registry.go#Registry.Version:go:-"
+path = "chord/next/registries/registry.go"
+owner = "Registry"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/registries/registry.ts Registry.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/registries/registry.go#RegistryEntry.Version:go:-"
+path = "chord/next/registries/registry.go"
+owner = "RegistryEntry"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/registries/registry.ts RegistryEntry.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/registries/value.go#RegistryValueSource.Version:go:-"
+path = "chord/next/registries/value.go"
+owner = "RegistryValueSource"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/registries/value.ts RegistryValueSource.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/catalog.go#TableRecord.Version:json:version"
+path = "chord/next/store/catalog.go"
+owner = "TableRecord"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/catalog.ts TableRecord.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/columns.go#ColumnRecord.Version:json:version"
+path = "chord/next/store/columns.go"
+owner = "ColumnRecord"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/columns.ts ColumnRecord.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/engine.go#DocumentBase.Version:json:version"
+path = "chord/next/store/engine.go"
+owner = "DocumentBase"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/engine.ts DocumentBase.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/engine.go#DocumentContent.Version:go:-"
+path = "chord/next/store/engine.go"
+owner = "DocumentContent"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/engine.ts DocumentContent.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/engine.go#DocumentContentAt.Version:go:-"
+path = "chord/next/store/engine.go"
+owner = "DocumentContentAt"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/engine.ts DocumentContentAt.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/engine.go#DocumentRecord.Version:json:version"
+path = "chord/next/store/engine.go"
+owner = "DocumentRecord"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/engine.ts DocumentRecord.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/engine.go#RevisionContent.Version:go:-"
+path = "chord/next/store/engine.go"
+owner = "RevisionContent"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/engine.ts RevisionContent.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/engine.go#StoredDocument.Version:go:-"
+path = "chord/next/store/engine.go"
+owner = "StoredDocument"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/engine.ts StoredDocument.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/engine.go#committedRecord.Version:json:version"
+path = "chord/next/store/engine.go"
+owner = "committedRecord"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/engine.ts createDocument (engine.ts:111-120) puts the base's version in the `document.create` record it returns, and DocumentRecord.version (engine.ts:291) is that column of the stored record; the store schema is Pi's (schema.ts MIGRATIONS, whose version 3, Pi 8a5da3ce6, adds the host column the record spreads after its key): the version the application declares for its own data. committedRecord is the Go twin of that record in Pi's key order; the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/json_column.go#JsonColumn.Version:go:-"
+path = "chord/next/store/json_column.go"
+owner = "JsonColumn"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/json-column.ts JsonColumn.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/json_column.go#JsonColumnOptions.Version:go:-"
+path = "chord/next/store/json_column.go"
+owner = "JsonColumnOptions"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/json-column.ts JsonColumnOptions.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/rows.go#const.RowVersion:go:-"
+path = "chord/next/store/rows.go"
+owner = "<package>"
+field = "RowVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact value of ROW_VERSION in pinned packages/chord/src/store/rows.ts: the reserved row column name $v; Pi owns it."
+
+[[fields]]
+id = "chord/next/store/table.go#TableDefinition.Version:go:-"
+path = "chord/next/store/table.go"
+owner = "TableDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table.ts TableDefinition.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table.go#TableOptions.Version:go:-"
+path = "chord/next/store/table.go"
+owner = "TableOptions"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table.ts TableOptions.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table.go#const.TableFormVersion:go:-"
+path = "chord/next/store/table.go"
+owner = "<package>"
+field = "TableFormVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact value of TABLE_FORM_VERSION in pinned packages/chord/src/store/table.ts: the table form number hashed into every table fingerprint; Pi owns it, a change there is a change of the fingerprint."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#AlterWrite.Version:go:-"
+path = "chord/next/store/table_writes.go"
+owner = "AlterWrite"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts AlterWrite.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#PutWrite.Version:go:-"
+path = "chord/next/store/table_writes.go"
+owner = "PutWrite"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts PutWrite.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#TableDefinitionWrite.Version:go:-"
+path = "chord/next/store/table_writes.go"
+owner = "TableDefinitionWrite"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts TableDefinitionWrite.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#UpdateWhereWrite.Version:go:-"
+path = "chord/next/store/table_writes.go"
+owner = "UpdateWhereWrite"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts UpdateWhereWrite.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#UpdateWrite.Version:go:-"
+path = "chord/next/store/table_writes.go"
+owner = "UpdateWrite"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts UpdateWrite.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#putWriteJSON.Version:json:version"
+path = "chord/next/store/table_writes.go"
+owner = "putWriteJSON"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts putWriteJSON.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#tableWriteJSON.Version:json:version"
+path = "chord/next/store/table_writes.go"
+owner = "tableWriteJSON"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts tableWriteJSON.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#updateWhereWriteJSON.Version:json:version"
+path = "chord/next/store/table_writes.go"
+owner = "updateWhereWriteJSON"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts updateWhereWriteJSON.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/next/store/table_writes.go#updateWriteJSON.Version:json:version"
+path = "chord/next/store/table_writes.go"
+owner = "updateWriteJSON"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/store/table-writes.ts updateWriteJSON.version: the version the application declares or the stored record carries for its own data; Pi owns the meaning, the port carries the number unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/nextnode/app/files_index.go#FileInfo.Version:go:-"
+path = "chord/nextnode/app/files_index.go"
+owner = "FileInfo"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/node/app/files-index.ts FileInfo.version: the version number of one stored file in the app's file index (one `files` row per version); user data identity decided by the index, not a format selector. Pi owns it; the port carries it unchanged."
+
+[[fields]]
+id = "chord/nextnode/app/info.go#AppInfoValues.Version:go:-"
+path = "chord/nextnode/app/info.go"
+owner = "AppInfoValues"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/node/app/info.ts AppInfoValues.version: the app's newest API version (the `version` member of the `chord.app.info` start data), a string the application declares; Pi owns the meaning and the port reads no Pig format from it."
+
+[[fields]]
+id = "chord/nextnode/plugins/model/model_built.go#BuiltApi.Version:go:-"
+path = "chord/nextnode/plugins/model/model_built.go"
+owner = "BuiltApi"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/node/plugins/build.ts `api?: { name, version }`: the version of the app's API a facet script imports (one of AppApi.versions, empty is Pi's `undefined`); the application declares it and Pi owns the meaning."
+
+[[fields]]
+id = "chord/nextnode/plugins/plugins_install.go#PluginSource.Version:go:-"
+path = "chord/nextnode/plugins/plugins_install.go"
+owner = "PluginSource"
+field = "Version"
+wire_name = "-"
+classification = "external"
+rationale = "The npm package version of the `{ npm, version }` plugin source (packages/chord/src/node/plugins/install.ts); the npm registry owns the version syntax and the install runs `npm pack` at it, so it is an external-standard version, not a Pig format discriminator."
+
+[[fields]]
+id = "chord/nextnode/plugins/plugins_node.go#NodeHostError.Version:go:-"
+path = "chord/nextnode/plugins/plugins_node.go"
+owner = "NodeHostError"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "The version of the contribution a registry error names (pi-chord next/registries/record.ts RegistryError.version), carried from the Node host unchanged; Pi owns the meaning."
+
+[[fields]]
+id = "chord/nextnode/plugins/plugins_node.go#hostErrorWire.Version:json:version"
+path = "chord/nextnode/plugins/plugins_node.go"
+owner = "hostErrorWire"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "The wire form of NodeHostError.Version as the Node host (pi-chord's own host.mjs run) sends it: the version of the contribution a registry error names; Pi owns the meaning."
+
+[[fields]]
+id = "chord/nextnode/plugins/plugins_node_contracts.go#ContractData.Version:json:version"
+path = "chord/nextnode/plugins/plugins_node_contracts.go"
+owner = "ContractData"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord next/contracts/contract.ts Contract.version, the version the application declares for a contract, handed to the Node host which rebuilds the contract and checks its fingerprint; the application owns it."
+
+[[fields]]
+id = "chord/nextnode/plugins/plugins_node_contracts.go#ContractDescription.Version:json:version"
+path = "chord/nextnode/plugins/plugins_node_contracts.go"
+owner = "ContractDescription"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord next/contracts/contract.ts Contract.version as the Node host rebuilt it from ContractData; the application owns it."
+
+[[fields]]
+id = "chord/nextnode/plugins/plugins_node_discover.go#const.versionsPerSource:go:-"
+path = "chord/nextnode/plugins/plugins_node_discover.go"
+owner = "<package>"
+field = "versionsPerSource"
+wire_name = "-"
+classification = "external"
+rationale = "A count of installed Node versions of one version manager read when discovering a Node executable, not a format version; the version managers own the installed names."
+
+[[fields]]
+id = "chord/nextnode/plugins/plugins_runtime.go#apiWire.Version:json:version"
+path = "chord/nextnode/plugins/plugins_runtime.go"
+owner = "apiWire"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/node/plugins/runtime.ts builds each facet as `api?: { name, version }` (version undefined is no key); apiWire is that shape on the plugin runtime's wire, with Pi's key name and omission. It names the app's API version the facet imports, not a Pig wire version."
+
+[[fields]]
+id = "chord/nextnode/plugins/plugins_testing.go#Contribution.Version:go:-"
+path = "chord/nextnode/plugins/plugins_testing.go"
+owner = "Contribution"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/registries/contribution.ts `version`: the registry version a contribution was built against, which testPlugin returns in the table of `contributions(R)` (packages/chord/src/node/plugins/testing.ts); Pi owns the number, the port carries it unchanged and reads no format from it."
+
+[[fields]]
+id = "chord/sqlite/migrations.go#SqliteMigration.Version:go:-"
+path = "chord/sqlite/migrations.go"
+owner = "SqliteMigration"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "Chord SQLite schema migration version (packages/chord/src/sqlite/migrations.ts), the migration type pi-durable re-exports."
+
+[[fields]]
+id = "chord/sync/lines.go#const.LogVersion:go:-"
+path = "chord/sync/lines.go"
+owner = "<package>"
+field = "LogVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/sync/lines.ts LOG_VERSION: the `v` of the sync log line envelope that Pi writes and checks (2). The Go constant is the same number so Pi and PiG logs interchange; Pi owns when it changes, and PiG adds no reader, negotiation or migration around it."
+
+[[fields]]
+id = "chord/telemetrysqlite/schema.go#const.versionTable:go:-"
+path = "chord/telemetrysqlite/schema.go"
+owner = "<package>"
+field = "versionTable"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-chord packages/chord/src/telemetry-sqlite/schema.ts VERSION_TABLE = \"telemetry_schema\": the name of the table in which Pi's SQLite migration runner records the store's version; the port opens Pi's store files with the same name. Pi owns the schema; this constant names a table, it selects no Pig reader."
+
+[[fields]]
+id = "codemode/deterministic.go#const.deterministicVersion:go:-"
+path = "codemode/deterministic.go"
+owner = "<package>"
+field = "deterministicVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact literal of pinned packages/codemode/src/runtime/vm.ts DETERMINISTIC_VERSION, named in the VM fingerprint a deterministic replay compares."
+
+[[fields]]
+id = "codemode/deterministic.go#const.quickjsWasiVersion:go:-"
+path = "codemode/deterministic.go"
+owner = "<package>"
+field = "quickjsWasiVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Release of the embedded quickjs-wasi module (codemode/assets/PROVENANCE.md), named in the VM fingerprint as Pi's vm.versions[\"quickjs-wasi\"]; the quickjs-wasi package owns it."
+
+[[fields]]
+id = "coding/cli/args.go#Args.Version:go:-"
+path = "coding/cli/args.go"
+owner = "Args"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "Represents the exact upstream-compatible --version CLI action, not a schema discriminator."
+
+[[fields]]
+id = "coding/cli/main.go#const.PigVersion:go:-"
+path = "coding/cli/main.go"
+owner = "<package>"
+field = "PigVersion"
+wire_name = "-"
+classification = "release-content"
+rationale = "Identifies the running Pig release."
+
+[[fields]]
+id = "coding/cli/main.go#const.UpstreamPackageVersion:go:-"
+path = "coding/cli/main.go"
+owner = "<package>"
+field = "UpstreamPackageVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "The version Pi's package.json files and `pi --version` report for the pinned upstream release."
+
+[[fields]]
+id = "coding/cli/main.go#const.UpstreamVersion:go:-"
+path = "coding/cli/main.go"
+owner = "<package>"
+field = "UpstreamVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Identifies the exact upstream Pi release mirrored by the binary."
+
+[[fields]]
+id = "coding/cli/main.go#const.Version:go:-"
+path = "coding/cli/main.go"
+owner = "<package>"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Aliases coding.Version (in turn internal/coding/pigversion/pigversion.go's Version), the combined Pig+upstream release string shown to users."
+
+[[fields]]
+id = "coding/cli/package_publish.go#publishableManifest.Version:json:version"
+path = "coding/cli/package_publish.go"
+owner = "publishableManifest"
+field = "Version"
+wire_name = "version"
+classification = "external"
+rationale = "Reads the version of a Package's own npm package.json before it is published. npm owns that manifest and its version grammar; PiG selects no schema reader from it."
+
+[[fields]]
+id = "coding/extension/host/subprocess/builder_node.go#const.minimumNodeRuntimeVersion:go:-"
+path = "coding/extension/host/subprocess/builder_node.go"
+owner = "<package>"
+field = "minimumNodeRuntimeVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Names the minimum external Node runtime release accepted by the extension build preflight."
+
+[[fields]]
+id = "coding/extension/host/subprocess/builder_node.go#const.nodeRuntimeVersion:go:-"
+path = "coding/extension/host/subprocess/builder_node.go"
+owner = "<package>"
+field = "nodeRuntimeVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Pins the external Node runtime bridge build identity."
+
+[[fields]]
+id = "coding/extension/host/subprocess/host.go#HostInfo.Version:go:-"
+path = "coding/extension/host/subprocess/host.go"
+owner = "HostInfo"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "Pi's VERSION from config.ts, passed to extension processes; it carries the exact upstream package version and is not a Pig-owned format."
+
+[[fields]]
+id = "coding/extension/host/subprocess/protocol.go#RegisterPayload.Version:json:version"
+path = "coding/extension/host/subprocess/protocol.go"
+owner = "RegisterPayload"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "coding/extension/host/subprocess/terminal_capabilities_env.go#const.productVersionEnv:go:-"
+path = "coding/extension/host/subprocess/terminal_capabilities_env.go"
+owner = "<package>"
+field = "productVersionEnv"
+wire_name = "-"
+classification = "release-content"
+rationale = "Names the environment variable that carries PiG's composite release version to a Node extension process for its user agent. It identifies released content and selects no Pig schema reader."
+
+[[fields]]
+id = "coding/extension/host/tsruntime/lock.go#LockEntry.Version:go:-"
+path = "coding/extension/host/tsruntime/lock.go"
+owner = "LockEntry"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "The pinned slot-runtime release (for example the Bun release) a lock entry downloads and verifies by SHA-256; it identifies released content and selects no Pig schema reader."
+
+[[fields]]
+id = "coding/extension/host/tsruntime/tsruntime.go#Manifest.Version:json:version"
+path = "coding/extension/host/tsruntime/tsruntime.go"
+owner = "Manifest"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The release of the slot runtime an installed runtime.json describes; validate only requires it be present, and no reader selects a schema by it."
+
+[[fields]]
+id = "coding/extension/host/tsruntime/tsruntime.go#Selection.Version:json:version"
+path = "coding/extension/host/tsruntime/tsruntime.go"
+owner = "Selection"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The release of the slot runtime selected for an extension set, copied from its runtime manifest; it selects no Pig schema reader."
+
+[[fields]]
+id = "coding/piglet/artifact/plan.go#Origin.Version:json:version"
+path = "coding/piglet/artifact/plan.go"
+owner = "Origin"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "coding/piglet/artifact/plan.go#RuntimeRequirement.Version:json:version"
+path = "coding/piglet/artifact/plan.go"
+owner = "RuntimeRequirement"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "coding/piglet/artifact/record.go#InputPin.Version:json:version"
+path = "coding/piglet/artifact/record.go"
+owner = "InputPin"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "coding/piglet/extends.go#LineageEntry.Version:json:version"
+path = "coding/piglet/extends.go"
+owner = "LineageEntry"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "coding/piglet/lineage.go#LineageLink.Version:json:version"
+path = "coding/piglet/lineage.go"
+owner = "LineageLink"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The release version of a Piglet in a lineage report, copied from its release metadata; diagnostic output, not a schema reader selector."
+
+[[fields]]
+id = "coding/piglet/lineage_cli.go#BinaryLineage.Version:json:version"
+path = "coding/piglet/lineage_cli.go"
+owner = "BinaryLineage"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The release version a Piglet Binary was built from, reported by lineage; it identifies released content and selects no schema reader."
+
+[[fields]]
+id = "coding/piglet/npmsource.go#NPMSource.Version:go:-"
+path = "coding/piglet/npmsource.go"
+owner = "NPMSource"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Holds the release.version of the Piglet being published to npm. It identifies released content and selects no Pig schema reader."
+
+[[fields]]
+id = "coding/piglet/npmsource.go#npmManifest.Version:json:version"
+path = "coding/piglet/npmsource.go"
+owner = "npmManifest"
+field = "Version"
+wire_name = "version"
+classification = "external"
+rationale = "Writes the version of the generated npm package.json from the Piglet's release.version. npm owns that manifest and its version grammar; PiG selects no schema reader from it."
+
+[[fields]]
+id = "coding/piglet/release/index.go#Index.Version:json:version"
+path = "coding/piglet/release/index.go"
+owner = "Index"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies the published Piglet release selected by the signed index, not a Pig-owned schema reader."
+
+[[fields]]
+id = "coding/piglet/release/pull.go#Options.Version:go:-"
+path = "coding/piglet/release/pull.go"
+owner = "Options"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Selects an exact Piglet release version for a pull operation."
+
+[[fields]]
+id = "coding/piglet/release/pull.go#Result.Version:go:-"
+path = "coding/piglet/release/pull.go"
+owner = "Result"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Reports the exact Piglet release version installed by a pull operation."
+
+[[fields]]
+id = "coding/piglet/tree_cli.go#TreeNode.Version:json:version"
+path = "coding/piglet/tree_cli.go"
+owner = "TreeNode"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The release version of a Piglet shown in the tree report; diagnostic output, not a schema reader selector."
+
+[[fields]]
+id = "coding/piglet/types.go#AgentPigRuntime.Version:yaml:version"
+path = "coding/piglet/types.go"
+owner = "AgentPigRuntime"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "coding/piglet/types.go#ExtendsSpec.Version:yaml:version"
+path = "coding/piglet/types.go"
+owner = "ExtendsSpec"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "coding/piglet/types.go#ReleaseSpec.Version:yaml:version"
+path = "coding/piglet/types.go"
+owner = "ReleaseSpec"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "coding/pigletbuild/plan.go#Options.Version:go:-"
+path = "coding/pigletbuild/plan.go"
+owner = "Options"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Carries the Profile release version into build identity."
+
+[[fields]]
+id = "coding/pigletbuild/records.go#buildInput.Version:go:-"
+path = "coding/pigletbuild/records.go"
+owner = "buildInput"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Carries the Profile release version into build record identity."
+
+[[fields]]
+id = "coding/pigletbuild/source_fetch.go#modDownloadResult.Version:go:-"
+path = "coding/pigletbuild/source_fetch.go"
+owner = "modDownloadResult"
+field = "Version"
+wire_name = "-"
+classification = "external"
+rationale = "Module version reported by `go mod download -json`; the Go toolchain owns the field."
+
+[[fields]]
+id = "coding/upstream.go#const.PigVersion:go:-"
+path = "coding/upstream.go"
+owner = "<package>"
+field = "PigVersion"
+wire_name = "-"
+classification = "release-content"
+rationale = "Aliases internal/coding/pigversion/pigversion.go's PigVersion for existing callers of coding.PigVersion."
+
+[[fields]]
+id = "coding/upstream.go#const.UpstreamPackageVersion:go:-"
+path = "coding/upstream.go"
+owner = "<package>"
+field = "UpstreamPackageVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Aliases internal/coding/pigversion/pigversion.go's UpstreamPackageVersion, the version Pi's package.json files report."
+
+[[fields]]
+id = "coding/upstream.go#const.UpstreamReviewedVersion:go:-"
+path = "coding/upstream.go"
+owner = "<package>"
+field = "UpstreamReviewedVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Names the last upstream Pi release whose parity ledgers carry reviewed dispositions; leap ledgers diff from it."
+
+[[fields]]
+id = "coding/upstream.go#const.UpstreamVersion:go:-"
+path = "coding/upstream.go"
+owner = "<package>"
+field = "UpstreamVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Aliases internal/coding/pigversion/pigversion.go's UpstreamVersion, the exact upstream Pi release used as the parity oracle."
+
+[[fields]]
+id = "coding/upstream.go#const.Version:go:-"
+path = "coding/upstream.go"
+owner = "<package>"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Aliases internal/coding/pigversion/pigversion.go's Version, the combined Pig+upstream release string."
+
+[[fields]]
+id = "durable/codecs.go#documentContentWire.Version:json:version"
+path = "durable/codecs.go"
+owner = "documentContentWire"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "Wire form of pi-durable DocumentContent.version (packages/durable/src/types.ts), the application document definition version stored with each document."
+
+[[fields]]
+id = "durable/codemode/docs.go#const.ModuleVersion:go:-"
+path = "durable/codemode/docs.go"
+owner = "<package>"
+field = "ModuleVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact literal of pinned packages/durable/src/codemode/codemode.ts CODEMODE_MODULE_VERSION; a call started under another version refuses to resume."
+
+[[fields]]
+id = "durable/codemode/docs.go#start.Version:json:version"
+path = "durable/codemode/docs.go"
+owner = "start"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-durable code mode Start.version (packages/durable/src/codemode/codemode.ts): the CODEMODE_MODULE_VERSION stored in a run's start data and compared before a resume."
+
+[[fields]]
+id = "durable/core/driver/session_registry.go#snapshotTask.Version:json:version"
+path = "durable/core/driver/session_registry.go"
+owner = "snapshotTask"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-durable task definition version (packages/durable/src/types.ts TaskDefinition.version) carried in the host registry snapshot (durable/core/host/PROTOCOL.md)."
+
+[[fields]]
+id = "durable/core/session/docs.go#DocDef.Version:go:-"
+path = "durable/core/session/docs.go"
+owner = "DocDef"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable document definition version (packages/durable/src/types.ts CommonDocDefinition.version) that the core keeps for each registered document kind."
+
+[[fields]]
+id = "durable/core/session/store.go#StoredDoc.Version:go:-"
+path = "durable/core/session/store.go"
+owner = "StoredDoc"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable StoredDocument.version (packages/durable/src/types.ts), the definition version of a stored document value."
+
+[[fields]]
+id = "durable/core/session/store.go#Write.Version:go:-"
+path = "durable/core/session/store.go"
+owner = "Write"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable DocumentChange.version (packages/durable/src/types.ts) carried by a document write the core stages."
+
+[[fields]]
+id = "durable/core/session/tx.go#TaskDef.Version:go:-"
+path = "durable/core/session/tx.go"
+owner = "TaskDef"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable TaskDefinition.version (packages/durable/src/types.ts), persisted with live task input and checkpoints."
+
+[[fields]]
+id = "durable/core/session/txdocs.go#Change.Version:go:-"
+path = "durable/core/session/txdocs.go"
+owner = "Change"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable DocumentChange.version (packages/durable/src/types.ts) of a staged document change."
+
+[[fields]]
+id = "durable/core/sqlhost/cmd/bench/k8s.go#sampleLine.Version:json:version"
+path = "durable/core/sqlhost/cmd/bench/k8s.go"
+owner = "sampleLine"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Names the core build (--version, the core commit) that produced a benchmark sample, as bench/durableperf result.version does; no reader selects a schema by it."
+
+[[fields]]
+id = "durable/core/sqlhost/cmd/bench/timing.go#timingLine.Version:json:version"
+path = "durable/core/sqlhost/cmd/bench/timing.go"
+owner = "timingLine"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Names the core build (--version, the core commit) that produced a timing line, as bench/durableperf result.version does; no reader selects a schema by it."
+
+[[fields]]
+id = "durable/core/store/dump.go#Revision.Version:go:-"
+path = "durable/core/store/dump.go"
+owner = "Revision"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "The version column of pi-durable's document_revisions table (packages/durable/src/storage/sqlite/migrations.ts), the definition version of a document revision."
+
+[[fields]]
+id = "durable/core/store/sql.go#const.stmtSchemaVersion:go:-"
+path = "durable/core/store/sql.go"
+owner = "<package>"
+field = "stmtSchemaVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Statement index for pi-durable's durable_schema.version read in applySqliteMigrations (packages/durable/src/storage/sqlite/migrations.ts)."
+
+[[fields]]
+id = "durable/core/store/sql.go#const.stmtSchemaVersionSet:go:-"
+path = "durable/core/store/sql.go"
+owner = "<package>"
+field = "stmtSchemaVersionSet"
+wire_name = "-"
+classification = "upstream"
+rationale = "Statement index for pi-durable's durable_schema.version update in applySqliteMigrations (packages/durable/src/storage/sqlite/migrations.ts)."
+
+[[fields]]
+id = "durable/core/store/store.go#LiveDocument.Version:go:-"
+path = "durable/core/store/store.go"
+owner = "LiveDocument"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable document definition version (packages/durable/src/types.ts DocumentContent.version) of a materialised document."
+
+[[fields]]
+id = "durable/core/store/store.go#SchemaNewerError.Version:go:-"
+path = "durable/core/store/store.go"
+owner = "SchemaNewerError"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "The durable_schema.version that pi-durable's applySqliteMigrations refuses as newer than CURRENT_SQLITE_SCHEMA_VERSION (packages/durable/src/storage/sqlite/migrations.ts)."
+
+[[fields]]
+id = "durable/core/store/store.go#const.SupportedSchemaVersion:go:-"
+path = "durable/core/store/store.go"
+owner = "<package>"
+field = "SupportedSchemaVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact pi-durable CURRENT_SQLITE_SCHEMA_VERSION (packages/durable/src/storage/sqlite/migrations.ts)."
+
+[[fields]]
+id = "durable/documents.go#AnyDocDefinition.Version:go:-"
+path = "durable/documents.go"
+owner = "AnyDocDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable document definition version (packages/durable/src/types.ts DocDefinition.version) that selects migrations."
+
+[[fields]]
+id = "durable/harness/scheduler.go#BlockedSubject.Version:go:-"
+path = "durable/harness/scheduler.go"
+owner = "BlockedSubject"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable task record version (packages/durable/src/harness/scheduler.ts BlockedSubject, a Pick of TaskRecord.version) that blockedReason() compares with the registered definition's version."
+
+[[fields]]
+id = "durable/session/session.go#LineDocument.Version:go:-"
+path = "durable/session/session.go"
+owner = "LineDocument"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable document definition version carried by a Session document line (packages/durable/src/session)."
+
+[[fields]]
+id = "durable/signals.go#AnySignal.Version:go:-"
+path = "durable/signals.go"
+owner = "AnySignal"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable signal kind version (packages/durable/src/signals.ts SignalToken.version, Pi 473515f9c) of the erased signal: the positive integer a stored signal value is compared with before it is migrated or refused."
+
+[[fields]]
+id = "durable/signals.go#SignalDefinition.Version:go:-"
+path = "durable/signals.go"
+owner = "SignalDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable signal definition version (packages/durable/src/signals.ts SignalDefinition.version, Pi 473515f9c), the positive integer version of the value shape that defineSignal checks."
+
+[[fields]]
+id = "durable/signals.go#SignalToken.Version:go:-"
+path = "durable/signals.go"
+owner = "SignalToken"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable signal token version (packages/durable/src/signals.ts SignalToken.version, Pi 473515f9c), the version a read compares a stored value's version with."
+
+[[fields]]
+id = "durable/storage/jsonl/storage.go#const.formatVersion:go:-"
+path = "durable/storage/jsonl/storage.go"
+owner = "<package>"
+field = "formatVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact upstream pi-durable JSONL storage FORMAT_VERSION (packages/durable/src/storage/jsonl/storage.ts:28)."
+
+[[fields]]
+id = "durable/storage/jsonl/storage.go#contentWire.Version:json:version"
+path = "durable/storage/jsonl/storage.go"
+owner = "contentWire"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-durable document content version in the JSONL storage line (packages/durable/src/storage/jsonl/storage.ts)."
+
+[[fields]]
+id = "durable/tasks.go#AnyTaskDefinition.Version:go:-"
+path = "durable/tasks.go"
+owner = "AnyTaskDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable task definition version (packages/durable/src/types.ts TaskDefinition.version)."
+
+[[fields]]
+id = "durable/types.go#CommonDocDefinition.Version:go:-"
+path = "durable/types.go"
+owner = "CommonDocDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable document definition version (packages/durable/src/types.ts:73)."
+
+[[fields]]
+id = "durable/types.go#DocFamilyDefinition.Version:go:-"
+path = "durable/types.go"
+owner = "DocFamilyDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable document family definition version (packages/durable/src/types.ts:84-89 Omit<CommonDocDefinition, \"initial\">, whose version is types.ts:73)."
+
+[[fields]]
+id = "durable/types.go#DocumentChange.Version:go:-"
+path = "durable/types.go"
+owner = "DocumentChange"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable document change version (packages/durable/src/types.ts)."
+
+[[fields]]
+id = "durable/types.go#DocumentContent.Version:json:version"
+path = "durable/types.go"
+owner = "DocumentContent"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-durable DocumentContent.version (packages/durable/src/types.ts)."
+
+[[fields]]
+id = "durable/types.go#StoredDocument.Version:go:-"
+path = "durable/types.go"
+owner = "StoredDocument"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable stored document version (packages/durable/src/types.ts)."
+
+[[fields]]
+id = "durable/types.go#TaskDefinition.Version:go:-"
+path = "durable/types.go"
+owner = "TaskDefinition"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "pi-durable task definition version (packages/durable/src/types.ts:237)."
+
+[[fields]]
+id = "durable/types.go#TaskRecord.Version:json:version"
+path = "durable/types.go"
+owner = "TaskRecord"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-durable TaskRecord.version (packages/durable/src/types.ts)."
+
+[[fields]]
+id = "env/connection.go#RemoteInfo.Version:go:-"
+path = "env/connection.go"
+owner = "RemoteInfo"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "The pi-env hello reply's version field (packages/env/docs/protocol.md): the npm package release the daemon shipped with. The client reports it and selects no reader by it; the wire protocol number is the separate protocol field."
+
+[[fields]]
+id = "env/daemon/server.go#Options.Version:go:-"
+path = "env/daemon/server.go"
+owner = "Options"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "What the daemon reports as the pi-env hello reply's version field (packages/env/docs/protocol.md): the pinned Pi release, as Pi's daemon reports its npm package version."
+
+[[fields]]
+id = "extensions/sdk/host_info.go#hostInfo.Version:json:version"
+path = "extensions/sdk/host_info.go"
+owner = "hostInfo"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "Pi's VERSION from config.ts as the host reports it in PIG_EXT_HOST_INFO; it carries the exact upstream package version and is not a Pig-owned format."
+
+[[fields]]
+id = "extensions/sdk/session_skill_helpers.go#const.CurrentSessionVersion:go:-"
+path = "extensions/sdk/session_skill_helpers.go"
+owner = "<package>"
+field = "CurrentSessionVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Pi's CURRENT_SESSION_VERSION (packages/coding-agent session-manager.ts): the version a Pi session file header carries."
+
+[[fields]]
+id = "extensions/sdk/tui/internal/widthx/unicode_tables.go#const.unicodeTablesVersion:go:-"
+path = "extensions/sdk/tui/internal/widthx/unicode_tables.go"
+owner = "<package>"
+field = "unicodeTablesVersion"
+wire_name = "-"
+classification = "external"
+rationale = "The SDK module's copy of tui/widthx/unicode_tables.go (tui/sdk_tui_copy_test.go): it identifies the Unicode standard data and upstream get-east-asian-width dependency used to generate terminal width tables; it does not select a Pig-owned format reader."
+
+[[fields]]
+id = "internal/coding/pigversion/pigversion.go#const.PigVersion:go:-"
+path = "internal/coding/pigversion/pigversion.go"
+owner = "<package>"
+field = "PigVersion"
+wire_name = "-"
+classification = "release-content"
+rationale = "Literal source of coding.PigVersion; ai imports it directly since ai cannot import coding (coding imports ai)."
+
+[[fields]]
+id = "internal/coding/pigversion/pigversion.go#const.UpstreamPackageVersion:go:-"
+path = "internal/coding/pigversion/pigversion.go"
+owner = "<package>"
+field = "UpstreamPackageVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "The version Pi's package.json files and `pi --version` report for the pinned upstream release."
+
+[[fields]]
+id = "internal/coding/pigversion/pigversion.go#const.UpstreamVersion:go:-"
+path = "internal/coding/pigversion/pigversion.go"
+owner = "<package>"
+field = "UpstreamVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Literal source of coding.UpstreamVersion; ai imports it directly since ai cannot import coding (coding imports ai)."
+
+[[fields]]
+id = "internal/coding/pigversion/pigversion.go#const.Version:go:-"
+path = "internal/coding/pigversion/pigversion.go"
+owner = "<package>"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Literal source of coding.Version and ai.ProductVersion's default; ai imports it directly since ai cannot import coding (coding imports ai)."
+
+[[fields]]
+id = "internal/codingagent/bug_report.go#BugReportDiagnostics.SchemaVersion:json:schemaVersion"
+path = "internal/codingagent/bug_report.go"
+owner = "BugReportDiagnostics"
+field = "SchemaVersion"
+wire_name = "schemaVersion"
+classification = "upstream"
+rationale = "Mirrors upstream core/bug-report.ts BUG_REPORT_SCHEMA_VERSION so PiG and Pi report archives share one exact upstream-owned format."
+
+[[fields]]
+id = "internal/codingagent/bug_report.go#BugReportEnvironment.Version:json:version"
+path = "internal/codingagent/bug_report.go"
+owner = "BugReportEnvironment"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Records the running PiG release in a bug report."
+
+[[fields]]
+id = "internal/codingagent/bug_report.go#BugReportInputs.Version:go:-"
+path = "internal/codingagent/bug_report.go"
+owner = "BugReportInputs"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Carries the running PiG release into a bug report."
+
+[[fields]]
+id = "internal/codingagent/bug_report.go#BugReportMetadata.SchemaVersion:json:schemaVersion"
+path = "internal/codingagent/bug_report.go"
+owner = "BugReportMetadata"
+field = "SchemaVersion"
+wire_name = "schemaVersion"
+classification = "upstream"
+rationale = "Mirrors upstream core/bug-report.ts BUG_REPORT_SCHEMA_VERSION so PiG and Pi report archives share one exact upstream-owned format."
+
+[[fields]]
+id = "internal/codingagent/bug_report.go#const.bugReportSchemaVersion:go:-"
+path = "internal/codingagent/bug_report.go"
+owner = "<package>"
+field = "bugReportSchemaVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Mirrors upstream core/bug-report.ts BUG_REPORT_SCHEMA_VERSION so PiG and Pi report archives share one exact upstream-owned format."
+
+[[fields]]
+id = "internal/codingagent/crash_log.go#CrashInput.Version:go:-"
+path = "internal/codingagent/crash_log.go"
+owner = "CrashInput"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Identifies the running Pig release (InstalledPigVersion) that produced the crash record, mirroring upstream core/crash-log.ts's version field."
+
+[[fields]]
+id = "internal/codingagent/crash_log.go#CrashRecord.Version:json:version"
+path = "internal/codingagent/crash_log.go"
+owner = "CrashRecord"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies the running Pig release (InstalledPigVersion) that produced the crash record, mirroring upstream core/crash-log.ts's version field."
+
+[[fields]]
+id = "internal/codingagent/interactive_changelog.go#extensionChangelogUpdate.Version:go:-"
+path = "internal/codingagent/interactive_changelog.go"
+owner = "extensionChangelogUpdate"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "The extension package's package.json version, stored per package as Pi's interactive-mode.ts does for settings.extensionChangelogVersions; a release identity, not a format discriminator."
+
+[[fields]]
+id = "internal/codingagent/selfupdate.go#LatestPiRelease.Version:go:-"
+path = "internal/codingagent/selfupdate.go"
+owner = "LatestPiRelease"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "internal/codingagent/selfupdate.go#UpdateManifest.Version:json:version"
+path = "internal/codingagent/selfupdate.go"
+owner = "UpdateManifest"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "Identifies released content, a dependency constraint, or a runtime/toolchain requirement rather than selecting a Pig schema reader."
+
+[[fields]]
+id = "internal/codingagent/selfupdate_configured.go#SelfUpdateRelease.Version:go:-"
+path = "internal/codingagent/selfupdate_configured.go"
+owner = "SelfUpdateRelease"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "The release version the signed update manifest names; it fills the {version} placeholder of the configured self-update command and selects no format."
+
+[[fields]]
+id = "internal/codingagent/session.go#const.CurrentSessionVersion:go:-"
+path = "internal/codingagent/session.go"
+owner = "<package>"
+field = "CurrentSessionVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact upstream Pi Session format discriminator retained for transcript compatibility."
+
+[[fields]]
+id = "internal/evals/cli.go#protocol.SchemaVersion:json:schemaVersion"
+path = "internal/evals/cli.go"
+owner = "protocol"
+field = "SchemaVersion"
+wire_name = "schemaVersion"
+classification = "upstream"
+rationale = "Exact upstream pi-evals protocol.json schemaVersion 1 (packages/evals/src/cli.ts:153-161)."
+
+[[fields]]
+id = "internal/evals/report.go#EvalComparisonReport.SchemaVersion:json:schemaVersion"
+path = "internal/evals/report.go"
+owner = "EvalComparisonReport"
+field = "SchemaVersion"
+wire_name = "schemaVersion"
+classification = "upstream"
+rationale = "Exact upstream pi-evals EvalComparisonReport schemaVersion (packages/evals/src/report.ts:76, :405)."
+
+[[fields]]
+id = "internal/evals/report.go#const.evalReportSchemaVersion:go:-"
+path = "internal/evals/report.go"
+owner = "<package>"
+field = "evalReportSchemaVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact upstream pi-evals report schemaVersion 3 (packages/evals/src/report.ts:405)."
+
+[[fields]]
+id = "internal/modelgen/modeldata/model_data.go#ModelDataManifest.SchemaVersion:json:schemaVersion"
+path = "internal/modelgen/modeldata/model_data.go"
+owner = "ModelDataManifest"
+field = "SchemaVersion"
+wire_name = "schemaVersion"
+classification = "upstream"
+rationale = "Reads the exact Pi model-data manifest field from packages/ai/scripts/model-data.ts:10-15; this is not a Pig-owned format."
+
+[[fields]]
+id = "internal/modelgen/modeldata/model_data.go#const.ModelDataSchemaVersion:go:-"
+path = "internal/modelgen/modeldata/model_data.go"
+owner = "<package>"
+field = "ModelDataSchemaVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact MODEL_DATA_SCHEMA_VERSION = 3 from packages/ai/scripts/model-data.ts:5; the checker validates the pinned upstream manifest."
+
+[[fields]]
+id = "internal/nodesemver/semver.go#const.mainVersion:go:-"
+path = "internal/nodesemver/semver.go"
+owner = "<package>"
+field = "mainVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Regular-expression fragment of the npm node-semver version grammar, which the external semver package owns; it is not a Pig-owned format."
+
+[[fields]]
+id = "internal/nodesemver/semver.go#const.mainVersionLoose:go:-"
+path = "internal/nodesemver/semver.go"
+owner = "<package>"
+field = "mainVersionLoose"
+wire_name = "-"
+classification = "external"
+rationale = "Regular-expression fragment of the npm node-semver version grammar, which the external semver package owns; it is not a Pig-owned format."
+
+[[fields]]
+id = "internal/npmpublish/npmpublish.go#Package.Version:go:-"
+path = "internal/npmpublish/npmpublish.go"
+owner = "Package"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "Names the version of the package that npm is asked to publish. It identifies released content and selects no Pig schema reader."
+
+[[fields]]
+id = "internal/photonimage/webpdecode.go#const.errWebPLosslessVersion:go:-"
+path = "internal/photonimage/webpdecode.go"
+owner = "<package>"
+field = "errWebPLosslessVersion"
+wire_name = "-"
+classification = "external"
+rationale = "The error of the WebP lossless bitstream's 3-bit version field, whose only valid value the WebP specification fixes at 0; the external standard owns it."
+
+[[fields]]
+id = "internal/sessionentry/entry.go#SessionHeader.Version:json:version"
+path = "internal/sessionentry/entry.go"
+owner = "SessionHeader"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "Exact upstream Pi session-format discriminator retained for transcript compatibility."
+
+[[fields]]
+id = "internal/sessionentry/union.go#const.CurrentSessionVersion:go:-"
+path = "internal/sessionentry/union.go"
+owner = "<package>"
+field = "CurrentSessionVersion"
+wire_name = "-"
+classification = "upstream"
+rationale = "Exact upstream Pi Session format discriminator retained for transcript compatibility."
+
+[[fields]]
+id = "internal/toolchain/resolve.go#const.MinGoVersion:go:-"
+path = "internal/toolchain/resolve.go"
+owner = "<package>"
+field = "MinGoVersion"
+wire_name = "-"
+classification = "release-content"
+rationale = "The oldest Go release that builds extensions (the go directive of extensions/sdk/go.mod): a toolchain requirement, not a Pig-owned format version."
+
+[[fields]]
+id = "internal/toolchain/toolchain.go#goFile.Version:json:version"
+path = "internal/toolchain/toolchain.go"
+owner = "goFile"
+field = "Version"
+wire_name = "version"
+classification = "external"
+rationale = "Go release index (go.dev/dl) file field owned by the external download service."
+
+[[fields]]
+id = "internal/toolchain/toolchain.go#goRelease.Version:json:version"
+path = "internal/toolchain/toolchain.go"
+owner = "goRelease"
+field = "Version"
+wire_name = "version"
+classification = "external"
+rationale = "Go release index (go.dev/dl) release field owned by the external download service."
+
+[[fields]]
+id = "internal/zstdblob/zstdblob.go#const.PinnedCLIVersion:go:-"
+path = "internal/zstdblob/zstdblob.go"
+owner = "<package>"
+field = "PinnedCLIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "The release of the zstd command (1.5.5, the zstd-source row of automation/dev/toolchains.lock) that writes every committed frame; zstd's own release version, an external toolchain pin and not a Pig format discriminator."
+
+[[fields]]
+id = "mcp/client.go#ClientOptions.ProtocolVersion:go:-"
+path = "mcp/client.go"
+owner = "ClientOptions"
+field = "ProtocolVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Model Context Protocol revision negotiated in initialize and sent as the MCP-Protocol-Version header; owned by the external MCP specification and mirrored from packages/mcp/src/protocol/types.ts (LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS), not a Pig-owned format."
+
+[[fields]]
+id = "mcp/oauth/discovery.go#DiscoveryOptions.ProtocolVersion:go:-"
+path = "mcp/oauth/discovery.go"
+owner = "DiscoveryOptions"
+field = "ProtocolVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Model Context Protocol revision negotiated in initialize and sent as the MCP-Protocol-Version header; owned by the external MCP specification and mirrored from packages/mcp/src/protocol/types.ts (LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS), not a Pig-owned format."
+
+[[fields]]
+id = "mcp/types.go#Implementation.Version:json:version"
+path = "mcp/types.go"
+owner = "Implementation"
+field = "Version"
+wire_name = "version"
+classification = "external"
+rationale = "MCP clientInfo/serverInfo implementation version string reported by the peer (Implementation.version in packages/mcp/src/protocol/types.ts); a release label, not a format discriminator."
+
+[[fields]]
+id = "mcp/types.go#InitializeParams.ProtocolVersion:json:protocolVersion"
+path = "mcp/types.go"
+owner = "InitializeParams"
+field = "ProtocolVersion"
+wire_name = "protocolVersion"
+classification = "external"
+rationale = "Model Context Protocol revision negotiated in initialize and sent as the MCP-Protocol-Version header; owned by the external MCP specification and mirrored from packages/mcp/src/protocol/types.ts (LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS), not a Pig-owned format."
+
+[[fields]]
+id = "mcp/types.go#InitializeResult.ProtocolVersion:json:protocolVersion"
+path = "mcp/types.go"
+owner = "InitializeResult"
+field = "ProtocolVersion"
+wire_name = "protocolVersion"
+classification = "external"
+rationale = "Model Context Protocol revision negotiated in initialize and sent as the MCP-Protocol-Version header; owned by the external MCP specification and mirrored from packages/mcp/src/protocol/types.ts (LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS), not a Pig-owned format."
+
+[[fields]]
+id = "mcp/types.go#const.LatestProtocolVersion:go:-"
+path = "mcp/types.go"
+owner = "<package>"
+field = "LatestProtocolVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Model Context Protocol revision negotiated in initialize and sent as the MCP-Protocol-Version header; owned by the external MCP specification and mirrored from packages/mcp/src/protocol/types.ts (LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS), not a Pig-owned format."
+
+[[fields]]
+id = "piglets/pig-bolt/extensions/boltruntime/build.go#buildOptions.Version:go:-"
+path = "piglets/pig-bolt/extensions/boltruntime/build.go"
+owner = "buildOptions"
+field = "Version"
+wire_name = "-"
+classification = "release-content"
+rationale = "The release version of the extension set being compiled, written into the runtime entry; in-memory build input, not a serialized Pig format."
+
+[[fields]]
+id = "piglets/pig-bolt/extensions/boltruntime/images.go#manifest.Version:json:version"
+path = "piglets/pig-bolt/extensions/boltruntime/images.go"
+owner = "manifest"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The Pi-Bolt toolchain release the runtime image was built with; the reader compares it to the pinned release and does not select a schema by it."
+
+[[fields]]
+id = "piglets/pig-bolt/extensions/boltruntime/lock.go#const.toolchainVersion:go:-"
+path = "piglets/pig-bolt/extensions/boltruntime/lock.go"
+owner = "<package>"
+field = "toolchainVersion"
+wire_name = "-"
+classification = "release-content"
+rationale = "The Pi-Bolt release this Piglet downloads and verifies; a pinned dependency, not a Pig schema discriminator."
+
+[[fields]]
+id = "piglets/pig-bolt/extensions/boltruntime/toolchain.go#const.versionTimeout:go:-"
+path = "piglets/pig-bolt/extensions/boltruntime/toolchain.go"
+owner = "<package>"
+field = "versionTimeout"
+wire_name = "-"
+classification = "external"
+rationale = "A duration bounding the toolchain's --version probe; a timeout, not a format version."
+
+[[fields]]
+id = "piglets/pig-bolt/extensions/boltruntime/toolchain.go#toolchainRecord.Version:json:version"
+path = "piglets/pig-bolt/extensions/boltruntime/toolchain.go"
+owner = "toolchainRecord"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The Pi-Bolt release recorded beside an installed toolchain and compared to the pinned release; it selects no Pig schema reader."
+
+[[fields]]
+id = "piglets/standard/extensions/bunruntime/install.go#const.versionTimeout:go:-"
+path = "piglets/standard/extensions/bunruntime/install.go"
+owner = "<package>"
+field = "versionTimeout"
+wire_name = "-"
+classification = "external"
+rationale = "A duration bounding the Bun --version probe; a timeout, not a format version."
+
+[[fields]]
+id = "piglets/standard/extensions/bunruntime/install.go#manifest.Version:json:version"
+path = "piglets/standard/extensions/bunruntime/install.go"
+owner = "manifest"
+field = "Version"
+wire_name = "version"
+classification = "release-content"
+rationale = "The Bun release an installed runtime.json describes; the reader compares it to the pinned release and does not select a schema by it."
+
+[[fields]]
+id = "piglets/standard/extensions/bunruntime/lock.go#const.bunVersion:go:-"
+path = "piglets/standard/extensions/bunruntime/lock.go"
+owner = "<package>"
+field = "bunVersion"
+wire_name = "-"
+classification = "release-content"
+rationale = "The Bun release this Piglet installs, equal to the runtime lock's pin; a pinned dependency, not a Pig schema discriminator."
+
+[[fields]]
+id = "telemetry/schema.go#TelemetrySchemaDefinition.Version:json:version"
+path = "telemetry/schema.go"
+owner = "TelemetrySchemaDefinition"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "pi-telemetry schema definition version (packages/telemetry/src/index.ts:67)."
+
+[[fields]]
+id = "test/parity/cmd/asynccheck/main.go#asyncManifest.Version:go:-"
+path = "test/parity/cmd/asynccheck/main.go"
+owner = "asyncManifest"
+field = "Version"
+wire_name = "-"
+classification = "upstream"
+rationale = "Identifies the exact pinned upstream release audited by the async manifest."
+
+[[fields]]
+id = "test/parity/cmd/interfaceinventory/main.go#inventoryPackage.Version:json:version"
+path = "test/parity/cmd/interfaceinventory/main.go"
+owner = "inventoryPackage"
+field = "Version"
+wire_name = "version"
+classification = "upstream"
+rationale = "Records the exact pinned upstream package release represented by the semantic inventory."
+
+[[fields]]
+id = "third_party/awssdk/config/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/config/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/credentials/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/credentials/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/internal/configsources/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/internal/configsources/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/internal/endpoints/v2/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/internal/endpoints/v2/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/internal/v4a/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/internal/v4a/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/internal/v4a/v4a.go#const.Version:go:-"
+path = "third_party/awssdk/internal/v4a/v4a.go"
+owner = "<package>"
+field = "Version"
+wire_name = "-"
+classification = "external"
+rationale = "The AWS SigV4A signing algorithm name (\"SigV4A\") of the forked aws-sdk-go-v2 signer, owned by the AWS signing protocol."
+
+[[fields]]
+id = "third_party/awssdk/service/bedrockruntime/api_client.go#const.ServiceAPIVersion:go:-"
+path = "third_party/awssdk/service/bedrockruntime/api_client.go"
+owner = "<package>"
+field = "ServiceAPIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "AWS service API version of the forked aws-sdk-go-v2 client (third_party/awssdk/FORK.md), owned by the AWS service contract."
+
+[[fields]]
+id = "third_party/awssdk/service/bedrockruntime/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/service/bedrockruntime/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/service/internal/accept-encoding/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/service/internal/accept-encoding/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/service/internal/presigned-url/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/service/internal/presigned-url/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/service/signin/api_client.go#const.ServiceAPIVersion:go:-"
+path = "third_party/awssdk/service/signin/api_client.go"
+owner = "<package>"
+field = "ServiceAPIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "AWS service API version of the forked aws-sdk-go-v2 client (third_party/awssdk/FORK.md), owned by the AWS service contract."
+
+[[fields]]
+id = "third_party/awssdk/service/signin/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/service/signin/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/service/sso/api_client.go#const.ServiceAPIVersion:go:-"
+path = "third_party/awssdk/service/sso/api_client.go"
+owner = "<package>"
+field = "ServiceAPIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "AWS service API version of the forked aws-sdk-go-v2 client (third_party/awssdk/FORK.md), owned by the AWS service contract."
+
+[[fields]]
+id = "third_party/awssdk/service/sso/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/service/sso/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/service/ssooidc/api_client.go#const.ServiceAPIVersion:go:-"
+path = "third_party/awssdk/service/ssooidc/api_client.go"
+owner = "<package>"
+field = "ServiceAPIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "AWS service API version of the forked aws-sdk-go-v2 client (third_party/awssdk/FORK.md), owned by the AWS service contract."
+
+[[fields]]
+id = "third_party/awssdk/service/ssooidc/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/service/ssooidc/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/awssdk/service/sts/api_client.go#const.ServiceAPIVersion:go:-"
+path = "third_party/awssdk/service/sts/api_client.go"
+owner = "<package>"
+field = "ServiceAPIVersion"
+wire_name = "-"
+classification = "external"
+rationale = "AWS service API version of the forked aws-sdk-go-v2 client (third_party/awssdk/FORK.md), owned by the AWS service contract."
+
+[[fields]]
+id = "third_party/awssdk/service/sts/go_module_metadata.go#const.goModuleVersion:go:-"
+path = "third_party/awssdk/service/sts/go_module_metadata.go"
+owner = "<package>"
+field = "goModuleVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Module release of the forked aws-sdk-go-v2 package (third_party/awssdk/FORK.md), which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "third_party/semver/version.go#const.MaxVersionLen:go:-"
+path = "third_party/semver/version.go"
+owner = "<package>"
+field = "MaxVersionLen"
+wire_name = "-"
+classification = "external"
+rationale = "Input-length bound of the vendored semver package, which owns it; it is not a Pig-owned format version."
+
+[[fields]]
+id = "tui/widthx/unicode_tables.go#const.unicodeTablesVersion:go:-"
+path = "tui/widthx/unicode_tables.go"
+owner = "<package>"
+field = "unicodeTablesVersion"
+wire_name = "-"
+classification = "external"
+rationale = "Identifies the Unicode standard data and upstream get-east-asian-width dependency used to generate terminal width tables; it does not select a Pig-owned format reader."

@@ -1,0 +1,66 @@
+# Behavior family: extensions-runtime
+# Surface: InteractiveMode.showExtensionSelector / showExtensionInput when a
+# dialog is already shown (pushExtensionDialog, removeExtensionDialog,
+# showTopExtensionDialog).
+#
+# Upstream (Pi 1.3.0+bdd9f039 interactive-mode.ts, commit 38847563, #11166):
+# dialogs in the editor slot form a stack. A new dialog hides the shown one
+# without settling it; closing the shown dialog shows the previous one again,
+# and it settles with its own answer. Before that commit the second dialog
+# replaced the first and the first promise never settled (Pi 1.2.0 behaviour,
+# which this scenario pinned until the pin bump).
+# testdata/ext/dialog-displace.mjs opens a selector without awaiting it, then
+# an input, answers the input, awaits the selector and notifies both results once. The tmux steps answer the input, wait for the earlier selector to
+# be shown again, and choose its first option.
+#
+# Upstream evidence (2026-10-21, 100x32 tmux, pinned Pi 1.3.0+bd3c9b82 built
+# from the oracle): `go test -tags=parity ./test/parity/runner -run
+# 'TestParity/83-extension-dialog-displacement$'` passed 3 of 3 declared pairs
+# with byte-identical crops:
+#   dialog-stack-result:displacing=Ada displaced=one
+
+name = "83-extension-dialog-displacement"
+description = "An extension input opened while a selector is shown stacks over it and receives the keys; the selector is shown again after the input is answered"
+covers = [
+  "packages/coding-agent/src/modes/interactive/interactive-mode.ts",
+]
+tags = ["hermetic", "tui"]
+driver = "interactive-tmux"
+model = "test-faux/faux-1"
+
+[env]
+pig = ["PIG_TEST_FAUX=1"]
+pig_args = ["--no-extensions"]
+pig_extensions = ["testdata/ext/dialog-displace.mjs"]
+pi_extensions = ["../../testdata/test-faux-provider.ts", "testdata/ext/dialog-displace.mjs"]
+
+[tmux]
+width = 100
+height = 32
+ready_pattern_pig = "(auto)"
+ready_pattern_pi = "(auto)"
+ready_timeout_seconds = 30
+capture_start = "dialog-stack-result:"
+capture_end = "displaced=one"
+
+[[tmux.steps]]
+keys = ["/dialog-displace", "Enter"]
+wait_contains = ["Displacing input"]
+wait_timeout_seconds = 20
+
+[[tmux.steps]]
+keys = ["Ada", "Enter"]
+wait_contains = ["Displaced selector"]
+wait_timeout_seconds = 20
+
+[[tmux.steps]]
+keys = ["Enter"]
+wait_contains = ["dialog-stack-result:displacing=Ada displaced=one"]
+wait_timeout_seconds = 20
+
+[assert]
+both_reach_ready = true
+both_contain = ["dialog-stack-result:displacing=Ada displaced=one"]
+both_not_contain = ["displaced-rejected", "displacing-rejected", "already open", "panic:"]
+output_equal = true
+runs = 3

@@ -1,0 +1,516 @@
+package contracts
+
+import (
+	"maps"
+	"slices"
+	"strconv"
+)
+
+// Ports packages/chord/src/contracts/evolve.ts (evolution: `evolve(previous, (e) => e...)` appends the next
+// version of a history with structured edits).
+//
+// Forced Go differences. The type-level editor interfaces (MethodEditor, RemoteEditor, LocalEditor, Put, Drop, Evolved)
+// are designed out: a RemoteEditor and a LocalEditor each wrap one draft. Every edit returns its editor so edits chain,
+// and the first failing edit is kept: later edits of the chain are skipped and Evolve returns that error (upstream: the
+// first failing edit throws out of `edit`). Evolve takes the editor type of the contract's kind, and refuses a
+// contract of the other kind (upstream's EditorOf<C> picks it from the type).
+
+// Editor is the editor of one kind of contract.
+type Editor interface {
+	*RemoteEditor | *LocalEditor
+}
+
+// Evolve appends the next version (`previous.Version + 1`) with the edits edit makes; edit must return the editor it
+// was given. Params and the variant set never change: a change to either is a new history base. The previous contract
+// is left untouched; snapshots of members no edit touched are shared with it.
+func Evolve[E Editor](previous *Contract, edit func(E) E) (*Contract, error) {
+	data, err := ContractDataOf(previous)
+	if err != nil {
+		return nil, err
+	}
+	d := newDraft(data)
+	var editor E
+	switch any(editor).(type) {
+	case *RemoteEditor:
+		if data.Kind != KindRemote {
+			return nil, fail("%s: evolve with a remote editor needs a remote contract", data.Name)
+		}
+		editor = any(&RemoteEditor{d}).(E)
+	case *LocalEditor:
+		if data.Kind != KindLocal {
+			return nil, fail("%s: evolve with a local editor needs a local contract", data.Name)
+		}
+		editor = any(&LocalEditor{d}).(E)
+	}
+	editErr := EditWith(editor, edit, d.path+": evolve")
+	if d.err != nil {
+		return nil, d.err
+	}
+	if editErr != nil {
+		return nil, editErr
+	}
+	next, err := d.next()
+	if err != nil {
+		return nil, err
+	}
+	return CreateContract(next), nil
+}
+
+// EditWith runs edit on editor (contracts' and tables' rule): an edit returning anything but the editor it was given
+// is an error (what names the call).
+func EditWith[E comparable](editor E, edit func(E) E, what string) error {
+	if edit(editor) != editor {
+		return fail("%s must return the editor it was given", what)
+	}
+	return nil
+}
+
+// Admission replaces the schema of the admission's value (slice 14 §2.5), or gives the contract one: the last edit of a
+// version. The wire fingerprint is untouched; a reload rehearses the new factory only with a value of an equal
+// admission schema.
+func (e *RemoteEditor) Admission(schema Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.setAdmission(schema) })
+	return e
+}
+
+// RemoteEditor edits a remote contract.
+type RemoteEditor struct{ d *draft }
+
+// State changes a state member of a variant.
+func (e *RemoteEditor) State(variant, member string, schema Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.state(variant, member, schema) })
+	return e
+}
+
+// AddState adds a state member to a variant.
+func (e *RemoteEditor) AddState(variant, member string, schema Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.addState(variant, member, schema) })
+	return e
+}
+
+// RemoveState removes a state member of a variant.
+func (e *RemoteEditor) RemoveState(variant, member string) *RemoteEditor {
+	e.d.run(func() error { return e.d.removeState(variant, member) })
+	return e
+}
+
+// AddMethod adds a method to a variant.
+func (e *RemoteEditor) AddMethod(variant, member string, args, result Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.addMethod(variant, member, args, result) })
+	return e
+}
+
+// Args changes the arguments of a method in every variant that has it.
+func (e *RemoteEditor) Args(member string, args Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.changeMethod(member, &args, nil) })
+	return e
+}
+
+// Result changes the result of a method in every variant that has it.
+func (e *RemoteEditor) Result(member string, result Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.changeMethod(member, nil, &result) })
+	return e
+}
+
+// Method changes both sides of a method in every variant that has it.
+func (e *RemoteEditor) Method(member string, args, result Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.changeMethod(member, &args, &result) })
+	return e
+}
+
+// RemoveMethod removes a method from every variant that has it.
+func (e *RemoteEditor) RemoveMethod(member string) *RemoteEditor {
+	e.d.run(func() error { return e.d.removeMethod(member) })
+	return e
+}
+
+// LocalEditor edits a local contract: like a remote editor, without a variant.
+type LocalEditor struct{ d *draft }
+
+// State changes a state member.
+func (e *LocalEditor) State(member string, schema Schema) *LocalEditor {
+	e.d.run(func() error { return e.d.state(LocalVariant, member, schema) })
+	return e
+}
+
+// AddState adds a state member.
+func (e *LocalEditor) AddState(member string, schema Schema) *LocalEditor {
+	e.d.run(func() error { return e.d.addState(LocalVariant, member, schema) })
+	return e
+}
+
+// RemoveState removes a state member.
+func (e *LocalEditor) RemoveState(member string) *LocalEditor {
+	e.d.run(func() error { return e.d.removeState(LocalVariant, member) })
+	return e
+}
+
+// AddMethod adds a method.
+func (e *LocalEditor) AddMethod(member string, args, result Schema) *LocalEditor {
+	e.d.run(func() error { return e.d.addMethod(LocalVariant, member, args, result) })
+	return e
+}
+
+// Args changes the arguments of a method.
+func (e *LocalEditor) Args(member string, args Schema) *LocalEditor {
+	e.d.run(func() error { return e.d.changeMethod(member, &args, nil) })
+	return e
+}
+
+// Result changes the result of a method.
+func (e *LocalEditor) Result(member string, result Schema) *LocalEditor {
+	e.d.run(func() error { return e.d.changeMethod(member, nil, &result) })
+	return e
+}
+
+// Method changes both sides of a method.
+func (e *LocalEditor) Method(member string, args, result Schema) *LocalEditor {
+	e.d.run(func() error { return e.d.changeMethod(member, &args, &result) })
+	return e
+}
+
+// RemoveMethod removes a method.
+func (e *LocalEditor) RemoveMethod(member string) *LocalEditor {
+	e.d.run(func() error { return e.d.removeMethod(member) })
+	return e
+}
+
+// Keyed changes keyed member member's schema, keyed by string or, with key, by addresses of that host kind (slice 7b:
+// an older consumer reads each key mapped, or is refused; a changed key kind only refused). TypeScript's two overloads
+// are the optional key; more than one panics.
+func (e *LocalEditor) Keyed(member string, schema Schema, key ...*HostKind) *LocalEditor {
+	kind := keyOption("Keyed", key)
+	e.d.run(func() error { return e.d.keyed(LocalVariant, member, schema, kind) })
+	return e
+}
+
+// AddKeyed adds a keyed member, keyed by string or, with key, by addresses of that host kind.
+func (e *LocalEditor) AddKeyed(member string, schema Schema, key ...*HostKind) *LocalEditor {
+	kind := keyOption("AddKeyed", key)
+	e.d.run(func() error { return e.d.addKeyed(LocalVariant, member, schema, kind) })
+	return e
+}
+
+// RemoveKeyed removes a keyed member.
+func (e *LocalEditor) RemoveKeyed(member string) *LocalEditor {
+	e.d.run(func() error { return e.d.removeKeyed(LocalVariant, member) })
+	return e
+}
+
+// Event changes event member member's schema in variant (an older consumer gets each value mapped, or is refused).
+func (e *RemoteEditor) Event(variant, member string, schema Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.event(variant, member, schema) })
+	return e
+}
+
+// AddEvent adds an event member to a variant.
+func (e *RemoteEditor) AddEvent(variant, member string, schema Schema) *RemoteEditor {
+	e.d.run(func() error { return e.d.addEvent(variant, member, schema) })
+	return e
+}
+
+// RemoveEvent removes an event member of a variant.
+func (e *RemoteEditor) RemoveEvent(variant, member string) *RemoteEditor {
+	e.d.run(func() error { return e.d.removeEvent(variant, member) })
+	return e
+}
+
+// Event changes event member member's schema (an older consumer gets each value mapped, or is refused).
+func (e *LocalEditor) Event(member string, schema Schema) *LocalEditor {
+	e.d.run(func() error { return e.d.event(LocalVariant, member, schema) })
+	return e
+}
+
+// AddEvent adds an event member.
+func (e *LocalEditor) AddEvent(member string, schema Schema) *LocalEditor {
+	e.d.run(func() error { return e.d.addEvent(LocalVariant, member, schema) })
+	return e
+}
+
+// RemoveEvent removes an event member.
+func (e *LocalEditor) RemoveEvent(member string) *LocalEditor {
+	e.d.run(func() error { return e.d.removeEvent(LocalVariant, member) })
+	return e
+}
+
+// draft is the next version under construction. Every edit is checked as it is made.
+type draft struct {
+	kind     Kind
+	path     string
+	err      error
+	data     *ContractData
+	version  int
+	variants *NamedMap[*VariantData]
+	kinds    map[string]MemberKind
+	changes  []Change
+	// admission is the admission of the next version: the previous one's unless Admission(schema) replaced it.
+	admission *AdmissionData
+}
+
+func newDraft(data *ContractData) *draft {
+	current := data.Versions[len(data.Versions)-1]
+	variants := NewNamedMap[*VariantData](current.Variants.Len())
+	for name, variant := range current.Variants.All() {
+		// Queries members are carried over as they are: no edit changes one yet (slice 14, carry-over), so the map is shared.
+		variants.Set(name, &VariantData{State: variant.State.Clone(), Methods: variant.Methods.Clone(), Keyed: variant.Keyed.Clone(), Events: variant.Events.Clone(), Queries: variant.Queries})
+	}
+	version := current.Version + 1
+	return &draft{
+		kind:     data.Kind,
+		path:     data.Name + " v" + strconv.Itoa(version),
+		data:     data,
+		version:  version,
+		variants: variants,
+		kinds:    maps.Clone(data.Kinds),
+		// The admission of the previous version, unless Admission(schema) replaces it.
+		admission: data.Admission,
+	}
+}
+
+// run performs an edit unless an earlier edit failed, and keeps the first failure.
+func (d *draft) run(edit func() error) {
+	if d.err == nil {
+		d.err = edit()
+	}
+}
+
+// setAdmission replaces the admission of the next version (slice 14 §2.5).
+func (d *draft) setAdmission(schema Schema) error {
+	admission, err := ReadAdmission(schema, d.path+".admission")
+	if err != nil {
+		return err
+	}
+	d.admission = admission
+	return nil
+}
+
+// next is the contract data with this version appended.
+func (d *draft) next() (ContractData, error) {
+	version, err := Materialize(d.kind, d.data.Params, d.version, d.variants, d.changes)
+	if err != nil {
+		return ContractData{}, err
+	}
+	next := *d.data
+	next.Versions = append(slices.Clone(d.data.Versions), version)
+	next.Kinds = d.kinds
+	next.Admission = d.admission
+	return next, nil
+}
+
+func (d *draft) state(variant, member string, schema Schema) error {
+	found, err := d.variant(variant)
+	if err != nil {
+		return err
+	}
+	if !found.State.Has(member) {
+		return fail("%s: no such state member", d.memberPath(variant, member, MemberKindState))
+	}
+	return d.putState(variant, member, schema)
+}
+
+func (d *draft) addState(variant, member string, schema Schema) error {
+	if err := d.refuseDeclared(variant, member, MemberKindState); err != nil {
+		return err
+	}
+	return d.putState(variant, member, schema)
+}
+
+func (d *draft) removeState(variant, member string) error {
+	found, err := d.variant(variant)
+	if err != nil {
+		return err
+	}
+	if !found.State.Delete(member) {
+		return fail("%s: no such state member", d.memberPath(variant, member, MemberKindState))
+	}
+	return nil
+}
+
+func (d *draft) addMethod(variant, member string, args, result Schema) error {
+	if err := d.refuseDeclared(variant, member, MemberKindMethod); err != nil {
+		return err
+	}
+	found, _ := d.variant(variant)
+	method, err := readMethod(&Method{Args: args, Result: result}, d.memberPath(variant, member, MemberKindMethod))
+	if err != nil {
+		return err
+	}
+	found.Methods.Set(member, method)
+	d.changes = append(d.changes, Change{variant, member, SideArgs}, Change{variant, member, SideResult})
+	return d.checked()
+}
+
+func (d *draft) keyed(variant, member string, schema Schema, key *HostKind) error {
+	found, err := d.variant(variant)
+	if err != nil {
+		return err
+	}
+	if !found.Keyed.Has(member) {
+		return fail("%s: no such keyed member", d.memberPath(variant, member, MemberKindKeyed))
+	}
+	return d.putKeyed(variant, member, schema, key)
+}
+
+func (d *draft) addKeyed(variant, member string, schema Schema, key *HostKind) error {
+	if err := d.refuseDeclared(variant, member, MemberKindKeyed); err != nil {
+		return err
+	}
+	return d.putKeyed(variant, member, schema, key)
+}
+
+func (d *draft) removeKeyed(variant, member string) error {
+	found, err := d.variant(variant)
+	if err != nil {
+		return err
+	}
+	if !found.Keyed.Delete(member) {
+		return fail("%s: no such keyed member", d.memberPath(variant, member, MemberKindKeyed))
+	}
+	return nil
+}
+
+func (d *draft) removeMethod(member string) error {
+	variants, err := d.variantsWith(member)
+	if err != nil {
+		return err
+	}
+	for _, variant := range variants {
+		found, _ := d.variant(variant)
+		found.Methods.Delete(member)
+	}
+	return nil
+}
+
+func (d *draft) putState(variant, member string, schema Schema) error {
+	snapshot, err := SnapshotSchema(schema, d.memberPath(variant, member, MemberKindState))
+	if err != nil {
+		return err
+	}
+	found, _ := d.variant(variant)
+	found.State.Set(member, snapshot)
+	d.changes = append(d.changes, Change{variant, member, SideState})
+	return d.checked()
+}
+
+func (d *draft) event(variant, member string, schema Schema) error {
+	found, err := d.variant(variant)
+	if err != nil {
+		return err
+	}
+	if !found.Events.Has(member) {
+		return fail("%s: no such event member", d.memberPath(variant, member, MemberKindEvent))
+	}
+	return d.putEvent(variant, member, schema)
+}
+
+func (d *draft) addEvent(variant, member string, schema Schema) error {
+	if err := d.refuseDeclared(variant, member, MemberKindEvent); err != nil {
+		return err
+	}
+	return d.putEvent(variant, member, schema)
+}
+
+func (d *draft) removeEvent(variant, member string) error {
+	found, err := d.variant(variant)
+	if err != nil {
+		return err
+	}
+	if !found.Events.Delete(member) {
+		return fail("%s: no such event member", d.memberPath(variant, member, MemberKindEvent))
+	}
+	return nil
+}
+
+func (d *draft) putEvent(variant, member string, schema Schema) error {
+	snapshot, err := eventSnapshot(schema, d.memberPath(variant, member, MemberKindEvent))
+	if err != nil {
+		return err
+	}
+	found, _ := d.variant(variant)
+	found.Events.Set(member, snapshot)
+	d.changes = append(d.changes, Change{variant, member, SideEvent})
+	return d.checked()
+}
+
+func (d *draft) putKeyed(variant, member string, schema Schema, key *HostKind) error {
+	snapshot, err := keyedSnapshot(schema, key, d.memberPath(variant, member, MemberKindKeyed))
+	if err != nil {
+		return err
+	}
+	found, _ := d.variant(variant)
+	found.Keyed.Set(member, snapshot)
+	d.changes = append(d.changes, Change{variant, member, SideKeyed})
+	return d.checked()
+}
+
+// changeMethod changes the given sides of a method in every variant that has it.
+func (d *draft) changeMethod(member string, args, result *Schema) error {
+	variants, err := d.variantsWith(member)
+	if err != nil {
+		return err
+	}
+	path := d.memberPath(variants[0], member, MemberKindMethod)
+	var newArgs, newResult *Snapshot
+	if args != nil {
+		if newArgs, err = SnapshotArguments(*args, path+".args"); err != nil {
+			return err
+		}
+	}
+	if result != nil {
+		if newResult, err = SnapshotSchema(*result, path+".result"); err != nil {
+			return err
+		}
+	}
+	for _, variant := range variants {
+		found, _ := d.variant(variant)
+		old := found.Methods.Value(member)
+		changed := &MethodData{Args: old.Args, Result: old.Result}
+		if newArgs != nil {
+			changed.Args = newArgs
+			d.changes = append(d.changes, Change{variant, member, SideArgs})
+		}
+		if newResult != nil {
+			changed.Result = newResult
+			d.changes = append(d.changes, Change{variant, member, SideResult})
+		}
+		found.Methods.Set(member, changed)
+	}
+	return d.checked()
+}
+
+func (d *draft) variant(variant string) (*VariantData, error) {
+	found, ok := d.variants.Get(variant)
+	if !ok {
+		return nil, fail("%s.%s: unknown variant (the variant set never changes)", d.path, variant)
+	}
+	return found, nil
+}
+
+func (d *draft) variantsWith(member string) ([]string, error) {
+	variants := VariantsWith(d.variants, member)
+	if len(variants) == 0 {
+		return nil, fail("%s: no method %s", d.path, quote(member))
+	}
+	return variants, nil
+}
+
+func (d *draft) refuseDeclared(variant, member string, kind MemberKind) error {
+	found, err := d.variant(variant)
+	if err != nil {
+		return err
+	}
+	if found.State.Has(member) || found.Methods.Has(member) || found.Keyed.Has(member) || found.Events.Has(member) || found.Queries.Has(member) {
+		return fail("%s: already declared", d.memberPath(variant, member, kind))
+	}
+	return nil
+}
+
+func (d *draft) memberPath(variant, member string, kind MemberKind) string {
+	return memberPath(d.path, d.kind, variant, member, kind)
+}
+
+// checked checks that a member's kind never changes, also not after a removal, and that a method keeps one signature
+// across variants.
+func (d *draft) checked() error {
+	return checkMembers(d.variants, d.kinds, d.memberPath)
+}

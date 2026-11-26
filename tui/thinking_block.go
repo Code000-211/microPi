@@ -1,0 +1,114 @@
+package tui
+
+import (
+	"strings"
+
+	"github.com/MichaelKinsy/PiG/tui/widthx"
+)
+
+// ThinkingBlock renders one reasoning trace.
+// Hidden blocks show `Thinking...`. Visible blocks use the theme's thinkingText
+// color in italic.
+
+// thinkingHiddenSGR is dim + italic: matches upstream's italic(fg("thinkingText"))
+// on a line renderer. "thinkingText" = "gray" in dark.json.
+const thinkingHiddenSGR = "\033[2m\033[3m"
+
+// thinkingVisibleSGR is the active theme's thinkingText fg + italic (Pi
+// assistant-message.ts theme.fg("thinkingText") with italic). The theme schema
+// requires the token.
+func thinkingVisibleSGR() string { return ActiveTheme().ThinkingText + "\033[3m" }
+
+const thinkingHiddenResetSGR = SGRBoldDimReset + SGRItalicReset
+const thinkingVisibleResetSGR = SGRFgReset + SGRItalicReset
+const thinkingHiddenLabel = DefaultHiddenThinkingLabel
+
+// DefaultHiddenThinkingLabel is the label that stands in for a hidden thinking run (interactive-mode.ts defaultHiddenThinkingLabel).
+const DefaultHiddenThinkingLabel = "Thinking..."
+
+// ThinkingBlock is a TUI component that renders a thinking/reasoning block.
+type ThinkingBlock struct {
+	invalidatable
+	content string
+	hidden  bool
+}
+
+// NewThinkingBlock creates a thinking block. Pass hidden=true when the user
+// has toggled visibility off (Ctrl+T). Content starts empty (invisible).
+func NewThinkingBlock(hidden bool) *ThinkingBlock {
+	return &ThinkingBlock{hidden: hidden}
+}
+
+// SetContent updates the thinking text (streaming or final).
+func (b *ThinkingBlock) SetContent(content string) {
+	b.content = content
+	b.Invalidate()
+}
+
+// SetHidden controls whether the full text or a "Thinking..." indicator is shown.
+func (b *ThinkingBlock) SetHidden(hidden bool) {
+	b.hidden = hidden
+	b.Invalidate()
+}
+
+// Content returns the current thinking text.
+func (b *ThinkingBlock) Content() string { return b.content }
+
+// Render implements Component.
+// Returns nil/empty when content is empty (invisible, takes zero height).
+func (b *ThinkingBlock) Render(width int) []string {
+	if b.content == "" {
+		return nil
+	}
+	if width < 1 {
+		width = 1
+	}
+	if b.hidden {
+		var hidden []string
+		for _, chunk := range wrapLineByWidth(thinkingHiddenLabel, width) {
+			hidden = append(hidden, thinkingHiddenSGR+chunk+thinkingHiddenResetSGR)
+		}
+		return hidden
+	}
+
+	// Wrap content lines column-aware (widthx), apply themed italic SGR per line.
+	var out []string
+	visible := thinkingVisibleSGR()
+	for rawLine := range strings.SplitSeq(b.content, "\n") {
+		wrapped := wrapLineByWidth(rawLine, width)
+		for _, chunk := range wrapped {
+			out = append(out, visible+chunk+thinkingVisibleResetSGR)
+		}
+	}
+	return out
+}
+
+// wrapLineByWidth breaks a single no-newline string into chunks of at most
+// width terminal columns. Segments by grapheme cluster and measures each
+// cluster with widthx.VisibleWidth, so width comes from the one canonical
+// width function (column-aware, never rune/byte counts).
+func wrapLineByWidth(line string, width int) []string {
+	if widthx.VisibleWidth(line) <= width {
+		return []string{line}
+	}
+	var out []string
+	chunkStart := 0
+	colCount := 0
+	from := 0
+	for rest := line; rest != ""; {
+		var cluster string
+		cluster, rest = widthx.FirstGrapheme(rest)
+		gw := widthx.VisibleWidth(cluster)
+		if colCount+gw > width && colCount > 0 {
+			out = append(out, line[chunkStart:from])
+			chunkStart = from
+			colCount = 0
+		}
+		colCount += gw
+		from += len(cluster)
+	}
+	if chunkStart < len(line) {
+		out = append(out, line[chunkStart:])
+	}
+	return out
+}

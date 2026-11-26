@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT
+#
+# CodeRabbit reads this file from the default branch.
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  collapse_walkthrough: true
+  poem: false
+  sequence_diagrams: false
+  review_status: false
+  auto_review:
+    enabled: true
+    # Review when a pull request opens, not again on every push. Comment
+    # "@coderabbitai review" on the pull request to request another pass.
+    auto_incremental_review: false
+    drafts: false
+  path_instructions:
+    - path: "{ai,coding,cmd/pig,internal/codingagent}/**/*.go"
+      instructions: |
+        Flag hard-coded provider/model literals, provider-name branches without Pi citations, and provider-specific copies of Pi's shared functions in shared code.
+        Flag single-provider tests of shared paths and timeouts, retries, or skips that hide failures.
+  path_filters:
+    # Generated or locked files: reviewing them adds noise, not signal.
+    - "!**/package-lock.json"
+    - "!**/go.sum"
+    - "!**/Cargo.lock"
+    - "!**/packages.lock"
+    - "!test/parity/interfaces/**"
+    - "!test/parity/generated/coverage.md"
+    - "!.github/badges/**"
+chat:
+  auto_reply: true

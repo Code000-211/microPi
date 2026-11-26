@@ -1,0 +1,591 @@
+// Ports packages/durable/test/harness-generation-recovery.test.ts.
+
+package harness
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/chord"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/durable"
+	sqlitenode "github.com/MichaelKinsy/PiG/durable/storage/sqlite/node"
+)
+
+func openAt(t *testing.T, path string, setup *chatState) (Harness, Conversation) {
+	t.Helper()
+	return openChat(t, openSqlite(t, path), setup)
+}
+
+func runTaskId(t *testing.T, harness Harness) durable.TaskId {
+	t.Helper()
+	return liveOf(t, harness, durable.ROOT_CONVERSATION_ID).Run.TaskId
+}
+
+// taskCheckpoint returns the task's checkpoint, or nil once terminal.
+func taskCheckpoint(t *testing.T, harness Harness, id durable.TaskId) durable.JsonValue {
+	t.Helper()
+	record := must(harness.GetTask(testContext, id))
+	if record == nil || record.State.Status == durable.TaskTerminal || record.State.Checkpoint == nil {
+		return nil
+	}
+	return *record.State.Checkpoint
+}
+
+// expectMatch fails unless every member of want is present in got with an equal JSON value (toMatchObject).
+func expectMatch(t *testing.T, got any, want string) {
+	t.Helper()
+	var left, right any
+	if err := json.Unmarshal([]byte(jsonText(t, got)), &left); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(want), &right); err != nil {
+		t.Fatal(err)
+	}
+	if !matchesObject(left, right) {
+		t.Fatalf("got  %s\nwant a match of %s", jsonText(t, got), want)
+	}
+}
+
+// withModels returns a setup sharing everything with setup except its models.
+func withModels(setup *chatState, models *ai.Models) *chatState {
+	setup.mu.Lock()
+	defer setup.mu.Unlock()
+	return &chatState{Faux: setup.Faux, Models: models, Registry: setup.Registry, Reports: setup.Reports, settings: setup.settings, now: setup.now}
+}
+
+func submissionOfHarness(t *testing.T, harness Harness, id durable.SubmissionId) durable.Submission {
+	t.Helper()
+	submission := must(harness.Submission(testContext, id))
+	if submission == nil {
+		t.Fatalf("submission %d does not exist", id)
+	}
+	return submission
+}
+
+func TestGenerationRecovery(t *testing.T) {
+	t.Run("reruns preparation interrupted before its commit", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		setup := chatSetup(t)
+		reached := deferred()
+		var mu sync.Mutex
+		block := true
+		addSection(t, setup.Registry, "preamble", func(ctx context.Context, _ durable.PromptInput) (*string, error) {
+			mu.Lock()
+			blocking := block
+			block = false
+			mu.Unlock()
+			if blocking {
+				reached.resolve()
+				return nil, abortedBy(ctx)
+			}
+			return new("p"), nil
+		})
+		setup.Faux.SetResponses([]ai.FauxResponseStep{fauxAnswer("answer")})
+		harness, root := openAt(t, path, setup)
+		harness.Resume()
+		id := submitInput(t, root, "hi").Id()
+		if err := reached.wait(testContext); err != nil {
+			t.Fatal(err)
+		}
+		taskId := runTaskId(t, harness)
+		closeHarness(t, harness)
+
+		harness, root = openAt(t, path, setup)
+		expectEqualJSON(t, taskCheckpoint(t, harness, taskId), `{"phase":"prepare","attempt":1}`)
+		harness.Resume()
+		expectSettled(t, must(submissionOfHarness(t, harness, id).Wait(testContext)), durable.SubmissionDone, "")
+		expectKinds(t, allEntries(t, root), "pi.user", "pi.system", "pi.assistant")
+		closeHarness(t, harness)
+	})
+
+	t.Run("resends a request interrupted before any partial without repeating preparation", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		setup := chatSetup(t)
+		addSection(t, setup.Registry, "preamble", text("p"), SectionOptions{Tag: new(false)})
+		reached := deferred()
+		var mu sync.Mutex
+		sent := [][]string{}
+		timeouts := []*int{}
+		setup.Faux.SetResponses([]ai.FauxResponseStep{
+			ai.FauxFactoryStep(func(_ ai.TranscriptContext, options ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
+				reached.resolve()
+				return ai.FauxResponse{}.AssistantMessage(), abortedBy(options.Signal)
+			}),
+			ai.FauxFactoryStep(func(request ai.TranscriptContext, options ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
+				mu.Lock()
+				sent = append(sent, roles(request.Messages()))
+				timeouts = append(timeouts, options.TimeoutMs)
+				mu.Unlock()
+				return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("answer")}}.AssistantMessage(), nil
+			}),
+		})
+		harness, root := openAt(t, path, setup)
+		setup.SetSettings(func(settings *HarnessSettings) {
+			settings.Stream = &durable.ConversationStreamOptions{TimeoutMs: new(1234)}
+		})
+		harness.Resume()
+		id := submitInput(t, root, "hi").Id()
+		if err := reached.wait(testContext); err != nil {
+			t.Fatal(err)
+		}
+		taskId := runTaskId(t, harness)
+		closeHarness(t, harness)
+
+		harness, root = openAt(t, path, setup)
+		expectMatch(t, taskCheckpoint(t, harness, taskId), `{"phase":"request","attempt":1,"thinkingLevel":"off","streamOptions":{"timeoutMs":1234}}`)
+		// The resend uses the pinned request, not options changed after preparation.
+		setup.SetSettings(func(settings *HarnessSettings) {
+			settings.Stream = &durable.ConversationStreamOptions{TimeoutMs: new(999)}
+		})
+		expectMatch(t, liveOf(t, harness, root.Id()), `{"generation":{"attempt":1}}`)
+		harness.Resume()
+		expectSettled(t, must(submissionOfHarness(t, harness, id).Wait(testContext)), durable.SubmissionDone, "")
+		mu.Lock()
+		expectEqualJSON(t, sent, `[["system","user"]]`)
+		expectEqualJSON(t, timeouts, `[1234]`)
+		mu.Unlock()
+		expectKinds(t, allEntries(t, root), "pi.user", "pi.system", "pi.assistant")
+		closeHarness(t, harness)
+	})
+
+	t.Run("converts a committed partial into an aborted entry and resends the same messages", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		slow := chatSetup(t, ai.FauxConfig{TokensPerSecond: 20, TokenSize: &ai.FauxTokenSize{Min: new(1), Max: new(1)}})
+		slow.Faux.SetResponses([]ai.FauxResponseStep{fauxAnswer(strings.Repeat("z", 400))})
+		harness, root := openAt(t, path, slow)
+		harness.Resume()
+		watch := must(harness.WatchDocErased(testContext, LiveDoc, root.Id()))
+		var mu sync.Mutex
+		watched := ""
+		seen := false
+		watch.Start(onValue(func(_ context.Context, change chord.WatchCall[durable.JsonObject]) error {
+			value := change.Value
+			generation, _ := value.Value("generation").(*delta.JsonObject)
+			message, _ := generation.Value("message").(*delta.JsonObject)
+			if got, ok := messageTextJSON(t, message); ok {
+				mu.Lock()
+				watched, seen = got, true
+				mu.Unlock()
+			}
+			return nil
+		}))
+		id := submitInput(t, root, "hi").Id()
+		waitFor(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return seen
+		})
+		closeHarness(t, harness)
+
+		setup := chatSetup(t)
+		sent := [][]string{}
+		setup.Faux.SetResponses([]ai.FauxResponseStep{
+			ai.FauxFactoryStep(func(request ai.TranscriptContext, _ ai.StreamOptions, _ *ai.FauxProviderState, _ *ai.Model) (ai.AssistantMessage, error) {
+				mu.Lock()
+				sent = append(sent, roles(request.Messages()))
+				mu.Unlock()
+				return ai.FauxResponse{Content: []ai.FauxContentBlock{ai.FauxText("answer")}}.AssistantMessage(), nil
+			}),
+		})
+		harness, root = openAt(t, path, setup)
+		stored := liveOf(t, harness, root.Id())
+		partial, _ := messageText(t, stored.Generation.Message)
+		// Everything observers saw before the crash is durable.
+		mu.Lock()
+		if !strings.HasPrefix(partial, watched) {
+			t.Fatalf("stored partial %q does not extend the watched %q", partial, watched)
+		}
+		mu.Unlock()
+		harness.Resume()
+		expectSettled(t, must(submissionOfHarness(t, harness, id).Wait(testContext)), durable.SubmissionDone, "")
+		mu.Lock()
+		expectEqualJSON(t, sent, `[["user"]]`)
+		mu.Unlock()
+		entries := allEntries(t, root)
+		expectKinds(t, entries, "pi.user", "pi.assistant", "pi.assistant")
+		converted := entries[1].Model[0].(ai.AssistantMessage)
+		if converted.StopReason != ai.StopReasonAborted {
+			t.Fatalf("stopReason = %s, want aborted", converted.StopReason)
+		}
+		if got, _ := textOf(converted); got != partial {
+			t.Fatalf("converted = %q, want %q", got, partial)
+		}
+		expectEqualJSON(t, liveOf(t, harness, root.Id()), `{}`)
+		closeHarness(t, harness)
+	})
+
+	t.Run("resumes a retry backoff after reopen", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		setup := chatSetup(t)
+		var mu sync.Mutex
+		now := 1_000.0
+		setup.SetNow(func() float64 {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		})
+		setup.Faux.SetResponses([]ai.FauxResponseStep{error503(), fauxAnswer("recovered")})
+		harness, root := openAt(t, path, setup)
+		harness.Resume()
+		setup.SetSettings(func(settings *HarnessSettings) {
+			settings.Retry = &RetryPolicyPatch{Enabled: new(true), MaxRetries: new(2), BaseDelayMs: new(60_000)}
+		})
+		id := submitInput(t, root, "hi").Id()
+		waitFor(t, func() bool {
+			state := liveOf(t, harness, root.Id())
+			return state.Generation != nil && state.Generation.Retry != nil
+		})
+		taskId := runTaskId(t, harness)
+		closeHarness(t, harness)
+
+		harness, root = openAt(t, path, setup)
+		// upstream: packages/durable/test/harness-generation-recovery.test.ts:186
+		expectEqualJSON(t, must(harness.GetTask(testContext, taskId)).State, `{"status":"sleeping","checkpoint":{"phase":"retry","attempt":1,"until":61000},"until":61000}`)
+		// upstream: packages/durable/test/harness-generation-recovery.test.ts:191: the wake is idle once open's recovery pass has landed.
+		eventually(t, func() bool { return !harness.Wake().Active })
+		wake := harness.Wake()
+		if wake.Active || wake.At == nil || *wake.At != 61_000 {
+			t.Fatalf("wake %+v, want {active: false, at: 61000}", wake)
+		}
+		// An early wake retries nothing.
+		harness.Resume()
+		settleOnLine(t, harness)
+		if calls := setup.Faux.CallCount(); calls != 1 {
+			t.Fatalf("provider calls after an early wake = %d, want 1", calls)
+		}
+		expectEqualJSON(t, liveOf(t, harness, root.Id()), jsonText(t, map[string]any{
+			"run":        map[string]any{"taskId": taskId, "inputs": []any{id}, "turns": 0, "first": arFirstUser(t, root)},
+			"generation": map[string]any{"attempt": 1, "retry": map[string]any{"at": 61_000, "error": "503 Service Unavailable"}},
+		}))
+		mu.Lock()
+		now = 61_000
+		mu.Unlock()
+		harness.Resume()
+		expectSettled(t, must(submissionOfHarness(t, harness, id).Wait(testContext)), durable.SubmissionDone, "")
+		expectKinds(t, allEntries(t, root), "pi.user", "pi.assistant", "pi.assistant")
+		closeHarness(t, harness)
+	})
+
+	t.Run("sleeps again for a retry stored as a running phase by an earlier version", func(t *testing.T) {
+		// upstream: packages/durable/test/harness-generation-recovery.test.ts:211
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		setup := chatSetup(t)
+		var mu sync.Mutex
+		now := 1_000.0
+		setup.SetNow(func() float64 {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		})
+		setup.Faux.SetResponses([]ai.FauxResponseStep{error503(), fauxAnswer("recovered")})
+		harness, root := openAt(t, path, setup)
+		harness.Resume()
+		setup.SetSettings(func(settings *HarnessSettings) {
+			settings.Retry = &RetryPolicyPatch{Enabled: new(true), MaxRetries: new(2), BaseDelayMs: new(60_000)}
+		})
+		id := submitInput(t, root, "hi").Id()
+		waitFor(t, func() bool {
+			record := must(harness.GetTask(testContext, runTaskId(t, harness)))
+			return record != nil && record.State.Status == durable.TaskSleeping
+		})
+		taskId := runTaskId(t, harness)
+		closeHarness(t, harness)
+		// Earlier versions slept inside a running retry phase.
+		rewriteSleepAsRunning(t, path, taskId)
+
+		harness, _ = openAt(t, path, setup)
+		harness.Resume()
+		waitFor(t, func() bool {
+			record := must(harness.GetTask(testContext, taskId))
+			return record != nil && record.State.Status == durable.TaskSleeping
+		})
+		record := must(harness.GetTask(testContext, taskId))
+		if record.State.Until == nil || *record.State.Until != 61_000 {
+			t.Fatalf("sleeps until %v, want 61000", record.State.Until)
+		}
+		if calls := setup.Faux.CallCount(); calls != 1 {
+			t.Fatalf("provider calls = %d, want 1", calls)
+		}
+		mu.Lock()
+		now = 61_000
+		mu.Unlock()
+		harness.Resume()
+		expectSettled(t, must(submissionOfHarness(t, harness, id).Wait(testContext)), durable.SubmissionDone, "")
+		if calls := setup.Faux.CallCount(); calls != 2 {
+			t.Fatalf("provider calls = %d, want 2", calls)
+		}
+		closeHarness(t, harness)
+	})
+
+	t.Run("resumes polling a deferred response after reopen", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		pollAfter := int64(60_000)
+		setup := chatSetup(t, ai.FauxConfig{Deferred: &ai.FauxDeferredConfig{PollAfterMS: &pollAfter}})
+		var mu sync.Mutex
+		now := 1_000.0
+		setup.SetNow(func() float64 {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		})
+		setup.Faux.SetResponses([]ai.FauxResponseStep{fauxAnswer("deferred answer")})
+		harness, root := openAt(t, path, setup)
+		harness.Resume()
+		setup.SetSettings(func(settings *HarnessSettings) {
+			settings.Stream = &durable.ConversationStreamOptions{Deferred: &ai.DeferredOption{Enabled: true}}
+		})
+		id := submitInput(t, root, "hi").Id()
+		waitFor(t, func() bool {
+			state := liveOf(t, harness, root.Id())
+			return state.Generation != nil && state.Generation.Deferred != nil
+		})
+		taskId := runTaskId(t, harness)
+		closeHarness(t, harness)
+
+		harness, root = openAt(t, path, setup)
+		expectMatch(t, taskCheckpoint(t, harness, taskId), `{"phase":"poll","attempt":1,"pollAt":61000}`)
+		// upstream: packages/durable/test/harness-generation-recovery.test.ts:273
+		expectMatch(t, must(harness.GetTask(testContext, taskId)).State, `{"status":"sleeping","until":61000}`)
+		// upstream: packages/durable/test/harness-generation-recovery.test.ts:278: the wake is idle once open's recovery pass has landed.
+		eventually(t, func() bool { return !harness.Wake().Active })
+		if wake := harness.Wake(); wake.Active || wake.At == nil || *wake.At != 61_000 {
+			t.Fatalf("wake %+v, want {active: false, at: 61000}", wake)
+		}
+		mu.Lock()
+		now = 61_000
+		mu.Unlock()
+		harness.Resume()
+		settled := must(submissionOfHarness(t, harness, id).Wait(testContext))
+		if settled.Status != durable.SubmissionDone || settled.Type != durable.SubmissionTypeInput {
+			t.Fatalf("Unexpected %s", settled.Status)
+		}
+		answer := commitValue(t, root, func(tx durable.Tx) (*durable.TypedEntry[durable.Never], error) {
+			return durable.TxEntry(tx, durable.AssistantEntry, *settled.Answer)
+		})
+		if got, _ := textOf(answer.Model[0]); got != "deferred answer" {
+			t.Fatalf("answer = %q", got)
+		}
+		if fetches := setup.Faux.(interface{ DeferredFetchCount() int }).DeferredFetchCount(); fetches != 1 {
+			t.Fatalf("deferred fetches = %d, want 1", fetches)
+		}
+		closeHarness(t, harness)
+	})
+
+	t.Run("polls a checkpoint stored without a thinking level and records none", func(t *testing.T) {
+		// upstream: packages/durable/test/harness-generation-recovery.test.ts:290
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		pollAfter := int64(60_000)
+		setup := chatSetup(t, ai.FauxConfig{Deferred: &ai.FauxDeferredConfig{PollAfterMS: &pollAfter}})
+		var mu sync.Mutex
+		now := 1_000.0
+		setup.SetNow(func() float64 {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		})
+		setup.Faux.SetResponses([]ai.FauxResponseStep{fauxAnswer("deferred answer")})
+		harness, root := openAt(t, path, setup)
+		if err := root.Configure(testContext, AgentChange{ThinkingLevel: SetTo(ai.ModelThinkingLevel("high"))}); err != nil {
+			t.Fatal(err)
+		}
+		harness.Resume()
+		setup.SetSettings(func(settings *HarnessSettings) {
+			settings.Stream = &durable.ConversationStreamOptions{Deferred: &ai.DeferredOption{Enabled: true}}
+		})
+		id := submitInput(t, root, "hi").Id()
+		waitFor(t, func() bool {
+			state := liveOf(t, harness, root.Id())
+			return state.Generation != nil && state.Generation.Deferred != nil
+		})
+		taskId := runTaskId(t, harness)
+		expectMatch(t, taskCheckpoint(t, harness, taskId), `{"phase":"poll","thinkingLevel":"high"}`)
+		closeHarness(t, harness)
+		// Earlier versions stored poll checkpoints without the field.
+		database, err := sqlitenode.OpenNodeSqliteDatabase(path, sqlitenode.NodeSqliteDatabaseOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Run("UPDATE tasks SET record = json_remove(record, '$.state.checkpoint.thinkingLevel') WHERE id = ?", int64(taskId)); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		harness, root = openAt(t, path, setup)
+		if text := jsonText(t, taskCheckpoint(t, harness, taskId)); strings.Contains(text, "thinkingLevel") {
+			t.Fatalf("checkpoint %s still has a thinking level", text)
+		}
+		mu.Lock()
+		now = 61_000
+		mu.Unlock()
+		harness.Resume()
+		settled := must(submissionOfHarness(t, harness, id).Wait(testContext))
+		if settled.Status != durable.SubmissionDone || settled.Type != durable.SubmissionTypeInput {
+			t.Fatalf("Unexpected %s", settled.Status)
+		}
+		answer := commitValue(t, root, func(tx durable.Tx) (*durable.TypedEntry[durable.Never], error) {
+			return durable.TxEntry(tx, durable.AssistantEntry, *settled.Answer)
+		})
+		if got, _ := textOf(answer.Model[0]); got != "deferred answer" {
+			t.Fatalf("answer = %q", got)
+		}
+		if text := jsonText(t, answer.Model[0]); strings.Contains(text, "thinkingLevel") {
+			t.Fatalf("answer %s records a thinking level the checkpoint did not have", text)
+		}
+		closeHarness(t, harness)
+	})
+
+	t.Run("fails no_model when the pinned model is gone after reopen, in request and in poll", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		pollAfter := int64(60_000)
+		setup := chatSetup(t, ai.FauxConfig{Deferred: &ai.FauxDeferredConfig{PollAfterMS: &pollAfter}})
+		var mu sync.Mutex
+		now := 1_000.0
+		setup.SetNow(func() float64 {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		})
+		busy := unanswered()
+		setup.Faux.SetResponses([]ai.FauxResponseStep{busy.step, fauxAnswer("deferred")})
+		harness, root := openAt(t, path, setup)
+		harness.Resume()
+		requesting := submitInput(t, root, "one").Id()
+		<-busy.reached
+		closeHarness(t, harness)
+
+		// Reopened without the faux provider: the request's pinned model is unknown.
+		empty := withModels(setup, ai.CreateModels())
+		harness, _ = openAt(t, path, empty)
+		harness.Resume()
+		expectSettled(t, must(submissionOfHarness(t, harness, requesting).Wait(testContext)), durable.SubmissionUnanswered, "no_model")
+		closeHarness(t, harness)
+
+		harness, root = openAt(t, path, setup)
+		setup.SetSettings(func(settings *HarnessSettings) {
+			settings.Stream = &durable.ConversationStreamOptions{Deferred: &ai.DeferredOption{Enabled: true}}
+		})
+		harness.Resume()
+		polling := submitInput(t, root, "two").Id()
+		waitFor(t, func() bool {
+			state := liveOf(t, harness, root.Id())
+			return state.Generation != nil && state.Generation.Deferred != nil
+		})
+		closeHarness(t, harness)
+
+		// The poll sleeps until it is due; then the model is resolved.
+		mu.Lock()
+		now = 61_000
+		mu.Unlock()
+		harness, _ = openAt(t, path, empty)
+		harness.Resume()
+		expectSettled(t, must(submissionOfHarness(t, harness, polling).Wait(testContext)), durable.SubmissionUnanswered, "no_model")
+		closeHarness(t, harness)
+	})
+
+	t.Run("runs a print-style turn and reads the durable answer after reopen", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "session.sqlite")
+		setup := chatSetup(t)
+		addSection(t, setup.Registry, "preamble", text("You are terse."), SectionOptions{Tag: new(false)})
+		setup.Faux.SetResponses([]ai.FauxResponseStep{fauxAnswer("42")})
+		harness, root := openAt(t, path, setup)
+		harness.Resume()
+		submission := submitInput(t, root, "answer?")
+		settled := must(submission.Wait(testContext))
+		if settled.Status != durable.SubmissionDone || settled.Type != durable.SubmissionTypeInput {
+			t.Fatalf("Unexpected %s", settled.Status)
+		}
+		readAnswer := func(conversation Conversation) *durable.TypedEntry[durable.Never] {
+			return commitValue(t, conversation, func(tx durable.Tx) (*durable.TypedEntry[durable.Never], error) {
+				return durable.TxEntry(tx, durable.AssistantEntry, *settled.Answer)
+			})
+		}
+		answer := readAnswer(root)
+		if got, _ := textOf(answer.Model[0]); got != "42" {
+			t.Fatalf("answer = %q", got)
+		}
+		closeHarness(t, harness)
+
+		harness, root = openAt(t, path, setup)
+		expectEqualJSON(t, must(submissionOfHarness(t, harness, submission.Id()).Status(testContext)), jsonText(t, settled))
+		expectEqualJSON(t, readAnswer(root).EntryRecord, jsonText(t, answer.EntryRecord))
+		closeHarness(t, harness)
+	})
+}
+
+// rewriteSleepAsRunning stores a sleeping task as a running one without its until, as a version before sleeping states did.
+func rewriteSleepAsRunning(t *testing.T, path string, id durable.TaskId) {
+	t.Helper()
+	database, err := sqlitenode.OpenNodeSqliteDatabase(path, sqlitenode.NodeSqliteDatabaseOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Run("UPDATE tasks SET status = 'running', record = json_set(json_remove(record, '$.state.until'), '$.state.status', 'running') WHERE id = ?", int64(id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// settleOnLine returns once the scheduling passes queued so far have run (an Inspect is a line read taken after them).
+func settleOnLine(t *testing.T, harness Harness) {
+	t.Helper()
+	for range 2 {
+		if _, err := harness.Inspect(testContext); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func roles(messages []ai.Message) []string {
+	names := []string{}
+	for _, message := range messages {
+		var role struct {
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal(must(json.Marshal(message)), &role); err != nil {
+			panic(err)
+		}
+		names = append(names, role.Role)
+	}
+	return names
+}
+
+// matchesObject is toMatchObject over JSON values: objects match by subset recursively, other values by equality.
+func matchesObject(got, want any) bool {
+	switch typed := want.(type) {
+	case map[string]any:
+		object, ok := got.(map[string]any)
+		if !ok {
+			return false
+		}
+		for key, value := range typed {
+			member, present := object[key]
+			if !present || !matchesObject(member, value) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		array, ok := got.([]any)
+		if !ok || len(array) != len(typed) {
+			return false
+		}
+		for index := range typed {
+			if !matchesObject(array[index], typed[index]) {
+				return false
+			}
+		}
+		return true
+	}
+	return jsonEqual(got, want)
+}

@@ -1,0 +1,67 @@
+# Fix-titled commits since 0.4.1 that change files outside tests and documents but are not bugs in a release.
+# "<commit> <category>: <reason>" counts the commit under its category on the public bug ledger page.
+# "<commit> see <commit>" joins the commit to the ledger entry that lists the second commit, for a follow-up of the same bug.
+# A new fix-titled commit prefers a "Bug-Ledger: exempt <category>: <reason>" or "Bug-Ledger: see <commit>" trailer in its own message; this file covers commits that were made before the ledger existed.
+0f0f46269b Repair of a merge between development branches: restored error classes and a test option the merge dropped
+c274c3aad6 Repair of a merge between development branches: compile and lint fallout of a merge
+9e0b2d12e9 Repair of a merge between development branches: compile fallout of a merge
+6a5b2b5236 Repair of a merge between development branches: conflicting key tables and a duplicated test
+b1c1bcf955 Repair of a merge between development branches: an interface the merge changed
+620a75d9a0 Repair of a merge between development branches: a field the merge duplicated
+1900b4c17f Repair of a merge between development branches: duplicate declarations after a merge
+42b51d78ac Repair of a merge between development branches: test fallout of a merge
+884b85520b Failure found by the integration build of unreleased work: test fixtures and declarations
+3a48c3f903 Failure found by the integration build of unreleased work: lint, mapping and ratchet checks
+fb6263b95d Review follow-up to unreleased work: corrections to a batch not yet released
+1eb814e5d0 Review follow-up to unreleased work: header cleanup
+f680b9591a see a81ec0dc55
+75c06b6556 see 433d232815
+6bfc7f1afc Fix reverted before release: DashScope quota retry (D123) was removed again by owner sign-off in 49938a5421
+bfc03c667c see b1cea06458
+9ba7e7f29f test-only: lint cleanup and test-invariant updates that merge the SDK cars (no product behaviour)
+9286e75ef1 Review follow-up to unreleased work: places the arrival-order start in the request scope (no behaviour change), drops one omitempty that conflated an empty operations list with an absent one, and adds tests for the emptydrop claims
+4935bcbfcc see 958e80d99f
+f3fd868442 see ab1d07097c
+33c8d77650 Follow-up to unreleased work: regenerates the embedded SDK copies of the unreleased ownThinkingRuns feature (D214) and extends the failed-factory probe, no product behaviour
+286c78da6d Repair of a merge between development branches: gofmt of a one-line accessor and a changelog sentence after a merge, no product behaviour
+ee03bf520b Follow-up to unreleased work: commits the vendored node_modules of the Chord plugins Node evaluator that the .gitignore hid (701 generated files), no product behaviour
+# f26dfe2355 corrects f06ba8fd15, which hid the symptom of the same bug (its trailer names f06ba8fd15 back): the entry is the correction's.
+f06ba8fd15 see f26dfe2355
+20e1c2a698 Follow-up to unreleased work: the --listen server's per-group sibling-tool check in the Node runtime (D232), no behaviour of a release changes
+0224f258c2 Follow-up to unreleased work: the --listen socket's mode (D232), replaced by a private bind directory in a95098aa83
+039dc7ba0c Follow-up to unreleased work: the --listen connection's forced-signal exit (D232), replaced by D234's repeated-signal handling in the merge
+4cdec4be2f Follow-up to unreleased work: the --listen server's stale-host bus allowance (D232)
+9e6d7943a2 Follow-up to unreleased work: per-group Node state of the --listen server's shared cells (D232)
+a40694ab0e Follow-up to unreleased work: --listen accept retries and signals (D232)
+c1b88904c3 Follow-up to unreleased work: lint fallout of the --listen server (D232), no product behaviour
+edae8e70d7 Follow-up to unreleased work: --listen live-host tracking and second-signal escape (D232)
+f34cb22f47 Follow-up to unreleased work: ctx.abort scoped per host group for the --listen server's shared cells (D232)
+ddc6060aa0 Follow-up to unreleased work: shared cell processes of the --listen server outlive their spawner (D232)
+a95098aa83 Follow-up to unreleased work: the --listen socket is bound in a private directory instead of under a changed umask (D232)
+e2b31cd983 Follow-up to unreleased work: the --listen server on Windows refuses a socket other users can reach (D232), no behaviour of a release changes
+85b025699f Follow-up to unreleased work: a --listen connection's exit ends its session (D232), found in review before any release
+1e9847163e Follow-up to unreleased work: the first generation of an isolated Node launcher carries its Host's group in the opt-in shared mode of --listen (D232)
+9d84543b6c Follow-up to unreleased work: --listen burst memory, accept messages and socket removal (D232)
+b18fc1ee00 Follow-up to unreleased work: comment-only D238 and D257 markers on two existing constants, no product behaviour
+c6ab561d18 Follow-up to unreleased work: the --listen server's isolated Node launcher gets its Host's group from connectExt only, and a user's PIG_EXT_GROUP never reaches it (D232), found in review before any release
+2a4c3c0bd7 Follow-up to unreleased work: the --listen server's exit removes the socket path only if it still names the socket it created, pinned by file ID on Windows (D232), found in CI before any release
+360170d195 Fix reverted before release: the tool declaration decode that keeps a lone surrogate was reverted by cad47e1edb in the same branch, because the decode alone did not make the request equal to Pi (the difference is recorded in ai/anthropic_wire_body_oracle_test.go)
+f98b572dcad57038e727d73145c89f271bb38cf5 see 4a0c240b0159238c7200ffb66f902727a74e81d7
+da08a31d17e4c10902bf4fa81cf1ddb3347214d1 see 4a0c240b0159238c7200ffb66f902727a74e81d7
+11c6a61eed2c875c4aeadd88d94cec0a1c76336d Follow-up to unreleased work: the stop transaction's storm test uses WaitGroup.Go and its progress keepalive context carries the portlint allow; no behavior changes, found by the stamping precheck before any release
+f1df4eb0d8 Follow-up to unreleased work: the exit settlement of 48ba73df5 (2026-11-13, in no tag) took a stream found empty as all told, which a descriptor held outside the worker's tree never lets happen; it settles on what the stream held at the exit, found in review (PR 508) before any release
+8b8524d39d Follow-up to unreleased work: the release of an exited worker that 48ba73df5 (2026-11-13, in no tag) added did not wait for the goroutines reading its streams, so Workers.Close returned before them; it awaits them, found in review (PR 508) before any release
+8f447242af06 Review follow-up to unreleased work: a repeated call of the cancel function took the derived contexts and the abort listeners of the first call, because cb409e6c320b and 6c69d7b4c38a (in no tag; v0.7.0 has no abort listeners) put the abort of both into every call, and the fix lets only the call that claims the cancel abort them
+00daef2ceb Follow-up to unreleased work: the remote-catalog startup resolution (ResolveRemoteCatalogModel, 72f75e5e70, 2026-11-11, in no tag; v0.7.0 has the OpenRouter routing variants but not this resolution) matched only stored ids, so it mis-resolved a routing variant of a personalized base; found in review (PR 508) before any release
+79f5b9d0231b302873e2e3fb0882cfff88152889 Follow-up to unreleased work: the exit's render hold of the frame flush fix (not in any release) skips a frontend's surface, whose editor node must show the requested exit; found by the race run of the package before any release
+37edb6abc245a2794d15ad8319617a40fad8a4d9 Follow-up to unreleased work: the portlint allow marker on the millisecond truncation of inDateRange and a table test of the Date range ends; inDateRange is the function 5e006747d9 (2026-11-17, in no tag; v0.7.0 has no range check) added, and the marker is a comment, so no behaviour of a release changes
+c29b7c65d7 Follow-up to unreleased work: the drained report of a held tool or handler that 9c2edf72d9 (2026-11-14, in no tag) added counted it as held before the run abort reached the runtime, which the host writes after runtime_input_end, so a stdin end could exit 0 before the dispose ran; the report waits for the abort, found in review before any release
+91d00732f51b98fac2713958fad2f059fc47de4c Follow-up to unreleased work: PIG_TELEMETRY is in no release; the order changed before it shipped
+0bbc97bbbd see 7d225e5e36
+d3374596a1 Follow-up to unreleased work: the reap-time field that d12bb5340f's member added (in no release) becomes a one-method interface so that port-lint's clock rule no longer takes the accessor for an injected clock; no shipped behavior changes.
+beeb65ebf2 Follow-up to unreleased work: replaces direct strconv.ParseFloat and byte-offset slicing in getGeminiMajorVersion (introduced by 016ee5f7d0 on this branch, in no release) with strings.Cut/CutPrefix and jsnumber.ParseInt to clear port-lint [numbers]/[utf16units] findings and removes the stale baseline.toml entry; no release behavior changes
+8f85bac54735a153e1a8c1b8feca6aa335bdeccd Follow-up to unreleased work: fixes compile error (&builder.partial and missing time import) in appendOpenAIReasoningRemovals introduced by eb9075718e on this same branch (in no release); no shipped behavior changes
+3800eb3212 Follow-up to unreleased work: puts back the packed catalog source stamp (meta.json and piOverlayCommit) that a1cb330fd5 set by hand on this same unreleased line; no shipped behavior changes
+e5e9f6453aa934d647c43ec23ea28e954ec65374 Follow-up to unreleased work: review repairs to the OpenAI dropped-reasoning notice that eb9075718e added on this same branch (in no release): the unchanged path no longer allocates and a present null id or reason is kept; no shipped behavior changes
+b37ff048ed Follow-up to unreleased work: switches oaiChunkChoice.UnmarshalJSON (added in unreleased pin-bump commit a7755b1fd1, in no tag) from encoding/json to jsstring.UnmarshalKeepingSurrogates; no shipped release behavior changes
+e5d83fa9b1 Follow-up to unreleased work: reverts the automaticContinuation tick folding added in unreleased pin-bump commit a7755b1fd1 (in no tag) and passes automaticContinuation: false in probe.mjs matching Pi google-generative-ai.ts:397; no shipped release behavior changes

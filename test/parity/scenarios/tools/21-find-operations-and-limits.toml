@@ -1,0 +1,32 @@
+# Pi 0.87.1 #6104 custom operations return absolute directory/file paths under
+# '/'; the tool must relativize them without losing a leading character or the
+# directory slash. Source find.ts:143-172 and :290-309 retain numeric limits,
+# including a reached zero. The latter case runs real fd against one temp file.
+# Exact result text and SDK details are compared.
+#
+# Pi main 676af1d77 (#11747, in the pin c23b9ec1; Pi 1.5.0 differed; the divergence record is retired) reads a limit below 1 as 1, floors a fraction, cuts a custom glob's results to the
+# limit and prints the limit notice only when more results than the limit exist. The probe asserts the pin's results (`limit-0` and `limit-1.5` keep one of the two globbed
+# entries and report limit 1; `fd-zero` runs real fd with limit 0 and lists the one file without a notice) and both_contain pins the three complete lines in both outputs.
+name = "21-find-operations-and-limits"
+description = "Custom find operations relativize roots; zero and fractional result limits read as the pinned Pi reads them"
+covers = ["packages/coding-agent/src/core/tools/find.ts"]
+tags = ["hermetic", "fast"]
+driver = "cli-mode"
+
+[env]
+override_base_args = true
+pig_bin = "/usr/bin/env"
+pi_bin = "/usr/bin/env"
+pig_args = ["bash", "./test/parity/testdata/find-operations-pig.sh"]
+pig_go_tests = ["./internal/codingagent/tools"]
+pi_args = ["node", "./test/parity/testdata/find-operations-pi.mjs"]
+
+[cli]
+cwd = "../../../.."
+timeout_seconds = 60
+
+[assert]
+exit_code = 0
+output_equal = true
+both_contain = ['FIND_OPS root ["home/user/project/\nhome/user/project/file.txt",null]', 'FIND_OPS limit-0 ["a\n\n[1 results limit reached]",{"resultLimitReached":1}]', 'FIND_OPS limit-1.5 ["a\n\n[1 results limit reached]",{"resultLimitReached":1}]', 'FIND_OPS fd-zero ["a.txt",null]']
+runs = 3

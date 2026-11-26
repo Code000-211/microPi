@@ -1,0 +1,25 @@
+# Pi 0.87.1 mermaid.ts:76-87 preserves unsupported and naturally over-wide source,
+# retains final partial-parse warnings, and renders readable partial diagrams while streaming.
+# The eight complete transform outputs are compared byte-for-byte; no ANSI/whitespace normalization applies.
+name = "42-mermaid-raw-fallback"
+description = "Unsupported and over-wide Mermaid diagrams retain source; partial warnings keep Pi's streaming boundary."
+covers = ["packages/coding-agent/src/modes/interactive/components/mermaid.ts"]
+tags = ["fast", "hermetic", "tui"]
+driver = "cli-mode"
+[env]
+override_base_args = true
+pig_bin = "/usr/bin/env"
+pi_bin = "/usr/bin/env"
+pig_args = ["bash", "./test/parity/testdata/mermaid-fallback-pig.sh"]
+pig_go_tests = ["./internal/codingagent"]
+pi_args = ["node", "./test/parity/testdata/mermaid-fallback-pi.mjs"]
+[cli]
+cwd = "../../../.."
+timeout_seconds = 60
+[assert]
+exit_code = 0
+output_equal = true
+# The pin's lovely-mermaid 0.3.3 (Pi aceb1bd1, #8158) draws the `pie` diagram as a titled bar chart instead of leaving its source, probed 2026-11-08 at c23b9ec1:
+# the title row is "`             Pets`  " and the bar row "`Dogs  ████████████████████ 100%`". Pi 1.5.0 kept "title Pets" as source; both_contain names the pin's rows.
+both_contain = ["`             Pets`  ", "Dogs  ████████████████████ 100%", "Notebook", "(+1 more)"]
+runs = 3

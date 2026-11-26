@@ -1,0 +1,89 @@
+package coding
+
+import (
+	"context"
+	"slices"
+	"testing"
+
+	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+
+	"github.com/MichaelKinsy/PiG/agent"
+)
+
+func agentToolNames(sess *Session) []string {
+	var names []string
+	for _, tool := range sess.Agent().Tools() {
+		names = append(names, tool.Name())
+	}
+	return names
+}
+
+// Upstream navigateTree restores the active tools declared by the target
+// branch's transcript (agent-session.ts _restoreToolsFromTranscript).
+func TestNavigateTreeRestoresActiveToolsFromTranscript(t *testing.T) {
+	svcs := newTestServices(t)
+	sess, err := NewSession(svcs, SessionOptions{
+		Model: fakeModel(), SkipBuiltinTools: true,
+		Tools: []agent.AgentTool{&fakeTool{name: "alpha"}, &fakeTool{name: "beta"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sess.Close() }()
+	go func() {
+		for range sess.Events() { //nolint:revive // drain
+		}
+	}()
+	if _, err := sess.Send(context.Background(), "with both tools"); err != nil {
+		t.Fatal(err)
+	}
+	var firstAssistant string
+	for _, entry := range sess.Entries() {
+		if message, ok := entry.(icodingagent.MessageEntry); ok && message.Message.Assistant != nil {
+			firstAssistant = entry.Base().ID
+			break
+		}
+	}
+	sess.Agent().SetTools([]agent.AgentTool{&fakeTool{name: "alpha"}})
+	if _, err := sess.Send(context.Background(), "with alpha only"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.NavigateTree(context.Background(), firstAssistant, NavigateTreeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := agentToolNames(sess); !slices.Equal(got, []string{"alpha", "beta"}) {
+		t.Fatalf("active tools after navigation = %v, want [alpha beta]", got)
+	}
+}
+
+// Upstream setActiveToolsByName treats the requested names as a set (agent-session.ts
+// _applyToolLoadout, b9e3eef6, #11495): tools that stay active keep their current order,
+// newly active ones are appended in the requested order, and names with no registered
+// tool are ignored.
+func TestSetActiveToolsByName(t *testing.T) {
+	svcs := newTestServices(t)
+	sess, err := NewSession(svcs, SessionOptions{
+		Model: fakeModel(), SkipBuiltinTools: true,
+		Tools: []agent.AgentTool{&fakeTool{name: "alpha"}, &fakeTool{name: "beta"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sess.Close() }()
+	sess.SetActiveToolsByName([]string{"beta", "missing", "alpha"})
+	if got := sess.ActiveToolNames(); !slices.Equal(got, []string{"alpha", "beta"}) {
+		t.Fatalf("active tools after reordering the same tools = %v, want [alpha beta]", got)
+	}
+	sess.SetActiveToolsByName(nil)
+	if got := sess.ActiveToolNames(); len(got) != 0 {
+		t.Fatalf("active tools = %v, want none", got)
+	}
+	sess.SetActiveToolsByName([]string{"beta", "missing", "alpha"})
+	if got := sess.ActiveToolNames(); !slices.Equal(got, []string{"beta", "alpha"}) {
+		t.Fatalf("active tools = %v, want [beta alpha]", got)
+	}
+	sess.SetActiveToolsByName([]string{"alpha", "beta"})
+	if got := sess.ActiveToolNames(); !slices.Equal(got, []string{"beta", "alpha"}) {
+		t.Fatalf("active tools = %v, want [beta alpha]", got)
+	}
+}

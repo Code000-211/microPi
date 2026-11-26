@@ -1,0 +1,3265 @@
+import { connect as ioWaitConnect } from "node:net";
+import fs from "node:fs";
+import { createHash } from "node:crypto";
+import zlib from "node:zlib";
+import { Readable } from "node:stream";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import * as piAi from "@earendil-works/pi-ai";
+import { Value } from "typebox/value";
+import { join as joinPath } from "node:path";
+import * as piTui from "@earendil-works/pi-tui";
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
+const { Container } = piTui;
+
+// Pi's waitForChildProcess releases the pipes of a shell that exited once they have been quiet for EXIT_STDIO_GRACE_MS (100 ms), a wall-clock timer that a writer's
+// CPU-bound gap between lines can outrun on a loaded host (the command then ends normally instead of at its deadline). The shell-exit cases need the writer to hold the
+// pipes until the deadline, so that one timer, set by Pi's armIdleTimer, never fires, as the host's own grace never elapses in the same cases (Pi's #5303 test uses
+// virtual time for it). Every other timer is untouched.
+// stdioGraceHolds counts the timers held, so a shell-exit case that holds none (a pin that renames armIdleTimer, changes the delay or loses the frame name) fails
+// loudly instead of going back to racing the wall clock.
+let stdioGraceHolds = 0;
+{
+  const wallClockSetTimeout = globalThis.setTimeout;
+  const longest = 2 ** 31 - 1;
+  globalThis.setTimeout = function setTimeout(callback, delay, ...rest) {
+    if (delay === 100 && typeof callback === "function" && new Error().stack.includes("armIdleTimer")) {
+      stdioGraceHolds++;
+      return wallClockSetTimeout(callback, longest, ...rest);
+    }
+    return wallClockSetTimeout(callback, delay, ...rest);
+  };
+}
+import {
+  createBashToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition, CONFIG_DIR_NAME, isToolCallEventType, CustomEditor, getAgentDir, getPackageDir, getShellConfig, generateDiffString, generateUnifiedPatch, sessionEntryToContextMessages, buildSessionContext, convertToPng, resizeImage, readStoredCredential, VERSION, formatSize, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES, truncateHead, truncateLine, truncateTail, withFileMutationQueue, isBashToolResult, isEditToolResult, isFindToolResult, isGrepToolResult, isLsToolResult, isPowerShellToolResult, isReadToolResult, isWriteToolResult,
+  getMarkdownTheme, getSelectListTheme, getSettingsListTheme, renderDiff,
+} from "@earendil-works/pi-coding-agent";
+
+// stringifyEventPayload is JSON.stringify of an event payload, a Set written as its array. A replacer function makes JSON.stringify run out of V8 stack at a lower depth than
+// plain JSON.stringify (nested arrays fail from 2500 levels with one, from 4400 without), so the replacer is used only when the payload holds a Set (found without recursion).
+function stringifyEventPayload(event) {
+  const seen = new Set();
+  const pending = [event];
+  let hasSet = false;
+  while (pending.length > 0 && !hasSet) {
+    const value = pending.pop();
+    if (value instanceof Set) hasSet = true;
+    else if (value !== null && typeof value === "object" && !seen.has(value)) {
+      seen.add(value);
+      for (const member of Object.values(value)) pending.push(member);
+    }
+  }
+  return hasSet ? JSON.stringify(event, (_key, value) => (value instanceof Set ? [...value] : value)) : JSON.stringify(event);
+}
+// D232: a module-level counter the factory increments; every generation in one Node process shares it.
+let processFactoryCalls = 0;
+export default function (pi) {
+  pi.ownThinkingRuns(true);
+  processFactoryCalls++;
+  // factoryAgentDir is getAgentDir() while the factory runs, where Pi's extensions call it (TestConformance_HostConfigurationAgreesAcrossSDKs).
+  const factoryAgentDir = getAgentDir();
+  let schemaRejected = false;
+  try { pi.registerTool({ name: "schema-invalid", description: "Must not register", parameters: null, execute: async () => ({ content: [] }) }); }
+  catch (error) { schemaRejected = error.message.endsWith('must define an object parameter schema.'); }
+  { const Type = piAi.Type;
+    pi.registerTool({ name: "type-schema-tool", description: "Parameters built with Type", parameters: Type.Object({
+      query: Type.String({ description: "What to look up" }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+      mode: Type.Union([Type.Literal("fast"), Type.Literal("deep")]),
+      tags: Type.Optional(Type.Array(Type.String())),
+      filter: Type.Optional(Type.Record(Type.String(), Type.Number())),
+    }, { additionalProperties: false }), execute: async () => ({ content: [{ type: "text", text: "ok" }] }) }); }
+  { // type-engine-tool (TestConformance_TypeEngineMembersAgreeAcrossSDKs): one property per member of Type that the host's type engine serves, built with Pi's own Type.
+    const Type = piAi.Type, S = Type.String(), N = Type.Number(), I = Type.Integer(), B = Type.Boolean(), L = (v) => Type.Literal(v), U = (...a) => Type.Union(a);
+    const base = Type.Object({ id: S, name: Type.Optional(S), n: I, tags: Type.Array(S) }), same = Type.Object({ a: S }), key = Type.Identifier("K");
+    pi.registerTool({ name: "type-engine-tool", description: "Parameters built with the engine members of Type", parameters: Type.Object({
+      picked: Type.Pick(base, ["id", "name"]), omitted: Type.Omit(base, ["tags"]), partial: Type.Partial(base), required: Type.Required(Type.Object({ a: Type.Optional(S), b: Type.Optional(N) })),
+      keys: Type.KeyOf(base), indexed: Type.Index(base, L("n")), readonlyObject: Type.ReadonlyObject(base), readonlyType: Type.ReadonlyType(Type.Array(S)),
+      evaluated: Type.Evaluate(Type.Intersect([same, Type.Object({ b: N })])), excluded: Type.Exclude(U(S, N, B), S), extracted: Type.Extract(U(S, N, B), U(S, N)),
+      nonNullable: Type.NonNullable(U(S, Type.Null())), uppercase: Type.Uppercase(L("abc")), lowercase: Type.Lowercase(L("ABC")), capitalize: Type.Capitalize(L("abc")),
+      uncapitalize: Type.Uncapitalize(L("ABC")), parameters: Type.Parameters(Type.Function([S, N], B)), constructorParameters: Type.ConstructorParameters(Type.Constructor([S], Type.Object({}))),
+      returnType: Type.ReturnType(Type.Function([S], N)), instanceType: Type.InstanceType(Type.Constructor([S], same)), fn: Type.Function([S], N), constructorType: Type.Constructor([S], same),
+      tuple: Type.Tuple([S, N]), template: Type.TemplateLiteral("a${string}"), conditional: Type.Conditional(S, S, L("yes"), L("no")),
+      mapped: Type.Mapped(key, U(L("a"), L("b")), Type.Ref("K"), S), cyclic: Type.Cyclic({ A: Type.Object({ next: Type.Optional(Type.Ref("A")) }) }, "A"),
+      module: Type.Module({ A: S, B: Type.Array(Type.Ref("A")) }), interface: Type.Interface([same], { b: N }), dependent: Type.Dependent(S, N, B), extends: Type.Extends({}, S, S),
+      instantiate: Type.Instantiate({ A: S }, Type.Ref("A")), call: Type.Instantiate({ Id: Type.Generic([Type.Parameter("T")], Type.Ref("T")) }, Type.Call(Type.Ref("Id"), [S])),
+      script: Type.Script("{ a: string; b?: number[] }"), rest: Type.Rest(Type.Tuple([S])), this: Type.This(), infer: Type.Infer("U", S), identifier: key,
+      generic: Type.Generic([Type.Parameter("T", S, S)], Type.Array(Type.Ref("T"))), recordKey: Type.RecordKey(Type.Record(S, N)), recordValue: Type.RecordValue(Type.Record(S, N)),
+      recordPattern: Type.String({ description: Type.RecordPattern(Type.Record(S, N)) }), enumKeyRecord: Type.Record(Type.Enum(["x", "y"]), N),
+    }, { additionalProperties: false }), execute: async () => ({ content: [{ type: "text", text: "ok" }] }) }); }
+  { // refine-probe (TestConformance_RefinedToolArgumentsAreNotRefined): Pi's own Type.Refine; every predicate and message function logs its call, and the test asserts the log stays empty (Pi 1.4.0+b556cfe5 never runs a refinement).
+    const Type = piAi.Type, log = [];
+    const checked = (tag, check) => (value) => { log.push(`check:${tag}`); return check(value); };
+    const worded = (tag, message) => (value) => { log.push(`error:${tag}`); return message(value); };
+    const equals = (tag, want) => Type.Refine(Type.String(), checked(tag, (v) => v === want), worded(`${tag}m`, () => `not ${want}`));
+    const probe = Type.Refine(Type.Object({
+      name: Type.Refine(Type.String(), checked("len", (v) => v.length >= 3), worded("lenmsg", () => "name is too short")),
+      qty: Type.Optional(Type.Refine(Type.Integer(), checked("even", (v) => v % 2 === 0), worded("evenmsg", (v) => `qty must be even, got ${v}`))),
+      pick: Type.Union([equals("u1", "a"), equals("u2", "b")]),
+      boom: Type.Optional(Type.Refine(Type.String(), checked("boom", () => { throw new Error("kaboom"); }))),
+    }), checked("root", () => true), worded("rootmsg", () => "root refused"));
+    pi.registerTool({ name: "refine-probe", description: "Arguments checked by refinements", parameters: probe, execute: async () => ({ content: [{ type: "text", text: "ok" }] }) });
+    // refine_value (TestConformance_RefinedValueRunsRefinements): TypeBox's own Value.Check and Value.Errors of the same schema, with the calls they made.
+    pi.registerCommand("refine_value", { description: "Run Value.Check or Value.Errors on the refine-probe schema", handler: async (args, ctx) => {
+      const { mode, value } = JSON.parse(args);
+      let report;
+      try {
+        const result = mode === "cycle" ? Value.Check(Type.Unsafe({ $ref: "#" }), 1) : mode === "check" ? Value.Check(probe, value) : [...Value.Errors(probe, value)].map((e) => ({ keyword: e.keyword, schemaPath: e.schemaPath, instancePath: e.instancePath, params: e.params, message: e.message }));
+        report = { result, calls: log.splice(0) };
+      } catch (error) { report = { thrown: String(error && error.message), calls: log.splice(0) }; }
+      ctx.ui.notify(`refine_value:${JSON.stringify(report)}:end`, "info");
+    } });
+    pi.registerCommand("refine_log", { description: "Report and clear the refinement call log", handler: async (_args, ctx) => { const calls = log.splice(0); ctx.ui.notify(`refine_log:${JSON.stringify(calls)}:end`, "info"); } });
+  }
+  pi.registerCommand("schema-probe", { description: "Report schema rejection", handler: async (_args, ctx) => ctx.ui.notify(`schema-rejected:${schemaRejected}`, "info") });
+  for (const [name, type, value] of [["flag-true", "boolean", true], ["flag-false", "boolean", false], ["flag-string", "string", "default"], ["flag-empty", "string", ""], ["flag-unset", "string", undefined]]) {
+    pi.registerFlag(name, { type, default: value });
+  }
+  pi.registerCommand("flag-probe", {
+    description: "Report registered flag values",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(JSON.stringify(["flag-true", "flag-false", "flag-string", "flag-empty", "flag-unset", "unregistered"].map(name => pi.getFlag(name))), "info");
+    },
+  });
+  pi.registerCommand("timeout-probe", { description: "Send JavaScript-number timeouts", handler: async (_args, ctx) => {
+    for (const timeout of [0.5, 4294967296.5, 1e21]) await pi.exec("timeout-command", [], { timeout });
+    await ctx.ui.select("timeout", ["a"], { timeout: 1500.5 });
+  }});
+  pi.registerCommand("exec-reject-probe", { description: "Report exec outcomes", handler: async (args, ctx) => {
+    for (const command of JSON.parse(args)) {
+      try {
+        ctx.ui.notify(`resolved:${(await pi.exec(command, [])).code}`, "info");
+      } catch (error) {
+        ctx.ui.notify(`rejected:${error.message}`, "info");
+      }
+    }
+  }});
+  pi.registerCommand("exec-abort-probe", { description: "Abort a running exec through its signal", handler: async (args, ctx) => {
+    const probe = JSON.parse(args);
+    const controller = new AbortController();
+    if (probe.pre) controller.abort();
+    else {
+      void (async () => {
+        for (const deadline = Date.now() + 15000; Date.now() < deadline && !existsSync(probe.pidFile);) await new Promise((resolve) => setTimeout(resolve, 10));
+        controller.abort();
+      })();
+    }
+    try {
+      const result = await pi.exec(probe.command, probe.args, { signal: controller.signal });
+      ctx.ui.notify(`exec-abort:killed=${result.killed};code=${result.code};stdout=${result.stdout.trim()}`, "info");
+    } catch (error) {
+      ctx.ui.notify(`rejected:${error.message}`, "info");
+    }
+  }});
+  pi.registerCommand("select-page-probe", { description: "Answer getSelectPageIndex", handler: async (args, ctx) => {
+    const probe = JSON.parse(args);
+    const index = piTui.getSelectPageIndex(piTui.getKeybindings(), probe.data, probe.selected, probe.count, probe.page);
+    ctx.ui.notify(`select-page=${index === undefined ? "none" : index}`, "info");
+  }});
+  pi.registerCommand("exec-limits-probe", { description: "Exec with a maxBuffer", handler: async (args, ctx) => {
+    const probe = JSON.parse(args);
+    try {
+      const result = await pi.exec(probe.command, probe.args, probe.maxBuffer === undefined ? undefined : { maxBuffer: probe.maxBuffer });
+      ctx.ui.notify(`exec-limits:truncated=${result.truncated};killed=${result.killed};code=${result.code};stdout=${result.stdout.trim()};stderr=${result.stderr.trim()}`, "info");
+    } catch (error) {
+      ctx.ui.notify(`rejected:${error.message}`, "info");
+    }
+  }});
+  pi.registerCommand("thinking-model", { description: "Read the thinking level and switch the model", handler: async (_args, ctx) => {
+    pi.setThinkingLevel("high");
+    const ok = await pi.setModel({ provider: "probe", id: "model" });
+    ctx.ui.notify(JSON.stringify([pi.getThinkingLevel(), ok]), "info");
+  }});
+  // replicated-accessors reads after each write straight from the handler's first synchronous run. With the argument "after-await" (TestNodeReplicatedWritesReadBackAfterAwait) it is the product shape beside that: the same writes and reads after one real wait, as an extension's handler makes them once it has awaited a timer or a host call. The host's session pushes then reach the receive loop's waiter, which cannot read them until the handler's synchronous run ends, not the calls the handler makes in that run. This fixture registers pi.onLoaded as well (below), so every request also first awaits the loaded handlers' promise. The other SDK fixtures ignore the argument.
+  pi.registerCommand("replicated-accessors", { description: "Read the replicated accessors after each write", handler: async (args, ctx) => {
+    const wait = args === "after-await" ? () => new Promise((resolve) => setTimeout(resolve, 5)) : undefined;
+    const lastType = () => { const entries = ctx.sessionManager.getEntries(); return entries[entries.length - 1]?.type ?? ""; };
+    const out = { name0: ctx.sessionManager.getSessionName() ?? "", model0: ctx.model?.id ?? "", provider0: ctx.model?.provider ?? "" };
+    if (wait) await wait();
+    pi.setSessionName("renamed");
+    out.name1 = ctx.sessionManager.getSessionName() ?? "";
+    out.entryAfterName = lastType();
+    pi.setLabel("one", "lab");
+    out.entryAfterLabel = lastType();
+    pi.sendMessage({ customType: "probe", content: "hi", display: true });
+    out.entryAfterMessage = lastType();
+    out.entryCount = ctx.sessionManager.getEntries().length;
+    await pi.setModel({ provider: "prov-after", id: "id-after" });
+    out.model1 = ctx.model?.id ?? "";
+    out.provider1 = ctx.model?.provider ?? "";
+    out.qualified1 = `${out.provider1}/${out.model1}`;
+    // The log read again once the serve loop ran: a push it applied a second time would collapse the log to one entry.
+    out.entryCountLater = ctx.sessionManager.getEntries().length;
+    out.lastLater = lastType();
+    ctx.ui.notify(JSON.stringify(out), "info");
+  }});
+  pi.registerCommand("active_tools_set", { description: "Set the active tools to the comma-separated names", handler: async (args) => pi.setActiveTools(String(args).trim().split(",")) });
+  pi.registerCommand("host_error_probe", { description: "Report what a host error on navigateTree looks like to the extension", handler: async (_args, ctx) => {
+    let text = "no error", code = "-";
+    try { await ctx.navigateTree("entry"); } catch (error) { text = error.message; code = error.code || "-"; }
+    ctx.ui.notify(`host_error:${text}|${code}`, "info");
+  }});
+  pi.registerCommand("session_actions_unbound", { description: "Report what unbound session actions answer", handler: async (_args, ctx) => {
+    const parts = [];
+    for (const [name, call] of [["new", () => ctx.newSession()], ["fork", () => ctx.fork("entry")], ["navigate", () => ctx.navigateTree("entry")], ["switch", () => ctx.switchSession("/s.jsonl")]]) {
+      try { parts.push(`${name}=${(await call()).cancelled}`); } catch (error) { parts.push(`${name}=error:${error.message}`); }
+    }
+    try { await ctx.reload(); parts.push("reload=ok"); } catch (error) { parts.push(`reload=error:${error.message}`); }
+    ctx.ui.notify(`unbound:${parts.join(",")}`, "info");
+  }});
+  // event_session_actions_on keeps the handler's context; event_session_actions_stored calls the actions through it after the handler's request ended. Pi's createContext() object has no such member (runner.ts:877-987), so Node's reports `undefined` and the call throws Pi's TypeError.
+  const sessionActionNames = ["waitForIdle", "newSession", "fork", "navigateTree", "switchSession", "reload"];
+  const reportSessionActions = async (ctx) => {
+    const parts = [];
+    for (const [name, call] of [["wait", () => ctx.waitForIdle()], ["new", () => ctx.newSession()], ["fork", () => ctx.fork("entry")], ["navigate", () => ctx.navigateTree("entry")], ["switch", () => ctx.switchSession("/s.jsonl")], ["reload", () => ctx.reload()]]) {
+      try { await call(); parts.push(`${name}=allowed`); } catch (error) { parts.push(/is not a function/.test(error.message) ? `${name}=rejected` : `${name}=error:${error.message}`); }
+    }
+    return parts.join(",");
+  };
+  // sessionActionShape is what Pi's JavaScript shows of an event context: typeof of each member, and the synchronous error a call throws.
+  const sessionActionShape = (ctx) => {
+    let thrown = "returned", thrownSwitch = "returned";
+    try { void Promise.resolve(ctx.waitForIdle()).catch(() => {}); } catch (error) { thrown = `${error.constructor.name}:${error.message}`; }
+    try { void Promise.resolve(ctx.switchSession("/s.jsonl")).catch(() => {}); } catch (error) { thrownSwitch = `${error.constructor.name}:${error.message}`; }
+    return `${sessionActionNames.map((name) => typeof ctx[name]).join(",")};${thrown};${thrownSwitch}`;
+  };
+  let keptEventCtx;
+  pi.registerCommand("event_session_actions_on", { description: "Subscribe to the event named by the argument with a handler that calls the session actions", handler: async (args) => {
+    pi.on(String(args).trim(), async (_event, ctx) => {
+      keptEventCtx = ctx;
+      ctx.ui.notify(`event_shape:${sessionActionShape(ctx)}`, "info");
+      ctx.ui.notify(`event_actions:${await reportSessionActions(ctx)}`, "info");
+    });
+  }});
+  pi.registerCommand("event_session_actions_stored", { description: "Call the session actions through the context an event handler kept", handler: async (_args, ctx) => {
+    ctx.ui.notify(`stored_shape:${sessionActionShape(keptEventCtx)}`, "info");
+    ctx.ui.notify(`stored_actions:${await reportSessionActions(keptEventCtx)}`, "info");
+  }});
+  // session_actions_tool makes the same calls through the context of a tool's execute: Pi's createContext() object (runner.ts:877-987), so none exists.
+  pi.registerTool({ name: "session_actions_tool", label: "session_actions_tool", description: "Call the session actions through the tool's context", parameters: { type: "object", properties: {} }, execute: async (_id, _params, _signal, _onUpdate, ctx) => ({ content: [{ type: "text", text: `tool_actions:${await reportSessionActions(ctx)}` }], details: {} }) });
+  // wait_idle_command waits for the run from a command context (runner.ts createCommandContext), and wait_idle_with_session from a withSession callback's context.
+  pi.registerCommand("wait_idle_command", { description: "Wait for the run from a command", handler: async (_args, ctx) => {
+    let text = "done";
+    try { await ctx.waitForIdle(); } catch (error) { text = `error:${error.message}`; }
+    ctx.ui.notify(`wait_idle:${text}`, "info");
+  }});
+  pi.registerCommand("wait_idle_with_session", { description: "Wait for the run from a withSession callback", handler: async (_args, ctx) => {
+    // The callback runs while this command's switchSession call is in flight, so the notice is sent once the call returned.
+    let text = "never ran";
+    await ctx.switchSession("/s.jsonl", { withSession: async (replaced) => {
+      text = "done";
+      try { await replaced.waitForIdle(); } catch (error) { text = `error:${error.message}`; }
+    } });
+    ctx.ui.notify(`with_session_wait:${text}`, "info");
+  }});
+  pi.registerCommand("active_tools_get", { description: "Report the active tools", handler: async (_args, ctx) => ctx.ui.notify(`active_tools:${pi.getActiveTools().join(",")}`, "info") });
+  // mcp_register_run registers two MCP servers in one synchronous run and reads the active tools after each call (TestConformance_McpServerRegisteredAtRunTimeIsHandledInsideTheCall).
+  pi.registerCommand("mcp_register_run", { description: "Register two MCP servers and report the active tools after each", handler: async (_args, ctx) => {
+    const reads = [];
+    for (const name of ["conformance-run-a", "conformance-run-b"]) {
+      pi.registerMcpServer(name, { url: `https://${name}.invalid/mcp` });
+      reads.push(pi.getActiveTools().join(","));
+    }
+    ctx.ui.notify(`mcp_register_run:${reads.join("|")}`, "info");
+  } });
+  // registry-model-probe registers the provider of the active model again with the argument as the model's name, then reads the model (TestARegistryWriteIsVisibleToTheNextModelReadAcrossSDKs).
+  pi.registerCommand("registry-model-probe", {
+    description: "Register the active model's provider with a new name, then read the model",
+    handler: async (args, ctx) => {
+      await pi.registerProvider("replica-reg", { baseUrl: "https://probe.invalid/v1", api: "openai-completions", apiKey: "probe-key", models: [{ id: "m", name: args, reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100 }] });
+      ctx.ui.notify("regname=" + (ctx.model?.name ?? ""), "info");
+    },
+  });
+  pi.registerCommand("provider_probe_register", { description: "Register a provider with one model", handler: async () => pi.registerProvider("conformance-probe", JSON.parse(`{"baseUrl":"https://probe.invalid/v1","api":"openai-completions","apiKey":"probe-key","models":[{"id":"probe-model","name":"Probe Model","reasoning":true,"input":["text","image"],"cost":{"input":3.5,"output":4.5,"cacheRead":0.35,"cacheWrite":0.45},"contextWindow":54321,"maxTokens":4321}]}`)) });
+  pi.registerCommand("provider_probe_unregister", { description: "Unregister the provider", handler: async () => pi.unregisterProvider("conformance-probe") });
+  pi.registerCommand("commands-probe", { description: "Read the host's slash commands", handler: async (_args, ctx) => {
+    ctx.ui.notify(JSON.stringify(pi.getCommands().filter((c) => c.name === "conformance-listed").map((c) => [c.name, c.source, c.description ?? ""])), "info");
+  }});
+  pi.registerCommand("session-identity", { description: "Read context identity accessors", handler: async (_args, ctx) => {
+    const s = ctx.sessionManager;
+    ctx.ui.notify(JSON.stringify([s.getSessionId(), s.getSessionFile() ?? null, s.getLeafId() ?? null, pi.getSessionName() ?? null]), "info");
+  }});
+  pi.registerCommand("registry-session", { description: "Read registry and session facades", handler: async (_args, ctx) => {
+    const s = ctx.sessionManager, r = ctx.modelRegistry;
+    const out = {
+      cwd:s.getCwd(), dir:s.getSessionDir(), id:s.getSessionId(), name:s.getSessionName()??null, leaf:s.getLeafId(),
+      entry:s.getEntry("one"), missing:s.getEntry("missing")??null, label:s.getLabel("one")??null,
+      entries:s.getEntries(), branch:s.getBranch("one"), tree:s.getTree(), contextEntries:s.buildContextEntries(), projection:s.buildSessionProjection(),
+      persisted:s.isPersisted(), usesDefaultDir:s.usesDefaultSessionDir(), children:s.getChildren("one"), sessionContext:s.buildSessionContext(),
+      models:r.getAll(), available:r.getAvailable(), status:r.getProviderAuthStatus("registry-probe"),
+      display:r.getProviderDisplayName("registry-probe"), error:r.getError()??null,
+      config:r.getRegisteredProviderConfig("registry-probe")??null, ids:r.getRegisteredProviderIds(),
+      auth:await r.getProviderAuth("registry-probe"), apiKey:await r.getApiKeyForProvider("registry-probe"),
+      missingKey:(await r.getApiKeyForProvider("missing"))??null,
+    };
+    const refresh=await r.refresh({allowNetwork:false});
+    out.refresh={aborted:refresh.aborted,errors:Object.fromEntries([...refresh.errors].map(([key,error])=>[key,error.message]))};
+    ctx.ui.notify(JSON.stringify(out),"info");
+  }});
+  pi.registerCommand("registry-edges", { description: "Read the registry answers that depend on the provider state", handler: async (_args, ctx) => {
+    const r = ctx.modelRegistry;
+    const models = [...r.getAll(), {}];
+    ctx.ui.notify(JSON.stringify({
+      available: r.getAvailable(), hasAuth: models.map((model) => r.hasConfiguredAuth(model)), oauth: models.map((model) => r.isUsingOAuth(model)),
+      found: r.find("registry-probe", "a") ?? null, foundOff: r.find("registry-off", "d") ?? null,
+      missing: r.find("registry-probe", "zzz") ?? null, mismatch: r.find("registry-probe", "c") ?? null,
+    }), "info");
+  }});
+  // The session reads of Pi's Pi-order probe (session_read_order_test.go): the answers are written as JSON.stringify writes them.
+  pi.registerCommand("session-order", { description: "Read the session as Pi returns it", handler: async (_args, ctx) => {
+    const s = ctx.sessionManager;
+    ctx.ui.notify(JSON.stringify({
+      getEntries: s.getEntries(), getEntry: s.getEntry("a4"), getLeafEntry: s.getLeafEntry(), getBranch: s.getBranch("a4"),
+      getChildren: s.getChildren("a1"), getTree: s.getTree(), buildContextEntries: s.buildContextEntries(),
+      buildSessionProjection: s.buildSessionProjection(), buildSessionContext: s.buildSessionContext(),
+    }), "info");
+  }});
+  const loginDefinition = () => ({
+    brand: Array.from({ length: 5 }, () => "A".repeat(41)),
+    hero: Array.from({ length: 14 }, () => "A".repeat(32)),
+    mascot: Array.from({ length: 14 }, () => "A".repeat(16)),
+    palette: { A: "#123ABC" },
+    name: "Conformance Pig",
+    description: "Cross-language login fixture",
+    tagline: "One canonical definition across every SDK",
+  });
+  const spriteDefinition = () => ({
+    id: "conformance-pig",
+    name: "Conformance Pig",
+    tagline: "One canonical sprite across every SDK",
+    mascot: Array.from({ length: 14 }, () => "A".repeat(16)),
+    palette: { A: "#123ABC" },
+  });
+
+  pi.registerMessageRenderer("conformance-message", (message, options) => ({
+    render(width) { return message.content === "padding-options" ? [JSON.stringify(options)] : [`renderer:${message.content}:expanded=${Boolean(options.expanded)}:width=${width}`]; },
+    invalidate() {},
+  }));
+  pi.registerEntryRenderer("conformance-entry", (entry, options) => ({
+    render(width) { return [`entryrenderer:${entry.data}:expanded=${Boolean(options.expanded)}:width=${width}`]; },
+    invalidate() {},
+  }));
+  // Test fixture, Pi 9376c8d1 (#4748): keyText and keyHint on the message and entry options and the tool render context. The content, data and q are the keybinding id.
+  const hintsOf = (hints, id) => `${hints.keyText(id)} | ${hints.keyHint(id, "to expand")}`;
+  pi.registerMessageRenderer("keyhints-message", (message, options) => ({ render: () => [hintsOf(options, message.content)], invalidate() {} }));
+  pi.registerEntryRenderer("keyhints-entry", (entry, options) => ({ render: () => [hintsOf(options, entry.data)], invalidate() {} }));
+  pi.registerMarkdownTransformer((markdown, context) =>
+    `md:${markdown}:${context.messageType}:streaming=${context.isStreaming}:width=${context.availableWidth}`,
+  { messageTypes: ["user", "assistant", "assistant-thinking", "custom", "summary", "changelog"] });
+  const resolvedLine = (prefix, toolName) => (args) => ({ render: () => [`${prefix}:${toolName}:${args?.q}`], invalidate: () => {} });
+  pi.registerToolRenderer((toolName, next) => {
+    switch (toolName) {
+      case "conformance_tool_renderer": return { renderCall: resolvedLine("resolved", toolName) };
+      case "conformance_keyhints": return { renderCall: (args, _theme, context) => ({ render: () => [hintsOf(context, args.q)], invalidate() {} }) };
+      case "conformance_no_renderer": return undefined;
+      case "conformance_fill": return next() ?? { renderCall: resolvedLine("filled", toolName) };
+      case "conformance_wrap": return { ...next(), renderCall: resolvedLine("wrapped", toolName) };
+      default: return next();
+    }
+  });
+  pi.registerCommand("late_tool_renderer", { description: "Register a tool renderer resolver after loading", handler: async () => {
+    pi.registerToolRenderer((toolName, next) => toolName === "conformance_late" ? { renderCall: resolvedLine("late", toolName) } : next());
+  } });
+
+  pi.registerTool({
+    name: "render_probe",
+    description: "Render its own tool card",
+    parameters: { type: "object", properties: {} },
+    renderShell: "self",
+    async execute() { return { content: [{ type: "text", text: "render ok" }] }; },
+    renderCall(args, _theme, context) {
+      context.state.calls = (context.state.calls ?? 0) + 1;
+      const calls = context.state.calls;
+      // lastComponent is the component this card's call renderer returned before; its line is what it drew last
+      const last = context.lastComponent?.line ?? "none";
+      return { line: undefined, render(width) { this.line = `toolrender:call:${args.topic}:partial=${context.isPartial}:calls=${calls}:width=${width}:last=${last}`; return [this.line]; }, invalidate() {} };
+    },
+    renderResult(result, options, _theme, context) {
+      const calls = context.state.calls;
+      const last = context.lastComponent?.line ?? "none";
+      return { line: undefined, render(width) { this.line = `toolrender:result:${result.content[0].text}:${result.details.k}:expanded=${Boolean(options.expanded)}:calls=${calls}:width=${width}:duration=${context.durationMs ?? "none"}:last=${last}`; return [this.line]; }, invalidate() {} };
+    },
+  });
+  pi.registerTool({
+    name: "echo",
+    description: "Echo input text",
+    parameters: { type: "object", required: ["text"], properties: { text: { type: "string", description: "Text to echo" }, offset: { type: "number" } } },
+    async execute(_id, params) { return { content: [{ type: "text", text: `echo: ${params.text ?? ""}` }] }; },
+  });
+  // D232 shared-cells rows: instance-local state, the process's event bus, and what this instance heard (the same three tools in every SDK fixture).
+  let sharedCalls = 0;
+  const sharedHeard = [];
+  pi.events.on("shared-cells", (data) => sharedHeard.push(data.from));
+  pi.registerTool({ name: "counter", description: "This instance's call count", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: String(++sharedCalls) }] }; } });
+  // Registered only for the module-state row, so the other conformance comparisons see the tool set every SDK fixture shares.
+  if (process.env.PIG_FIXTURE_MODULE_STATE) pi.registerTool({ name: "module_state", description: "The factory calls this process's module has seen", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "factoryCalls=" + processFactoryCalls }] }; } });
+  pi.registerTool({ name: "ping", description: "Emit on the shared-cells channel", parameters: { type: "object", required: ["name"], properties: { name: { type: "string" } } }, async execute(_id, params) { pi.events.emit("shared-cells", { from: params.name }); return { content: [{ type: "text", text: "pinged" }] }; } });
+  pi.registerTool({ name: "received", description: "What this instance heard on shared-cells", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "received=" + sharedHeard.join(",") }] }; } });
+  let abortObserved = false;
+  pi.registerTool({
+    name: "update_tool",
+    description: "Stream two partial results",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, _signal, onUpdate) {
+      onUpdate({ content: [{ type: "text", text: "step 1" }] });
+      onUpdate({ content: [{ type: "text", text: "step 2" }] });
+      return { content: [{ type: "text", text: "done" }] };
+    },
+  });
+  pi.registerTool({
+    name: "big_out",
+    description: "Return text of the size in the argument",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, params) {
+      return { content: [{ type: "text", text: "a".repeat(params.n) }] };
+    },
+  });
+  // lone_decl: a description, a parameter name and a parameter's text hold a lone UTF-16 surrogate (TestConformance_ToolDeclarationLoneSurrogatesAgreeAcrossSDKs).
+  pi.registerTool({
+    name: "lone_decl",
+    description: "D[\ud83d]",
+    parameters: { type: "object", properties: { "K[\ude00\ud83d]": { type: "string", description: "PD[\ud83d]", enum: ["E[\ude00]"], default: "DF[\ud83d]" } } },
+    async execute() {
+      return { content: [{ type: "text", text: "lone" }] };
+    },
+  });
+  pi.registerTool({
+    name: "echo_params",
+    description: "Return the arguments as the result details",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, params) {
+      return { content: [{ type: "text", text: "echoed" }], details: params };
+    },
+  });
+  pi.registerTool({
+    name: "nan_out",
+    description: "Return details holding NaN and Infinity",
+    parameters: { type: "object", properties: {} },
+    async execute() {
+      return { content: [{ type: "text", text: "nan" }], details: { n: NaN, i: -Infinity, l: [NaN, 2, { d: Infinity }], ok: 1 } };
+    },
+  });
+  pi.registerTool({
+    name: "ordered_details",
+    description: "Return details whose members are not in alphabetical order",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, _signal, onUpdate) {
+      onUpdate({ content: [{ type: "text", text: "partial" }], details: { zeta: 1, alpha: { yy: 2, bb: 3 }, mid: [{ qq: 1, aa: 2 }] } });
+      return { content: [{ type: "text", text: "done" }], details: { zeta: 1, alpha: { yy: 2, bb: 3 }, mid: [{ qq: 1, aa: 2 }] } };
+    },
+  });
+  pi.registerTool({
+    name: "ordered_result",
+    description: "Return a result whose members are not in the declared order",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, _signal, onUpdate) {
+      onUpdate({ details: { k: 1 }, content: [{ type: "text", text: "partial" }] });
+      return { details: { k: 1 }, isError: true, content: [{ type: "text", text: "done" }] };
+    },
+  });
+  pi.registerTool({
+    name: "abort_tool",
+    description: "Wait for the abort signal",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, signal, onUpdate) {
+      await new Promise((resolve) => {
+        signal.addEventListener("abort", resolve, { once: true });
+        onUpdate({ content: [{ type: "text", text: "waiting" }] });
+      });
+      abortObserved = true;
+      return { content: [{ type: "text", text: "aborted" }] };
+    },
+  });
+  // hang_tool ignores its abort signal for longer than the host's abort grace period (D111).
+  pi.registerTool({
+    name: "hang_tool",
+    description: "Ignore the abort signal",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, _signal, onUpdate) {
+      onUpdate({ content: [{ type: "text", text: "waiting" }] });
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+      return { content: [{ type: "text", text: "late" }] };
+    },
+  });
+  // signal_host_probe awaits host dialogs across the abort: the host keeps answering a tool's host calls after the abort, as Pi's in-process calls are.
+  pi.registerTool({
+    name: "signal_host_probe",
+    description: "Await host dialogs across the abort",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      let first;
+      try { first = await ctx.ui.input("tool_signal:first", "p"); } catch (error) { first = `failed: ${error?.message ?? error}`; }
+      const aborted = signal.aborted;
+      let second;
+      try { second = await ctx.ui.input("tool_signal:later", "p"); } catch (error) { second = `failed: ${error?.message ?? error}`; }
+      return { content: [{ type: "text", text: `tool_signal:${aborted}:${first}:${second}` }] };
+    },
+  });
+  // aborted_entry_probe is called with its run already aborted (TestConformance_ToolCalledAbortedEntersWithItsSignalAborted): Pi runs tool.execute with an aborted signal. It echoes the nonce it was given, reports whether its signal was aborted on its first line, and makes a host call after that, which the host answers.
+  pi.registerTool({
+    name: "aborted_entry_probe",
+    description: "Report the signal a tool starts with",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const aborted = signal.aborted;
+      let answer;
+      try { answer = await ctx.ui.input(`aborted_entry:${params.nonce}`, "p"); } catch (error) { answer = `failed: ${error?.message ?? error}`; }
+      return { content: [{ type: "text", text: `aborted_entry:${params.nonce}:${aborted}:${answer}` }] };
+    },
+  });
+  // signal_nested_probe runs abort_tool as a nested call: the host keeps answering a tool's host calls after the abort, as Pi's in-process calls are.
+  pi.registerTool({
+    name: "signal_nested_probe",
+    description: "Run abort_tool as a nested tool call",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      try {
+        const outcome = await ctx.executeTool("abort_tool", {});
+        return { content: [{ type: "text", text: `tool_signal_nested:${outcome.result.content[0].text}` }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `tool_signal_nested:failed: ${error?.message ?? error}` }] };
+      }
+    },
+  });
+  pi.registerCommand("abort_probe", {
+    description: "Report whether abort_tool saw its abort signal",
+    handler: async (_args, ctx) => ctx.ui.notify(`abort:${abortObserved}`, "info"),
+  });
+  pi.registerTool({
+    name: "rich_tool",
+    description: "Return text, image, and terminate",
+    parameters: { type: "object", properties: {} },
+    async execute() {
+      return {
+        content: [
+          { type: "text", text: "  padded  " },
+          { type: "image", data: "aW1n", mimeType: "image/png" },
+          { type: "text", text: "tail\n" },
+        ],
+        terminate: true,
+      };
+    },
+  });
+  pi.registerTool({
+    name: "prepared_tool",
+    description: "Transform legacy arguments before execution",
+    parameters: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
+    prepareArguments(params) { return { text: params.legacy }; },
+    async execute(_id, params) { return { content: [{ type: "text", text: `prepared:${params.text ?? ""}` }] }; },
+  });
+  // Reports the order in which calls start: the number of calls that started before it, plus its own argument.
+  let startedCalls = 0;
+  pi.registerTool({
+    name: "start_order",
+    description: "Report the order in which calls start",
+    parameters: { type: "object", properties: { n: { type: "number" } } },
+    async execute(_id, params) { startedCalls += 1; return { content: [{ type: "text", text: `start#${startedCalls} n=${params.n}` }] }; },
+  });
+  // Notifies inline (before the handler returns, and from a microtask and a promise continuation) and from a setImmediate and a setTimeout(0) callback; the callbacks run once the handler returned (D189).
+  let staleCtx;
+  pi.registerTool({
+    name: "timer_defer",
+    description: "Notify inline and from deferred callbacks",
+    parameters: { type: "object" },
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      staleCtx = ctx;
+      ctx.ui.notify("inline:sync", "info");
+      queueMicrotask(() => ctx.ui.notify("inline:microtask", "info"));
+      Promise.resolve().then(() => ctx.ui.notify("inline:promise", "info"));
+      process.nextTick(() => ctx.ui.notify("tick:nextTick", "info"));
+      setImmediate(() => ctx.ui.notify("deferred:immediate", "info"));
+      setTimeout(() => ctx.ui.notify("deferred:timeout", "info"), 0);
+      return { content: [{ type: "text", text: "queued" }] };
+    },
+  });
+  // Awaits a host call made through the context of the earlier timer_defer request, from a timer callback it waits for (Pi-port extensions keep such a context); the call must not wait for a loop turn that waits for this handler.
+  pi.registerTool({
+    name: "timer_stale",
+    description: "Await a host call made through an earlier request's context",
+    parameters: { type: "object" },
+    async execute() {
+      await new Promise((resolve) => setTimeout(() => { staleCtx.ui.notify("stale:awaited", "info"); resolve(); }, 0));
+      return { content: [{ type: "text", text: "applied" }] };
+    },
+  });
+  pi.registerTool({
+    name: "timer_release",
+    description: "Nothing: Node's callbacks need no release",
+    parameters: { type: "object" },
+    async execute() { return { content: [{ type: "text", text: "released" }] }; },
+  });
+  // order_probe makes the host calls and updates whose order the ordering rows pin (ordering_test.go): its first acts are two synchronous host calls, then one update, and the tool_result handler below reports each result as its first act.
+  pi.registerTool({
+    name: "order_probe",
+    description: "Make a host call and an update in the first tick",
+    parameters: { type: "object", properties: { n: { type: "number" } } },
+    async execute(_id, params, _signal, onUpdate, ctx) {
+      ctx.ui.notify(`order-call=${params.n}`, "info");
+      ctx.ui.notify(`order-then=${params.n}`, "info");
+      onUpdate({ content: [{ type: "text", text: `order-update=${params.n}` }] });
+      return { content: [{ type: "text", text: `order-done n=${params.n}` }] };
+    },
+  });
+  // mutation_order_probe takes the file mutation queue in its first statement (late: "loop" awaits the event loop first) and appends its tag to the file (TestFileMutationOrderAcrossSDKs).
+  pi.registerTool({
+    name: "mutation_order_probe",
+    description: "Take the file mutation queue and append a tag to the file",
+    parameters: { type: "object", properties: { file: { type: "string" }, tag: { type: "string" }, late: { type: "string" } } },
+    async execute(_id, params) {
+      if (params.late === "loop") await new Promise((resolve) => setImmediate(resolve));
+      await withFileMutationQueue(params.file, async () => {
+        const before = fs.existsSync(params.file) ? fs.readFileSync(params.file, "utf8") : "";
+        fs.writeFileSync(params.file, `${before}${params.tag}\n`);
+      });
+      return { content: [{ type: "text", text: `mutated ${params.tag}` }] };
+    },
+  });
+  // mutation_order_ctx_probe makes `calls` getter calls, then takes the queue through its context (TestFileMutationOrderOfTheContextFormAcrossSDKs).
+  pi.registerTool({
+    name: "mutation_order_ctx_probe",
+    description: "Make getter calls, take the queue through the context and append a tag",
+    parameters: { type: "object", properties: { file: { type: "string" }, tag: { type: "string" }, calls: { type: "number" } } },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      for (let i = 0; i < (params.calls ?? 0); i++) ctx.getContextUsage();
+      await ctx.withFileMutationQueue(params.file, async () => {
+        const before = fs.existsSync(params.file) ? fs.readFileSync(params.file, "utf8") : "";
+        fs.writeFileSync(params.file, `${before}${params.tag}\n`);
+      });
+      return { content: [{ type: "text", text: `mutated ${params.tag}` }] };
+    },
+  });
+  pi.registerTool({
+    name: "dialog_order",
+    description: "Open a select dialog titled by the call and report the answer",
+    parameters: { type: "object", properties: { title: { type: "string" }, exec: { type: "boolean" } } },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (params.exec === true) await pi.exec("dialog-order-exec", []).catch(() => {});
+      const selected = await ctx.ui.select(params.title, ["a", "b"]);
+      return { content: [{ type: "text", text: `dialog:${params.title}=${selected ?? ""}` }] };
+    },
+  });
+  pi.registerTool({
+    name: "throw_probe",
+    description: "Throw a value of the requested kind",
+    parameters: { type: "object", properties: { kind: { type: "string" } } },
+    async execute(_id, params) {
+      switch (params.kind) {
+        case "unicode": throw new Error("é😀 \n x");
+        case "empty": throw new Error("");
+        case "long": throw new Error("x".repeat(100000));
+      }
+      return { content: [{ type: "text", text: "ok" }] };
+    },
+  });
+  pi.registerTool({
+    name: "tool_error",
+    description: "Return a thrown tool error",
+    parameters: { type: "object" },
+    async execute() { throw new Error("tool exploded"); },
+  });
+  pi.registerTool({
+    name: "tool_is_error",
+    description: "Return a structured tool error result",
+    parameters: { type: "object" },
+    async execute() { return { content: [{ type: "text", text: "soft tool error" }], isError: true }; },
+  });
+  pi.registerTool({
+    name: "guided_tool",
+    description: "Tool with prompt guidelines",
+    parameters: { type: "object" },
+    promptSnippet: " \ufeffGuided\r\n tool\t summary ",
+    promptGuidelines: ["Use guided_tool when the user asks for guided behavior."],
+    async execute() { return { content: [{ type: "text", text: "guided" }] }; },
+  });
+  pi.registerTool({
+    name: "sourced_tool",
+    description: "Tool with explicit source",
+    parameters: { type: "object" },
+    promptGuidelines: ["Use sourced_tool to test per-tool source attribution."],
+    source: "mcp:test-server",
+    async execute() { return { content: [{ type: "text", text: "sourced" }] }; },
+  });
+  pi.registerTool({name: "sampling_disabled", label: "sampling_disabled", description: "Disable constrained sampling", parameters: {type: "object"}, constrainedSampling: false, async execute() { return {content:[{type:"text",text:"disabled"}]}; }});
+  pi.registerTool({
+    name: "grammar_tool",
+    description: "Tool with a grammar constrained sampling request",
+    parameters: { type: "object" },
+    constrainedSampling: { type: "grammar", variants: { openai_lark: "start: NUMBER" } },
+    async execute() { return { content: [{ type: "text", text: "grammar" }] }; },
+  });
+
+  pi.registerCommand("complete_probe", {
+    description: "Complete its arguments",
+    getArgumentCompletions: (prefix) => {
+      const items = [{ value: "alpha", label: "alpha — first" }, { value: "apple", description: "fruit" }, { value: "beta" }]
+        .filter((item) => item.value.startsWith(prefix.trim()));
+      return items.length > 0 ? items : null;
+    },
+    handler: async () => {},
+  });
+  pi.registerCommand("ping", { description: "Respond with pong", handler: async (_args, ctx) => ctx.ui.notify("pong", "info") });
+  pi.registerCommand("thinking_runs_off", { description: "Release thinking-run ownership", handler: async () => pi.ownThinkingRuns(false) });
+  pi.registerCommand("thinking_runs_on", { description: "Claim thinking-run ownership", handler: async () => pi.ownThinkingRuns(true) });
+  pi.registerCommand("model-stream-probe", {
+    description: "Exercise model streaming",
+    handler: async (_args, ctx) => {
+      const current = ctx.modelRegistry.find("conformance", "current");
+      if (!current || current.id !== "current") throw new Error(`find current = ${JSON.stringify(current)}`);
+      const found = ctx.modelRegistry.find("conformance", "declared");
+      if (!found || found.id !== "declared" || found.provider !== "conformance") throw new Error(`find declared = ${JSON.stringify(found)}`);
+      const slash = ctx.modelRegistry.find("conformance", "org/model/name");
+      if (!slash || slash.id !== "org/model/name") throw new Error(`find slash = ${JSON.stringify(slash)}`);
+      const expectedLimits = {"maxRequestBytes":12345,"images":{"maxPerMessage":7,"maxPerRequest":11,"resize":{"maxWidth":321,"maxHeight":123,"maxBytes":45678,"jpegQuality":67}}};
+      const checkLimits = (actual, expected) => Object.entries(expected).every(([key, value]) => typeof value === "object" ? actual?.[key] && checkLimits(actual[key], value) : actual?.[key] === value);
+      if (!checkLimits(slash.inputLimits, expectedLimits) || !checkLimits(ctx.model?.inputLimits, expectedLimits)) throw new Error(`model inputLimits = ${JSON.stringify(slash)}`);
+      for (const field of ["baseUrl", "input", "cost", "thinkingLevelMap", "promptCache", "contextWindow", "maxTokens", "samplingParams", "headers", "compat"]) {
+        if (!(field in slash)) throw new Error(`find slash missing ${field}: ${JSON.stringify(slash)}`);
+      }
+      if (slash.input.length !== 0 || slash.cost.input !== 0 || slash.cost.tiers.length !== 1 || slash.compat.supportsStrictMode !== false) throw new Error(`find slash shape = ${JSON.stringify(slash)}`);
+      if (ctx.modelRegistry.find("conformance", "missing") !== undefined) throw new Error("find missing returned a model");
+      if (ctx.modelRegistry.find("conformance", "override-only") !== undefined) throw new Error("find override-only returned a model");
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(found);
+      if (Object.keys(auth).length !== 5 || auth.ok !== true || auth.apiKey !== "conformance-key" || auth.headers?.["X-Conformance-Auth"] !== "yes" || auth.baseUrl !== "https://models.invalid/v1" || auth.env?.CONFORMANCE_AUTH !== "yes") throw new Error(`auth = ${JSON.stringify(auth)}`);
+      const model = { provider: "conformance", id: "declared", modelId: "declared", api: "openai-responses" };
+      const request = {
+        systemPrompt: "conformance-system",
+        messages: [
+          { role: "system", content: [{ type: "text", text: "signed system", textSignature: "system-signature" }], sections: { zeta: "last-first", alpha: null, middle: "middle" }, timestamp: 41 },
+          { role: "user", content: "hello", timestamp: 42 },
+          { role: "assistant", content: [{ type: "text", text: "prior", textSignature: "signed" }], api: "openai-responses", provider: "prior-provider", model: "prior-model", usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10, cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1.0 } }, stopReason: "stop", timestamp: 43 },
+        ],
+        tools: [{ name: "lookup", description: "lookup", parameters: { type: "object" }, constrainedSampling: { type: "grammar", variants: { openai_lark: "start: NUMBER" } } }],
+      };
+      const options = {
+        timeoutMs:0,websocketConnectTimeoutMs:1234,maxRetries:2,maxRetryDelayMs:3000,
+        maxTokens: 321, temperature: 0.65, samplingParams: { topP: 0.8 },
+        thinkingBudgets: { minimal: 11, low: 22, medium: 33, high: 44 }, reasoning: "high", isReasoning: true,
+        env: { WIRE_ENV: "request-value", SECOND_ENV: "distinct-value" }, headers: { "X-Wire": "yes", "X-Remove": null }, sessionId: "conformance-session", transport: "sse",
+      };
+      const stream = ctx.modelRegistry.stream(model, request, options);
+      const types = [];
+      for await (const event of stream) types.push(event.type);
+      if (types.join(",") !== "start,text_start,text_delta,text_end,done") throw new Error(`stream events = ${types}`);
+      const result = await stream.result();
+      if (result.content?.[0]?.text !== "streamed") throw new Error(`stream result = ${JSON.stringify(result)}`);
+      const simple = ctx.modelRegistry.streamSimple(model, request, options);
+      const simpleTypes = [];
+      for await (const event of simple) simpleTypes.push(event.type);
+      if (simpleTypes.join(",") !== "start,text_start,text_delta,text_end,done") throw new Error(`simple events = ${simpleTypes}`);
+      if ((await simple.result()).stopReason !== "stop") throw new Error("simple did not stop");
+      if ((await ctx.modelRegistry.complete(model, request, options)).stopReason !== "stop") throw new Error("complete did not stop");
+      if ((await ctx.modelRegistry.stream(model, request, options).result()).stopReason !== "stop") throw new Error("result without iteration did not stop");
+      const unknown = await ctx.modelRegistry.complete({ provider: "conformance", id: "unknown", modelId: "unknown", api: "openai-responses" }, request, options);
+      if (unknown.stopReason !== "error" || !unknown.errorMessage?.includes("unknown model")) throw new Error(`unknown result = ${JSON.stringify(unknown)}`);
+      const transportError = await ctx.modelRegistry.complete({ provider: "conformance", id: "protocol-error", modelId: "protocol-error", api: "openai-responses" }, request, options);
+      if (!Number.isInteger(transportError.timestamp) || transportError.timestamp <= 0) throw new Error(`transport timestamp = ${transportError.timestamp}`);
+      const { timestamp: _timestamp, ...transportWithoutTimestamp } = transportError;
+      const expectedTransport = {
+        role: "assistant", content: [], api: "openai-responses", provider: "conformance", model: "protocol-error",
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "error", errorMessage: "transport boom",
+      };
+      if (JSON.stringify(transportWithoutTimestamp) !== JSON.stringify(expectedTransport)) throw new Error(`transport result = ${JSON.stringify(transportWithoutTimestamp)}`);
+      ctx.ui.notify("model-stream=ok", "info");
+    },
+  });
+  pi.registerCommand("model-stream-callback-probe", {
+    description: "Exercise the provider request callbacks of modelRegistry.stream",
+    handler: async (_args, ctx) => {
+      const model = { provider: "conformance", id: "declared", modelId: "declared", api: "openai-responses" };
+      const request = { systemPrompt: "callbacks", messages: [{ role: "user", content: "hello", timestamp: 1 }] };
+      const seen = {};
+      const options = {
+        onPayload: (payload, callbackModel) => { seen.payload = payload; seen.model = callbackModel?.id; return { ...payload, mark: "on-payload" }; },
+        onResponse: (response, callbackModel) => { seen.response = response; },
+        transformHeaders: (headers) => ({ ...headers, "x-transformed": "yes" }),
+      };
+      const stream = ctx.modelRegistry.stream(model, request, options);
+      for await (const event of stream) void event;
+      if ((await stream.result()).stopReason !== "stop") throw new Error("callback stream did not stop");
+      if (seen.payload?.original !== true || seen.model !== "declared") throw new Error(`onPayload saw ${JSON.stringify(seen)}`);
+      if (seen.response?.status !== 201 || seen.response?.headers?.["x-upstream"] !== "seen") throw new Error(`onResponse saw ${JSON.stringify(seen.response)}`);
+      if ((await ctx.modelRegistry.stream(model, request, {}).result()).stopReason !== "stop") throw new Error("plain stream did not stop");
+      ctx.ui.notify("model-callbacks=ok", "info");
+    },
+  });
+  pi.registerCommand("overlay-handle-probe", {
+    description: "Exercise the overlay handle ui.custom hands to onHandle",
+    handler: async (_args, ctx) => {
+      const failures = [];
+      const expect = (label, actual, expected) => { if (JSON.stringify(actual) !== JSON.stringify(expected)) failures.push(`${label}: ${JSON.stringify(actual)} != ${JSON.stringify(expected)}`); };
+      const onHandle = (handle) => {
+        expect("initial focused", handle.isFocused(), true);
+        expect("initial hidden", handle.isHidden(), false);
+        expect("initial bounds", handle.getBounds(), { row: 3, col: 4, width: 20, height: 5 });
+        handle.focus();
+        expect("focus", handle.isFocused(), true);
+        handle.setHidden(true);
+        expect("hidden", [handle.isHidden(), handle.isFocused(), handle.getBounds()], [true, false, undefined]);
+        handle.setHidden(false);
+        expect("shown", [handle.isHidden(), handle.isFocused()], [false, false]);
+        handle.focus();
+        expect("refocus", handle.isFocused(), true);
+        handle.unfocus();
+        expect("unfocus", handle.isFocused(), false);
+        handle.unfocus({ target: null });
+      };
+      const result = await ctx.ui.custom((_tui, _theme, _keys, done) => ({ render: () => ["overlay"], handleInput: (data) => { if (data === "q") done("closed"); }, invalidate() {} }), { overlay: true, onHandle });
+      void result;
+      if (failures.length) throw new Error(failures.join("; "));
+      ctx.ui.notify("overlay-handle=ok", "info");
+    },
+  });
+  pi.registerCommand("overlay-invalidate-probe", {
+    description: "Count the host's invalidations of a mounted overlay and draw the theme",
+    handler: async (args, ctx) => {
+      const row = () => `${ctx.ui.theme.name}|${ctx.ui.theme.fg("accent", "x")}`;
+      await ctx.ui.custom((_tui, _theme, _keys, done) => {
+        const handleInput = (data) => { if (data === "q") done("closed"); };
+        // A component without invalidate() is rendered again all the same.
+        if (String(args ?? "").trim() === "plain") return { render: () => [`plain live=${row()}`], handleInput };
+        let invalidations = 0;
+        let kept = row();
+        return {
+          render: () => [`inv=${invalidations} kept=${kept} live=${ctx.ui.theme.name}`],
+          handleInput,
+          invalidate() { invalidations++; kept = row(); },
+        };
+      }, { overlay: true });
+      ctx.ui.notify("overlay-invalidate=ok", "info");
+    },
+  });
+  pi.registerCommand("theme-read-probe", {
+    description: "Report the theme the extension holds, with no component mounted",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(`theme-read=${ctx.ui.theme.name}|${ctx.ui.theme.fg("accent", "x")}`, "info");
+    },
+  });
+  pi.registerCommand("overlay-focus-probe", {
+    description: "Render the focus the host publishes to a mounted overlay",
+    handler: async (_args, ctx) => {
+      let handle;
+      await ctx.ui.custom((_tui, _theme, _keys, done) => ({
+        render: () => [`focused=${handle ? handle.isFocused() : "pending"}`],
+        handleInput: (data) => { if (data === "q") done("closed"); },
+        invalidate() {},
+      }), { overlay: true, onHandle: (value) => { handle = value; } });
+      ctx.ui.notify("overlay-focus=ok", "info");
+    },
+  });
+  // Pi's TuiAltScreen is served as Pi's own class; the Go, Rust and Python SDKs reach the host's port of it, and every SDK must report this text.
+  pi.registerCommand("tui-alt-screen-probe", {
+    description: "Drive a TuiAltScreen over a recording terminal",
+    handler: async (_args, ctx) => {
+      const { TuiAltScreen } = piTui;
+      const log=[]; let onInput, onResize, started=false;
+      const term={columns:20,rows:6,kittyProtocolActive:false,
+       start(i,r){onInput=i;onResize=r;started=true;log.push("start")},stop(){started=false;log.push("stop")},
+       async drainInput(){},write(d){log.push(d)},moveBy(){},hideCursor(){},showCursor(){},clearLine(){},clearFromCursor(){},clearScreen(){},setTitle(){},setProgress(){},setProgramStatus(){}};
+      const vis=s=>s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)?/g,"");
+      const lines=(name,fn)=>({name,render:fn,invalidate(){}});
+      const screen=new TuiAltScreen(term,false,undefined,{mouse:false,wheelScrollLines:3,copyOnSelect:true});
+      const doc=lines("doc",w=>Array.from({length:12},(_,i)=>`row ${i+1} w=${w}`));
+      screen.addChild(doc);
+      const f=[];
+      f.push(`mode=${screen.mode}`,`children=${screen.children.length}`,`terminal=${screen.terminal===term}`);
+      screen.start(); screen.renderNow();
+      const sl=()=>screen.getScreenLines().map(s=>vis(s).trimEnd());
+      f.push(`viewport=${screen.viewportTop}/${screen.isFollowingOutput}`,`first=${sl()[0]}`,`last=${sl()[5]}`,`redraws=${screen.fullRedraws>0}`,`entered=${log.some(l=>l.includes("\x1b[?1049h"))}`);
+      screen.scrollBy(-2);screen.renderNow();f.push(`up=${screen.viewportTop}/${screen.isFollowingOutput}`);
+      screen.scrollToTop();screen.renderNow();f.push(`top=${screen.viewportTop}/${screen.isFollowingOutput}`,`topfirst=${sl()[0]}`);
+      screen.scrollToBottom();screen.renderNow();f.push(`bottom=${screen.viewportTop}/${screen.isFollowingOutput}`);
+      screen.flash("hello",500);screen.renderNow();f.push(`flash=${sl().some(l=>l.includes("hello"))}`);
+      const ov=lines("ov",w=>["OVER"]);
+      const h=screen.showOverlay(ov,{width:8,anchor:"center"});screen.renderNow();
+      f.push(`overlay=${screen.hasOverlay()}/${screen.hasOverlayEntries}/${h.isFocused()}/${h.getBounds()?.width}`);
+      h.setHidden(true);f.push(`hidden=${h.isHidden()}`);h.setHidden(false);
+      screen.hideOverlay();f.push(`afterHide=${screen.hasOverlay()}/${screen.hasOverlayEntries}`);
+      const inputs=[];const foc={focused:false,render:()=>["foc"],invalidate(){},handleInput(d){inputs.push(d)}};
+      screen.setFocus(foc);f.push(`focus=${screen.getFocusedComponent()===foc}/${foc.focused}`);
+      onInput("k");
+      const lst=d=>d==="c"?{consume:true}:undefined;
+      const rm=screen.addInputListener(lst);onInput("c");rm();onInput("c");
+      screen.addInputListener(lst);screen.removeInputListener(lst);
+      f.push(`inputs=${inputs.join(",")}`);
+      let dbg=0;screen.onDebug=()=>{dbg++};onInput("\x1b[100;6u");f.push(`debug=${dbg}`);
+      screen.setShowHardwareCursor(true);screen.setClearOnShrink(true);
+      f.push(`flags=${screen.getShowHardwareCursor()}/${screen.getClearOnShrink()}`);
+      screen.setWheelScrollLines(2);screen.setCopyOnSelect(false);
+      f.push(`copy=${screen.getCopyOnSelect()}/${screen.hasActiveSelection()}/${await screen.copyActiveSelectionToClipboard()}`);screen.resetTextSelection();
+      const schemes=[];screen.onTerminalColorSchemeChange(s=>schemes.push(s));
+      screen.setTerminalColorSchemeNotifications(true);onInput("\x1b[?997;1n");onInput("\x1b[?997;2n");
+      f.push(`schemes=${schemes.join(",")}`);
+      const colors=await screen.queryTerminalColors({timeoutMs:20});f.push(`colors=${JSON.stringify(colors)}`);
+      const mr=screen.handleMouse?.({type:"wheel",button:"none",x:0,y:0,screenX:0,screenY:0,width:20,height:6,shift:false,alt:false,ctrl:false,wheelDelta:1});
+      f.push(`mouse=${JSON.stringify(mr??null)}`);
+      f.push(`render=${screen.render(10).slice(0,2).join("|")}`);
+      screen.invalidate();screen.requestRender();
+      const root=lines("root",w=>["ROOT"]);screen.setLayoutRoot(root);screen.renderNow();f.push(`root=${sl()[0].startsWith("ROOT")}`);screen.setLayoutRoot(undefined);
+      screen.removeChild(doc);f.push(`removed=${screen.children.length}`);screen.addChild(doc);screen.clear();f.push(`cleared=${screen.children.length}`);
+      screen.stop();f.push(`stopped=${!started}`);
+      ctx.ui.notify("tui-alt: "+f.join("; "), "info");
+      
+    },
+  });
+  // A component's render reads the screen, an overlay's visible callback decides its visibility, invalidate reaches the overlays, and a render that changes the screen reads its own changes back: Pi runs each call at once (Pi's own class here).
+  pi.registerCommand("tui-alt-frame-probe", {
+    description: "Read a TuiAltScreen from a component's render and exercise overlay visibility",
+    handler: async (_args, ctx) => {
+      const { TuiAltScreen } = piTui;
+      const term={columns:20,rows:6,kittyProtocolActive:false,start(){},stop(){},async drainInput(){},write(){},moveBy(){},hideCursor(){},showCursor(){},clearLine(){},clearFromCursor(){},clearScreen(){},setTitle(){},setProgress(){},setProgramStatus(){}};
+      const screen=new TuiAltScreen(term,false,undefined,{mouse:false});
+      const seen=[];let docInv=0,ovInv=0;
+      const doc={render(w){seen.push(`${screen.viewportTop}/${screen.isFollowingOutput}/${screen.getScreenLines().length}/${screen.hasActiveSelection()}/${screen.hasOverlay()}/${screen.getShowHardwareCursor()}`);return Array.from({length:12},(_,i)=>`row ${i+1}`)},invalidate(){docInv++}};
+      screen.addChild(doc);screen.start();screen.renderNow();screen.renderNow();
+      const f=[`frame1=${seen[0]}`,`frame2=${seen[seen.length-1]}`];
+      const widths=[];
+      const ov={render:()=>["OVER"],invalidate(){ovInv++}};
+      const hOn=screen.showOverlay(ov,{width:8,visible:(w,h)=>{widths.push(`${w}x${h}`);return w>=20}});
+      screen.renderNow();
+      f.push(`visibleOn=${screen.hasOverlay()}/${screen.hasOverlayEntries}/${widths.includes("20x6")}`);
+      hOn.hide();
+      const hOff=screen.showOverlay({render:()=>["X"],invalidate(){}},{visible:()=>false});
+      f.push(`visibleOff=${screen.hasOverlay()}/${screen.hasOverlayEntries}`);hOff.hide();
+      const ov2=screen.showOverlay(ov,{width:8});
+      docInv=0;ovInv=0;screen.invalidate();
+      f.push(`invalidate=${docInv}/${ovInv}`);
+      ov2.hide();
+      const mutLog=[];let armed=false,mutInv=0;
+      const extra={render:()=>["EXTRA"],invalidate(){}},target={render:()=>["TARGET"],invalidate(){}},popup={render:()=>["POP"],invalidate(){}};
+      const mut={render(w){
+        if(!armed)return ["MUT"];
+        armed=false;
+        const flags=()=>`${screen.getShowHardwareCursor()}/${screen.getClearOnShrink()}/${screen.getCopyOnSelect()}`;
+        const r=[`flags=${flags()}`];
+        screen.setShowHardwareCursor(true);screen.setClearOnShrink(true);screen.setCopyOnSelect(false);r.push(`set=${flags()}`);
+        screen.addChild(extra);r.push(`add=${screen.children.length}`);screen.removeChild(extra);r.push(`remove=${screen.children.length}`);
+        screen.setFocus(target);r.push(`focus=${screen.getFocusedComponent()===target}`);
+        let first;const h=screen.showOverlay(popup,{width:8,visible:()=>{first??=String(screen.getShowHardwareCursor());return true}});
+        r.push(`overlay=${screen.hasOverlay()}/${screen.hasOverlayEntries}/${h.isFocused()}/${first}`);
+        h.hide();r.push(`hidden=${screen.hasOverlayEntries}`);
+        screen.scrollBy(-2);r.push(`scroll=${screen.viewportTop}/${screen.isFollowingOutput}`);
+        mutInv=0;screen.invalidate();r.push(`invalidate=${mutInv}`);
+        r.push(`lines=${screen.getScreenLines().length}`);
+        mutLog.push(r.join(","));
+        return ["MUT"];
+      },invalidate(){mutInv++}};
+      screen.addChild(mut);screen.renderNow();armed=true;screen.renderNow();
+      f.push(`mutate=${mutLog.join("|")}`,`after=${screen.getShowHardwareCursor()}/${screen.getClearOnShrink()}/${screen.getCopyOnSelect()}/${screen.children.length}`);
+      screen.stop();
+      ctx.ui.notify("tui-alt-frame: "+f.join("; "), "info");
+      
+    },
+  });
+  // TuiAltScreen.children after addChild, removeChild and clear, with components of equal content (D207: the Go, Rust and Python SDKs return a copy of Pi's live array, so each read follows the call that changed the list).
+  pi.registerCommand("tui-alt-children-probe", {
+    description: "Read TuiAltScreen children after addChild, removeChild and clear, with components of equal content",
+    handler: async (_args, ctx) => {
+      const { TuiAltScreen } = piTui;
+      const term={columns:20,rows:6,kittyProtocolActive:false,start(){},stop(){},async drainInput(){},write(){},moveBy(){},hideCursor(){},showCursor(){},clearLine(){},clearFromCursor(){},clearScreen(){},setTitle(){},setProgress(){},setProgramStatus(){}};
+      const screen=new TuiAltScreen(term,false,undefined,{mouse:false});
+      const mk=()=>({render:()=>["same"],invalidate(){}});
+      const a=mk(),b=mk(),c=mk();
+      const name=k=>k===a?"a":k===b?"b":k===c?"c":"?";
+      const order=()=>screen.children.map(name).join("")||"-";
+      const f=[`empty=${order()}`];
+      screen.addChild(a);screen.addChild(b);screen.addChild(c);f.push(`added=${order()}`);
+      screen.removeChild(b);f.push(`removeB=${order()}`);
+      screen.removeChild(b);f.push(`removeAbsent=${order()}`);
+      screen.addChild(a);f.push(`duplicate=${order()}`);
+      screen.removeChild(a);f.push(`removeFirst=${order()}`);
+      screen.addChild(b);f.push(`readd=${order()}`);
+      f.push(`render=${screen.render(10).join("|")}`);
+      screen.setFocus(b);f.push(`focus=${name(screen.getFocusedComponent())}`);
+      screen.clear();f.push(`cleared=${order()}`);
+      ctx.ui.notify("tui-alt-children: "+f.join("; "), "info");
+    },
+  });
+  // Pi hands a ui.custom factory its TUI: tui.showOverlay shows a raw panel whose handle works inside the factory (tui.ts:729-826).
+  pi.registerCommand("overlay-show-probe", {
+    description: "Show and focus a raw overlay from a ui.custom factory's tui",
+    handler: async (_args, ctx) => {
+      const result = await ctx.ui.custom((tui, _theme, _keys, done) => {
+        const keys = [];
+        let panel;
+        const child = {
+          focused: false,
+          render: () => [`panel focused=${child.focused} keys=${keys.join("")}`],
+          handleInput: (data) => {
+            keys.push(data);
+            if (data === "x") { panel.hide(); done(`closed:${panel.isFocused()}`); }
+          },
+          invalidate() {},
+        };
+        panel = tui.showOverlay(child, { nonCapturing: true, width: 30 });
+        panel.focus();
+        if (!panel.isFocused() || !child.focused) throw new Error("the panel's focus did not apply inside the factory");
+        return { render: () => ["owner"], handleInput() {}, invalidate() {} };
+      }, { overlay: true });
+      ctx.ui.notify(`overlay-show=${result}`, "info");
+    },
+  });
+  pi.registerCommand("model-stream-fetch-probe", {
+    description: "Exercise the fetch option of modelRegistry.stream",
+    handler: async (_args, ctx) => {
+      const model = { provider: "conformance", id: "declared", modelId: "declared", api: "openai-responses" };
+      const request = { systemPrompt: "fetch", messages: [{ role: "user", content: "hello", timestamp: 1 }] };
+      const seen = {};
+      const fetch = async (url, init) => {
+        seen.url = String(url);
+        seen.method = init.method;
+        seen.host = new Headers(init.headers).get("x-host");
+        seen.body = Buffer.from(init.body).toString();
+        return new Response(Uint8Array.from({ length: 70000 }, (_, index) => index % 251), { status: 207, statusText: "Answered", headers: { "x-sdk-fetch": "answered" } });
+      };
+      const stream = ctx.modelRegistry.stream(model, request, { fetch });
+      for await (const event of stream) void event;
+      if ((await stream.result()).stopReason !== "stop") throw new Error("fetch stream did not stop");
+      if (seen.url !== "https://fetch.invalid/v1/chat?x=1" || seen.method !== "POST" || seen.host !== "1" || seen.body !== "ping-body") throw new Error(`fetch saw ${JSON.stringify(seen)}`);
+      if ((await ctx.modelRegistry.stream(model, request, {}).result()).stopReason !== "stop") throw new Error("plain stream did not stop");
+      ctx.ui.notify("model-fetch=ok", "info");
+    },
+  });
+  pi.registerCommand("liveness_host_call", { description: "Exercise an awaited host call", handler: async (_args, ctx) => ctx.waitForIdle() });
+  pi.registerCommand("liveness_user_call", { description: "Exercise an interactive host call", handler: async (_args, ctx) => ctx.ui.input("Question", "Answer") });
+  pi.registerCommand("liveness_fire_call", { description: "Exercise a no-result UI host call", handler: async (_args, ctx) => ctx.ui.setTitle("Conformance title") });
+  // io_wait waits on a plain TCP read: it dials the address it gets, announces itself with a "waiting" line and returns when the peer writes a line.
+  pi.registerCommand("io_wait", {
+    description: "Wait on a socket read",
+    handler: (args) => new Promise((resolve, reject) => {
+      const [host, port] = String(args).split(":");
+      const socket = ioWaitConnect({ host, port: Number(port) });
+      socket.setEncoding("utf8");
+      socket.on("connect", () => socket.write("waiting\n"));
+      socket.on("data", () => { socket.destroy(); resolve(); });
+      socket.on("error", reject);
+    }),
+  });
+  let nameWaitAddr = "";
+  pi.registerCommand("io_wait_name", {
+    description: "Make the session_info_changed handler wait on a socket read",
+    handler: async (args) => { nameWaitAddr = String(args); },
+  });
+  // io_wait_input and io_wait_start subscribe an input / before_agent_start handler that waits on a socket read first and then notifies "<event>:<text or prompt>".
+  const ioWaitOnce = (addr) => new Promise((resolve, reject) => {
+    const [host, port] = addr.split(":");
+    const socket = ioWaitConnect({ host, port: Number(port) });
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write("waiting\n"));
+    socket.on("data", () => { socket.destroy(); resolve(); });
+    socket.on("error", reject);
+  });
+  pi.registerCommand("io_wait_input", {
+    description: "Make an input handler wait on a socket read",
+    handler: async (args) => {
+      const addr = String(args);
+      pi.on("input", async (event, ctx) => { await ioWaitOnce(addr); ctx.ui.notify(`input:${event.text}`, "info"); });
+    },
+  });
+  pi.registerCommand("io_wait_start", {
+    description: "Make a before_agent_start handler wait on a socket read",
+    handler: async (args) => {
+      const addr = String(args);
+      pi.on("before_agent_start", async (event, ctx) => { await ioWaitOnce(addr); ctx.ui.notify(`before_agent_start:${event.prompt}`, "info"); });
+    },
+  });
+  pi.registerCommand("command_error", { description: "Return a command error", handler: async () => { throw new Error("command exploded"); } });
+  pi.registerCommand("command_awaited_error", {
+    description: "Return an error after awaited work",
+    handler: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      throw new Error("awaited command exploded");
+    },
+  });
+  pi.registerCommand("status", { description: "Set a status entry", handler: async (_args, ctx) => ctx.ui.setStatus("conformance", "ok") });
+  pi.registerCommand("status_burst", {
+    description: "Set one status repeatedly without awaiting",
+    handler: async (_args, ctx) => { for (let i = 0; i < 200; i++) ctx.ui.setStatus("burst", String(i)); },
+  });
+  // effect_probe: one host API called in the synchronous part of an event handler, a command or a tool, which then returns (TestConformance_HandlerEffectsPrecedeTheReleaseOfItsCaller).
+  const effectProbeKinds = {
+    notify: (ctx) => ctx.ui.notify("effect_probe:notify", "info"),
+    status: (ctx) => ctx.ui.setStatus("effect_probe", "status"),
+    title: (ctx) => ctx.ui.setTitle("effect_probe:title"),
+    widget: (ctx) => ctx.ui.setWidget("effect_probe", ["effect_probe:widget"]),
+    editor: (ctx) => ctx.ui.setEditorText("effect_probe:editor"),
+    // The host actions after a slow notify: the call that follows the notify can apply only once the notify did.
+    append: (ctx) => { ctx.ui.notify("effect_probe:lead", "info"); pi.appendEntry("effect_probe", "entry"); },
+    sendUserMessage: (ctx) => { ctx.ui.notify("effect_probe:lead", "info"); pi.sendUserMessage("effect_probe:user"); },
+    failedAppend: (ctx) => { pi.appendEntry("effect_probe_fails", "entry"); ctx.ui.notify("effect_probe:notify", "info"); },
+  };
+  pi.registerCommand("effect_probe_on", { description: "Subscribe a handler that calls one host API and returns: <event> <kind> [sync|await]; a sync handler is not an async function, an await handler then awaits a timer for 20 s", handler: async (args) => { const [event, kind, style] = String(args).trim().split(" "); if (style === "sync") pi.on(event, (_event, ctx) => { effectProbeKinds[kind](ctx); }); else if (style === "await") pi.on(event, async (_event, ctx) => { effectProbeKinds[kind](ctx); await new Promise((resolve) => setTimeout(resolve, 20000)); }); else pi.on(event, async (_event, ctx) => { effectProbeKinds[kind](ctx); }); } });
+  pi.registerCommand("effect_probe_run", { description: "Call one host API and return", handler: async (args, ctx) => { effectProbeKinds[String(args).trim()](ctx); } });
+  pi.registerCommand("effect_probe_tool", {
+    description: "Register a tool that calls one host API and returns",
+    handler: async () => {
+      pi.registerTool({ name: "effect_probe_tool", label: "effect_probe_tool", description: "Call one host API and return", parameters: { type: "object", properties: { kind: { type: "string" } } }, execute: async (_id, params, _signal, _update, ctx) => { effectProbeKinds[params.kind](ctx); return { content: [{ type: "text", text: "ok" }] }; } });
+    },
+  });
+  // A width handler makes a host call the way any other handler does; the host's reply must reach it (conformance TestConformance_WidthHandlerHostCall).
+  let widthProbe;
+  pi.registerCommand("arm_width_probe", { description: "Notify from a width handler", handler: async (_args, ctx) => { widthProbe ??= ctx.ui.onWidthChange(async (width) => { await ctx.ui.notify(`width-probe:${width}`, "info"); await ctx.ui.notify(`width-probe-returned:${width}`, "info"); }); } });
+  let eventProbeOff;
+  pi.registerCommand("event_probe_subscribe", { description: "Subscribe to turn_end after connecting", handler: async () => { eventProbeOff = pi.on("turn_end", async (event, ctx) => { ctx.ui.notify(`event_probe:${event.messageEntryId}`, "info"); }); } });
+  pi.registerCommand("event_probe_unsubscribe", { description: "Remove the turn_end handler registered after connecting", handler: async () => { eventProbeOff?.(); eventProbeOff = undefined; } });
+  // D614 plugin UI mounts: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewMounts).
+  const viewText = (ctx, suffix) => ({ root: { kind: "text", text: `fixture-view-${ctx.ui.viewAbilities()?.limits.intentArgBytes ?? 0}${suffix}` } });
+  const viewCode = async (call) => {
+    try {
+      await call();
+      return "none";
+    } catch (err) {
+      return err.code;
+    }
+  };
+  let viewCancelledTag = "";
+  pi.registerCommand("ui_view_abilities", { description: "Report the replicated client abilities", handler: async (_args, ctx) => {
+    const ab = ctx.ui.viewAbilities();
+    ctx.ui.notify(ab ? `view-abilities:mounts=${ab.limits.mounts},argbytes=${ab.limits.intentArgBytes},slots=${ab.slots.join("+")},nodes=${ab.nodes.join("+")},markdown=${ab.markdown}` : "view-abilities:none", "info");
+  } });
+  pi.registerCommand("ui_view_probe", { description: "Mount, update, hide, show, finish and remove a view", handler: async (_args, ctx) => {
+    let st = await ctx.ui.mountView({ key: "probe", slot: "panel", view: viewText(ctx, "") });
+    ctx.ui.notify(`view-mounted:epoch=${st.mount.epoch},rev=${st.mount.rev},state=${st.state}`, "info");
+    const first = st.mount;
+    st = await ctx.ui.updateView(first, { view: viewText(ctx, "-2") });
+    ctx.ui.notify(`view-updated:rev=${st.mount.rev}`, "info");
+    ctx.ui.notify(`view-stale:${await viewCode(() => ctx.ui.updateView(first, { view: viewText(ctx, "-stale") }))}`, "info");
+    const cur = st.mount;
+    ctx.ui.notify(`view-hidden:${(await ctx.ui.hideView(cur)).state}`, "info");
+    ctx.ui.notify(`view-shown:${(await ctx.ui.showView(cur)).state}`, "info");
+    ctx.ui.notify(`view-finished:${(await ctx.ui.finishView(cur)).state}`, "info");
+    ctx.ui.notify(`view-terminal:${await viewCode(() => ctx.ui.removeView(cur))}`, "info");
+    ctx.ui.notify(`view-final:${(await ctx.ui.viewState("probe")).state}`, "info");
+    const intents = [
+      { name: "fx.add", arg: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] }, answer: { type: "object", properties: { sum: { type: "integer" } }, required: ["sum"] } },
+      { name: "fx.wait", arg: { type: "object", properties: { tag: { type: "string" } }, required: ["tag"] }, cancellable: true, timeoutMs: 5000 },
+    ];
+    st = await ctx.ui.mountView({ key: "probe2", slot: "panel", view: viewText(ctx, "-live"), intents });
+    ctx.ui.notify(`view-second:epoch=${st.mount.epoch},rev=${st.mount.rev}`, "info");
+  } });
+  pi.registerCommand("ui_view_cancelled", { description: "Report the intent whose handler was cancelled", handler: async (_args, ctx) => ctx.ui.notify(`intent-cancelled:${viewCancelledTag}`, "info") });
+  pi.registerCommand("ui_view_state", { description: "Report the state of the second mount", handler: async (_args, ctx) => {
+    const st = await ctx.ui.viewState("probe2");
+    ctx.ui.notify(`view-state:${st.state}:${st.reason ?? ""}`, "info");
+  } });
+  // D614 amendment: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewExtras).
+  const xClaim = (claims, name) => (claims ?? []).find((c) => c.name === name)?.value;
+  const xPicked = (ab) => xClaim((ab.slotClaims ?? []).find((s) => s.slot === "panel")?.claims, "display.colors");
+  const xList = (id, label) => ({ root: { kind: "select-list", id, items: [{ value: id, label }], maxVisible: 5 } });
+  const xRects = (n) => Array.from({ length: n }, () => ({ kind: "rect", width: 1, height: 1 }));
+  pi.registerCommand("ui_view_extras", { description: "Mount a view with alternatives, a drawing, a11y and focus, and probe the bounds", handler: async (_args, ctx) => {
+    const ab = ctx.ui.viewAbilities();
+    const picked = xPicked(ab);
+    ctx.ui.notify(`view-x-claims:colors=${xClaim(ab.claims, "display.colors")},kind=${xClaim(ab.claims, "display.kind")},gestures=${xClaim(ab.claims, "input.gestures").join("+")},hover=${xClaim(ab.claims, "display.hover")},panel.colors=${picked},profiles=${ab.drawing.profiles.join("+")},shapes=${ab.drawing.shapes},pixels=${ab.drawing.pixels}`, "info");
+    const base = xList("base", "fixture-x-base");
+    const st = await ctx.ui.mountView({
+      key: "extras", slot: "panel", view: base, intents: [{ name: "fx.tap", arg: { type: "object" } }],
+      alternatives: [{
+        when: { any: [{ all: [{ claim: "display.colors", op: "equals", value: picked }] }] },
+        view: xList("alt", `fixture-x-alt-${picked}`),
+        drawing: { profile: "scene", shapes: xRects(ab.drawing.shapes - 1), regions: [{ key: "r", shape: { kind: "rect", width: 4, height: 4 }, gestures: ["activate"], intent: "fx.tap", name: "Tap" }] },
+      }],
+      a11y: [{ node: "alt", name: `Extras ${picked}`, role: "button", checked: true, relations: [{ kind: "describedBy", target: "base" }] }, { node: "base", name: "Base" }],
+      focus: [{ node: "alt", request: "mount", restore: "previous" }],
+    });
+    ctx.ui.notify(`view-x-mounted:${st.state}`, "info");
+    const attempt = async (label, content) => ctx.ui.notify(`view-x-${label}:${await viewCode(() => ctx.ui.updateView(st.mount, { view: base, ...content }))}`, "info");
+    const scene = (shapes) => ({ drawing: { profile: "scene", shapes } });
+    let nested = { kind: "rect", width: 1, height: 1 };
+    for (let i = 0; i < 8; i++) nested = { kind: "group", children: [nested] };
+    await attempt("alts", { alternatives: Array.from({ length: 9 }, () => ({ when: { any: [{ all: [{ claim: "display.hover", op: "present" }] }] }, view: base })) });
+    await attempt("nest", scene([nested]));
+    await attempt("points", scene([{ kind: "polyline", points: Array.from({ length: 1025 }, (_, i) => ({ x: i, y: i })) }]));
+    await attempt("shapes", scene(xRects(4097)));
+    await attempt("a11y", { a11y: Array.from({ length: 257 }, (_, i) => ({ node: `n${i}` })) });
+    await attempt("over", scene(xRects(ab.drawing.shapes + 1)));
+    await attempt("pixels", { drawing: { profile: "pixels", pixels: { width: 2, height: 2, asset: "img", scaling: "nearest" } }, assets: [{ id: "img", mime: "image/png", size: 4, sha256: "a".repeat(64), delivery: "inline" }] });
+    let stale = "none";
+    for (let i = 0; i < 3; i++) stale = await viewCode(() => ctx.ui.updateView({ ...st.mount, rev: st.mount.rev + 50 }, { view: base }));
+    ctx.ui.notify(`view-x-stale:${stale}`, "info");
+    const notices = await ctx.ui.viewDiagnostics("extras");
+    const count = (code) => notices.filter((n) => n.code === code && n.path === "update").reduce((sum, n) => sum + n.count, 0);
+    ctx.ui.notify(`view-x-diag:invalid=${count("invalid")},limit=${count("limit")},unsupported=${count("unsupported")},stale=${count("stale")}`, "info");
+    ctx.ui.notify(`view-x-bigresult:${await viewCode(() => ctx.ui.finishView(st.mount, "r".repeat(65536)))}`, "info");
+  } });
+  pi.registerCommand("ui_view_extras_end", { description: "Read the notices of the extras mount and finish it with a result", handler: async (_args, ctx) => {
+    const picked = xPicked(ctx.ui.viewAbilities());
+    const st = await ctx.ui.viewState("extras");
+    const notices = await ctx.ui.viewDiagnostics("extras");
+    ctx.ui.notify(`view-x-diag2:n=${notices.length},last=${notices[notices.length - 1]?.path ?? ""}`, "info");
+    const done = await ctx.ui.finishView(st.mount, { picked });
+    ctx.ui.notify(`view-x-finished:${done.state},picked=${done.result?.picked}`, "info");
+    const cur = await ctx.ui.viewState("extras");
+    ctx.ui.notify(`view-x-state:${cur.state},picked=${cur.result?.picked}`, "info");
+  } });
+  // D614: the redraw panel and the abilities watcher, the same way in every SDK fixture (conformance TestConformance_UIViewAnswerRedraw and
+  // TestConformance_UIViewAbilitiesEvent).
+  const redrawShape = (member) => ({ type: "object", properties: { [member]: { type: "integer" } }, required: [member] });
+  const redrawIntents = ["fx.redraw", "fx.foreign"].map((name) => ({ name, arg: redrawShape("n"), answer: redrawShape("rev") }));
+  const textView = (text) => ({ root: { kind: "text", text } });
+  // foreignUpdate hands an update to the loop the ui_view_redraw command started: the call is made in that command's continuation, so it is the
+  // extension's, not an intent handler's.
+  let foreignUpdate = async () => { throw new Error("ui_view_redraw has not run"); };
+  pi.registerCommand("ui_view_redraw", { description: "Mount the panel whose intents redraw it", handler: async (_args, ctx) => {
+    const st = await ctx.ui.mountView({ key: "redraw", slot: "panel", view: textView("fixture-redraw-0"), intents: redrawIntents });
+    const jobs = [];
+    let wake = () => {};
+    foreignUpdate = (mount, content) => new Promise((resolve, reject) => { jobs.push({ mount, content, resolve, reject }); wake(); });
+    (async () => {
+      for (;;) {
+        while (jobs.length === 0) await new Promise((resolve) => { wake = resolve; });
+        const job = jobs.shift();
+        ctx.ui.updateView(job.mount, job.content).then(job.resolve, job.reject);
+      }
+    })();
+    ctx.ui.notify(`view-redraw:rev=${st.mount.rev}`, "info");
+  } });
+  const viewWatch = { armed: false, block: false, events: 0, release: undefined };
+  const describeAbilities = (ab) => (ab ? `slots=${ab.slots.join("+")},mounts=${ab.limits.mounts}` : "none");
+  pi.onViewAbilities(async (ab, ctx) => {
+    viewWatch.events++;
+    if (!viewWatch.armed) return;
+    if (viewWatch.block) {
+      viewWatch.block = false;
+      ctx.ui.notify("view-event-blocked", "info");
+      await new Promise((resolve) => { viewWatch.release = resolve; });
+      ctx.ui.notify("view-event-released", "info");
+    }
+    if (!ab) {
+      ctx.ui.notify("view-event:none", "info");
+      return;
+    }
+    ctx.ui.notify(`view-event:${describeAbilities(ab)},same=${describeAbilities(ab) === describeAbilities(ctx.ui.viewAbilities())}`, "info");
+    try {
+      const st = await ctx.ui.mountView({ key: "arrived", slot: "panel", view: textView(`fixture-arrived-${ab.limits.mounts}`) });
+      ctx.ui.notify(`view-arrived:${st.state}`, "info");
+    } catch (err) {
+      ctx.ui.notify(`view-arrived:${err.code}`, "info");
+    }
+  });
+  pi.registerCommand("ui_view_watch", { description: "Arm the abilities watcher", handler: async (_args, ctx) => { viewWatch.armed = true; ctx.ui.notify("view-watch:armed", "info"); } });
+  pi.registerCommand("ui_view_block", { description: "Block the abilities watcher on its next event", handler: async (_args, ctx) => { viewWatch.block = true; ctx.ui.notify("view-block:set", "info"); } });
+  pi.registerCommand("ui_view_release", { description: "Release the blocked abilities watcher", handler: async (_args, ctx) => { viewWatch.release?.(); viewWatch.release = undefined; ctx.ui.notify("view-release:done", "info"); } });
+  pi.registerCommand("ui_view_events", { description: "Report how often the abilities watcher ran", handler: async (_args, ctx) => ctx.ui.notify(`view-events:${viewWatch.events}`, "info") });
+  // D614: a view an agent's tool shows. The command registers the tool; the tool mounts a titled panel, hides it, shows it and
+  // updates it with a focus request, the same way in every SDK fixture (conformance TestConformance_UIViewToolShowsAndFocuses).
+  // D521: bigint_tool registers a tool whose schema declares a bigint parameter and answers the kind of value it receives for it and the value.
+  pi.registerCommand("bigint_tool", { description: "Register the tool that reports what a bigint argument arrives as", handler: async () => {
+    pi.registerTool({
+      name: "bigint_arg",
+      label: "bigint_arg",
+      description: "Report the kind and value of n",
+      parameters: { type: "object", required: ["n"], properties: { n: { type: "bigint" } } },
+      async execute(_id, params) { return { content: [{ type: "text", text: `${typeof params.n === "string" ? "string" : "other"}:${params.n}` }] }; },
+    });
+  } });
+  pi.registerCommand("ui_view_tool", { description: "Register the tool that shows a titled view", handler: async () => {
+    pi.registerTool({
+      name: "view_show",
+      label: "view_show",
+      description: "Mount, show and focus a titled view",
+      parameters: { type: "object", properties: {} },
+      async execute(_id, params, _signal, _onUpdate, ctx) {
+        const text = (value) => ({ content: [{ type: "text", text: value }] });
+        if (params.op === "hide") return text(`view-tool:${(await ctx.ui.hideView((await ctx.ui.viewState("shown")).mount)).state}`);
+        const content = (title, request) => ({
+          title, view: xList(params.node, "fixture-shown"),
+          intents: [{ name: "fx.reopen", arg: { type: "object" }, whenHidden: true }, { name: "fx.tap", arg: { type: "object" } }],
+          focus: [request ? { node: params.node, request } : { node: params.node }],
+        });
+        let st = await ctx.ui.mountView({ key: "shown", slot: "panel", ...content(params.title) });
+        st = await ctx.ui.hideView(st.mount);
+        st = await ctx.ui.showView(st.mount);
+        st = await ctx.ui.updateView(st.mount, content(`${params.title}/2`, "update"));
+        return text(`view-tool:${st.state},rev=${st.mount.rev}`);
+      },
+    });
+  } });
+  // D614 grid node: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewGrid). The argument is the
+  // row's token: the cell values, the selection and one chip text are built from it. A view is a plain object here, so this fixture can
+  // also write a member the record lacks (the `member` line); the builders of the Go, Rust and Python kits cannot.
+  pi.registerCommand("ui_view_grid", { description: "Mount a month as a grid and probe the bounds of the grid", handler: async (args, ctx) => {
+    const tok = args.trim();
+    const cells = [{ label: "30", dim: true }, { label: "31", dim: true }];
+    for (let d = 1; d <= 28; d++) {
+      const cell = { value: `${tok}-${d}`, label: String(d) };
+      if (d === 1) Object.assign(cell, { chips: [{ text: `${tok} standup`, color: "#3366cc" }, { text: "lunch", color: "accent" }], more: 2 });
+      if (d === 2) Object.assign(cell, { mark: "current", color: "#ff000080" });
+      if (d === 3) cell.chips = [{ text: "plain" }];
+      if (d === 28) delete cell.label;
+      cells.push(cell);
+    }
+    const content = (grid) => ({
+      view: { root: { kind: "container", children: [{ kind: "text", text: `Month ${tok}`, paddingX: 0, paddingY: 0 }, { kind: "grid", id: "month", ...grid }] } },
+      intents: [{ name: "fx.pick", nodeKey: "month", arg: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }],
+      fallback: { kind: "text", text: `grid-fallback ${tok}`, paddingX: 0, paddingY: 0 },
+    });
+    const st = await ctx.ui.mountView({ key: "grid", slot: "panel", ...content({ columns: 7, head: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"], chipRows: 2, selected: `${tok}-2`, cells }) });
+    ctx.ui.notify(`view-g-mounted:${st.state}`, "info");
+    const attempt = async (label, columns, cells) => ctx.ui.notify(`view-g-${label}:${await viewCode(() => ctx.ui.updateView(st.mount, content({ columns, cells })))}`, "info");
+    await attempt("cells", 7, Array.from({ length: 129 }, () => ({ label: "x" })));
+    await attempt("chips", 7, [{ value: "a", chips: Array.from({ length: 9 }, () => ({ text: "c" })) }]);
+    await attempt("columns", 17, [{ value: "a" }]);
+    await attempt("mark", 7, [{ value: "a", mark: tok }]);
+    await attempt("member", 7, [{ value: "a", extra: 1 }]);
+    const cur = await ctx.ui.viewState("grid");
+    ctx.ui.notify(`view-g-state:${cur.state},rev=${cur.mount.rev}`, "info");
+  } });
+  // D614 node ids: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewNodeIds). The argument is the
+  // row's token: the ids of the container, the text and the box are built from it.
+  pi.registerCommand("ui_view_node_ids", { description: "Mount a view whose container, text and box carry an id", handler: async (args, ctx) => {
+    const tok = args.trim();
+    const st = await ctx.ui.mountView({
+      key: "ids",
+      slot: "panel",
+      view: { root: { kind: "container", id: `${tok}-root`, children: [
+        { kind: "text", id: `${tok}-label`, text: `Label ${tok}`, paddingX: 0, paddingY: 0, bg: "selectedBg" },
+        { kind: "box", id: `${tok}-frame`, paddingX: 1, paddingY: 0, bg: "toolPendingBg", children: [{ kind: "text", text: "inside", paddingX: 0, paddingY: 0 }] },
+      ] } },
+      a11y: [{ node: `${tok}-label`, name: `Label ${tok}` }],
+    });
+    ctx.ui.notify(`view-i-mounted:${st.state}`, "info");
+  } });
+  // D614 image id: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewImageID). The argument is the row's token and a Kitty image id only that row uses: the image node carries both, its bytes are the token's.
+  pi.registerCommand("ui_view_image_id", { description: "Mount a view whose image node carries a Kitty image id", handler: async (args, ctx) => {
+    const [tok, number] = args.trim().split(" ");
+    const bytes = Buffer.from(`pig-image-${tok}`);
+    const ref = createHash("sha256").update(bytes).digest("hex");
+    const st = await ctx.ui.mountView({
+      key: "image-id",
+      slot: "panel",
+      view: {
+        root: { kind: "image", id: `${tok}-photo`, ref, mimeType: "image/png", imageId: Number(number), filename: `${tok}.png` },
+        images: [{ ref, mimeType: "image/png", data: bytes.toString("base64") }],
+      },
+    });
+    ctx.ui.notify(`view-m-mounted:${st.state}`, "info");
+  } });
+  // D614 bindings: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewBindings).
+  pi.registerCommand("ui_view_bindings", { description: "Mount a view with bindings and probe what the host refuses", handler: async (args, ctx) => {
+    const [key, number] = args.split(" ");
+    const n = Number(number);
+    const content = (bindings) => ({
+      view: viewText(ctx, "-bind"), bindings,
+      intents: [{ name: "fx.go", arg: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] } }, { name: "fx.tap", arg: { type: "object" } }],
+    });
+    const goTo = (key, n) => ({ key, intent: "fx.go", arg: { n } });
+    const tap = (key) => ({ key, intent: "fx.tap" });
+    const st = await ctx.ui.mountView({ key: "bind", slot: "panel", ...content([{ ...goTo(key, n), name: `Go ${n}` }, goTo("w", n + 1), { gesture: "swipe-left", intent: "fx.tap" }]) });
+    ctx.ui.notify(`view-b-mounted:${st.state}`, "info");
+    const attempt = async (label, bindings) => ctx.ui.notify(`view-b-${label}:${await viewCode(() => ctx.ui.updateView(st.mount, content(bindings)))}`, "info");
+    await attempt("many", [..."abcdefghijklmnopqrstuvwxyz0123456"].map(tap));
+    await attempt("reserved", [tap("shift+tab")]);
+    await attempt("order", [tap("ctrl+shift+p"), tap("shift+ctrl+p")]);
+    await attempt("gesture", [{ gesture: "pinch", intent: "fx.tap" }]);
+    await attempt("arg", [goTo("a", "x")]);
+    await attempt("ok", [goTo("ctrl+shift+p", n), goTo("shift+ctrl+q", n + 1)]);
+  } });
+  // D614 slot dialog: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDialog).
+  pi.registerCommand("ui_view_dialog", { description: "Mount a titled view with a bound key in the dialog slot, hide it and show it", handler: async (args, ctx) => {
+    const [key, number] = args.split(" ");
+    const n = Number(number);
+    let st;
+    try {
+      st = await ctx.ui.mountView({
+        key: "dlg", slot: "dialog", title: `Chart ${n}`, view: viewText(ctx, "-dlg"),
+        intents: [{ name: "fx.add", arg: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] }, answer: { type: "object", properties: { sum: { type: "integer" } }, required: ["sum"] } }],
+        bindings: [{ key, intent: "fx.add", arg: { n } }],
+      });
+    } catch (err) {
+      ctx.ui.notify(`view-d-mounted:${err.code}`, "info");
+      return;
+    }
+    ctx.ui.notify(`view-d-mounted:${st.state}`, "info");
+    ctx.ui.notify(`view-d-hidden:${(await ctx.ui.hideView(st.mount)).state}`, "info");
+    ctx.ui.notify(`view-d-shown:${(await ctx.ui.showView(st.mount)).state}`, "info");
+  } });
+  // D614 dismiss: the probe every SDK fixture implements the same way (conformance TestConformance_UIViewDismiss).
+  pi.registerCommand("ui_view_dismiss", { description: "Mount a dialog with a dismiss intent and probe what the host refuses", handler: async (args, ctx) => {
+    const object = { type: "object" };
+    const tap = { name: "fx.tap", arg: object };
+    const closing = (name) => ({ name, arg: object, dismiss: true });
+    const content = (intents) => ({ view: viewText(ctx, "-dismiss"), intents });
+    const st = await ctx.ui.mountView({ key: "dismiss", slot: "dialog", ...content([tap, closing(args)]) });
+    ctx.ui.notify(`view-d-mounted:${st.state}`, "info");
+    const attempt = async (label, intents) => ctx.ui.notify(`view-d-${label}:${await viewCode(() => ctx.ui.updateView(st.mount, content(intents)))}`, "info");
+    await attempt("two", [tap, closing(args), closing(`${args}2`)]);
+    await attempt("node", [tap, { ...closing(args), nodeKey: "n" }]);
+    await attempt("arg", [tap, { ...closing(args), arg: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }]);
+    await attempt("ok", [closing(args), tap]);
+  } });
+  pi.onViewIntent(async (inv, ctx) => {
+    if (inv.intent.startsWith("fx.close-")) {
+      // The user dismissed the dialog: the client raised the intent with {}, and its handler removes the mount.
+      if (JSON.stringify(inv.arg) !== "{}") return { outcome: "refused", error: "dismiss takes {}" };
+      await ctx.ui.removeView({ ...inv.mount, rev: inv.rev });
+      return { outcome: "done" };
+    }
+    if (inv.intent === "fx.redraw" || inv.intent === "fx.foreign") {
+      const own = inv.intent === "fx.redraw";
+      const content = { view: textView(`fixture-${own ? "redraw" : "foreign"}-${inv.arg.n + (ctx.ui.viewAbilities()?.limits.intentArgBytes ?? 0)}`), intents: redrawIntents };
+      const mount = { key: inv.mount.key, epoch: inv.mount.epoch, rev: inv.rev };
+      const st = own ? await ctx.ui.updateView(mount, content) : await foreignUpdate(mount, content);
+      return { outcome: "done", answer: { rev: st.mount.rev } };
+    }
+    if (inv.intent === "fx.reopen") {
+      // The user opened the hidden view: its handler shows it.
+      await ctx.ui.showView({ ...inv.mount, rev: inv.rev });
+      return { outcome: "done" };
+    }
+    if (inv.intent === "fx.pick") return { outcome: "done", answer: { node: inv.nodeKey, picked: inv.arg.value } };
+    if (inv.intent === "fx.add") return { outcome: "done", answer: { sum: inv.arg.n * 2 + (ctx.ui.viewAbilities()?.limits.intentArgBytes ?? 0) } };
+    if (inv.intent === "fx.wait") {
+      ctx.ui.notify(`intent-started:${inv.arg.tag}`, "info");
+      if (!inv.signal.aborted) await new Promise((resolve) => inv.signal.addEventListener("abort", resolve, { once: true }));
+      // A call made after the cancel is cancelled with its request, so the tag is kept for ui_view_cancelled.
+      viewCancelledTag = inv.arg.tag;
+      return { outcome: "done", answer: {} };
+    }
+    return { outcome: "refused", error: "unknown intent" };
+  });
+  pi.registerCommand("report_geometry", { description: "Report observed terminal geometry", handler: async (_args, ctx) => ctx.ui.notify(`geometry:${ctx.width}x${ctx.height}`, "info") });
+
+  pi.registerCommand("surface_footer", { description: "Install a footer renderer", handler: async (_args, ctx) => ctx.ui.setFooter(() => ({ render: (width) => [`footer@${width}`], invalidate() {} })) });
+  pi.registerCommand("surface_header", { description: "Install a header renderer", handler: async (_args, ctx) => ctx.ui.setHeader(() => ({ render: (width) => [`header@${width}`], invalidate() {} })) });
+  pi.registerCommand("surface_static_footer", { description: "Push static footer rows", handler: async (_args, ctx) => ctx.ui.setFooter(() => ({ render: () => [`static@${ctx.width}`], invalidate() {} })) });
+  pi.registerCommand("surface_static_header", { description: "Push static header rows", handler: async (_args, ctx) => ctx.ui.setHeader(() => ({ render: () => [`static@${ctx.width}`], invalidate() {} })) });
+  pi.registerCommand("surface_widget", { description: "Set a string list widget wider than the pane", handler: async (_args, ctx) => ctx.ui.setWidget("wide", ["A".repeat(60) + " tail", "short"]) });
+
+  let unsubscribeTerminalInput;
+  pi.registerCommand("term_subscribe", {
+    description: "Subscribe to raw terminal input",
+    handler: async (_args, ctx) => {
+      unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) => {
+        if (["\ud83d", "\ude00", "😀"].includes(data)) return { data: "seen:" + data };
+        if (data === "\x1b[96~") return { data: JSON.stringify([ctx.ui.getEditorText(), ctx.ui.getToolsExpanded()]) };
+        if (data === "\x1b[98~") return { data: "rewritten" };
+        if (data === "\x1b[97~") {
+          const until = Date.now() + 200;
+          while (Date.now() < until) {}
+          return { consume: true };
+        }
+        return { consume: data === "\x1b[99~" };
+      });
+    },
+  });
+  pi.registerCommand("term_unsubscribe", {
+    description: "Release the raw input subscription",
+    handler: async () => { unsubscribeTerminalInput?.(); unsubscribeTerminalInput = undefined; },
+  });
+  pi.registerCommand("send_message", { description: "Send a custom message", handler: async () => pi.sendMessage({ customType: "notice", content: "hello-custom", display: true }, { triggerTurn: true, deliverAs: "steer" }) });
+  pi.registerCommand("send_message_default", { description: "Send a custom message with default options", handler: async () => pi.sendMessage({ customType: "notice", content: "default", display: true }) });
+  pi.registerCommand("send_message_no_turn", { description: "Send a custom message that never starts a turn", handler: async () => pi.sendMessage({ customType: "notice", content: "no-turn", display: true }, { triggerTurn: false }) });
+  pi.registerCommand("send_user_message", { description: "Send a user message", handler: async (args) => pi.sendUserMessage(args ? JSON.parse(args) : "hello-user", { deliverAs: "followUp" }) });
+  pi.registerCommand("send_user_message_delivery", { description: "Send a user message with the delivery named by the argument", handler: async (args) => args === "absent" ? pi.sendUserMessage("delivery-absent") : pi.sendUserMessage("delivery-" + args, { deliverAs: args }) });
+  pi.registerCommand("send_refusal_order", { description: "Send a refused user message and others in one run, as the argument names", handler: async (args) => {
+    const first = () => { pi.sendUserMessage("order-absent"); pi.sendUserMessage("order-steer", { deliverAs: "steer" }); pi.sendUserMessage("order-followUp", { deliverAs: "followUp" }); };
+    switch (args) {
+      case "first": first(); break;
+      case "between": pi.sendUserMessage("order-absent"); pi.sendUserMessage("order-steer", { deliverAs: "steer" }); pi.sendUserMessage("order-absent-2"); break;
+      case "yielded": await Promise.resolve(); first(); break;
+      case "throws": first(); throw new Error("order-throws");
+      case "blocked": first(); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000); break;
+      case "detached": setTimeout(first, 100); break;
+      case "detached_alone": setTimeout(() => pi.sendUserMessage("order-absent"), 100); break;
+      default: throw new Error(`send_refusal_order: unknown case ${args}`);
+    }
+  } });
+  pi.registerCommand("send_user_message_expand", { description: "Send a user message with expandPromptTemplates set to the argument", handler: async (args) => pi.sendUserMessage("expand-user", { deliverAs: "followUp", expandPromptTemplates: args === "true" }) });
+  pi.registerCommand("set_session_name", { description: "Set the session name", handler: async () => pi.setSessionName("conformance-session") });
+  pi.registerCommand("event_result_probe", { description: "Subscribe to an event with a handler that returns the given JSON", handler: async (args) => { const [name, ...rest] = String(args).trim().split(" "); const result = JSON.parse(rest.join(" ")); pi.on(name, async () => result); } });
+  pi.registerCommand("event_signal_probe", { description: "Subscribe to session_before_compact or session_before_tree with a handler that returns the state of its event signal", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event, ctx) => {
+    const mode = (name === "session_before_tree" ? event.preparation : event).customInstructions;
+    const before = event.signal.aborted;
+    // Pi's handler awaits ordinary host calls with the signal aborted or aborting (custom-compaction.ts notifies first): the call returns the user's answer.
+    let answer;
+    try { answer = await ctx.ui.input(`event_signal:${name}:${mode}:pending`, "p"); } catch (error) { answer = `failed: ${error?.message ?? error}`; }
+    const state = `event_signal:${mode}:${before}:${event.signal.aborted}:${answer}`;
+    return name === "session_before_compact" ? { compaction: { summary: state, firstKeptEntryId: "k", tokensBefore: 1 } } : { label: state };
+  }); } });
+  pi.registerCommand("tool_call_abort_probe", { description: "Subscribe to tool_call with a handler that answers from a dialog it opened", handler: async () => { pi.on("tool_call", async (event, ctx) => {
+    const mode = event.input?.mode ?? "";
+    let answer;
+    try { answer = await ctx.ui.input(`tool_call_abort:${mode}:pending`, "p"); } catch (error) { answer = `failed: ${error?.message ?? error}`; }
+    return { block: true, reason: `tool_call_abort:${mode}:${answer}` };
+  }); } });
+  pi.registerCommand("event_ordered_result_probe", { description: "Subscribe to an event with a handler that returns the given JSON, members in written order", handler: async (args) => { const [name, ...rest] = String(args).trim().split(" "); const result = JSON.parse(rest.join(" ")); pi.on(name, async () => result); } });
+  pi.registerCommand("event_keys_probe", { description: "Subscribe to the event named by the argument with a handler that reports the key order of its payload", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event, ctx) => { ctx.ui.notify("event_keys:" + name + ":" + JSON.stringify([Object.keys(event.payload), Object.keys(event.payload.zeta)]), "info"); }); } });
+  pi.registerCommand("event_echo_probe", { description: "Subscribe to the event named by the argument with a handler that hands back the objects it was sent", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event) => { switch (name) { case "turn_end": return { entries: event.entries }; case "context": return { messages: event.messages.slice(1) }; case "before_provider_request": return event.payload; case "tool_result": return { content: event.content, details: event.details }; case "message_end": return { message: event.message }; } throw new Error(`event_echo_probe has no echo for ${name}`); }); } });
+  pi.registerCommand("event_mutate_probe", { description: "Subscribe to the event named by the argument `<event> [mode]` with a handler that works on the event's payload (before_provider_request) or headers (before_provider_headers) as the mode says: no mode edits it in place and returns nothing, fail throws after the edit, replace edits nothing and returns a replacement, both edits it in place under a key of its own and returns the replacement, delete (headers) sets the header the first edit wrote to null", handler: async (args) => { const [name, mode] = String(args).trim().split(/\s+/); const key = mode === "fail" ? "inPlaceBeforeError" : mode === "both" ? "inPlaceAlongside" : "inPlace"; const headers = name === "before_provider_headers"; pi.on(name, async (event) => { if (headers) { if (mode === "delete") event.headers["x-pig-inPlace"] = null; else if (mode !== "replace") event.headers[`x-pig-${key}`] = "in-place-edit"; } else if (mode !== "replace") { event.payload[key] = "in-place-edit"; if (event.payload.zeta) event.payload.zeta[key] = "in-place-edit"; } if (mode === "fail") throw new Error("failed after the edit"); if (mode === "replace" || mode === "both") return headers ? { "x-pig-replaced": "returned" } : { replaced: "returned" }; }); } });
+  pi.registerCommand("event_edit_probe", { description: "Subscribe to the event named by the argument `<event> <edit> [fail]` with a handler that makes one edit of the event's content, details, isError, message or messages (tool_result, message_end, context; message_start, turn_end and agent_end hold only the Node probe), returns nothing and, with fail, throws after the edit", handler: async (args) => { const [name, edit, fail] = String(args).trim().split(/\s+/); const edited = "other-event-edit"; const text = () => [{ type: "text", text: edited }]; pi.on(name, async (event) => { switch (`${name}/${edit}`) { case "tool_result/content-assign": event.content = text(); break; case "tool_result/details-assign": event.details = { k: edited }; break; case "tool_result/iserror-assign": event.isError = true; break; case "tool_result/content-deep": event.content[0].text = edited; break; case "tool_result/details-deep": event.details.k = edited; break; case "message_end/deep": case "message_start/deep": case "turn_end/deep": event.message.content[0].text = edited; break; case "agent_end/deep": event.messages[event.messages.length - 1].content[0].text = edited; break; case "message_end/content-assign": event.message.content = text(); break; case "message_end/message-assign": event.message = { role: "user", content: text(), timestamp: 1 }; break; case "context/deep": event.messages[0].content[0].text = edited; break; default: throw new Error(`event_edit_probe has no edit ${name}/${edit}`); } if (fail === "fail") throw new Error("failed after the edit"); }); } });
+  pi.registerCommand("event_field_probe", { description: "Report a field of the events named by the argument `<event> <field>`", handler: async (args) => { const [name, field] = String(args).trim().split(/\s+/); pi.on(name, async (event, ctx) => { ctx.ui.notify(`event_field:${name}.${field}=${JSON.stringify(event[field]) ?? "absent"}`, "info"); }); } });
+  // event_level_edit_probe `<event> <top|deep>` subscribes to the event with a handler that edits it in place and returns nothing: `top` assigns a member of the event itself (probeTop), `deep` edits inside the message the event carries (the first user message of a `messages` list): the text of its first text block, else a string content, else a `probe` member. Every edit writes `other-event-edit` (TestInPlaceMessageEventEditsMatchPi).
+  pi.registerCommand("event_level_edit_probe", { description: "Subscribe to the event named by the argument `<event> <top|deep>` with a handler that edits the event itself or the message inside it in place", handler: async (args) => { const [name, level] = String(args).trim().split(/\s+/); const edited = "other-event-edit"; pi.on(name, async (event) => { if (level === "top") { event.probeTop = edited; return; } const list = event.messages; const target = event.message ?? (Array.isArray(list) ? (list.find((m) => m?.role === "user") ?? list[0]) : undefined); if (!target || typeof target !== "object") return; const first = Array.isArray(target.content) ? target.content[0] : undefined; if (first && typeof first === "object" && first.type === "text") first.text = edited; else if (typeof target.content === "string") target.content = edited; else target.probe = edited; }); } });
+  // event_member_probe `<event> <set|delete|once> <member> [json]` subscribes to the event with a handler that assigns the member the JSON, deletes it, or (once) assigns it in its first call only and reports `member_probe_stale:<event>:<bool>` whether a later call found it already there (TestInPlaceMessageEventEditsMatchPi).
+  pi.registerCommand("event_member_probe", { description: "Subscribe to the event named by the argument `<event> <set|delete|once> <member> [json]` with a handler that assigns, deletes or once assigns a member of the event", handler: async (args) => { const [, name, op, member, raw] = String(args).trim().match(/^(\S+)\s+(\S+)\s+(\S+)\s*([\s\S]*)$/); const value = raw === "" ? undefined : JSON.parse(raw); let calls = 0; pi.on(name, async (event, ctx) => { calls++; if (op === "delete") { delete event[member]; return; } if (op === "once" && calls > 1) { ctx.ui.notify(`member_probe_stale:${name}:${JSON.stringify(event[member]) === JSON.stringify(value)}`, "info"); return; } event[member] = value; }); } });
+  // event_assign_probe: `<event>`, a handler that ASSIGNS a new value to one member of the event (tool_call input, context messages, turn_end entries) instead of editing the old value in place, and returns nothing (TestAssignedEventMembersFollowPi).
+  pi.registerCommand("event_assign_probe", { description: "Subscribe to the event named by the argument with a handler that assigns a new value to the event's input, messages or entries", handler: async (args) => { const name = String(args).trim(); const edited = "other-event-edit"; pi.on(name, async (event) => { if (name === "tool_call") event.input = { command: edited }; else if (name === "context") event.messages = [{ role: "user", content: [{ type: "text", text: edited }], timestamp: 1 }]; else if (name === "turn_end") event.entries = [{ type: "custom", customType: edited }]; else throw new Error(`event_assign_probe has no event ${name}`); }); } });
+  pi.registerCommand("event_probe_on", { description: "Subscribe to the event named by the argument", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (_event, ctx) => { ctx.ui.notify(`event_probe_on:${name}`, "info"); }); } });
+  pi.registerCommand("host_state_probe", {
+    description: "Report the thinking level and the session commands",
+    handler: async (_args, ctx) => {
+      const commands = pi.getCommands().map((c) => [c.name, c.description ?? "", c.source, c.sourceInfo?.path ?? "", c.sourceInfo?.scope ?? ""].join("|"));
+      ctx.ui.notify(`getThinkingLevel=${pi.getThinkingLevel()};getCommands=${commands.join(",")}`, "info");
+    },
+  });
+  // rw_prompt_state registers two tools and activates one, reading the system prompt state after each write.
+  pi.registerCommand("rw_prompt_state", {
+    description: "Read the system prompt state after registering and activating tools",
+    handler: async (_args, ctx) => {
+      const tool = (name) => ({ name, label: name, description: name, promptSnippet: `${name}-snippet`, parameters: { type: "object", properties: {} }, execute: async () => ({ content: [{ type: "text", text: "ok" }] }) });
+      pi.registerTool(tool("rw-alpha"));
+      pi.registerTool(tool("rw-beta"));
+      const registered = ctx.getSystemPromptOptions();
+      pi.setActiveTools(["rw-beta"]);
+      const options = ctx.getSystemPromptOptions();
+      const prompt = ctx.getSystemPrompt();
+      ctx.ui.notify(`rw_prompt_state=registered:${registered.toolSnippets?.["rw-alpha"] ?? ""};selected:${(options.selectedTools ?? []).join(",")};beta:${prompt.includes("rw-beta-snippet")};alpha:${prompt.includes("rw-alpha-snippet")}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_after_trigger", {
+    description: "Read isIdle after a message that starts a run",
+    handler: async (_args, ctx) => {
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      ctx.ui.notify(`rw_idle_after_trigger=${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_busy_until_yield", {
+    description: "Read isIdle after a message that starts a run, before and after a wait for the run",
+    handler: async (_args, ctx) => {
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      const sync = [ctx.isIdle(), ctx.isIdle()];
+      await ctx.waitForIdle();
+      ctx.ui.notify(`rw_idle_busy_until_yield=sync:${sync.join(",")};later:${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_send_then_await", {
+    description: "Await the run a message starts with no read in between, then read; again for a second message",
+    handler: async (_args, ctx) => {
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      await ctx.waitForIdle();
+      const awaited = ctx.isIdle();
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      const second = ctx.isIdle();
+      await ctx.waitForIdle();
+      ctx.ui.notify(`rw_idle_send_then_await=awaited:${awaited};second:${second};awaited-again:${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_blocking", {
+    description: "Read isIdle after a message that starts a run and a wait that is no call",
+    handler: async (_args, ctx) => {
+      const before = ctx.isIdle();
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+      ctx.ui.notify(`rw_idle_blocking=before:${before};after:${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_yield_poll", {
+    description: "Poll isIdle with a sleep after a message that starts a run, until the Session is idle",
+    handler: async (_args, ctx) => {
+      pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+      const first = ctx.isIdle();
+      for (const deadline = Date.now() + 5000; !ctx.isIdle() && Date.now() < deadline;) await new Promise((resolve) => setTimeout(resolve, 10));
+      ctx.ui.notify(`rw_idle_yield_poll=first:${first};final:${ctx.isIdle()}`, "info");
+    },
+  });
+  pi.registerCommand("rw_idle_callback", {
+    description: "Read isIdle after a message that starts a run, sent from a timer's callback while the handler awaits it",
+    handler: async (_args, ctx) => {
+      const before = ctx.isIdle();
+      await new Promise((resolve) => {
+        setTimeout(async () => {
+          pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+          const sync = [ctx.isIdle(), ctx.isIdle()];
+          await ctx.waitForIdle();
+          ctx.ui.notify(`rw_idle_callback=before:${before};sync:${sync.join(",")};later:${ctx.isIdle()}`, "info");
+          resolve();
+        }, 10);
+      });
+    },
+  });
+  let rwSettledOnce = false;
+  pi.registerCommand("rw_idle_in_settled", {
+    description: "Read isIdle after a message that starts a run, sent from an agent_settled handler",
+    handler: async () => {
+      pi.on("agent_settled", async (_event, ctx) => {
+        if (rwSettledOnce) return;
+        rwSettledOnce = true;
+        pi.sendMessage({ customType: "rw-trigger", content: "rw-trigger", display: true }, { triggerTurn: true });
+        ctx.ui.notify(`rw_idle_in_settled=${ctx.isIdle()}`, "info");
+      });
+    },
+  });
+  pi.registerCommand("rw_idle_background", {
+    description: "Poll isIdle from a background callback after agent_end",
+    handler: async () => {
+      pi.on("agent_end", async (_event, ctx) => {
+        let idle = false;
+        const deadline = Date.now() + 3000;
+        const poll = () => {
+          idle = ctx.isIdle();
+          if (idle || Date.now() >= deadline) ctx.ui.notify(`rw_idle_background=${idle}`, "info");
+          else setTimeout(poll, 10);
+        };
+        setTimeout(poll, 10);
+      });
+    },
+  });
+  pi.registerCommand("rw_idle_live", {
+    description: "Poll isIdle live and report the sequence of answers",
+    handler: async (_args, ctx) => {
+      const seen = [];
+      const deadline = Date.now() + 10000;
+      const poll = () => {
+        const answer = String(ctx.isIdle());
+        if (seen.at(-1) !== answer) {
+          seen.push(answer);
+          ctx.ui.notify(`rw_idle_live=${seen.join(",")}`, "info");
+        }
+        if (seen.length < 3 && Date.now() < deadline) setTimeout(poll, 10);
+      };
+      poll();
+    },
+  });
+  pi.registerCommand("set_model", {
+    description: "Switch to the model in the arguments",
+    handler: async (args, ctx) => {
+      const slash = args.indexOf("/");
+      const provider = args.slice(0, slash), id = args.slice(slash + 1);
+      // The registry's model of that name, as a Pi extension passes it; a name the registry does not list is an object built by hand.
+      const ok = await pi.setModel(ctx.modelRegistry.find(provider, id) ?? { provider, id });
+      ctx.ui.notify(`setModel=${ok}`, "info");
+    },
+  });
+  pi.registerCommand("set_model_object", {
+    description: "Switch to the model object in the arguments",
+    handler: async (args, ctx) => {
+      try {
+        ctx.ui.notify(`setModelObject=${await pi.setModel(JSON.parse(args))}`, "info");
+      } catch (err) {
+        ctx.ui.notify(`setModelObject=error:${err.message}`, "info");
+      }
+    },
+  });
+  pi.registerCommand("set_model_object_before_agent_start", {
+    description: "Switch to the model object in the arguments before each agent start",
+    handler: async (args) => {
+      const model = JSON.parse(args);
+      pi.on("before_agent_start", async (_event, ctx) => {
+        ctx.ui.notify(`beforeAgentSetModel=${await pi.setModel(model)}`, "info");
+      });
+    },
+  });
+  const eventProbeOn = new Map();
+  const eventProbeResults = new Map();
+  pi.registerCommand("event_probe_result", { description: "Queue the JSON result the next event_probe_on handler call of an event returns", handler: async (args) => { const text = String(args).trim(); const split = text.indexOf(" "); const name = text.slice(0, split); eventProbeResults.set(name, [...(eventProbeResults.get(name) ?? []), JSON.parse(text.slice(split + 1))]); } });
+  pi.registerCommand("event_probe_on", { description: "Subscribe to the event named by the argument", handler: async (args) => { const name = String(args).trim(); const off = pi.on(name, async (event, ctx) => { ctx.ui.notify(`event_probe_on:${name}`, "info"); ctx.ui.notify(`event_probe_data:${name}:${JSON.stringify(event)}`, "info"); if (Array.isArray(event?.servers)) ctx.ui.notify(`event_probe_servers:${event.servers.map((server) => server.name).join(",")}`, "info"); ctx.ui.notify(`event_payload:${name}:${JSON.stringify(event, (_key, value) => (value instanceof Set ? [...value].sort() : value))}`, "info"); const queued = (eventProbeResults.get(name) ?? []).shift(); if (name === "before_provider_headers" && queued) { for (const key of Object.keys(event.headers)) delete event.headers[key]; Object.assign(event.headers, queued); return undefined; } return queued; }); eventProbeOn.set(name, [...(eventProbeOn.get(name) ?? []), off]); } });
+  pi.registerCommand("event_probe_off", { description: "Unsubscribe the event_probe_on handlers of the event named by the argument", handler: async (args) => { const name = String(args).trim(); for (const off of eventProbeOn.get(name) ?? []) off(); eventProbeOn.delete(name); } });
+  // lone_passthrough subscribes to the event named by the argument with a handler that returns the value it received, and lone_send sends the
+  // argument's text back through sendUserMessage, sendMessage or registerProvider (TestConformance_LoneSurrogatePassThroughAcrossSDKs).
+  const loneUnits = (text) => (typeof text === "string" ? Array.from({ length: text.length }, (_, i) => text.charCodeAt(i).toString(16)).join(".") : "none");
+  const loneContent = (content) => (typeof content === "string" ? content : content?.[0]?.text);
+  const loneSeen = { input: (event) => event.text, before_agent_start: (event) => event.systemPrompt, tool_result: (event) => event.content?.[0]?.text, context: (event) => loneContent(event.messages?.[0]?.content), context_edit: (event) => loneContent(event.messages?.[0]?.content) };
+  const loneResult = { input: (event) => ({ action: "transform", text: event.text }), before_agent_start: (event) => ({ systemPrompt: event.systemPrompt }), tool_result: (event) => ({ content: event.content }), context: (event) => ({ messages: event.messages }), context_edit: (event) => ({ messages: [event.messages[0], { role: "user", content: "edited", timestamp: 2 }] }) };
+  pi.registerCommand("lone_passthrough", { description: "Subscribe to the event named by the argument with a handler that returns the value it received", handler: async (args) => { const name = String(args).trim(); pi.on(name === "context_edit" ? "context" : name, async (event, ctx) => { ctx.ui.notify(`lone_seen:${name}:${loneUnits(loneSeen[name](event))}`, "info"); return loneResult[name](event); }); } });
+  pi.registerCommand("lone_send", { description: "Send the argument's text back through sendUserMessage, sendMessage or registerProvider", handler: async (args, ctx) => { const text = String(args); const split = text.indexOf(" "); const kind = text.slice(0, split); const value = text.slice(split + 1); ctx.ui.notify(`lone_seen:${kind}:${loneUnits(value)}`, "info"); if (kind === "user") pi.sendUserMessage(value, { deliverAs: "followUp" }); else if (kind === "custom") pi.sendMessage({ customType: "lone", content: value, display: true }); else await pi.registerProvider("lone-compat", { baseUrl: "https://probe.invalid/v1", api: "openai-completions", apiKey: "probe-key", models: [{ id: "m", name: value, reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 100, compat: { openRouterRouting: { sort: value } } }] }); } });
+  // A JavaScript Set (session_before_compact preparation.fileOps) has no JSON form; the other SDKs receive the host's array, so report the Set as its members.
+  pi.registerCommand("event_payload_probe", { description: "Subscribe and report the payload of the event named by the argument", handler: async (args) => { const name = String(args).trim(); pi.on(name, async (event, ctx) => { ctx.ui.notify(`event_payload:${name}:${stringifyEventPayload(event)}`, "info"); }); } });
+  // event_isolation_probe: two handlers; the first reports the marker it received, writes a sentinel into its container and changes it again from a timer after returning; the second reports what it received (TestConformance_EventHandlersDoNotShareTheirPayload). A boundary event's marker is the first context entry's sourceEntry id (the container is that source entry); a context or context_with_system event's is the length of event.messages (the container is that list).
+  pi.registerCommand("event_isolation_probe", { description: "Subscribe two handlers that report the nested marker they received and then write sentinels into it", handler: async (args) => {
+    const name = String(args).trim();
+    const conversation = name === "context" || name === "context_with_system";
+    const source = (event) => event.context?.contextEntries?.[0]?.sourceEntry;
+    const marker = (event) => (conversation ? (event.messages ?? []).length : source(event)?.id);
+    const scribble = (event, value) => {
+      if (conversation) event.messages.push({ role: "user", content: value, timestamp: 0 });
+      else source(event).id = value;
+    };
+    const messages = (event) => {
+      if (conversation) return [0, 1, 2].map((i) => event.messages?.[i]);
+      const context = event.context ?? {};
+      return [context.contextMessages?.[0], context.llmMessages?.[0], context.contextEntries?.[0]?.messages?.[0]];
+    };
+    const report = (found) => found.map((m) => (m ? String(m.content) : "None")).join("|");
+    pi.on(name, async (event, ctx) => {
+      ctx.ui.notify(`event_isolation:A:${marker(event)}:end`, "info");
+      scribble(event, "SENTINEL-HANDLER-A");
+      const found = messages(event);
+      ctx.ui.notify(`event_isolation_msgs:A:${report(found)}`, "info");
+      for (const m of found) if (m) m.content = "SENTINEL-HANDLER-A";
+      setTimeout(() => {
+        scribble(event, "SENTINEL-LATE-WRITER");
+        for (const m of found) if (m) m.content = "SENTINEL-LATE-WRITER";
+      }, 100);
+    });
+    pi.on(name, async (event, ctx) => {
+      ctx.ui.notify(`event_isolation:B:${marker(event)}:end`, "info");
+      ctx.ui.notify(`event_isolation_msgs:B:${report(messages(event))}`, "info");
+    });
+  } });
+  pi.registerCommand("tool_result_guards_probe", { description: "Report the tool_result guards that accept each tool_result event", handler: async () => { const guards = { bash: isBashToolResult, edit: isEditToolResult, find: isFindToolResult, grep: isGrepToolResult, ls: isLsToolResult, powershell: isPowerShellToolResult, read: isReadToolResult, write: isWriteToolResult }; pi.on("tool_result", async (event, ctx) => { ctx.ui.notify(`tool_result_guards:${Object.keys(guards).filter((name) => guards[name](event)).join(",")}:end`, "info"); }); } });
+  pi.registerCommand("language_probe", { description: "Report the highlight language of a path", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    ctx.ui.notify(`language:${JSON.stringify({ lang: piCodingAgent.getLanguageFromPath(c.path) ?? null })}:end`, "info");
+  } });
+  pi.registerCommand("convert_probe", { description: "Run convertToLlm or formatDimensionNote on a JSON case and report the result", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    const result = c.fn === "convert" ? piCodingAgent.convertToLlm(c.messages) : piCodingAgent.formatDimensionNote(c.image) ?? null;
+    ctx.ui.notify(`convert:${JSON.stringify({ result })}:end`, "info");
+  } });
+  pi.registerCommand("serialize_probe", { description: "Run serializeConversation on JSON messages and report the text", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    let out;
+    try { out = { result: piCodingAgent.serializeConversation(c.messages) }; } catch { out = { error: true }; }
+    ctx.ui.notify(`serialize:${JSON.stringify(out)}:end`, "info");
+  } });
+  // branch_probe runs prepareBranchEntries or collectEntriesForBranchSummary (TestConformance_BranchSummaryHelpersAgreeAcrossSDKs); collect reads a session built from the entries.
+  pi.registerCommand("branch_probe", { description: "Run a branch summarization helper on a JSON case and report the result", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    let out;
+    try {
+      if (c.fn === "prepare") {
+        const r = piCodingAgent.prepareBranchEntries(c.entries, c.budget);
+        out = { messages: r.messages, fileOps: { read: [...r.fileOps.read], written: [...r.fileOps.written], edited: [...r.fileOps.edited] }, totalTokens: r.totalTokens };
+      } else {
+        const byId = new Map(c.entries.map((e) => [e.id, e]));
+        const session = {
+          getEntry: (id) => byId.get(id),
+          getBranch: (fromId) => { const path = []; let cur = fromId === undefined ? undefined : byId.get(fromId); while (cur) { path.unshift(cur); cur = cur.parentId ? byId.get(cur.parentId) : undefined; } return path; },
+        };
+        const r = piCodingAgent.collectEntriesForBranchSummary(session, c.old, c.target);
+        out = { entries: r.entries, commonAncestorId: r.commonAncestorId };
+      }
+    } catch { out = { error: true }; }
+    ctx.ui.notify(`branch:${JSON.stringify(out)}:end`, "info");
+  } });
+  const keyLists = (value, out = []) => {
+    if (Array.isArray(value)) value.forEach((element) => keyLists(element, out));
+    else if (value !== null && typeof value === "object") { out.push(Object.keys(value).join(",")); Object.values(value).forEach((element) => keyLists(element, out)); }
+    return out;
+  };
+  const helperReport = (fn, input) => {
+    try {
+      if (fn === "date") { const ms = Date.parse(input); return { ms: Number.isNaN(ms) ? null : ms }; }
+      if (fn === "strip") return { body: piCodingAgent.stripFrontmatter(input) };
+      const parsed = piCodingAgent.parseFrontmatter(input);
+      return { frontmatter: parsed.frontmatter, body: parsed.body, keys: keyLists(parsed.frontmatter) };
+    } catch { return { error: true }; }
+  };
+  const factoryHelpers = { frontmatter: helperReport("frontmatter", "---\nz: 1\n10: a\n2: b\nnested:\n  y: 1\n  3: x\n  \"q r\": [1, 2]\n---\nbody text\n"), error: helperReport("frontmatter", "---\na: [\n---\nx"), date: helperReport("date", "2020-01-02T03:04:05.678Z"), strip: helperReport("strip", "---\nz: 1\n---\nbody text\n") };
+  pi.registerCommand("helper_probe", { description: "Run parseFrontmatter, stripFrontmatter or Date.parse on its argument", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    ctx.ui.notify(`helper:${JSON.stringify(helperReport(c.fn, c.input))}:end`, "info");
+  } });
+  pi.registerCommand("helper_factory_probe", { description: "Report the helpers' results from the factory", handler: async (args, ctx) => {
+    ctx.ui.notify(`helper-factory:${JSON.stringify(factoryHelpers)}:end`, "info");
+  } });
+  pi.registerCommand("compact_usage_probe", { description: "Run a compaction usage helper on a JSON case and report the result", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    const pick = (u) => ({ input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0, totalTokens: u.totalTokens ?? 0 });
+    let result;
+    if (c.fn === "calc") result = { tokens: piCodingAgent.calculateContextTokens(c.usage) };
+    else if (c.fn === "should") result = { result: piCodingAgent.shouldCompact(c.tokens, c.window, c.settings) };
+    else if (c.fn === "last") { const u = piCodingAgent.getLastAssistantUsage(c.entries); result = { usage: u ? pick(u) : null }; }
+    else if (c.fn === "cut") result = piCodingAgent.findCutPoint(c.entries, c.start, c.end, c.keep);
+    else if (c.fn === "turn") result = { index: piCodingAgent.findTurnStartIndex(c.entries, c.index, c.start) };
+    else if (c.fn === "estimate") result = { tokens: piCodingAgent.estimateTokens(c.message) };
+    else result = piCodingAgent.DEFAULT_COMPACTION_SETTINGS;
+    ctx.ui.notify(`compact:${JSON.stringify(result)}:end`, "info");
+  } });
+  pi.registerCommand("skills_probe", { description: "Run a session or skill helper on a JSON case and report the result", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    let result;
+    if (c.fn === "latest") result = { entry: piCodingAgent.getLatestCompactionEntry(c.entries) };
+    else if (c.fn === "parse") { const b = piCodingAgent.parseSkillBlock(c.text); result = { block: b ? { name: b.name, location: b.location, content: b.content, userMessage: b.userMessage ?? null } : null }; }
+    else if (c.fn === "format") result = { text: c.tool == null ? piCodingAgent.formatSkillsForPrompt(c.skills) : piCodingAgent.formatSkillsForPrompt(c.skills, c.tool) };
+    else result = { version: piCodingAgent.CURRENT_SESSION_VERSION, virtual: piCodingAgent.VIRTUAL_MODEL_STATE_ENTRY };
+    ctx.ui.notify(`skills:${JSON.stringify(result)}:end`, "info");
+  } });
+  pi.registerCommand("truncate_probe", { description: "Run a truncation helper on a JSON case and report the result", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    const options = { maxLines: c.maxLines ?? undefined, maxBytes: c.maxBytes ?? undefined };
+    let result;
+    if (c.fn === "head") result = truncateHead(c.content, options);
+    else if (c.fn === "tail") result = truncateTail(c.content, options);
+    else if (c.fn === "line") { const r = c.maxChars === undefined ? truncateLine(c.content) : truncateLine(c.content, c.maxChars); result = { text: r.text, wasTruncated: r.wasTruncated }; }
+    else if (c.fn === "limits") result = { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES };
+    else result = { text: formatSize(c.bytes) };
+    ctx.ui.notify(`truncate:${JSON.stringify(result)}:end`, "info");
+  } });
+  // builtin_probe: see the Go fixture (testfixture/builtin_tool.go). Pi's own create<Tool>ToolDefinition, create<Tool>Tool and createLocalBashOperations are the reference.
+  const builtinReport = (result) => {
+    const report = { content: result.content.map((block) => block.type === "text" ? { type: "text", text: block.text } : { type: block.type, mimeType: block.mimeType }), isError: !!result.isError };
+    if (result.details !== undefined && result.details !== null) { report.details = result.details; report.detailsJSON = JSON.stringify(result.details); }
+    if (result.structuredContent && typeof result.structuredContent === "object") { report.structuredKeys = Object.keys(result.structuredContent); report.exitCode = result.structuredContent.exit_code ?? null; /* an object without exit_code (an image read) reports null, as the native fixtures' nil does */ }
+    return report;
+  };
+  const builtinOptions = (c, log) => {
+    const hook = c.hook ? (spawn) => { log.push(`spawnHook:${spawn.command}`); return { command: "printf '%s|%s' \"$HOOK_VAR\" \"$PI_SESSION_ID\"", cwd: spawn.cwd, env: { ...spawn.env, HOOK_VAR: "hook-env" } }; } : undefined;
+    const custom = c.ops === "custom";
+    switch (c.tool) {
+      case "read": if (c.ops === "stream") return { operations: { readFile: async (p) => { log.push(`readFile:${p}`); return Buffer.from(`OPS:${p}`); }, access: async (p) => { log.push(`access:${p}`); }, createReadStream: (p) => { log.push(`createReadStream:${p}`); return Readable.from([Buffer.from("STREAM:"), Buffer.from(`${p}\n`)]); } } };
+        return { autoResizeImages: c.autoResizeImages ?? undefined, operations: custom ? { readFile: async (p) => { log.push(`readFile:${p}`); return Buffer.from(`OPS:${p}`); }, access: async (p) => { log.push(`access:${p}`); } } : undefined };
+      case "write": return { operations: custom ? { writeFile: async (p, content) => { log.push(`writeFile:${p}:${content}`); }, mkdir: async (d) => { log.push(`mkdir:${d}`); } } : undefined };
+      case "edit": return { operations: custom ? { readFile: async (p) => { log.push(`readFile:${p}`); return Buffer.from("hello world\n"); }, writeFile: async (p, content) => { log.push(`writeFile:${p}:${content}`); }, access: async (p) => { log.push(`access:${p}`); } } : undefined };
+      case "ls": return { operations: custom ? { exists: async (p) => { log.push(`exists:${p}`); return true; }, stat: async (p) => { log.push(`stat:${p}`); return { isDirectory: () => !p.includes(".") }; }, readdir: async (p) => { log.push(`readdir:${p}`); return ["b.txt", "a.txt", "sub"]; } } : undefined };
+      // readFile is Pi's deprecated GrepOperations.readFile: a JS extension passes one and Pi never calls it; every native SDK's grepdir case passes one too.
+      case "grep": if (c.ops === "grepdir") return { operations: { isDirectory: async (p) => { log.push(`isDirectory:${p}`); return true; }, readFile: async (p) => { log.push(`readFile:${p}`); return ""; } } };
+        return { operations: custom ? { isDirectory: async (p) => { log.push(`isDirectory:${p}`); throw new Error("no such path for the probe"); }, readFile: async (p) => { log.push(`readFile:${p}`); return ""; } } : undefined };
+      case "find": if (c.ops === "globlimit") return { operations: { exists: async (p) => { log.push(`exists:${p}`); return true; }, glob: async (pattern, cwd, o) => { log.push(`glob:${pattern}:limit=${o.limit}`); return ["a.txt", "b.txt", "c.txt"].slice(0, o.limit); } } };
+        return { operations: custom ? { exists: async (p) => { log.push(`exists:${p}`); return false; }, glob: async (pattern) => { log.push(`glob:${pattern}`); return []; } } : undefined };
+      case "powershell": return { exposeSessionEnvironment: c.exposeSessionEnvironment ?? undefined };
+      default: if (c.ops === "localThread") {
+        // The local operations run on another thread (Node has one thread, so the nearest is another turn of the event loop) and their error comes back unchanged.
+        const local = piCodingAgent.createLocalBashOperations();
+        return { operations: { exec: (command, cwd, o) => new Promise((resolve, reject) => { setImmediate(() => { local.exec(command, cwd, o).then(resolve, reject); }); }) } };
+      }
+      if (c.ops === "local" || c.ops === "localWrapped") {
+        // The bash tool runs on the local operations. "local" rethrows their error unchanged; "localWrapped" throws a new Error with the same message, which is not the
+        // backend's class and keeps nothing of it (bash.ts matches the class).
+        const local = piCodingAgent.createLocalBashOperations();
+        return { operations: { exec: async (command, cwd, o) => { try { return await local.exec(command, cwd, o); } catch (error) { throw c.ops === "localWrapped" ? new Error(error.message) : error; } } } };
+      }
+      return { commandPrefix: c.commandPrefix || undefined, exposeSessionEnvironment: c.exposeSessionEnvironment ?? undefined, spawnHook: hook, operations: custom ? { exec: async (command, cwd, o) => { log.push(`exec:${command}|cwd=${cwd}`); o.onData(Buffer.from(`custom:${command}`)); return { exitCode: 0 }; } } : undefined };
+    }
+  };
+  const builtinFactories = { read: [piCodingAgent.createReadToolDefinition, piCodingAgent.createReadTool], write: [piCodingAgent.createWriteToolDefinition, piCodingAgent.createWriteTool], edit: [piCodingAgent.createEditToolDefinition, piCodingAgent.createEditTool], bash: [piCodingAgent.createBashToolDefinition, piCodingAgent.createBashTool], grep: [piCodingAgent.createGrepToolDefinition, piCodingAgent.createGrepTool], find: [piCodingAgent.createFindToolDefinition, piCodingAgent.createFindTool], ls: [piCodingAgent.createLsToolDefinition, piCodingAgent.createLsTool], powershell: [piCodingAgent.createPowerShellToolDefinition, piCodingAgent.createPowerShellTool] };
+  pi.registerCommand("builtin_probe", { description: "Delegate to a built-in tool through the SDK and report what it returned", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    const emit = (report) => ctx.ui.notify(`builtin:${JSON.stringify(report)}:end`, "info");
+    if (c.kind === "cwd") return emit({ cwd: ctx.cwd });
+    if (c.kind === "register") {
+      const read = createReadToolDefinition(c.factoryCwd);
+      pi.registerTool({ ...read, async execute(...a) { const r = await read.execute(...a); r.content = r.content.map((b, i) => i === 0 ? { ...b, text: `«delegated:${b.text}»` } : b); r.details = { delegated: true }; return r; } });
+      const bash = createBashToolDefinition(c.factoryCwd);
+      pi.registerTool({ ...bash, async execute(...a) { const r = await bash.execute(...a); r.content = r.content.map((b, i) => i === 0 ? { ...b, text: `«${b.text}»` } : b); return r; } });
+      return emit({ registered: [read.name, bash.name] });
+    }
+    if (c.kind === "registerEdit") {
+      const edit = piCodingAgent.createEditToolDefinition(c.factoryCwd);
+      pi.registerTool({ ...edit, async execute(...a) { const r = await edit.execute(...a); r.content = r.content.map((b, i) => i === 0 ? { ...b, text: `«edited:${b.text}»` } : b); return r; } });
+      return emit({ registered: [edit.name] });
+    }
+    if (c.kind === "prepare") {
+      const def = builtinFactories[c.tool][0](c.factoryCwd);
+      const report = { has: typeof def.prepareArguments === "function" };
+      if (report.has) { try { report.prepared = def.prepareArguments(c.params ?? {}); } catch (error) { report.error = error.message; } }
+      return emit(report);
+    }
+    if (c.kind === "sets") return emit({ coding: piCodingAgent.createCodingTools(c.factoryCwd).map((t) => t.name), readOnly: piCodingAgent.createReadOnlyTools(c.factoryCwd).map((t) => t.name) });
+    if (c.kind === "local") {
+      const operations = c.shell === "powershell" ? piCodingAgent.createLocalPowerShellOperations() : piCodingAgent.createLocalBashOperations();
+      const controller = new AbortController();
+      const chunks = [];
+      const report = {};
+      try {
+        const result = await operations.exec(c.command, c.factoryCwd, { onData: (data) => { chunks.push(Buffer.from(data).toString("utf8")); if (c.abortOnOutput) controller.abort(); }, signal: controller.signal, timeout: c.timeout ?? undefined, env: c.env ?? undefined });
+        report.exitCode = result.exitCode;
+      } catch (error) { report.error = error.message; }
+      report.output = chunks.join("");
+      return emit(report);
+    }
+    const log = [];
+    const [createDefinition, createTool] = builtinFactories[c.tool];
+    const options = builtinOptions(c, log);
+    if (c.kind === "definition") {
+      const def = createDefinition(c.factoryCwd, options);
+      return emit({ definition: { name: def.name, label: def.label, description: def.description, promptSnippet: def.promptSnippet ?? "", promptGuidelines: def.promptGuidelines ?? null, parameters: JSON.parse(JSON.stringify(def.parameters)), outputSchema: def.outputSchema ? JSON.parse(JSON.stringify(def.outputSchema)) : null, constrainedSampling: def.constrainedSampling ?? null, executionMode: def.executionMode ?? "", renderShell: def.renderShell ?? "" } });
+    }
+    const controller = new AbortController();
+    if (c.preAborted) controller.abort();
+    const updates = [];
+    const onUpdate = c.updates || c.abortOnOutput ? (partial) => { const text = partial.content.filter((b) => b.type === "text").map((b) => b.text).join("\n"); updates.push(text); if (c.abortOnOutput && text !== "") controller.abort(); } : undefined;
+    const report = {};
+    const holdsBefore = stdioGraceHolds;
+    try {
+      const result = c.noContext ? await createTool(c.factoryCwd, options).execute("probe-call", c.params ?? {}, controller.signal, onUpdate) : await createDefinition(c.factoryCwd, options).execute("probe-call", c.params ?? {}, controller.signal, onUpdate, ctx);
+      report.result = builtinReport(result);
+    } catch (error) { report.error = error.message; }
+    // The shell-exit cases (local operations over a shell that exits while a writer holds the pipes) must have held Pi's post-exit grace timer at least once.
+    if (["local", "localWrapped", "localThread"].includes(c.ops) && stdioGraceHolds === holdsBefore) {
+      report.error = "the fixture held no post-exit stdio grace timer: Pi's waitForChildProcess no longer sets a 100 ms timer from armIdleTimer, so the shell-exit cases would race the wall clock";
+    }
+    if (c.updates) report.updates = updates;
+    report.calls = log;
+    emit(report);
+  } });
+  // message_probe: see the Go fixture.
+  pi.registerCommand("message_probe", { description: "Report messageRole and messageText of a JSON event payload", handler: async (args, ctx) => {
+    const data = JSON.parse(args);
+    ctx.ui.notify(`message:${JSON.stringify({ role: pi.messageRole(data), text: pi.messageText(data) })}:end`, "info");
+  } });
+  // file_queue_probe: see the Go fixture; tasks wait on each other's progress, never on a sleep race.
+  pi.registerCommand("file_queue_probe", { description: "Run tasks through the file mutation queue and report the log", handler: async (args, ctx) => {
+    const c = JSON.parse(args);
+    const log = [], failed = [], progress = new Set();
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const awaitStage = async (kind, ids, who) => {
+      for (const other of ids ?? []) {
+        const deadline = Date.now() + 20000;
+        while (!progress.has(`${kind}:${other}`)) {
+          if (Date.now() > deadline) { log.push(`timeout:${who}:${kind}:${other}`); return; }
+          await sleep(1);
+        }
+      }
+    };
+    const settle = async (ids) => { if ((ids ?? []).length > 0) await sleep(c.settleMs); };
+    await Promise.all(c.tasks.map(async (task) => {
+      await awaitStage("started", task.waitStarted, task.id);
+      await awaitStage("called", task.waitCalled, task.id);
+      await settle(task.waitCalled);
+      progress.add(`called:${task.id}`);
+      try {
+        await withFileMutationQueue(task.path, async () => {
+          log.push(`start:${task.id}`);
+          progress.add(`started:${task.id}`);
+          await awaitStage("ended", task.holdEnded, task.id);
+          await awaitStage("called", task.holdCalled, task.id);
+          await settle(task.holdCalled);
+          log.push(`end:${task.id}`);
+          progress.add(`ended:${task.id}`);
+          if (task.fail) throw new Error("task failed");
+        });
+      } catch { progress.add(`ended:${task.id}`); failed.push(task.id); }
+    }));
+    ctx.ui.notify(`file_queue:${JSON.stringify({ log, errors: failed.sort((a, b) => a - b) })}:end`, "info");
+  } });
+  // host_paths_probe reports getPackageDir() and getShellConfig() as the runtime answers them, for the default shell and for the existing and the missing custom shell path
+  // in args ("<existing>|<missing>") (TestConformance_HostPathsAgreeAcrossSDKs).
+  pi.registerCommand("host_paths_probe", { description: "Report getPackageDir and getShellConfig", handler: async (args, ctx) => {
+    const [existing, missing] = args.split("|");
+    const shell = (...custom) => {
+      try {
+        const config = getShellConfig(...custom);
+        return { shell: config.shell, args: config.args, ...(config.commandTransport ? { commandTransport: config.commandTransport } : {}) };
+      } catch (error) { return { error: error.message }; }
+    };
+    ctx.ui.notify(`host_paths:${JSON.stringify({ packageDir: getPackageDir(), default: shell(), custom: shell(existing), missing: shell(missing) })}:end`, "info");
+  } });
+  // host_helpers_probe runs the pi helpers over the golden file's inputs through Pi's own code (TestConformance_HostHelpersAgreeAcrossSDKs). args is
+  // "<golden>|<auth.json path>|<text to copy>". Pi's copyToClipboard runs in this process and writes the system clipboard, so it is not called here.
+  pi.registerCommand("host_helpers_probe", { description: "Run the pi helpers over the golden inputs", handler: async (args, ctx) => {
+    const [goldenPath, authPath] = args.split("|", 3);
+    const golden = JSON.parse(readFileSync(goldenPath, "utf8"));
+    const diffs = golden.diffs.map((c) => {
+      const lines = c.contextLines === undefined ? [] : [c.contextLines];
+      const report = { patch: generateUnifiedPatch(c.path ?? "src/a.ts", c.oldContent, c.newContent, ...lines) };
+      if (!c.patchOnly) { const diff = generateDiffString(c.oldContent, c.newContent, ...lines); report.diff = diff.diff; report.firstChangedLine = diff.firstChangedLine ?? null; }
+      return report;
+    });
+    const entries = golden.entries.map((c) => sessionEntryToContextMessages(c.entry));
+    const contexts = golden.contexts.map((c) => {
+      const [entries, leafId, pairs] = c.args;
+      try { return { result: JSON.parse(JSON.stringify(buildSessionContext(entries, leafId, pairs === undefined ? undefined : new Map(pairs)))) }; } catch (error) { return { throws: error.message }; }
+    });
+    const meta = (image) => (image ? { mimeType: image.mimeType, ...(image.originalWidth === undefined ? {} : { originalWidth: image.originalWidth, originalHeight: image.originalHeight, width: image.width, height: image.height, wasResized: image.wasResized }), decodes: image.data.length > 0 } : null);
+    const images = [];
+    for (const c of golden.images) {
+      if (c.op === "convert") images.push(meta(await convertToPng(c.data, c.mimeType)));
+      else { try { images.push(meta(await resizeImage(new Uint8Array(Buffer.from(c.data, "base64")), c.mimeType, c.options))); } catch { images.push(null); } }
+    }
+    const read = (provider, path) => readStoredCredential(provider, path) ?? null;
+    const creds = { explicit: read("anthropic", authPath), default: read("anthropic"), absentProvider: read("nobody", authPath), missingFile: read("anthropic", `${authPath}.missing`), notJSON: read("anthropic", `${authPath}.bad`) };
+    ctx.ui.notify(`host_helpers:${JSON.stringify({ diffs, entries, contexts, images, creds })}:end`, "info");
+  } });
+  // pi_ai_helpers_probe runs every call of the vector calls (test/parity/sdk-vectors, Pi's own answers at the pin, listed in one file by the test) through the runtime's pi-ai and
+  // reports each answer as JSON (TestConformance_PiAiHelpersAgreeAcrossSDKs).
+  pi.registerCommand("pi_ai_helpers_probe", { description: "Run the golden pi-ai helper calls", handler: async (args, ctx) => {
+    const golden = JSON.parse(readFileSync(args, "utf8"));
+    const cases = golden.cases.map((c) => {
+      const value = c.fn === "DEFAULT_MAX_AGENT_RETRY_DELAY_MS" ? piAi[c.fn] : piAi[c.fn](...c.args.map((arg) => (arg === null ? undefined : arg)));
+      return value === undefined ? [] : [value];
+    });
+    const signal = new AbortController().signal;
+    const auth = [];
+    for (const c of golden.auth.cases) {
+      const seen = [];
+      const result = await piAi.envApiKeyAuth(c.name, c.envVars).resolve({ ctx: { env: async (name) => { seen.push(name); return c.env[name]; } }, credential: c.credential ?? undefined, signal });
+      auth.push({ result: result ?? null, seen });
+    }
+    const prompts = [];
+    const credential = await piAi.envApiKeyAuth("Name", ["FIRST", "SECOND"]).login({ signal, prompt: async (request) => { prompts.push(request); return "typed-key"; } });
+    const timing = golden.timing.map((c) => {
+      const stream = piAi.createAssistantMessageEventStream();
+      const message = (isLater) => ({ role: "assistant", content: [], stopReason: c.kind === "error" ? "error" : "stop", ...(isLater || c.timestamp === "now" ? { timestamp: Date.now() } : c.timestamp === "old" ? { timestamp: 1 } : {}), ...(c.preset !== null && !isLater ? { durationMs: c.preset } : {}) });
+      const final = message(false);
+      const later = message(true);
+      if (c.kind === "done") stream.push({ type: "done", reason: "stop", message: final });
+      else if (c.kind === "error") stream.push({ type: "error", reason: "error", error: final });
+      else if (c.kind === "end") stream.end(final);
+      else { stream.push({ type: "done", reason: "stop", message: final }); stream.end(later); }
+      return { present: final.durationMs !== undefined, value: c.preset !== null && final.durationMs === c.preset ? c.preset : null, laterTimed: later.durationMs !== undefined };
+    });
+    ctx.ui.notify(`pi_ai_helpers:${JSON.stringify({ cases, timing, auth, login: { prompts, result: credential } })}:end`, "info");
+  } });
+  pi.registerCommand("host_info_probe", { description: "Report getAgentDir, CONFIG_DIR_NAME and VERSION", handler: async (_args, ctx) => {
+    ctx.ui.notify(`host_info:${JSON.stringify({ agentDir: getAgentDir(), configDirName: CONFIG_DIR_NAME, version: VERSION, factoryAgentDir })}:end`, "info");
+  } });
+  // ui_dialog_values_probe reports the value each dialog resolves with (TestConformance_UIDialogValuesAgreeAcrossSDKs): `<undefined>` for Pi's undefined, else the JSON of the value.
+  pi.registerCommand("ui_dialog_values_probe", { description: "Report the typed result of each dialog", handler: async (_args, ctx) => {
+    const report = (name, value) => ctx.ui.notify(`${name}=${value === undefined ? "<undefined>" : JSON.stringify(value)}`, "info");
+    for (const title of ["S1", "S2", "S3", "S4"]) report(title, await ctx.ui.select(title, ["a", "b"]));
+    for (const title of ["C1", "C2", "C3", "C4"]) report(title, await ctx.ui.confirm(title, "m"));
+    for (const title of ["I1", "I2"]) report(title, await ctx.ui.input(title, "p"));
+    for (const title of ["E1", "E2"]) report(title, await ctx.ui.editor(title, "p"));
+  } });
+  pi.registerCommand("ui_forward_probe", { description: "Call the working, paste, editor-text and tools-expanded UI members", handler: async (_args, ctx) => {
+    ctx.ui.setWorkingMessage("Thinking hard");
+    ctx.ui.setWorkingMessage("");
+    ctx.ui.setWorkingMessage(undefined);
+    ctx.ui.setHiddenThinkingLabel("Pondering");
+    ctx.ui.setHiddenThinkingLabel("");
+    ctx.ui.setHiddenThinkingLabel(undefined);
+    ctx.ui.setWorkingVisible(false);
+    ctx.ui.setWorkingIndicator({ frames: ["-", "+"], intervalMs: 120 });
+    ctx.ui.pasteToEditor("pasted \u{1F600}");
+    ctx.ui.setEditorText("draft");
+    ctx.ui.setToolsExpanded(true);
+  } });
+  // dialog-stack-probe opens its dialogs at the same time and reports each one's answer as it settles (TestConformance_ConcurrentDialogsAgreeAcrossSDKs). "pair" is a select A and a confirm B; "mix" is a select S, a confirm C, an input I and an editor E.
+  pi.registerCommand("dialog-stack-probe", { description: "Open concurrent dialogs from one command", handler: async (scenario, ctx) => {
+    const settled = (name) => (value) => ctx.ui.notify(`stack settled ${name}=${value ?? "cancelled"}`, "info");
+    const dialogs = scenario === "mix"
+      ? [ctx.ui.select("S", ["s1", "s2"]).then(settled("S")), ctx.ui.confirm("C", "message").then(settled("C")), ctx.ui.input("I", "placeholder").then(settled("I")), ctx.ui.editor("E", "prefill").then(settled("E"))]
+      : [ctx.ui.select("A", ["a1", "a2"]).then(settled("A")), ctx.ui.confirm("B", "message").then(settled("B"))];
+    await Promise.all(dialogs);
+    ctx.ui.notify("stack done", "info");
+  } });
+  // ui_wire_empties_probe calls the UI members Pi's RPC mode writes with empty strings and lists, and the optional members it omits, in this SDK's own spelling of each (TestConformance_UIEmptyMembersAgreeAcrossSDKs).
+  pi.registerCommand("ui_wire_empties_probe", { description: "Call the UI members with empty and unset arguments", handler: async (_args, ctx) => {
+    ctx.ui.setStatus("k", "");
+    ctx.ui.setStatus("k", undefined);
+    ctx.ui.notify("");
+    ctx.ui.notify("typed", "warning");
+    ctx.ui.setTitle("");
+    ctx.ui.setEditorText("");
+    await ctx.ui.select("T", []);
+    await ctx.ui.confirm("", "");
+    await ctx.ui.input("T1");
+    await ctx.ui.input("T2", "");
+    await ctx.ui.input("T3", "ph");
+    await ctx.ui.editor("E1");
+    await ctx.ui.editor("E2", "");
+    await ctx.ui.editor("E3", "pre");
+  } });
+  pi.registerCommand("tool_call_guard_probe", { description: "Report the tool names the tool_call guard accepts", handler: async () => {
+    pi.on("tool_call", async (event, ctx) => { ctx.ui.notify(`tool_call_guard:${["bash", "read", "probe", "other"].filter((name) => isToolCallEventType(name, event)).join(",")}:end`, "info"); });
+  } });
+  let installedEditorFactory;
+  pi.registerCommand("editor-install", { description: "Install a custom editor component", handler: async (_args, ctx) => { installedEditorFactory = (tui, theme, keybindings) => new CustomEditor(tui, theme, keybindings); ctx.ui.setEditorComponent(installedEditorFactory); } });
+  // An editor that refuses a provider with the "!" trigger, as an extension's own setAutocompleteProvider may throw.
+  pi.registerCommand("editor-install-refusing", { description: "Install a custom editor that refuses a rebuilt autocomplete provider", handler: async (_args, ctx) => {
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+      const editor = new CustomEditor(tui, theme, keybindings);
+      const take = editor.setAutocompleteProvider.bind(editor);
+      editor.setAutocompleteProvider = (provider) => {
+        if ((provider.triggerCharacters ?? []).includes("!")) throw new Error("EDITOR_SYNC_REFUSED");
+        take(provider);
+      };
+      return editor;
+    });
+  } });
+  pi.registerCommand("editor-get-probe", { description: "Report the factory getEditorComponent returns", handler: async (_args, ctx) => { const got = ctx.ui.getEditorComponent(); ctx.ui.notify(`editor_get:${got === undefined ? "absent" : got === installedEditorFactory ? "installed" : "other"}:end`, "info"); } });
+  pi.registerCommand("editor-clear", { description: "Restore the host's editor", handler: async (_args, ctx) => { installedEditorFactory = undefined; ctx.ui.setEditorComponent(undefined); } });
+  pi.registerCommand("settings_probe", { description: "Report the effective settings", handler: async (_args, ctx) => ctx.ui.notify(`settings_probe:${JSON.stringify(pi.getSettings())}`, "info") });
+  pi.registerCommand("model_set", { description: "Switch the model", handler: async (args, ctx) => { const [provider, ...rest] = String(args).trim().split("/"); const ok = await pi.setModel({ provider, id: rest.join("/") }); ctx.ui.notify(`model_set:${ok}`, "info"); } });
+  pi.registerCommand("thinking_set", { description: "Set the thinking level", handler: async (args) => pi.setThinkingLevel(String(args).trim()) });
+  pi.registerCommand("thinking_get", { description: "Report the thinking level", handler: async (_args, ctx) => ctx.ui.notify(`thinking_get:${pi.getThinkingLevel()}`, "info") });
+  pi.registerCommand("label_probe", { description: "Label the entry named first", handler: async (args) => { const [id, ...rest] = String(args).trim().split(" "); pi.setLabel(id, rest.join(" ")); } });
+  pi.registerCommand("set_label", { description: "Set an entry label", handler: async () => pi.setLabel("label-entry", "conformance-label") });
+  pi.registerShortcut("ctrl+alt+y", { description: "Conformance shortcut", handler: async () => {} });
+  pi.registerCommand("append_entry", { description: "Append a custom entry", handler: async () => pi.appendEntry("conformance-entry", "hello-entry") });
+  // An entry and a message with the optional member left out, then with it written as null.
+  pi.registerCommand("entry_null_members", { description: "Append entries and send messages with an omitted and a null member", handler: async () => {
+    pi.appendEntry("conformance-null-omitted");
+    pi.appendEntry("conformance-null-explicit", null);
+    pi.sendMessage({ customType: "conformance-null-omitted", content: "x", display: false });
+    pi.sendMessage({ customType: "conformance-null-explicit", content: "x", display: false, details: null });
+  } });
+  // setLabel on the entry in the arguments without a label, with a null one and with an empty one: Pi writes a different entry for each.
+  pi.registerCommand("label_members", { description: "Set a label that is omitted, null and empty", handler: async (args) => {
+    pi.setLabel(args);
+    pi.setLabel(args, null);
+    pi.setLabel(args, "");
+  } });
+  // The setup callback's SessionManager: an entry and a message with the optional member left out, then with it written as null.
+  pi.registerCommand("setup_null_members", { description: "Seed a new session with an omitted and a null member", handler: async (_args, ctx) => {
+    await ctx.newSession({ setup: async (sessionManager) => {
+      sessionManager.appendCustomEntry("api-custom");
+      sessionManager.appendCustomEntry("api-custom", null);
+      sessionManager.appendCustomMessageEntry("api-message", "x", false);
+      sessionManager.appendCustomMessageEntry("api-message", "x", true, null);
+    } });
+  } });
+  pi.registerCommand("append-entries-probe", { description: "Append a custom entry for each comma-separated type", handler: async (args) => { for (const customType of String(args).split(",")) pi.appendEntry(customType, `data-of-${customType}`); } });
+  pi.registerCommand("scoped-models-probe", { description: "Report the model scope", handler: async (_args, ctx) => ctx.ui.notify(JSON.stringify(ctx.scopedModels), "info") });
+  pi.registerCommand("ui-availability", {
+    description: "Probe bound UI and headless defaults",
+    handler: async (_args, ctx) => {
+      const selected = await ctx.ui.select("Pick", ["first", "second"]);
+      ctx.ui.notify("availability-notify", "info");
+      if (!ctx.hasUI) {
+        const fail = () => { throw new Error("headless factory invoked"); };
+        if (await ctx.ui.input("Input", "placeholder") !== undefined ||
+            await ctx.ui.editor("Editor", "prefill") !== undefined ||
+            await ctx.ui.confirm("Confirm", "message") !== false ||
+            await ctx.ui.custom(fail) !== undefined) throw new Error("headless dialog result");
+        ctx.ui.setWidget("ignored", fail);
+        ctx.ui.setFooter(fail);
+        ctx.ui.setHeader(fail);
+        ctx.ui.setEditorComponent(fail);
+        ctx.ui.addAutocompleteProvider(fail);
+        const off = ctx.ui.onTerminalInput(fail); off(); off();
+        ctx.ui.setEditorText("ignored"); ctx.ui.setToolsExpanded(true);
+        if (ctx.ui.getEditorText() !== "" || ctx.ui.getToolsExpanded() ||
+            ctx.ui.getAllThemes().length || ctx.ui.getTheme("dark") !== undefined ||
+            ctx.ui.setTheme("dark").error !== "UI not available") throw new Error("headless getter result");
+      }
+      pi.appendEntry("ui-availability", `hasUI=${ctx.hasUI} selected=${selected ?? ""}`);
+    },
+  });
+  pi.registerCommand("ui-state-barrier", { handler: async (_, ctx) => {
+    const selected = await ctx.ui.select("expand", ["chosen"]);
+    const named = ctx.ui.getTheme("light");
+    const missing = ctx.ui.getTheme("missing");
+    const result = ctx.ui.setTheme("missing");
+    ctx.ui.notify(`selected=${selected} expanded=${ctx.ui.getToolsExpanded()} named=${named?.name} missing=${missing === undefined} success=${result.success} error=${result.error}`, "info");
+  }});
+  pi.registerCommand("autocomplete-settle-register", {handler: async (_,ctx) => {
+    ctx.ui.addAutocompleteProvider(current => ({
+      async getSuggestions(lines,line,col,options) {
+        await current.getSuggestions(lines,line,col,options);
+        if(lines[0]==="slow")await new Promise(resolve=>setTimeout(resolve,400));
+        return {items:[{value:lines[0],label:"settled:"+lines[0]}],prefix:lines[0]};
+      },
+      applyCompletion(...args){return current.applyCompletion(...args);},
+    }));
+  }});
+  pi.registerCommand("autocomplete-register", {handler: async (_,ctx) => {
+    for(const tag of ["A","B"]) {
+      ctx.ui.addAutocompleteProvider(current => {
+        ctx.ui.notify("factory:"+tag,"info");
+        let calls=0;
+        return {
+          triggerCharacters: tag === "A" ? ["$"] : ["#","$"],
+          async getSuggestions(lines,line,col,options) {
+            const count=++calls;
+            const result=await current.getSuggestions(lines,line,col,options);
+            if(result==null)return result;
+            return {...result,items:tag === "A" ? result.items.filter(item=>item.value!=="drop").map(item=>({...item,label:`${item.value}:${count}`})) : [...result.items,{value:"tail",label:`tail:${count}`} ]};
+          },
+          applyCompletion(...args) {
+            const result=current.applyCompletion(...args);
+            result.lines[result.cursorLine]+="-"+tag;
+            result.cursorCol+=2;
+            return result;
+          },
+          shouldTriggerFileCompletion(...args){return current.shouldTriggerFileCompletion(...args);},
+        };
+      });
+      ctx.ui.notify("registered:"+tag,"info");
+    }
+  }});
+  // Upstream ctx.cwd, ctx.mode, ctx.hasUI and ctx.model throw the stale message after invalidation (runner.ts:571-600).
+  pi.registerCommand("stale-probe", {
+    description: "Report cwd, mode, hasUI and model",
+    handler: (_args, ctx) => ctx.ui.notify(`stale:${ctx.cwd}|${ctx.mode}|${ctx.hasUI}|${ctx.model?.id ?? ""}`, "info"),
+  });
+  // stale-members calls the members Pi guards with assertActive (runner.ts:883-1037): each outcome is one line, and the command fails with every
+  // line when one carries the stale message, else it reports them. Node has no width, height or tool-update member on the context.
+  pi.registerCommand("stale-members", {
+    description: "Call the members that fail with the stale message",
+    handler: (_args, ctx) => {
+      const lines = [];
+      let stale = false;
+      const member = (name, call) => {
+        let outcome;
+        try { outcome = `ok:${call() ?? ""}`; } catch (error) { outcome = `throws:${error.message}`; }
+        stale = stale || outcome.includes("This extension ctx is stale");
+        lines.push(`${name}=${outcome}`);
+      };
+      member("theme", () => typeof ctx.ui.theme);
+      member("sessionName", () => ctx.sessionManager.getSessionName());
+      member("setWidgetLines", () => ctx.ui.setWidget("stale-members", ["x"]));
+      member("setWidgetView", () => ctx.ui.setWidget("stale-members-view", () => ({ render: () => ["x"], invalidate() {} })));
+      if (stale) throw new Error(`stale-members\n${lines.join("\n")}`);
+      ctx.ui.notify(`members\n${lines.join("\n")}`, "info");
+    },
+  });
+  pi.registerCommand("signal-probe", {
+    description: "Report ctx.signal",
+    handler: (_args, ctx) => ctx.ui.notify(`signal:${ctx.signal === undefined ? "none" : ctx.signal.aborted ? "aborted" : "live"}`, "info"),
+  });
+  pi.registerCommand("signal-wait", {
+    description: "Wait for ctx.signal to abort",
+    handler: async (_args, ctx) => {
+      const signal = ctx.signal;
+      if (signal === undefined) return ctx.ui.notify("wait:none", "info");
+      ctx.ui.notify("wait:start", "info");
+      const outcome = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve("timeout"), 10_000);
+        const done = () => { clearTimeout(timer); resolve("aborted"); };
+        if (signal.aborted) return done();
+        signal.addEventListener("abort", done, { once: true });
+      });
+      ctx.ui.notify(`wait:${outcome}`, "info");
+    },
+  });
+  // signal-poll reads ctx.signal from timers, as an extension does between requests (runner.ts:917-920): the state is "live" or "none".
+  pi.registerCommand("signal-poll", {
+    description: "Poll ctx.signal until it is live or none",
+    handler: async (args, ctx) => {
+      ctx.ui.notify("poll:start", "info");
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        if ((ctx.signal !== undefined) === (args === "live")) return ctx.ui.notify(`poll:${args}`, "info");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      ctx.ui.notify("poll:timeout", "info");
+    },
+  });
+  pi.registerCommand("usage-probe", {
+    handler: (_args, ctx) => ctx.ui.notify(JSON.stringify(ctx.getContextUsage() ?? null), "info"),
+  });
+  pi.registerCommand("console-probe", {
+    description: "Write console lines to stdout and stderr",
+    handler: async (args) => {
+      for (const n of [1, 2]) {
+        if (args !== "stderr") console.log(`probe-out-${n}`);
+        console.error(`probe-err-${n}`);
+      }
+    },
+  });
+  // panic-probe and the onLoaded handler throw after a deliberate stderr line the extension itself writes (TestConformance_SDKDiagnosticsReachOnlyTheExtensionLog).
+  pi.onLoaded(() => {
+    if (process.env.PIG_FIXTURE_PANIC_PROBE) {
+      console.error("probe-err-loaded");
+      throw new Error("probe-panic-boom");
+    }
+  });
+  pi.registerCommand("panic-probe", {
+    description: "Throw after an stderr line of the extension's own",
+    handler: async () => {
+      console.error("probe-err-command");
+      throw new Error("probe-panic-boom");
+    },
+  });
+  // replica-probe (TestReplicatedReadsAreLocalAcrossSDKs) reads the model object, the session id, the session manager's id and the context usage, and reports them as one JSON object. Its argument is empty, or "set-model:<provider>/<id>" to call setModel before it reads. Every SDK fixture reports the same shape.
+  pi.registerCommand("replica-probe", {
+    description: "Report the replicated model object, session ids and context usage",
+    handler: async (args, ctx) => {
+      if (args.startsWith("set-model:")) {
+        const [provider, ...rest] = args.slice("set-model:".length).split("/");
+        await pi.setModel({ provider, id: rest.join("/") });
+      }
+      const m = ctx.model;
+      const model = m === undefined || !m.id ? null : {
+        id: m.id, name: m.name ?? "", provider: typeof m.provider === "string" ? m.provider : m.provider?.id ?? "", contextWindow: m.contextWindow ?? 0, maxOutputTokens: m.maxTokens ?? 0, reasoning: m.reasoning === true,
+        inputCostPer1M: m.cost?.input ?? 0, outputCostPer1M: m.cost?.output ?? 0, cacheReadCostPer1M: m.cost?.cacheRead ?? 0, cacheWriteCostPer1M: m.cost?.cacheWrite ?? 0,
+      };
+      ctx.ui.notify(JSON.stringify({ model, sessionId: ctx.sessionManager.getSessionId(), managerSessionId: ctx.sessionManager.getSessionId(), sessionName: ctx.sessionManager.getSessionName() ?? null, sessionFile: ctx.sessionManager.getSessionFile() ?? null, managerSessionName: ctx.sessionManager.getSessionName() ?? null, managerSessionFile: ctx.sessionManager.getSessionFile() ?? null, usage: ctx.getContextUsage() ?? null }), "info");
+    },
+  });
+  pi.registerCommand("context-probe", {
+    description: "Report ctx.mode + ctx.getSystemPromptOptions()",
+    handler: async (_args, ctx) => {
+      const options = ctx.getSystemPromptOptions();
+      const shape = (v) => v === undefined || v === null ? "absent" : Array.isArray(v) ? `array:${v.length}` : v !== null && typeof v === "object" ? `object:${Object.keys(v).length}` : `${typeof v}:${String(v).length}`;
+      const shapes = ["selectedTools", "toolSnippets", "toolGuidelines", "promptGuidelines", "appendSystemPrompt", "sections", "contextFiles", "skills"].map((key) => `${key}:${shape(options[key])}`).join(",");
+      ctx.ui.notify(`mode=${ctx.mode} trusted=${ctx.isProjectTrusted()} spo_prompt=${options.customPrompt ?? ""} spo_cwd=${options.cwd ?? ""} spo_tools=${(options.selectedTools ?? []).join(",")} spo_shape=${shapes} spo_guidelines=${(options.toolGuidelines?.read ?? []).join(",")} spo_skill_scope=${options.skills?.[0]?.sourceInfo?.scope ?? ""} spo_force_empty=${options.forceSystemPrompt === ""} spo_custom_present=${Object.hasOwn(options, "customPrompt")}`, "info");
+    },
+  });
+  pi.registerCommand("sprite-probe", {
+    description: "Exercise sprite registration and host errors",
+    handler: async (_args, ctx) => {
+      const definition = spriteDefinition();
+      await ctx.ui.registerSprite(definition);
+      definition.mascot[0] = definition.mascot[0].slice(0, -1);
+      try {
+        await ctx.ui.registerSprite(definition);
+      } catch (error) {
+        ctx.ui.notify(error.message, "error");
+        return;
+      }
+      throw new Error("invalid sprite definition was accepted");
+    },
+  });
+  pi.registerCommand("login-probe", {
+    description: "Exercise semantic login submission and host errors",
+    handler: async (_args, ctx) => {
+      const definition = loginDefinition();
+      await ctx.ui.setLogin(definition);
+      definition.brand[0] = definition.brand[0].slice(0, -1);
+      try {
+        await ctx.ui.setLogin(definition);
+      } catch (error) {
+        ctx.ui.notify(error.message, "error");
+        return;
+      }
+      throw new Error("invalid login definition was accepted");
+    },
+  });
+  pi.registerCommand("session-log-probe", {
+    description: "Read a paged session log",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(`session entries=${ctx.sessionManager.getEntries().length} branch=${ctx.sessionManager.getBranch().length}`, "info");
+    },
+  });
+  pi.registerCommand("session-branch-probe", {
+    description: "Read the branch, an entry and its label",
+    handler: async (args, ctx) => {
+      const manager = ctx.sessionManager;
+      ctx.ui.notify(`branch=${manager.getBranch().map((entry) => entry.id).join(">")} leaf=${manager.getLeafEntry()?.id ?? "none"} entry=${manager.getEntry(args)?.id ?? "none"} label=${manager.getLabel(args) ?? "none"}`, "info");
+    },
+  });
+  pi.registerCommand("dialog-probe", {
+    description: "Exercise interactive dialog responses",
+    handler: async (_args, ctx) => {
+      const selected = await ctx.ui.select("Pick", ["first", "second"]);
+      const input = await ctx.ui.input("Input", "placeholder");
+      const edited = await ctx.ui.editor("Editor", "prefill");
+      const confirmed = await ctx.ui.confirm("Confirm", "message");
+      ctx.ui.notify(`select=${selected} input=${input} editor=${edited} confirm=${confirmed}`, "info");
+    },
+  });
+
+  class FocusedList {
+    constructor(done) {
+      this.done = done;
+      this.items = ["alpha", "beta", "gamma"];
+      this.selected = 0;
+      this.disposed = false;
+    }
+    render(width) { return [`focused width=${width}`, ...this.items.map((item, index) => `${index === this.selected ? "> " : "  "}${item}`)]; }
+    handleInput(data) {
+      if (data === "\x1b[A") this.selected = (this.selected + this.items.length - 1) % this.items.length;
+      else if (data === "\x1b[B") this.selected = (this.selected + 1) % this.items.length;
+      else if (data === "\x1b[6~") this.selected = Math.min(this.selected + 2, this.items.length - 1);
+      else if (data === "\r" || data === "\n") this.done(this.items[this.selected]);
+      else if (data === "\x1b") this.done(undefined);
+    }
+    dispose() { this.disposed = true; }
+  }
+  pi.registerCommand("focused-probe", {
+    description: "Exercise focused subprocess UI",
+    handler: async (_args, ctx) => {
+      let component;
+      const selected = await ctx.ui.custom((_tui, _theme, _keys, done) => (component = new FocusedList(done)), { overlayOptions: { title: "Focused", widthFraction: 0.5, heightFraction: 0.5 } });
+      ctx.ui.notify(`focused=${selected ?? ""} disposed=${component.disposed}`, "info");
+    },
+  });
+
+  // The component kit's conformance probe (D107,
+  // docs/plan/extension-component-kit.md §10), built from Pi's components: the
+  // runtime derives its view while a frontend draws. As ui.custom's component
+  // every key reaches it; it passes the list's keys to the list and logs the
+  // rest, and the list's callbacks log its events. It closes on select with
+  // the log joined by ",". kit-surfaces and kit-message draw the same tree.
+  class KitProbe extends Container {
+    constructor(theme, keys, done) {
+      super();
+      this.keys = keys;
+      this.log = [];
+      const items = Array.from({ length: 5 }, (_, i) => ({ value: `k${i}`, label: `Track ${i}`, description: `Artist ${i}` }));
+      this.list = new piTui.SelectList(items, 3, getSelectListTheme());
+      this.list.setSelectedIndex(2);
+      this.list.onSelectionChange = (item) => this.log.push(`selectionChange:${this.list.selectedIndex}:${item.value}`);
+      this.list.onSelect = (item) => {
+        this.log.push(`select:${this.list.selectedIndex}:${item.value}`);
+        done?.(this.log.join(","));
+      };
+      this.addChild(new piCodingAgent.DynamicBorder((s) => theme.fg("accent", s)));
+      this.addChild(new piTui.Text("Kit probe", 2, 0, (s) => theme.bg("customMessageBg", s)));
+      this.addChild(new piTui.Markdown("- one\n- **two**", 1, 0, getMarkdownTheme()));
+      this.addChild(new piTui.HStack([{ component: new piTui.TruncatedText("left side"), grow: 1 }, { component: new piTui.TruncatedText("right"), grow: 1 }], { gap: 1 }));
+      this.addChild(new piTui.Spacer(1));
+      this.addChild(this.list);
+      this.viewTheme = { accent: "#d75f00" };
+    }
+    handleInput(data) {
+      if (["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"].some((id) => this.keys.matches(data, id))) this.list.handleInput(data);
+      else this.log.push(`input:${data}`);
+    }
+  }
+  pi.registerCommand("kit-probe", {
+    description: "Exercise the component kit (D107)",
+    handler: async (_args, ctx) => {
+      const result = await ctx.ui.custom((_tui, theme, keys, done) => new KitProbe(theme, keys, done), { overlayOptions: { title: "Kit" } });
+      ctx.ui.notify(`kit=${result ?? ""}`, "info");
+    },
+  });
+  // mouse-probe's component: Pi's handleMouse, which logs every event
+  // it receives, all of its fields, and closes on a click with the log
+  // joined by ",".
+  class MouseProbe {
+    constructor(done) {
+      this.done = done;
+      this.log = [];
+    }
+    render() { return ["mouse probe", "row 1", "row 2", "row 3"]; }
+    handleInput() {}
+    handleMouse(e) {
+      const mods = [[e.shift, "S"], [e.alt, "A"], [e.ctrl, "C"]].filter(([on]) => on).map(([, name]) => name).join("");
+      this.log.push(`${e.type}/${e.button}/${e.x},${e.y}/${e.screenX},${e.screenY}/${e.width}x${e.height}/w${e.wheelDelta ?? 0}/c${e.clickCount ?? 0}/${mods}`);
+      if (e.type === "click") this.done(this.log.join(","));
+      return { handled: true };
+    }
+  }
+  // kit-widget "<case key>": a widget kind's Pi vector case
+  // (D107, docs/plan/extension-component-kit.md §10), built from Pi's own
+  // components; the runtime derives its view while a frontend draws. As
+  // ui.custom's component it takes the keys and mouse events the components
+  // leave to the extension and notifies each callback they fire as
+  // "kit-widget-event=<type>:<value>". It never closes itself: the harness
+  // delivers the case's steps and then reads the callbacks, and a component
+  // that closed after the callbacks Pi fired would drop the steps still to
+  // come. The key is "<module>/<export>/<case name>" and the case's wire
+  // node is its vector's `root`.
+  const kitWidgetCases = {};
+  {
+    const branch = (expanded, outputPad = 1) => () => {
+      const node = new piCodingAgent.BranchSummaryMessageComponent({ summary: "The branch explored **two** options:\n\n- keep the cache\n- drop the cache\n\nIt chose `drop`." }, undefined, outputPad);
+      if (expanded) node.setExpanded(true);
+      const root = new Container();
+      root.addChild(node);
+      return { root };
+    };
+    const prefix = "pi-coding-agent/BranchSummaryMessageComponent/";
+    kitWidgetCases[`${prefix}collapsed`] = branch(false);
+    kitWidgetCases[`${prefix}click toggles`] = branch(false);
+    kitWidgetCases[`${prefix}right click ignored`] = branch(false);
+    kitWidgetCases[`${prefix}expanded`] = branch(true);
+    kitWidgetCases[`${prefix}outputPad 0 collapsed`] = branch(false, 0);
+    kitWidgetCases[`${prefix}outputPad 0 expanded`] = branch(true, 0);
+    kitWidgetCases[`${prefix}empty summary expanded`] = () => {
+      const node = new piCodingAgent.BranchSummaryMessageComponent({ summary: "" }, undefined, 1);
+      node.setExpanded(true);
+      return { root: node };
+    };
+  }
+  {
+    const compaction = (tokens, expanded, outputPad = 1) => () => {
+      const node = new piCodingAgent.CompactionSummaryMessageComponent({ summary: "Compacted the first **forty** turns:\n\n1. the build setup\n2. the failing test\n\nThe fix is pending.", tokensBefore: tokens }, undefined, outputPad);
+      if (expanded) node.setExpanded(true);
+      const root = new Container();
+      root.addChild(node);
+      return { root };
+    };
+    const prefix = "pi-coding-agent/CompactionSummaryMessageComponent/";
+    kitWidgetCases[`${prefix}collapsed`] = compaction(123456, false);
+    kitWidgetCases[`${prefix}click toggles`] = compaction(123456, false);
+    kitWidgetCases[`${prefix}right click ignored`] = compaction(123456, false);
+    kitWidgetCases[`${prefix}expanded`] = compaction(123456, true);
+    kitWidgetCases[`${prefix}outputPad 0 collapsed`] = compaction(123456, false, 0);
+    kitWidgetCases[`${prefix}outputPad 0 expanded`] = compaction(123456, true, 0);
+    kitWidgetCases[`${prefix}tokens 999`] = compaction(999, false);
+    kitWidgetCases[`${prefix}tokens 1234567 expanded`] = compaction(1234567, true);
+    kitWidgetCases[`${prefix}empty summary tokens 0 expanded`] = () => {
+      const node = new piCodingAgent.CompactionSummaryMessageComponent({ summary: "", tokensBefore: 0 }, undefined, 1);
+      node.setExpanded(true);
+      return { root: node };
+    };
+  }
+  {
+    const skill = (expanded, outputPad = 1) => () => {
+      const node = new piCodingAgent.SkillInvocationMessageComponent({ name: "code-review", content: "Review the diff for **bugs** first.\n\n- correctness\n- naming\n\nReport findings as a list." }, undefined, outputPad);
+      if (expanded) node.setExpanded(true);
+      const root = new Container();
+      root.addChild(node);
+      return { root };
+    };
+    const prefix = "pi-coding-agent/SkillInvocationMessageComponent/";
+    kitWidgetCases[`${prefix}collapsed`] = skill(false);
+    kitWidgetCases[`${prefix}click toggles`] = skill(false);
+    kitWidgetCases[`${prefix}right click ignored`] = skill(false);
+    kitWidgetCases[`${prefix}expanded`] = skill(true);
+    kitWidgetCases[`${prefix}outputPad 0 collapsed`] = skill(false, 0);
+    kitWidgetCases[`${prefix}outputPad 0 expanded`] = skill(true, 0);
+    kitWidgetCases[`${prefix}empty skill expanded`] = () => {
+      const node = new piCodingAgent.SkillInvocationMessageComponent({ name: "", content: "" }, undefined, 1);
+      node.setExpanded(true);
+      return { root: node };
+    };
+  }
+  {
+    const custom = (text, expanded, outputPad = 1) => () => {
+      const node = new piCodingAgent.CustomMessageComponent({ customType: "ci-status", content: text }, undefined, undefined, outputPad);
+      if (expanded) node.setExpanded(true);
+      const root = new Container();
+      root.addChild(node);
+      return { root };
+    };
+    const body = "Build **passed** in 12s\n\n- 214 tests\n- 0 failures";
+    const prefix = "pi-coding-agent/CustomMessageComponent/";
+    kitWidgetCases[`${prefix}default`] = custom(body, false);
+    kitWidgetCases[`${prefix}outputPad 0`] = custom(body, false, 0);
+    kitWidgetCases[`${prefix}expanded changes nothing`] = custom(body, true);
+    kitWidgetCases[`${prefix}empty text`] = custom("", false);
+    kitWidgetCases[`${prefix}no id`] = () => ({ root: new piCodingAgent.CustomMessageComponent({ customType: "note", content: "plain" }, undefined, undefined, 1) });
+  }
+  {
+    const cancellable = (message, { spinner, messageColor, indicator, frame } = {}) => ({ theme, note }) => {
+      const style = (token) => (token ? (text) => theme.fg(token, text) : (text) => text);
+      const loader = new piTui.CancellableLoader({ requestRender() {} }, style(spinner), style(messageColor), message, indicator);
+      loader.stop();
+      if (frame !== undefined) { loader.currentFrame = frame % loader.frames.length; loader.updateDisplay(); }
+      loader.onAbort = () => note("abort:");
+      const root = new Container();
+      root.addChild(loader);
+      return { root, focus: loader };
+    };
+    const bordered = (message, options) => ({ theme, note }) => {
+      const loader = new piCodingAgent.BorderedLoader({ requestRender() {} }, theme, message, options);
+      loader.loader.stop();
+      loader.onAbort = () => note("abort:");
+      const root = new Container();
+      root.addChild(loader);
+      return { root, focus: loader };
+    };
+    const framed = (build, frame) => (ctx) => {
+      const result = build(ctx);
+      const inner = result.focus.loader;
+      inner.currentFrame = frame % inner.frames.length;
+      inner.updateDisplay();
+      return result;
+    };
+    const wide = "A very long message that wraps around the narrow widths of the table";
+    const c = "pi-tui/CancellableLoader/";
+    for (const name of ["default", "escape aborts", "escape twice aborts twice", "other keys are ignored"]) kitWidgetCases[c + name] = cancellable("Working");
+    kitWidgetCases[`${c}default message`] = cancellable("Loading...");
+    kitWidgetCases[`${c}colors`] = cancellable("Working", { spinner: "accent", messageColor: "muted" });
+    kitWidgetCases[`${c}frame 3`] = cancellable("Working", { frame: 3 });
+    kitWidgetCases[`${c}indicator frames`] = cancellable("Working", { indicator: { frames: ["*", "+", "x"], intervalMs: 50 }, frame: 1 });
+    kitWidgetCases[`${c}hidden indicator`] = cancellable("Working", { indicator: { frames: [] } });
+    kitWidgetCases[`${c}wide message`] = cancellable(wide, { spinner: "accent" });
+    const b = "pi-coding-agent/BorderedLoader/";
+    for (const name of ["cancellable", "escape aborts", "escape twice aborts twice", "other keys are ignored"]) kitWidgetCases[b + name] = bordered("Fetching models");
+    for (const name of ["not cancellable", "escape ignored when not cancellable"]) kitWidgetCases[b + name] = bordered("Fetching models", { cancellable: false });
+    kitWidgetCases[`${b}default message`] = bordered("Loading...");
+    kitWidgetCases[`${b}frame 4`] = framed(bordered("Fetching models"), 4);
+    kitWidgetCases[`${b}wide message`] = bordered("Fetching the models of every configured provider, one after another");
+  }
+  {
+    const input = ({ value, focused = true, options = {}, token } = {}) => ({ theme, note }) => {
+      const component = new piTui.Input(token ? { ...options, placeholderStyle: (text) => theme.fg(token, text) } : options);
+      if (value) component.setValue(value);
+      component.focused = focused;
+      component.onSubmit = (text) => note(`submit:${text}`);
+      component.onEscape = () => note(`escape:${component.getValue()}`);
+      const root = new Container();
+      root.addChild(component);
+      return { root, focus: component };
+    };
+    const i = "pi-tui/Input/";
+    kitWidgetCases[`${i}empty`] = input({ focused: false });
+    for (const name of ["empty focused", "typing", "left then insert", "backspace and delete", "home and end", "kill word and yank", "kill to end", "paste scrolls", "submit"]) kitWidgetCases[i + name] = input();
+    kitWidgetCases[`${i}placeholder`] = input({ focused: false, options: { placeholder: "type here" } });
+    kitWidgetCases[`${i}placeholder focused colored`] = input({ options: { placeholder: "type here" }, token: "dim" });
+    kitWidgetCases[`${i}custom prompt`] = input({ options: { prompt: "$ " }, value: "ls -la" });
+    kitWidgetCases[`${i}value`] = input({ focused: false, value: "hello world" });
+    for (const name of ["value focused", "click moves the cursor", "right click ignored"]) kitWidgetCases[i + name] = input({ value: "hello world" });
+    kitWidgetCases[`${i}wide characters`] = input({ value: "漢字 and 😀 text" });
+    kitWidgetCases[`${i}submit newline key`] = input({ value: "preset" });
+    kitWidgetCases[`${i}escape`] = input({ value: "keep" });
+  }
+  {
+    const commands = [
+      { name: "help", description: "Show help" },
+      { name: "model", description: "Switch the model", argumentHint: "<name>" },
+      { name: "quit", description: "Exit" },
+      { name: "session", description: "Session info" },
+      { name: "settings", description: "Open settings" },
+      { name: "share" },
+      { name: "skills", description: "List skills" },
+      { name: "compact", description: "Compact the context" },
+    ];
+    const editor = ({ value, padding, acmax, border, disable, history = [], auto = false, focused = true } = {}) => ({ tui, theme, note }) => {
+      const options = {};
+      if (padding !== undefined) options.paddingX = padding;
+      if (acmax !== undefined) options.autocompleteMaxVisible = acmax;
+      const component = new piTui.Editor(tui, { borderColor: (text) => theme.fg("borderMuted", text), selectList: piCodingAgent.getSelectListTheme() }, options);
+      if (border) component.borderColor = (text) => theme.fg(border, text);
+      if (disable) component.disableSubmit = true;
+      for (const entry of history) component.addToHistory(entry);
+      if (auto) component.setAutocompleteProvider(new piTui.CombinedAutocompleteProvider(commands, process.cwd()));
+      if (value) component.setText(value);
+      component.focused = focused;
+      component.onSubmit = (text) => note(`submit:${text}`);
+      const root = new Container();
+      root.addChild(component);
+      return { root, focus: component };
+    };
+    const e = "pi-tui/Editor/";
+    kitWidgetCases[e + "empty"] = editor({ focused: false });
+    kitWidgetCases[e + "empty focused"] = editor();
+    kitWidgetCases[e + "value"] = editor({ value: "hello world", focused: false });
+    kitWidgetCases[e + "multiline value focused"] = editor({ value: "one\ntwo\nthree" });
+    kitWidgetCases[e + "wrapped line"] = editor({ value: "The quick brown fox jumps over the lazy dog and keeps running through the field" });
+    kitWidgetCases[e + "wide characters"] = editor({ value: "漢字 and 😀 text" });
+    kitWidgetCases[e + "typing"] = editor();
+    kitWidgetCases[e + "newline"] = editor();
+    kitWidgetCases[e + "backspace and delete"] = editor();
+    kitWidgetCases[e + "kill word and yank"] = editor();
+    kitWidgetCases[e + "undo"] = editor();
+    kitWidgetCases[e + "submit"] = editor();
+    kitWidgetCases[e + "paste"] = editor();
+    kitWidgetCases[e + "paste large"] = editor();
+    kitWidgetCases[e + "cursor movement"] = editor({ value: "one\ntwo\nthree" });
+    kitWidgetCases[e + "submit multiline"] = editor({ value: "one\ntwo" });
+    kitWidgetCases[e + "submit disabled"] = editor({ value: "keep", disable: true });
+    kitWidgetCases[e + "padding"] = editor({ value: "padded text", padding: 2 });
+    kitWidgetCases[e + "padding wrapped"] = editor({ value: "The quick brown fox jumps over the lazy dog and keeps running", padding: 3 });
+    kitWidgetCases[e + "border color"] = editor({ value: "colored", border: "accent" });
+    kitWidgetCases[e + "history"] = editor({ history: ["first", "second", "third"] });
+    kitWidgetCases[e + "history then edit"] = editor({ history: ["first", "second"] });
+    kitWidgetCases[e + "scrolls past the visible lines"] = editor({ value: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12" });
+    kitWidgetCases[e + "scroll indicator below"] = editor({ value: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12" });
+    kitWidgetCases[e + "more rows show more lines"] = editor({ value: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12" });
+    kitWidgetCases[e + "few rows show five lines"] = editor({ value: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12" });
+    kitWidgetCases[e + "page up and down"] = editor({ value: "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\nline 25\nline 26\nline 27\nline 28\nline 29\nline 30" });
+    kitWidgetCases[e + "click moves the cursor"] = editor({ value: "hello\nworld" });
+    kitWidgetCases[e + "click on the border"] = editor({ value: "hello\nworld" });
+    kitWidgetCases[e + "right click ignored"] = editor({ value: "hello" });
+    kitWidgetCases[e + "slash opens the menu"] = editor({ auto: true });
+    kitWidgetCases[e + "slash narrows"] = editor({ auto: true });
+    kitWidgetCases[e + "slash no match"] = editor({ auto: true });
+    kitWidgetCases[e + "slash tab accepts"] = editor({ auto: true });
+    kitWidgetCases[e + "slash arrow then tab"] = editor({ auto: true });
+    kitWidgetCases[e + "slash enter accepts"] = editor({ auto: true });
+    kitWidgetCases[e + "slash escape closes"] = editor({ auto: true });
+    kitWidgetCases[e + "slash click selects"] = editor({ auto: true });
+    kitWidgetCases[e + "text after the slash opens nothing"] = editor({ auto: true });
+    kitWidgetCases[e + "slash max visible 3"] = editor({ acmax: 3, auto: true });
+    kitWidgetCases[e + "slash with padding"] = editor({ padding: 2, auto: true });
+    kitWidgetCases[e + "autocomplete menu does not follow disabled submit"] = editor({ disable: true, auto: true });
+  }
+  // The child the scroll-view and mouse-region cases wrap: a text of wrapping rows, a markdown, an empty container, or a
+  // branch summary (which a click toggles).
+  const kitScrollLines = "Alpha line of the log\nBeta line of the log\nGamma line of the log that is long enough to wrap at the narrow widths\nDelta";
+  const kitScrollMarkdown = "# Title\n\n- one\n- two with a long line that wraps at narrow widths\n\n`code`";
+  const kitScrollChild = (kind) => {
+    if (kind === "md") return new piTui.Markdown(kitScrollMarkdown, 1, 0, piCodingAgent.getMarkdownTheme());
+    if (kind === "region") return new piTui.Text("Region content\nsecond row", 1, 0);
+    if (kind === "empty") return new Container();
+    if (kind === "branch") return new piCodingAgent.BranchSummaryMessageComponent({ summary: "The branch explored **two** options:\n\n- keep the cache\n- drop the cache\n\nIt chose `drop`." }, undefined, 1);
+    return new piTui.Text(kitScrollLines, 1, 0);
+  };
+  {
+    const styled = (theme, token) => (token ? (text) => theme.fg(token, text) : undefined);
+    const scroll = (o, kind = "text", wrap) => ({ theme }) => {
+      const options = {};
+      if (o.follow) options.follow = o.follow;
+      if (o.primary) options.primary = true;
+      if (o.overscroll) options.overscroll = o.overscroll;
+      if (o.scrollbar) options.scrollbar = o.scrollbar;
+      if (o.track) options.scrollbarTrackStyle = styled(theme, o.track);
+      if (o.thumb) options.scrollbarThumbStyle = styled(theme, o.thumb);
+      if (o.delay !== undefined) options.scrollbarHideDelayMs = o.delay;
+      const view = new piTui.ScrollView(kitScrollChild(kind), options);
+      if (o.scrollTop !== undefined) view.scrollTo(o.scrollTop);
+      const root = new Container();
+      if (wrap === "hf") root.addChild(new piTui.Text("Header", 1, 0));
+      root.addChild(view);
+      if (wrap === "hf") root.addChild(new piTui.Text("Footer", 1, 0));
+      if (wrap === "after") root.addChild(new piTui.Text("after", 1, 0));
+      return { root };
+    };
+    const s = "pi-tui/ScrollView/";
+    kitWidgetCases[s + "default"] = scroll({}, "text", undefined);
+    kitWidgetCases[s + "scrollbar always"] = scroll({"scrollbar": "always"}, "text", undefined);
+    kitWidgetCases[s + "scrollbar auto"] = scroll({"scrollbar": "auto"}, "text", undefined);
+    kitWidgetCases[s + "scrollbar colors"] = scroll({"scrollbar": "always", "track": "dim", "thumb": "accent"}, "text", undefined);
+    kitWidgetCases[s + "follow end"] = scroll({"follow": "end"}, "text", undefined);
+    kitWidgetCases[s + "primary and contain"] = scroll({"overscroll": "contain", "primary": true}, "text", undefined);
+    kitWidgetCases[s + "hide delay"] = scroll({"scrollbar": "auto", "delay": 50}, "text", undefined);
+    kitWidgetCases[s + "scroll top clamps"] = scroll({"scrollTop": 3}, "text", undefined);
+    kitWidgetCases[s + "markdown child"] = scroll({"scrollbar": "always"}, "md", undefined);
+    kitWidgetCases[s + "after other rows"] = scroll({"scrollbar": "always"}, "text", "hf");
+    kitWidgetCases[s + "empty child"] = scroll({"scrollbar": "always"}, "empty", undefined);
+    kitWidgetCases[s + "wheel and click pass"] = scroll({}, "text", "after");
+  }
+  {
+    const region = (o, kind = "text", wrap) => ({ note }) => {
+      const mouseRegion = new piTui.MouseRegion(kitScrollChild(kind), (event) => {
+        if (o.types && !o.types.includes(event.type)) return undefined;
+        note(`mouse:${event.type}/${event.button}/${event.x}/${event.y}`);
+        const result = { handled: o.handled ?? true };
+        if (o.capture) result.capture = true;
+        if (o.focus) result.focus = true;
+        if (o.render !== undefined) result.render = o.render;
+        return result;
+      });
+      const root = new Container();
+      if (wrap === "ab") root.addChild(new piTui.Text("Above the region", 1, 0));
+      root.addChild(mouseRegion);
+      if (wrap === "ab") root.addChild(new piTui.Text("Below", 1, 0));
+      return { root };
+    };
+    const m = "pi-tui/MouseRegion/";
+    kitWidgetCases[m + "renders its child"] = region({}, "region", undefined);
+    kitWidgetCases[m + "every type by default"] = region({}, "region", undefined);
+    kitWidgetCases[m + "types filter"] = region({"types": ["click"]}, "region", undefined);
+    kitWidgetCases[m + "not handled"] = region({"handled": false}, "region", undefined);
+    kitWidgetCases[m + "capture"] = region({"capture": true}, "region", undefined);
+    kitWidgetCases[m + "focus and render"] = region({"focus": true, "render": false}, "region", undefined);
+    kitWidgetCases[m + "local coordinates"] = region({}, "region", "ab");
+    kitWidgetCases[m + "the child takes the event first"] = region({}, "branch", undefined);
+    kitWidgetCases[m + "right button"] = region({}, "region", undefined);
+  }
+  // kit-widget-cases
+  pi.registerCommand("kit-widget", {
+    description: "Show a widget kind's Pi vector case (D107)",
+    handler: async (key, ctx) => {
+      const build = kitWidgetCases[key];
+      if (!build) throw new Error(`kit-widget: unknown case ${JSON.stringify(key)}`);
+      await ctx.ui.custom((tui, theme, keys) => {
+        const note = (entry) => ctx.ui.notify(`kit-widget-event=${entry}`, "info");
+        // build returns the root component and, when a node of it holds the focus, that node.
+        const { root, focus } = build({ tui, theme, keys, note });
+        if (focus) root.handleInput = (data) => focus.handleInput(data);
+        else if (!root.handleInput) root.handleInput = () => {};
+        return root;
+      }, { overlayOptions: { title: "Kit" } });
+    },
+  });
+  pi.registerCommand("mouse-probe", {
+    description: "Exercise extension mouse input",
+    handler: async (_args, ctx) => {
+      const result = await ctx.ui.custom((_tui, _theme, _keys, done) => new MouseProbe(done), { overlay: true });
+      ctx.ui.notify(`mouse=${result ?? ""}`, "info");
+    },
+  });
+  // viewport-probe's component: Component.capturesViewportInput is true until it gets "t", and it closes on "q".
+  class ViewportProbe {
+    constructor(done) {
+      this.done = done;
+      this.capturesViewportInput = true;
+    }
+    render() { return ["viewport probe"]; }
+    handleInput(data) {
+      if (data === "t") this.capturesViewportInput = false;
+      if (data === "q") this.done("viewport=done");
+    }
+  }
+  pi.registerCommand("viewport-probe", {
+    description: "Exercise capturesViewportInput",
+    handler: async (_args, ctx) => {
+      const result = await ctx.ui.custom((_tui, _theme, _keys, done) => new ViewportProbe(done), { overlay: true });
+      ctx.ui.notify(`${result ?? ""}`, "info");
+    },
+  });
+  // The click cards, written as Pi's renderers are: the state lives in a WeakMap keyed by the message (entry) object, which the renderer receives on every rebuild, and a MouseRegion over the text counts the click.
+  const clickCard = (prefix, subjectOf) => {
+    const states = new WeakMap();
+    return (subject, options) => {
+      let state = states.get(subject);
+      if (state === undefined) {
+        state = { clicks: 0, last: "none" };
+        states.set(subject, state);
+      }
+      const content = { render: () => [`${prefix}:${subjectOf(subject)}:clicks=${state.clicks}:last=${state.last}:expanded=${options.expanded}`], invalidate() {} };
+      return new piTui.MouseRegion(content, (event) => {
+        if (event.type !== "click") return undefined;
+        state.clicks += 1;
+        state.last = `${event.x},${event.y}`;
+        return { handled: true };
+      });
+    };
+  };
+  pi.registerMessageRenderer("conformance-click-message", clickCard("clickcard", (message) => message.content));
+  // A card in a padded Box, as Pi's own cards are: the MouseRegion answers inside the padding only, so Box.handleMouse leaves a click on the padding unhandled.
+  const paddedClick = clickCard("clickpadded", (message) => message.content);
+  pi.registerMessageRenderer("conformance-click-padded", (message, options, theme) => {
+    const box = new piTui.Box(3, 0);
+    box.addChild(paddedClick(message, options, theme));
+    return box;
+  });
+  pi.registerEntryRenderer("conformance-click-entry", clickCard("clickentry", (entry) => entry.data));
+  pi.registerMessageRenderer("kit-message", (_message, _options, theme) => new KitProbe(theme));
+  pi.registerEntryRenderer("kit-entry", (_entry, _options, theme) => new KitProbe(theme));
+  pi.registerCommand("kit-surfaces", {
+    description: "Show the kit probe on every view surface (D107)",
+    handler: async (_args, ctx) => {
+      ctx.ui.setWidget("kit-probe", (_tui, theme) => new KitProbe(theme));
+      ctx.ui.setHeader((_tui, theme) => new KitProbe(theme));
+      ctx.ui.setFooter((_tui, theme) => new KitProbe(theme));
+      const kitTool = {
+        name: "kit_view_tool",
+        label: "kit_view_tool",
+        description: "Render its result as the kit probe",
+        parameters: { type: "object", properties: {} },
+        async execute() { return { content: [{ type: "text", text: "kit" }] }; },
+      };
+      kitTool.renderCall = (_args, theme) => new KitProbe(theme);
+      kitTool.renderResult = (_result, _options, theme) => new KitProbe(theme);
+      pi.registerTool(kitTool);
+    },
+  });
+  // kitImagePNG is image n of kit-images: a 1×1 PNG whose pixel encodes n, so
+  // each n has its own bytes and ref.
+  const kitImagePNG = (n) => {
+    const chunk = (type, data) => {
+      const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+      const out = Buffer.alloc(body.length + 8);
+      out.writeUInt32BE(data.length, 0);
+      body.copy(out, 4);
+      out.writeUInt32BE(zlib.crc32(body), body.length + 4);
+      return out;
+    };
+    const header = Buffer.from([0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+    const pixel = zlib.deflateSync(Buffer.from([0, n & 0xff, (n >> 8) & 0xff, 0x5f, 0xff]));
+    return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", header), chunk("IDAT", pixel), chunk("IEND", Buffer.alloc(0))]).toString("base64");
+  };
+  // kit-images drives the image transport (D107, spec §7): step "a<k>"
+  // shows image 0 and step "b<n>" image n (1 ≤ n ≤ 64), each with its step
+  // as the text, as one ui.setWidget call on the "kit-img" widget.
+  pi.registerCommand("kit-images", {
+    description: "Exercise the component kit's image transport (D107)",
+    handler: async (args, ctx) => {
+      const step = /^([ab])(\d+)$/.exec(args);
+      const n = Number(step?.[2]);
+      if (!step || n < 1 || (step[1] === "b" && n > 64)) throw new Error(`kit-images: unknown step ${JSON.stringify(args)}`);
+      const image = step[1] === "a" ? 0 : n;
+      ctx.ui.setWidget("kit-img", () => {
+        const c = new Container();
+        c.addChild(new piTui.Image(kitImagePNG(image), "image/png", { fallbackColor: (s) => s }));
+        c.addChild(new piTui.Text(args, 0, 0));
+        return c;
+      });
+    },
+  });
+  // headless-ui-probe hands the runtime footer, header, custom, editor, terminal-input and theme calls; its argument is a file every closure appends a marker to when it runs (TestConformance_HeadlessModesNeverRunUIClosures).
+  pi.registerCommand("headless-ui-probe", {
+    description: "Hand the runtime footer, header and custom component closures",
+    handler: async (path, ctx) => {
+      const mark = (line) => fs.appendFileSync(path, `${line}\n`);
+      ctx.ui.setFooter(() => {
+        mark("node:footer");
+        return { render: () => { mark("node:footer-render"); return ["node:footer"]; }, invalidate() {} };
+      });
+      ctx.ui.setHeader(() => {
+        mark("node:header");
+        return { render: () => { mark("node:header-render"); return ["node:header"]; }, invalidate() {} };
+      });
+      await ctx.ui.custom((_tui, _theme, _keybindings, done) => {
+        mark("node:custom");
+        return { render: () => { mark("node:custom-render"); return ["node:custom"]; }, handleInput: () => done("closed"), invalidate() {} };
+      });
+      ctx.ui.setEditorComponent(() => { mark("node:editor"); return { render: () => ["node:editor"], handleInput() {}, invalidate() {} }; });
+      mark(`node:getEditorComponent:${typeof ctx.ui.getEditorComponent()}`);
+      const unsubscribe = ctx.ui.onTerminalInput(() => { mark("node:terminal-input"); });
+      mark(`node:onTerminalInput:${typeof unsubscribe}`);
+      unsubscribe();
+      ctx.ui.setWorkingMessage("node:working");
+      ctx.ui.setWorkingIndicator({ frames: ["node:working"] });
+      try {
+        mark(`node:setTheme:${JSON.stringify(ctx.ui.setTheme(ctx.ui.theme))}`);
+      } catch (error) {
+        mark(`node:setTheme:threw:${error?.message}`);
+      }
+    },
+  });
+  // kit-kinds sets the "kit-kinds" widget to the kinds kit-probe does not
+  // draw (D107, spec §10), from Pi's components: a box, a settings list, a
+  // loader, an image and a component with its own render whose viewLines
+  // list goes out only while a frontend draws.
+  const kitKindsPNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c48900000010494441547801010500faff002a005fff026a01892888e8cd0000000049454e44ae426082", "hex").toString("base64");
+  pi.registerCommand("kit-kinds", {
+    description: "Show every other component kit kind (D107)",
+    handler: async (_args, ctx) => {
+      ctx.ui.setWidget("kit-kinds", (tui, theme) => {
+        const box = new piTui.Box(1, 0, (s) => theme.bg("customMessageBg", s));
+        box.addChild(new piTui.Text("boxed", 0, 0));
+        // getSettingsListTheme() draws the cursor once, when it is called;
+        // a getter draws it at render time, under the surface's viewTheme.
+        const settingsTheme = Object.defineProperty({ ...getSettingsListTheme() }, "cursor", { get: () => getSettingsListTheme().cursor, enumerable: true });
+        const settings = new piTui.SettingsList([
+          { id: "theme", label: "Theme", description: "Color theme", currentValue: "dark", values: ["dark", "light"] },
+          { id: "wrap", label: "Wrap", description: "Wrap lines", currentValue: "on", values: ["on", "off"] },
+        ], 3, settingsTheme, () => {}, () => {});
+        const loader = new piTui.Loader(tui, (s) => theme.fg("accent", s), (s) => theme.fg("muted", s), "Working", { frames: ["*"] });
+        const tracks = {
+          render: () => ["track one", "track two"],
+          invalidate() {},
+        };
+        // The list rides on the component itself: a frontend draws it, a terminal draws the lines.
+        tracks.viewLines = { list: { items: [{ label: "track one", detail: "A" }, { label: "track two", detail: "B" }], selectedIndex: 1 } };
+        const stack = new piTui.VStack([box, settings, loader, new piTui.Image(kitKindsPNG, "image/png", { fallbackColor: (s) => s }), tracks], { gap: 1 });
+        stack.viewTheme = { accent: "#d75f00" };
+        return stack;
+      });
+    },
+  });
+  // kit-conversation sets the "kit-conversation" widget to Pi's
+  // conversation components (D107, spec §2.1, §10); "next" updates the
+  // components the last frame kept (the streaming reply, the ls and grep
+  // cards and the ls -la command), as a Pi author updates kept components.
+  let kitKept;
+  pi.registerCommand("kit-conversation", {
+    description: "Show Pi's conversation components (D107)",
+    handler: async (args, ctx) => {
+      const next = args === "next";
+      ctx.ui.setWidget("kit-conversation", (tui) => {
+        const reply = (more) => ({ content: [{ type: "thinking", thinking: "Reading the *kit* file" }, { type: "text", text: `Done. **Bold** reply\n\n1. a\n2. b${more ? "\n\nThen more kit." : ""}` }] });
+        const card = (name, callId, toolArgs, definition) => {
+          const tool = new piCodingAgent.ToolExecutionComponent(name, callId, toolArgs, {}, definition, tui, "/work/kit");
+          tool.setArgsComplete();
+          tool.markExecutionStarted();
+          return tool;
+        };
+        if (!next || !kitKept) {
+          const streaming = new piCodingAgent.AssistantMessageComponent();
+          streaming.updateContent(reply(false), true);
+          const ls = card("ls", "call-1", { path: "src" }, createLsToolDefinition("/work/kit"));
+          ls.updateResult({ content: [{ type: "text", text: "a.go\nb.go" }] }, false);
+          const grep = card("grep", "call-2", { pattern: "TODO" }, createGrepToolDefinition("/work/kit"));
+          grep.updateResult({ content: [{ type: "text", text: "x.go:1: TODO kit" }] }, true);
+          const exited = new piCodingAgent.BashExecutionComponent("ls -la", tui, false);
+          exited.appendOutput("a.txt\n");
+          exited.appendOutput("b.txt");
+          exited.setComplete(2, false);
+          kitKept = { streaming, ls, grep, exited };
+        }
+        const { streaming, ls, grep, exited } = kitKept;
+        if (next) {
+          streaming.updateContent(reply(true), false);
+          grep.updateResult({ content: [{ type: "text", text: "x.go:1: TODO kit\ny.go:2: TODO kit" }] }, false);
+          exited.setExpanded(true);
+        }
+        const user = new piCodingAgent.UserMessageComponent("Fix **the** kit build\n\n- one\n- two");
+        const failed = new piCodingAgent.AssistantMessageComponent({ content: [{ type: "thinking", thinking: "secret" }, { type: "text", text: "Visible kit" }], stopReason: "error", errorMessage: "kit-boom-7" });
+        failed.setHideThinkingBlock(true);
+        failed.setHiddenThinkingLabel("Pondering kit...");
+        failed.setOutputPad(0);
+        const read = card("read", "call-3", { path: "missing.txt" }, createReadToolDefinition("/work/kit"));
+        read.updateResult({ content: [{ type: "text", text: "ENOENT: kit" }], isError: true }, false);
+        read.setExpanded(true);
+        const custom = card("kit_tool", "call-4", { q: "x" }, {});
+        custom.updateResult({ content: [{ type: "text", text: "answer 42" }] }, false);
+        const seq = new piCodingAgent.BashExecutionComponent("seq 25", tui, true);
+        seq.appendOutput(Array.from({ length: 25 }, (_, i) => String(i + 1)).join("\n"));
+        seq.setComplete(0, false);
+        const diff = new piTui.Text(renderDiff(" 1 keep\n-2 old kit line\n+2 new kit line\n 3 tail", { filePath: "kit.go" }), 0, 0);
+        const root = new Container();
+        for (const child of [user, streaming, failed, ls, grep, read, custom, exited, seq, diff]) root.addChild(child);
+        return root;
+      });
+    },
+  });
+
+  // kit-output-pad sets the "kit-output-pad" widget to a bash tool card and
+  // a bash command with Pi 1.1.0's outputPad 3 and a final result's
+  // durationMs 1234 (F7); "next" calls setOutputPad(2) on the kept
+  // components and gives the result durationMs 61500.
+  let padKept;
+  pi.registerCommand("kit-output-pad", {
+    description: "Show Pi's outputPad and durationMs (D107)",
+    handler: async (args, ctx) => {
+      const next = args === "next";
+      ctx.ui.setWidget("kit-output-pad", (tui) => {
+        const result = (durationMs) => ({ content: [{ type: "text", text: "kit out" }], durationMs });
+        if (!next || !padKept) {
+          const tool = new piCodingAgent.ToolExecutionComponent("bash", "call-p1", { command: "echo kit" }, { outputPad: 3 }, createBashToolDefinition("/work/kit"), tui, "/work/kit");
+          tool.setArgsComplete();
+          tool.markExecutionStarted();
+          tool.updateResult(result(1234), false);
+          const command = new piCodingAgent.BashExecutionComponent("echo pad", tui, false, 3);
+          command.appendOutput("padded");
+          command.setComplete(0, false);
+          padKept = { tool, command };
+        }
+        const { tool, command } = padKept;
+        if (next) {
+          tool.setOutputPad(2);
+          tool.updateResult(result(61500), false);
+          command.setOutputPad(2);
+        }
+        const root = new Container();
+        root.addChild(tool);
+        root.addChild(command);
+        return root;
+      });
+    },
+  });
+
+  class TimerFocused {
+    constructor(tui, done) {
+      this.done = done;
+      this.frame = 0;
+      this.disposed = false;
+      this.detached = false;
+      this.timer = setInterval(() => { this.frame++; tui.requestRender(); }, 20);
+    }
+    render(width) { return [`timer frame=${this.frame} width=${width}`]; }
+    handleInput(data) { if (data === "\r") this.done(this.frame); }
+    dispose() { clearInterval(this.timer); this.disposed = true; this.detached = true; }
+  }
+  pi.registerCommand("overlay-width-probe", {
+    description: "Report the width overlay components render at",
+    handler: async (_args, ctx) => {
+      const probe = (_tui, _theme, _keys, done) => {
+        let width = 0;
+        return { render(w) { width = w; return [`overlay width=${w}`]; }, invalidate() {}, handleInput(data) { if (data === "\r") done(width); } };
+      };
+      const defaultWidth = await ctx.ui.custom(probe, { overlay: true });
+      const percentWidth = await ctx.ui.custom(probe, { overlay: true, overlayOptions: { width: "50%" } });
+      ctx.ui.notify(`overlay-width default=${defaultWidth} percent=${percentWidth}`, "info");
+    },
+  });
+  pi.registerCommand("blocked-custom-probe", {
+    description: "Open inline custom components with and without the blocked option",
+    handler: async (_args, ctx) => {
+      const probe = (_tui, _theme, _keys, done) => ({ render() { return ["blocked probe"]; }, invalidate() {}, handleInput(data) { if (data === "\r") done(1); } });
+      await ctx.ui.custom(probe, { blocked: { kind: "permission", message: "Approve?" } });
+      await ctx.ui.custom(probe);
+      ctx.ui.notify("blocked-custom done", "info");
+    },
+  });
+  pi.registerCommand("timer-focused-probe", {
+    description: "Exercise timer-driven focused UI",
+    handler: async (_args, ctx) => {
+      let component;
+      const frame = await ctx.ui.custom((tui, _theme, _keys, done) => (component = new TimerFocused(tui, done)), { overlayOptions: { title: "Timer" } });
+      ctx.ui.notify(`timer=${frame ?? 0} disposed=${component.disposed} detached=${component.detached}`, "info");
+    },
+  });
+
+  // Typed tool events (upstream PowerShellToolCallEvent/BashToolCallEvent and
+  // their result variants): record the input and details, block the
+  // conformance sentinel command, and replace a result's content.
+  pi.on("user_bash", event => {
+    const result = { output: "handled", exitCode: 7, cancelled: false, truncated: false };
+    const value = { result };
+    switch (event.command) {
+      case "valid": break;
+      case "undefined": result.exitCode = undefined; break;
+      case "undefined-path": result.fullOutputPath = undefined; break;
+      case "missing": delete result.exitCode; break;
+      case "invalid": result.exitCode = "invalid"; break;
+      case "null-operations": value.operations = null; break;
+      case "operations": return { operations: conformanceBashOperations() };
+      default: return undefined;
+    }
+    return value;
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    // Pi's handler mutates event.input in place and the runner reads it back (runner.ts emitToolCall).
+    // Assigning a new object to event.input leaves the object the tool runs with (agent-loop.ts prepareToolCall).
+    if (event.toolName === "rewrite_reassign_probe") {
+      event.input = { ...event.input, command: "git status --short" };
+      return;
+    }
+    // Moving a member to the end is an edit in Pi, and two added members follow in the order the handler added them.
+    if (event.toolName === "rewrite_order_probe") {
+      if (event.input.command === "reorder") {
+        const timeout = event.input.timeout;
+        delete event.input.timeout;
+        event.input.timeout = timeout;
+      } else {
+        event.input.zeta = 1;
+        event.input.alpha = 2;
+      }
+      return;
+    }
+    if (event.toolName === "rewrite_probe" || event.toolName === "rewrite_block_probe") {
+      if (event.input.command === "git status" || event.toolName === "rewrite_block_probe") {
+        event.input.command = "git status --short";
+        delete event.input.drop;
+        event.input.added = true;
+        event.input.nested = { depth: 2 };
+      }
+      if (event.toolName === "rewrite_block_probe") return { block: true, reason: "blocked after rewrite" };
+      return;
+    }
+    if (event.toolName !== "powershell" && event.toolName !== "bash") return;
+    ctx.ui.notify(`tool-call=${event.toolName}:${event.input?.command}:${event.input?.timeout}`, "info");
+    if (event.input?.command === "blocked-command") return { block: true, reason: `blocked ${event.toolName}` };
+  });
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName === "order_probe") { ctx.ui.notify(`order-result=${event.toolCallId}`, "info"); return; }
+    const held = [["bash", isBashToolResult], ["powershell", isPowerShellToolResult], ["read", isReadToolResult], ["edit", isEditToolResult], ["write", isWriteToolResult], ["grep", isGrepToolResult], ["find", isFindToolResult], ["ls", isLsToolResult]].filter(([, is]) => is(event)).map(([name]) => name);
+    ctx.ui.notify(`tool-result-guards=${held.join(",")}`, "info");
+    if (event.toolName !== "powershell" && event.toolName !== "bash") return;
+    ctx.ui.notify(`tool-result=${event.toolName}:${event.details?.fullOutputPath}:${event.details?.truncation?.totalLines}:${event.content?.[0]?.text}`, "info");
+    return { content: [{ type: "text", text: `${event.toolName} redacted` }] };
+  });
+  pi.on("after_provider_response", async (event, ctx) => {
+    await Promise.resolve();
+    ctx.ui.notify(`provider-response=${event.type}:${event.status}:${event.headers["x-probe"]}`, "info");
+    return { cancel: true };
+  });
+  pi.on("after_provider_response", (_event, ctx) => ctx.ui.notify("provider-response=second", "info"));
+  pi.on("message_update", async (event, ctx) => {
+    const assistant = event.assistantMessageEvent ?? {};
+    ctx.ui.notify(`message-update=${assistant.type}:${assistant.contentIndex}:${assistant.delta}:${Object.hasOwn(assistant, "assistantMessageEvent")}`, "info");
+  });
+  pi.on("tool_execution_update", async (event, ctx) => {
+    if (event.toolName === "production_tool") {
+      ctx.ui.notify(`tool-update=${event.toolName}:${event.args?.path}:${event.args?.nested?.depth}:${event.partialResult?.content?.[0]?.text}:${event.partialResult?.details?.progress}`, "info");
+      return;
+    }
+    ctx.ui.notify(`tool-update=${event.toolName}:${JSON.stringify(event.args)}:${event.partialResult?.content?.[0]?.text}:${event.partialResult?.details?.progress}`, "info");
+  });
+  pi.on("tool_execution_end", async (event, ctx) => {
+    if (event.toolName === "production_tool") {
+      ctx.ui.notify(`tool-end=${event.toolName}:${event.result?.content?.[0]?.text}:${event.result?.content?.length}:${event.result?.content?.[1]?.data}:${event.result?.content?.[1]?.mimeType}:${event.result?.details?.nested?.value}:${event.isError}`, "info");
+      return;
+    }
+    ctx.ui.notify(`tool-end=${event.toolName}:${event.result?.content?.length}:${event.result?.content?.[1]?.data}:${event.result?.details?.nested?.value}:${event.isError}`, "info");
+  });
+  pi.on("project_trust", async () => { throw new Error("trust-boom"); });
+  pi.on("project_trust", async () => ({ trusted: "undecided" }));
+  pi.on("project_trust", async (event) => (event.cwd === "/probe" ? { trusted: "undecided" } : { trusted: "yes", remember: true }));
+  pi.on("cache_warming_decision", async (event) => {
+    if (event.warmCost !== 0.05 || event.missCost !== 0.5 || event.continuationProbability !== 0.15 || event.action !== "warm") throw new Error("unexpected cache decision");
+    return { action: "stop" };
+  });
+  pi.on("agent_before_settle", async (event, ctx) => {
+    ctx.ui.notify(`agent_before_settle:${event.outcome}:${event.entries.length}:${Boolean(event.continue)}:${event.context.contextEntries.length}:${Boolean(event.context.canContinue)}`, "info");
+    event.entries.push({ type: "custom", customType: "kept" });
+  });
+  pi.on("agent_before_settle", (event) => {
+    event.entries.push({ type: "custom", customType: "before-error" });
+    throw new Error("boundary failed");
+  });
+  pi.on("agent_before_settle", (event) => {
+    if (event.entries.length !== 2 || event.context.contextEntries.length !== 2 || event.entries[0].customType !== "kept" || event.entries[1].customType !== "before-error") {
+      throw new Error("lost boundary mutation or preview");
+    }
+    // One draft with a null replacement, one without the member, and a compaction that keeps nothing.
+    return {
+      entries: [
+        { type: "custom", customType: "conformance-boundary" },
+        { type: "context_edit", targetId: "conformance-failed-attempt", replacement: null },
+        { type: "context_edit", targetId: "conformance-omitted-member" },
+        { type: "compaction", summary: "conformance-summary", firstKeptEntryId: null, details: { format: "conformance-checkpoint" }, usage: null },
+        // A data, a details and (above) a usage member written as null: Pi's file holds each as null.
+        { type: "custom", customType: "conformance-null-data", data: null },
+        { type: "custom_message", customType: "conformance-null-details", content: "x", display: false, details: null },
+      ],
+      continue: true,
+    };
+  });
+  pi.on("agent_before_settle", (event, ctx) => {
+    if (event.entries.length !== 6) throw new Error(`boundary result reached the next handler as ${event.entries.length} entries`);
+    const member = (index, key) => (key in event.entries[index] ? (event.entries[index][key] === null ? "null" : "value") : "absent");
+    ctx.ui.notify(`agent_before_settle_drafts:${event.entries.length}:${member(1, "replacement")}:${member(2, "replacement")}:${member(3, "firstKeptEntryId")}:${event.entries[3].details?.format}:${member(0, "data")}:${member(3, "usage")}:${member(4, "data")}:${member(5, "details")}`, "info");
+  });
+  pi.on("session_start", async (event, ctx) => {
+    ctx.ui.notify(`session_start:${event.reason ?? ""}`, "info");
+    if (event.previousSessionFile) ctx.ui.notify(`previous:${event.previousSessionFile}`, "info");
+  });
+  pi.on("session_shutdown", async (event, ctx) => {
+    ctx.ui.notify(`session_shutdown:${event.reason ?? ""}`, "info");
+    if (event.targetSessionFile) ctx.ui.notify(`target:${event.targetSessionFile}`, "info");
+  });
+  pi.on("session_info_changed", async (event, ctx) => {
+    // io_wait_name arms the handler to wait on a socket read first, as a handler that awaits does in Pi.
+    if (nameWaitAddr) {
+      await new Promise((resolve, reject) => {
+        const [host, port] = nameWaitAddr.split(":");
+        const socket = ioWaitConnect({ host, port: Number(port) });
+        socket.setEncoding("utf8");
+        socket.on("connect", () => socket.write("waiting\n"));
+        socket.on("data", () => { socket.destroy(); resolve(); });
+        socket.on("error", reject);
+      });
+    }
+    ctx.ui.notify(`session_info_changed:${event.name ?? ""}`, "info");
+  });
+  pi.on("session_before_compact", async (event, ctx) => ctx.ui.notify(`session_before_compact:${event.reason ?? ""}:${Boolean(event.willRetry)}`, "info"));
+  pi.on("session_compact", async (event, ctx) => ctx.ui.notify(`session_compact:${event.reason ?? ""}:${Boolean(event.willRetry)}:${Boolean(event.fromExtension)}`, "info"));
+  pi.on("session_compact_failed", async (event, ctx) => ctx.ui.notify(`session_compact_failed:${event.reason ?? ""}:${event.errorMessage ?? ""}:${Boolean(event.aborted)}:${Boolean(event.willRetry)}:${Boolean(event.fromExtension)}`, "info"));
+  pi.on("turn_end", event => {
+    if (event.messageEntryId !== "boundary-assistant") return;
+    event.entries.push({type:"custom", customType:"mutated"});
+    throw new Error("turn-boundary-failure");
+  });
+  pi.on("turn_end", event => {
+    if (event.messageEntryId !== "boundary-assistant") return;
+    return {entries:[{type:"custom", customType:"turn-boundary", data:structuredClone(event)}], continue:true};
+  });
+  pi.on("turn_end", async (event, ctx) => ctx.ui.notify(`turn_end:${event.messageEntryId}:${event.toolResultEntryIds[0]}`, "info"));
+  let promptSequence = 0;
+  for (const name of ["ui_prompt_start", "ui_prompt_end"]) {
+    pi.on(name, (event, ctx) => {
+      const sequence = promptSequence++;
+      if (event.title?.startsWith("fifo:")) {
+        ctx.ui.notify(`fifo:${sequence}:${event.type}:${event.title}`, "info");
+        return;
+      }
+      ctx.ui.notify(`ui_prompt:${event.type}:${event.reason}:${event.kind}:${"title" in event ? event.title : "(none)"}`, "info");
+    });
+  }
+  // state-push-probe (TestHostStateChangeReachesABackgroundReaderAcrossSDKs) arms a timer that reads one replicated accessor from outside every request and returns: the host then changes its own state with no call and no event to this extension, and the timer reports the first value that differs from the one it armed on, or the value it still holds after the window, to a file in the directory the arguments name. The arguments are {"kind": "model" | "model-name" | "session-id" | "context-usage" | "session-name" | "thinking-level" | "theme" | "settings:<key>" | "mcp", "dir": <directory>}; the report is "<armed>=><read>".
+  pi.registerCommand("state-push-probe", { description: "Read one replicated accessor from a timer between requests", handler: async (args, ctx) => {
+    const { kind, dir } = JSON.parse(args);
+    let read;
+    if (kind === "model") read = () => ctx.model?.id ?? "";
+    else if (kind === "model-name") read = () => ctx.model?.name ?? "";
+    else if (kind === "usage-then-id") read = () => { const usage = ctx.getContextUsage(); if (!usage || usage.tokens == null) return "none"; return usage.tokens === 250 ? `tokens=250,id=${ctx.sessionManager.getSessionId()}` : `tokens=${usage.tokens}`; };
+    else if (kind === "context-usage") read = () => { const usage = ctx.getContextUsage(); return usage ? `tokens=${usage.tokens ?? ""}` : "none"; };
+    else if (kind === "session-id") read = () => ctx.sessionManager.getSessionId();
+    else if (kind === "session-name") read = () => pi.getSessionName() ?? "";
+    else if (kind === "theme") read = () => ctx.ui.theme.name ?? "";
+    else if (kind === "thinking-level") read = () => pi.getThinkingLevel();
+    else if (kind.startsWith("settings:")) read = () => JSON.stringify(pi.getSettings()[kind.slice("settings:".length)] ?? null);
+    else if (kind === "mcp") read = () => pi.getMcpServers().map((server) => server.name).join(",");
+    else throw new Error(`state-push-probe: unsupported kind ${JSON.stringify(kind)}`);
+    const guarded = () => { try { return read(); } catch (error) { return `error:${error.message}`; } };
+    const armed = guarded();
+    const deadline = Date.now() + 5000;
+    const timer = setInterval(() => {
+      const current = guarded();
+      if (current === armed && Date.now() < deadline) return;
+      clearInterval(timer);
+      const report = joinPath(dir, `state-push-${kind.replaceAll(":", "_")}`);
+      writeFileSync(`${report}.tmp`, `${armed}=>${current}`);
+      renameSync(`${report}.tmp`, report);
+    }, 2);
+  } });
+  registerSignalAbort(pi);
+}
+
+// The BashOperations every SDK fixture returns for the user_bash command "operations" (TestConformance_UserBashOperationsRunInTheExtension).
+function conformanceBashOperations() {
+  return {
+    exec: async (command, cwd, { onData, signal, timeout, env }) => {
+      switch (command) {
+        case "echo":
+          onData(Buffer.from(`cmd:${command}\n`));
+          onData(Buffer.from(`cwd:${cwd}\n`));
+          if (env !== undefined && Object.keys(env).length === 0) onData(Buffer.from("env-empty\n"));
+          for (const name of Object.keys(env ?? {}).sort()) onData(Buffer.from(`env:${name}=${env[name]}\n`));
+          if (timeout !== undefined) onData(Buffer.from(`timeout:${timeout}\n`));
+          return { exitCode: 3 };
+        case "chunks":
+          for (const chunk of ["a", "b", "c"]) onData(Buffer.from(chunk));
+          return { exitCode: null };
+        case "binary":
+          onData(Buffer.from([0xff, 0x00, 0x80]));
+          return { exitCode: 0 };
+        case "wait":
+          onData(Buffer.from("waiting"));
+          await new Promise((resolve) => (signal.aborted ? resolve() : signal.addEventListener("abort", resolve, { once: true })));
+          onData(Buffer.from("stopped"));
+          throw new Error("aborted");
+        default:
+          throw new Error(`exec failed: ${command}`);
+      }
+    },
+  };
+}
+
+// The signal-abort row every SDK fixture carries. Pi's ctx.abort() aborts the run's signal before it returns (agent.ts:340-342), so a handler that holds the signal and reads it again right after the abort sees it aborted, in the same turn.
+function registerSignalAbort(pi) {
+  const state = (signal) => (signal === undefined ? "none" : signal.aborted ? "aborted" : "live");
+  pi.registerCommand("signal-abort", {
+    description: "Abort the run and report ctx.signal",
+    handler: (_args, ctx) => {
+      const held = ctx.signal;
+      ctx.abort();
+      ctx.ui.notify(`abort:${state(held)}:${state(ctx.signal)}`, "info");
+    },
+  });
+}

@@ -1,0 +1,464 @@
+// SPDX-FileCopyrightText: Copyright Hewlett Packard Enterprise Development LP
+// SPDX-License-Identifier: MIT
+
+package inbox
+
+import (
+	"errors"
+	"strings"
+
+	"github.com/MichaelKinsy/PiG/durable/core/internal/delta"
+	"github.com/MichaelKinsy/PiG/durable/core/jv"
+	"github.com/MichaelKinsy/PiG/durable/core/session"
+)
+
+// Submission types and settlement statuses (src/harness/types.ts SubmissionDraft).
+const (
+	TypeInput    = "input"
+	TypeWrite    = "write"
+	TypeContinue = "continue"
+)
+
+// OnAbortKeep is the onAbort of an input that Conversation.abort() and abort cascades leave queued (types.ts SubmissionDraft).
+const OnAbortKeep = "keep"
+
+// ErrConversationBusy matches a *BusyError with errors.Is.
+// Read-only: assigned once at initialization.
+var ErrConversationBusy = errors.New("ConversationBusy")
+
+// BusyError is Pi's ConversationBusy: a submission reached a busy conversation and was not admitted.
+type BusyError struct{ ConversationID session.ID }
+
+func (e *BusyError) Error() string {
+	return "Conversation " + jv.FormatNumber(float64(e.ConversationID)) + " is busy"
+}
+
+// Is matches ErrConversationBusy.
+func (e *BusyError) Is(target error) bool { return target == ErrConversationBusy }
+
+// ErrConversationIdle matches an *IdleError with errors.Is.
+// Read-only: assigned once at initialization.
+var ErrConversationIdle = errors.New("ConversationIdle")
+
+// IdleError is Pi's ConversationIdle: an input with whenIdle "reject" reached an idle conversation and was not admitted.
+type IdleError struct{ ConversationID session.ID }
+
+func (e *IdleError) Error() string {
+	return "Conversation " + jv.FormatNumber(float64(e.ConversationID)) + " is idle"
+}
+
+// Is matches ErrConversationIdle.
+func (e *IdleError) Is(target error) bool { return target == ErrConversationIdle }
+
+// Draft is a SubmissionDraft: input carries Content, WhenBusy, WhenIdle and optionally the InputEntry it is placed as (Entry), a
+// write carries Entry, the entry it appends, a continue carries neither.
+type Draft struct {
+	RequestID *string
+	Type      string
+	Content   any
+	Entry     *jv.Object
+	// WhenBusy is "steer", "followUp" or "reject"; empty queues as followUp.
+	WhenBusy string
+	// WhenIdle is "reject" or empty (start a run).
+	WhenIdle string
+	// OnAbort is "keep" for an input a conversation abort leaves queued (stored on its inbox item); any other value
+	// withdraws it, as the default.
+	OnAbort string
+	// Span is the host's handle of the submission's span, which the commit's events go to (TxScope.Span); Trace is the carrier of the submission's span (propagation.inject(span)), stored on its record; nil: none.
+	Trace any
+	Span  uint32
+	// Propagation is set when that span's adapter propagates (span.propagation !== undefined).
+	Propagation bool
+}
+
+// RunStart is what startRun takes (generation.ts): the run's placed inputs, and its first entry (LiveRun.first; HasFirst: whether it has one).
+type RunStart struct {
+	Inputs   []session.ID
+	First    session.ID
+	HasFirst bool
+}
+
+// Runs is what admission needs of the generation task: the conversation's pi.live document and the start of a run for
+// placed inputs (startRun in src/harness/generation.ts). The turn package, which depends on this one, implements it.
+type Runs interface {
+	Live(tx *session.Tx, conversationID session.ID) (*delta.Obj, error)
+	Start(tx *session.Tx, conversationID session.ID, live *delta.Obj, run RunStart) error
+}
+
+func idOf(record *jv.Object) session.ID {
+	id, _ := record.Get("id")
+	n, _ := id.(float64)
+	return session.ID(n)
+}
+
+func submissionRecord(conversationID session.ID, requestID *string, trace any, typ, status string) *jv.Object {
+	record := jv.NewObject()
+	record.Set("conversationId", float64(conversationID))
+	if requestID != nil {
+		record.Set("requestId", *requestID)
+	}
+	// submissions.ts: the admission's span carrier follows the request ID.
+	if trace != nil {
+		record.Set("trace", trace)
+	}
+	record.Set("type", closedAny(typ))
+	record.Set("status", closedAny(status))
+	return record
+}
+
+// closedAny boxes a submission type or status, a closed set, without allocating: a constant converts to an interface for free, a variable string does not.
+func closedAny(s string) any {
+	switch s {
+	case TypeInput:
+		return TypeInput
+	case TypeWrite:
+		return TypeWrite
+	case TypeContinue:
+		return TypeContinue
+	case "queued":
+		return "queued"
+	case "placed":
+		return "placed"
+	case "done":
+		return "done"
+	}
+	return "unanswered"
+}
+
+// Admit is admitSubmission: it admits a submission inside a commit (spec section 6); Conversation.submit() and
+// conversation-owned compactions share it. A known request ID returns its existing submission without writing. A busy
+// display-only write (only kind and data) is appended and settled done at once, busy or not, as it changes nothing the
+// model sees; only behind a queued reset it queues, so it lands after the reset instead of before it in the context the
+// reset ends. A busy conversation queues anything else in pi.inbox, or rejects whenBusy "reject" input with
+// ConversationBusy. An idle conversation with queued items queues it behind them and runs a final boundary. Otherwise idle
+// input places its entry (pi.user, or the input's own) and starts a run, and an idle write appends its entry and settles
+// done, or stale when its head reaches before the active range.
+func Admit(tx *session.Tx, runs Runs, conversationID session.ID, draft Draft, now float64, modes QueueModes) (session.ID, error) {
+	return admit(tx, runs, conversationID, draft, now, modes, nil)
+}
+
+// Admission is what admitSubmission returns (submissions.ts Admission): the submission's ID and its `status` once admitted: queued,
+// placed, or done (a stale write reports done), and, for a steer admission to a busy run, the run's carrier, which the
+// submission's span links to.
+type Admission struct {
+	ID     session.ID
+	Status string
+	Link   any
+}
+
+// set records the admission's status; a nil Admission records nothing.
+func (a *Admission) set(status string) {
+	if a != nil {
+		a.Status = status
+	}
+}
+
+// AdmitStatus is Admit that also reports how the submission was admitted, in a.
+func AdmitStatus(tx *session.Tx, runs Runs, conversationID session.ID, draft Draft, now float64, modes QueueModes, a *Admission) error {
+	*a = Admission{}
+	id, err := admit(tx, runs, conversationID, draft, now, modes, a)
+	a.ID = id
+	return err
+}
+
+func admit(tx *session.Tx, runs Runs, conversationID session.ID, draft Draft, now float64, modes QueueModes, a *Admission) (session.ID, error) {
+	if draft.Type == TypeInput && draft.Entry != nil {
+		if err := checkInputEntry(draft.Entry); err != nil {
+			return 0, err
+		}
+	}
+	if draft.RequestID != nil {
+		existing, err := tx.SubmissionByRequest(conversationID, *draft.RequestID)
+		if err != nil {
+			return 0, err
+		}
+		if existing != nil {
+			if typ, _ := existing.Get("type"); typ != draft.Type {
+				return 0, errors.New("Request " + *draft.RequestID + " already identifies a submission of type " + asString(typ))
+			}
+			status, _ := existing.Get("status")
+			if status == "unanswered" {
+				status = "done"
+			}
+			a.set(asString(status))
+			return idOf(existing), nil
+		}
+	}
+	if draft.Type == TypeWrite && draft.Entry != nil && IsDisplayOnly(draft.Entry) {
+		inbox, err := tx.Doc(Def, session.DocArgs{Owner: conversationID})
+		if err != nil {
+			return 0, err
+		}
+		if !HasQueuedReset(queued(inbox)) {
+			entry, err := tx.AppendEntry(conversationID, draft.Entry)
+			if err != nil {
+				return 0, err
+			}
+			record := submissionRecord(conversationID, draft.RequestID, draft.Trace, TypeWrite, "done")
+			record.Set("entry", float64(idOf(entry)))
+			created, err := tx.CreateSubmission(record)
+			if err != nil {
+				return 0, err
+			}
+			a.set("done")
+			return idOf(created), nil
+		}
+	}
+	live, err := runs.Live(tx, conversationID)
+	if err != nil {
+		return 0, err
+	}
+	busy := live.Has("run")
+	// A steer admission links its span to the run's (submissions.ts: only with a propagating span, read before anything is written).
+	if a != nil && busy && draft.Propagation && draft.Type == TypeInput && draft.WhenBusy == "steer" {
+		if run, err := tx.Task(session.ID(live.Obj("run").Get("taskId").(float64))); err != nil {
+			return 0, err
+		} else if run != nil {
+			a.Link, _ = run.Get("trace")
+		}
+	}
+	if busy && draft.Type == TypeInput && draft.WhenBusy == "reject" {
+		return 0, &BusyError{conversationID}
+	}
+	if !busy && draft.Type == TypeInput && draft.WhenIdle == "reject" {
+		return 0, &IdleError{conversationID}
+	}
+	if draft.Type == TypeContinue {
+		// Never queued: whether a run can continue depends on how the current one ends. Rejected before any write.
+		if busy {
+			return 0, &BusyError{conversationID}
+		}
+		boundary, err := Prepare(tx, conversationID, modes)
+		if err != nil {
+			return 0, err
+		}
+		tx.Await(1)
+		created, err := tx.CreateSubmission(submissionRecord(conversationID, draft.RequestID, draft.Trace, TypeContinue, "placed"))
+		if err != nil {
+			return 0, err
+		}
+		id := idOf(created)
+		// Items an earlier failed run left queued (`afterFailedRun: "keep"`) are placed first and join the run. Its history starts with the
+		// failed run's, so `afterRun` hooks see what that run did.
+		result, err := Apply(tx, boundary, true, now)
+		if err != nil {
+			return 0, err
+		}
+		tx.Await(1)
+		run := RunStart{Inputs: append(result.Users, id), First: result.First, HasFirst: result.HasFirst}
+		if failure := live.Obj("runFailure"); failure != nil {
+			if first, ok := failure.Get("first").(float64); ok {
+				run.First, run.HasFirst = session.ID(first), true
+			}
+		}
+		a.set("placed")
+		return id, start(tx, runs, conversationID, live, run)
+	}
+	// A boundary reads the table, so it is prepared before the first table write; a busy conversation needs none.
+	var boundary *Boundary
+	if !busy {
+		if boundary, err = Prepare(tx, conversationID, modes); err != nil {
+			return 0, err
+		}
+		// submissions.ts :169: `await prepareBoundary(...)` resumes one tick after the async function returns.
+		tx.Await(1)
+	}
+	if boundary == nil || queued(boundary.Inbox).Len() > 0 {
+		return queueAndPlace(tx, runs, conversationID, draft, now, boundary, live, a)
+	}
+	if draft.Type == TypeWrite {
+		if boundary.IsStale(draft.Entry) {
+			record := submissionRecord(conversationID, draft.RequestID, draft.Trace, TypeWrite, "unanswered")
+			record.Set("reason", "stale")
+			created, err := tx.CreateSubmission(record)
+			if err != nil {
+				return 0, err
+			}
+			a.set("done")
+			return idOf(created), nil
+		}
+		entry, err := tx.AppendEntry(conversationID, draft.Entry)
+		if err != nil {
+			return 0, err
+		}
+		record := submissionRecord(conversationID, draft.RequestID, draft.Trace, TypeWrite, "done")
+		record.Set("entry", float64(idOf(entry)))
+		created, err := tx.CreateSubmission(record)
+		if err != nil {
+			return 0, err
+		}
+		a.set("done")
+		return idOf(created), nil
+	}
+	entry, err := tx.AppendEntry(conversationID, inputDraft(draft, now))
+	if err != nil {
+		return 0, err
+	}
+	record := submissionRecord(conversationID, draft.RequestID, draft.Trace, TypeInput, "placed")
+	record.Set("entry", float64(idOf(entry)))
+	created, err := tx.CreateSubmission(record)
+	if err != nil {
+		return 0, err
+	}
+	id := idOf(created)
+	a.set("placed")
+	return id, start(tx, runs, conversationID, live, RunStart{Inputs: []session.ID{id}, First: idOf(entry), HasFirst: true})
+}
+
+// start is `await startRun(...)` (submissions.ts :189, :205): the caller resumes one tick after startRun returns.
+func start(tx *session.Tx, runs Runs, conversationID session.ID, live *delta.Obj, run RunStart) error {
+	if err := runs.Start(tx, conversationID, live, run); err != nil {
+		return err
+	}
+	tx.Await(1)
+	return nil
+}
+
+// inputDraft is appendInput's draft for an idle input: its own entry's kind and data, or pi.user.
+func inputDraft(draft Draft, now float64) *jv.Object {
+	if draft.Entry == nil {
+		return UserDraft(draft.Content, now)
+	}
+	return withInputModel(PickInputEntry(draft.Entry), UserDraft(draft.Content, now))
+}
+
+// checkInputEntry rejects an input entry whose kind is not a non-empty string outside the pi. prefix, as a TypeError
+// (submissions.ts checkInputEntry).
+func checkInputEntry(entry *jv.Object) error {
+	kind, has := entry.Get("kind")
+	if s, ok := kind.(string); !ok || s == "" || strings.HasPrefix(s, "pi.") {
+		if !has {
+			return session.NewTypeError("An input entry's kind must be a non-empty string not starting with \"pi.\", got undefined")
+		}
+		return session.NewTypeError("An input entry's kind must be a non-empty string not starting with \"pi.\", got " + jsString(kind))
+	}
+	return nil
+}
+
+// jsString is String(value) for a JSON value.
+func jsString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return v
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return jv.FormatNumber(v)
+	case []any:
+		parts := make([]string, len(v))
+		for i, element := range v {
+			if element != nil {
+				parts[i] = jsString(element)
+			}
+		}
+		return strings.Join(parts, ",")
+	}
+	return "[object Object]"
+}
+
+func asString(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+// queueAndPlace queues the submission in pi.inbox; an idle conversation (boundary set) then runs a final boundary.
+func queueAndPlace(tx *session.Tx, runs Runs, conversationID session.ID, draft Draft, now float64, boundary *Boundary, live *delta.Obj, a *Admission) (session.ID, error) {
+	created, err := tx.CreateSubmission(submissionRecord(conversationID, draft.RequestID, draft.Trace, draft.Type, "queued"))
+	if err != nil {
+		return 0, err
+	}
+	id := idOf(created)
+	var inbox *delta.Obj
+	if boundary != nil {
+		inbox = boundary.Inbox
+	} else if inbox, err = tx.Doc(Def, session.DocArgs{Owner: conversationID}); err != nil {
+		return 0, err
+	}
+	item := jv.NewObject()
+	item.Set("id", float64(id))
+	if draft.Type == TypeWrite {
+		item.Set("mode", "write")
+		item.Set("entry", jv.Clone(draft.Entry))
+	} else {
+		mode := "followUp"
+		if draft.WhenBusy == "steer" {
+			mode = "steer"
+		}
+		item.Set("mode", mode)
+		item.Set("content", jv.Clone(draft.Content))
+		if draft.Entry != nil {
+			item.Set("entry", PickInputEntry(draft.Entry))
+		}
+		if draft.OnAbort == OnAbortKeep {
+			item.Set("onAbort", OnAbortKeep)
+		}
+	}
+	if _, err := queued(inbox).Push(item); err != nil {
+		return 0, err
+	}
+	if boundary == nil {
+		a.set("queued")
+		return id, nil
+	}
+	result, err := Apply(tx, boundary, true, now)
+	if err != nil {
+		return 0, err
+	}
+	tx.Await(1) // submissions.ts :188: `await applyBoundary(...)`
+	// submissions.ts: a write is done once the boundary applied it; an input is placed when it is the last user the boundary placed.
+	switch {
+	case draft.Type == TypeWrite:
+		a.set("done")
+	case len(result.Users) > 0 && result.Users[len(result.Users)-1] == id:
+		a.set("placed")
+	default:
+		a.set("queued")
+	}
+	if len(result.Users) > 0 {
+		return id, start(tx, runs, conversationID, live, RunStart{Inputs: result.Users, First: result.First, HasFirst: result.HasFirst})
+	}
+	return id, nil
+}
+
+// AbortResult is the outcome of Abort.
+type AbortResult string
+
+// Abort outcomes (submissions.ts AbortResult, plus not_found).
+const (
+	Aborted       AbortResult = "aborted"
+	AlreadyPlaced AbortResult = "already_placed"
+	Settled       AbortResult = "settled"
+	NotFound      AbortResult = "not_found"
+)
+
+// Abort is Submissions.abort: it withdraws a queued submission and removes its inbox item; placed inputs and settled
+// submissions are reported. conversationID zero matches any conversation.
+func Abort(tx *session.Tx, id, conversationID session.ID) (AbortResult, error) {
+	record, err := tx.Submission(id)
+	if err != nil {
+		return "", err
+	}
+	if record == nil {
+		return NotFound, nil
+	}
+	owner, _ := record.Get("conversationId")
+	ownerID := session.ID(owner.(float64))
+	if conversationID != 0 && ownerID != conversationID {
+		return NotFound, nil
+	}
+	switch status, _ := record.Get("status"); status {
+	case "queued":
+		if err := tx.SettleSubmission(id, Unanswered("aborted")); err != nil {
+			return "", err
+		}
+		return Aborted, RemoveItem(tx, ownerID, id)
+	case "placed":
+		return AlreadyPlaced, nil
+	}
+	return Settled, nil
+}

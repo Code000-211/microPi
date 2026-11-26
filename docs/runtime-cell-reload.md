@@ -1,0 +1,117 @@
+# Runtime-cell reload and operations
+
+This page covers atomic replacement, crash quarantine/fission, diagnostics, and the protocol boundary. Start with the [runtime-cell overview](extension-runtime-cells.md).
+
+## Atomic reload
+
+`Host.Reload` treats a new extension set as a transaction:
+
+1. resolve the requested extension configs/specs;
+2. plan isolated and packed cells;
+3. reuse or build cell artifacts;
+4. start replacement cells beside current cells, for unchanged extensions too (upstream reload invokes every extension factory again);
+5. complete per-extension protocol registration;
+6. validate identities/contributions and construct the replacement registry;
+7. atomically publish the new registry;
+8. stop old cells only after the swap.
+
+Like upstream reload, every extension factory runs again even when its source and cached artifact are unchanged. Each extension loads on its own. An extension that fails to resolve, build, start, or register is not loaded: its previous runtime stops, and `ReloadReport.Issues` records `<path>: Failed to load extension: <error>`, which `/reload` lists under Extension issues. Every other extension loads. When a packed cell fails, each member is staged again in its own isolated cell, so only the failing members are reported. Only a config loader failure fails the whole reload.
+
+## Quarantine and fission
+
+Native packed cells retain their quarantine/fission fallback. Node cells preserve cooperating healthy extensions:
+
+```text
+attributable failure:  A + culprit + C -> (A + C) | culprit
+first unknown failure: A + B + C + D -> A + B + C + D
+repeated unknown:      A + B + C + D -> (A + B) | (C + D)
+culprit identified:    (A + B) | C | D -> (A + B + D) | C
+```
+
+The host attributes a crash to the factory being admitted, an extension path in the bounded stderr stack tail, or the last dispatched owner. With no attribution, it restarts the whole group once. Repeated unknown failures split diagnostic groups in halves until the culprit is isolated. Healthy members then rejoin one shared Node bus. Only the culprit's recurrent singleton failure can trip its restart circuit breaker.
+
+Recovery reruns factories, not interrupted tools or callbacks. Current invocations fail on their original dead connections. Subsequent named capability calls can use the recovered instance. Generation checks reject stale crash reports; old connection-owned UI state cannot mutate the replacement. Original owner cancellation and Host shutdown cancel and drain recovery. Every restart, diagnostic split and quarantine is reported through the existing crash-notice callback. Quarantine is host runtime state and never changes authored isolation.
+
+A cell whose process ends just before a `/reload` begins is restarted by that reload without a notice of the exit. The reload replaces the cell before the watcher of the process reports its end, and the generation check rejects the late report. Before the end of a Node cell's process was reported once for each extension, each extension of such a cell was reported as disabled, with a request for the `/reload` that was already running.
+
+## Diagnostic logs
+
+PiG captures one temporary `pig-packed-*.log` stderr file per packed process (D20) or `pig-ext-*.log` per isolated process (D56). Each file keeps the first 1 MiB and the last 64 KiB of the output and states how many bytes it dropped, so a startup failure and a crash line both survive a flood. Shutdown and reload close the process handles and remove that file. A load or crash diagnostic that names the file retains it for troubleshooting, including after reload. A cancelled load does not retain a log. Remove a retained file manually when you no longer need it.
+
+When a shared Go, Rust, or Python process crashes and its stderr trace names no one member (a kill, `os.Exit`, a runtime fatal error), every member of the cell stops, and the error for each says that `/reload` restarts it. A Go, Rust, Python, or Lisp extension that fails while it registers shows its own error in the load message, and a Go or Rust panic shows its panic message. A factory that panics or returns no extension fails only its own member: the shared process keeps serving the others, and the host does not quarantine the cell. The Go and Lisp SDKs turn a panic or condition in any callback of the extension's own code that they run on a goroutine or thread they started into that call's error, so it ends neither process. What no SDK can recover is a goroutine or thread the extension started itself. When one ends a shared Go or Lisp process, the host reads the trace (a Go trace names the goroutine's frames by import path, a Lisp backtrace names the package) and blames the one member it names, provided that trace is what ended the process: the Go process exited with status 2 and no `fatal error:` follows the panic, or SBCL's unhandled-condition quit line follows the backtrace. A panic or backtrace an extension only logged, in the form of the runtime's, blames no one when the process ended another way (`os.Exit`, a kill). That member stops, reported with its panic and the log that holds it, as an isolated extension stops when its process ends, and a `/reload` runs it isolated. The other members start again together in a new shared process, each reported as restarting; their factories run again, so their in-memory state starts over, and a call in flight when the process ended fails with the connection error and is not replayed (D274).
+
+A socket close and process exit claim the same failed member only once. Interrupted commands, shortcuts and events keep their error result, but the lifecycle handler owns the connection failure diagnostic when a crash handler is installed. Ordinary handler errors still reach the runner's error listener. Interactive commands use that same runner path.
+
+PiG does not sweep logs from earlier sessions. Their names do not identify an owner or prove that its process has exited. Automatic deletion could remove a live session's log or a retained failure diagnostic.
+
+## Reload report
+
+`Host.LastReloadReport()` returns the last placement transaction. `/reload --explain` renders the same facts for a user.
+
+| Fact | Examples |
+|---|---|
+| strategy/key/members | packed or isolated placement |
+| reason | source command, shared factory, quarantine/fission; for a member moved out of a packed cell that failed, `packed cell failed:` and the error that ended that cell on one line |
+| artifact | resolved runner path |
+| cache/build | hit or cold-build duration |
+| result | success/failure and wall duration |
+
+## Protocol boundary
+
+Every extension, including each member of a packed cell, uses the same current wire contract over its own connection. The wire has no independent version. Required behavior includes:
+
+- registration with stable extension identity;
+- request/response correlation;
+- cancellation and shutdown;
+- host calls and results;
+- tool updates and UI notifications;
+- frame-size enforcement;
+- startup/register timeouts;
+- error propagation without crashing the host.
+
+Packed mode must be observationally identical to isolated mode. Fix the host or number a divergence when a conformance difference appears; do not change SDK semantics to hide it.
+
+## Oversized results and panics
+
+The host catches extension-call panics at the extension boundary and returns a structured internal error when a response is possible. Results above the protocol frame limit are replaced with a small `result_too_large` error so the host does not write a frame no compliant extension can read.
+
+## Piglet component runtime
+
+A Piglet build/release may populate neutral runtime inputs:
+
+| Input | Runtime job |
+|---|---|
+| effective Piglet | provide immutable agent composition |
+| component closure | expose exact prebuilt subprocess runners/assets to ordinary resolution |
+| fused registrations | register build-time-linked compatible Go factories |
+
+Stock Pig has no Piglet-specific registrations or closure. Runtime registration remains generic and does not own Piglet schema or product transport.
+
+## Operational boundaries
+
+| Pig owns | Product/platform owns |
+|---|---|
+| placement/reload facts | org policy and quotas |
+| cell build/cache/start | build-environment scheduling |
+| registration/cancellation/errors | vulnerability/signature policy |
+| quarantine/fission | publication approval |
+| local reports | external telemetry collection/storage |
+
+## Verification
+
+- reload success swaps all registries together;
+- a failed build/start/register drops only that extension and reports it;
+- Node factory admission preserves interleaved native order without splitting the Node bus;
+- a Node crash restarts healthy members together, with one whole-group retry and then bisection when attribution is unavailable;
+- native quarantine retains its explicit fission policy;
+- report getters return copies and are race-safe;
+- oversized results return a small structured error;
+- SDK conformance compares isolated, packed, and fused paths where applicable;
+- stress tests cover reload/provider lifecycle and cancellation.
+
+Primary sources/tests:
+
+- `coding/extension/host/subprocess/host.go`
+- `reload_cells.go`, `packed_quarantine.go`, `reload_report.go`
+- `coding/extension/host/runtimecell/`
+- `test/extension-conformance/`

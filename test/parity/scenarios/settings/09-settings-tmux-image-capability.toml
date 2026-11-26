@@ -1,0 +1,44 @@
+# Upstream evidence: Pi 0.99.1 terminal-image.ts:79-82 rejects inherited image hints under tmux.
+# settings-selector.ts:757-796 hides Show images and Image width, but retains
+# Auto-resize images and Block images. Reproduced with Herdr graphics forwarded
+# to the outer terminal; tmux is still the immediate terminal boundary.
+# Pi 1.2.0+3daa2028 shows (1/33) rows here: its roster adds share-destination (settings-selector.ts:516) and tmux hides the two image-only rows. PiG omits that row by approved divergence D64 and adds D80's Mask secret input row, so both sides show (1/33) with no count normalization.
+name = "09-settings-tmux-image-capability"
+description = "Tmux hides terminal image controls even inside an image-capable Herdr pane"
+covers = [
+  "packages/tui/src/terminal-image.ts",
+  "packages/coding-agent/src/modes/interactive/components/settings-selector.ts",
+]
+tags = ["fast", "hermetic", "tui"]
+driver = "interactive-tmux"
+
+[tmux]
+width = 100
+height = 40
+ready_pattern_pig = "(auto)"
+ready_pattern_pi = "(auto)"
+ready_timeout_seconds = 20
+capture_start = "Auto-compact"
+capture_end = "Type to search · Enter/Space to change · Esc to cancel"
+
+[[tmux.steps]]
+keys = ["/settings", "Enter"]
+wait_contains = ["Type to search · Enter/Space to change · Esc to cancel"]
+wait_timeout_seconds = 5
+settle_seconds = 1
+
+[env]
+pig = ["PIG_CODING_AGENT_DIR=../model-resolver-selector/testdata/model-picker-defaults", "HERDR_ENV=1", "HERDR_KITTY_GRAPHICS=1"]
+pi = ["PI_CODING_AGENT_DIR=../model-resolver-selector/testdata/model-picker-defaults", "HERDR_ENV=1", "HERDR_KITTY_GRAPHICS=1"]
+pig_args = ["--no-extensions", "--offline", "--session-dir", "{{TEMP}}/sessions"]
+pi_args = ["--no-extensions", "--offline", "--session-dir", "{{TEMP}}/sessions"]
+
+[assert]
+both_reach_ready = true
+both_contain = ["Auto-resize images", "Block images"]
+both_not_contain = ["Show images", "Image width"]
+output_equal = true
+escaped_output_equal = true
+runs = 3
+pig_contains = ["(1/33)"]
+pi_contains = ["(1/33)"]

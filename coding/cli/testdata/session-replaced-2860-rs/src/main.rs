@@ -1,0 +1,381 @@
+//! session-replaced-2860-rs runs the bodies of Pi's 2860-replaced-session-context.test.ts cases as Rust SDK commands.
+//! Each line goes to the file named by PIG_TEST_2860_LOG; process ids name the extension instances, because each
+//! Session's extensions run in their own process here.
+use pig_sdk::{CommandResult, Extension, ReplacedSessionContext};
+use serde_json::{Value, json};
+use std::io::Write;
+
+fn record(line: &str) {
+    if let Ok(path) = std::env::var("PIG_TEST_2860_LOG")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+fn conversation(ctx: &pig_sdk::Context) -> String {
+    let branch = match ctx.session_manager().get_branch(None) {
+        Ok(branch) => branch,
+        Err(error) => return format!("error:{error}"),
+    };
+    branch
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["type"] == "message" && entry["message"]["role"] != "system")
+        .map(|entry| {
+            format!(
+                "{}:{}",
+                entry["message"]["role"].as_str().unwrap_or_default(),
+                text(&entry["message"]["content"])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn marks() -> serde_json::Map<String, Value> {
+    std::env::var("PIG_TEST_2860_MARKS")
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default()
+}
+
+fn session_file(ctx: &pig_sdk::Context) -> Option<String> {
+    ctx.session_manager()
+        .get_session_file()
+        .ok()
+        .and_then(|file| file.as_str().map(str::to_string))
+}
+
+fn result(outcome: std::io::Result<Option<Value>>) -> CommandResult {
+    match outcome {
+        Ok(_) => CommandResult::Ok,
+        Err(error) => CommandResult::Error(error.to_string()),
+    }
+}
+
+fn main() {
+    let pid = std::process::id();
+    let mut ext = Extension::new("session-replaced-2860-rs");
+    ext.on_event("session_start", move |_, _| {
+        record(&format!("start:{pid}"));
+        None
+    });
+    ext.on_event("session_shutdown", move |_, _| {
+        record(&format!("shutdown:{pid}"));
+        None
+    });
+    ext.command("repro", "repro", move |ctx, _| {
+        let old_ctx = ctx.clone();
+        let old_session_file = session_file(ctx);
+        result(ctx.new_session_with(
+            json!({"parentSession": old_session_file}),
+            move |replaced: &ReplacedSessionContext| {
+                record(&format!("with:{pid}"));
+                let replacement = session_file(replaced);
+                record(&format!(
+                    "replacement:{}",
+                    replacement.is_some() && replacement != old_session_file
+                ));
+                record(&format!(
+                    "staleCtx:{}",
+                    old_ctx.session_manager().get_session_file().is_err()
+                ));
+                record(&format!(
+                    "stalePi:{}",
+                    old_ctx.send_user_message("stale message", "").is_err()
+                ));
+                replaced.send_user_message("reply with exactly: hello reply", "")?;
+                record(&format!("idle:{}", replaced.is_idle()?));
+                // Pi's `await sleep()` works in a withSession callback: the SDK's yield helper must answer on the replacement route too.
+                match replaced.sleep(std::time::Duration::from_millis(1)) {
+                    Ok(()) => record("yield:ok"),
+                    Err(error) => record(&format!("yield:{error}")),
+                }
+                record(&format!("model:{}", replaced.model()));
+                record(&format!("conversation:{}", conversation(replaced)));
+                Ok(())
+            },
+        ))
+    });
+    // types.ts:411, agent-session-runtime.ts:254-257: setup seeds the replacement Session through its SessionManager before withSession runs.
+    ext.command("seed-it", "seed-it", |ctx, _| {
+        result(ctx.new_session_setup(
+            json!({}),
+            |manager: &pig_sdk::SetupSessionManager| {
+                let first = manager.append_custom_message_entry(
+                    "seed-msg",
+                    json!("from setup"),
+                    true,
+                    Value::Null,
+                )?;
+                let second = manager.append_session_info("seeded-session")?;
+                record(&format!(
+                    "setup:{}",
+                    first.as_str().is_some_and(|id| !id.is_empty())
+                        && second.as_str().is_some_and(|id| !id.is_empty())
+                        && first != second
+                ));
+                Ok(())
+            },
+            Some(Box::new(|replaced: &ReplacedSessionContext| {
+                let manager = replaced.session_manager();
+                record(&format!(
+                    "seedName:{}",
+                    manager.get_session_name()?.as_str().unwrap_or_default()
+                ));
+                let entries = manager.get_entries()?;
+                let rows = entries
+                    .as_array()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter(|entry| entry["type"] == "custom_message")
+                            .map(|entry| {
+                                format!(
+                                    "{}={}",
+                                    entry["customType"].as_str().unwrap_or_default(),
+                                    entry["content"].as_str().unwrap_or_default()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                    .unwrap_or_default();
+                record(&format!("seedEntry:{rows}"));
+                Ok(())
+            })),
+        ))
+    });
+    ext.command("throw-it", "throw-it", |ctx, _| {
+        let outcome = ctx.new_session_with(json!({}), |_: &ReplacedSessionContext| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "callback failed",
+            ))
+        });
+        match outcome {
+            Ok(_) => record("caught:none"),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                record(&format!("caught:{error}"))
+            }
+            Err(error) => record(&format!("caught:other:{error}")),
+        }
+        CommandResult::Ok
+    });
+    // A context kept past its callback must not block the extension: the command still returns.
+    ext.command("keep-it", "keep-it", |ctx, _| {
+        let kept = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = kept.clone();
+        if let Err(error) =
+            ctx.new_session_with(json!({}), move |replaced: &ReplacedSessionContext| {
+                *slot.lock().unwrap() = Some(replaced.context().clone());
+                Ok(())
+            })
+        {
+            return CommandResult::Error(error.to_string());
+        }
+        if let Some(kept) = kept.lock().unwrap().take() {
+            let _ = kept.session_manager().get_session_file();
+            let _ = kept.is_idle();
+            let _ = kept.send_user_message("kept message", "");
+        }
+        record("kept:returned");
+        CommandResult::Ok
+    });
+    ext.command("fork-it", "fork-it", |ctx, _| {
+        let leaf = match ctx.session_manager().get_leaf_id() {
+            Ok(Value::String(leaf)) => leaf,
+            Ok(_) => return CommandResult::Error("Missing leaf id".to_string()),
+            Err(error) => return CommandResult::Error(error.to_string()),
+        };
+        result(ctx.fork_with(
+            &leaf,
+            json!({"position": "at"}),
+            |replaced: &ReplacedSessionContext| {
+                replaced.send_user_message("reply with exactly: fork reply", "")?;
+                record(&format!("conversation:{}", conversation(replaced)));
+                Ok(())
+            },
+        ))
+    });
+    // types.ts:463-473: the replacement context's sendUserMessage takes expandPromptTemplates; true expands the prompt template, false and no option send the text as typed.
+    ext.command("expand-it", "expand-it", |ctx, _| {
+        result(
+            ctx.new_session_with(json!({}), |replaced: &ReplacedSessionContext| {
+                replaced.send_user_message_with("/echo Alice", "", Some(true))?;
+                replaced.send_user_message_with(
+                    "/echo reply with exactly: Bob",
+                    "",
+                    Some(false),
+                )?;
+                replaced.send_user_message_with("/echo reply with exactly: Carol", "", None)?;
+                record(&format!("conversation:{}", conversation(replaced)));
+                Ok(())
+            }),
+        )
+    });
+    // D30: what a captured context's state getters answer after the replacement. Each outcome is one line.
+    ext.command("getters", "getters", |ctx, _| {
+        let old_ctx = ctx.clone();
+        result(
+            ctx.new_session_with(json!({}), move |replaced: &ReplacedSessionContext| {
+                let probe = |name: &str, read: &dyn Fn() -> String| match std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(read),
+                ) {
+                    Ok(value) => record(&format!("getter:{name}={value}")),
+                    Err(payload) => {
+                        let message = payload
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        record(&format!("getter:{name}=panics:{message}"));
+                    }
+                };
+                probe("cwd", &|| {
+                    if old_ctx.cwd().is_empty() {
+                        "empty"
+                    } else {
+                        "nonempty"
+                    }
+                    .to_string()
+                });
+                probe("mode", &|| old_ctx.mode().to_string());
+                probe("hasUI", &|| old_ctx.has_ui().to_string());
+                probe("model", &|| old_ctx.model());
+                probe("theme", &|| {
+                    let _ = old_ctx.theme();
+                    "Theme".to_string()
+                });
+                probe("branch", &|| conversation(&old_ctx));
+                probe(
+                    "entries",
+                    &|| match old_ctx.session_manager().get_entries() {
+                        Ok(entries) => entries
+                            .as_array()
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .filter(|entry| entry["type"] == "message")
+                                    .count()
+                            })
+                            .unwrap_or_default()
+                            .to_string(),
+                        Err(error) => format!("error:{error}"),
+                    },
+                );
+                record(&format!("replacement:{}", conversation(replaced)));
+                Ok(())
+            }),
+        )
+    });
+    // D30: what each host call from a captured context does after the replacement, and whether it reaches the replacement. One line per call.
+    ext.command("calls", "calls", |ctx, _| {
+        let old_ctx = ctx.clone();
+        result(ctx.new_session_with(
+            json!({}),
+            move |replaced: &ReplacedSessionContext| {
+                let before = replaced.get_active_tools().unwrap_or_default();
+                let report = |name: &str, call: &dyn Fn() -> std::io::Result<()>| {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+                        Ok(Ok(())) => record(&format!("call:{name}=nil")),
+                        Ok(Err(error)) => record(&format!("call:{name}=error:{error}")),
+                        Err(payload) => {
+                            let message = payload
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                                .unwrap_or_default();
+                            record(&format!("call:{name}=panics:{message}"));
+                        }
+                    }
+                };
+                report("notify", &|| { old_ctx.notify("stale note", "info"); Ok(()) });
+                report("setStatus", &|| { old_ctx.set_status("stale", "text"); Ok(()) });
+                report("setActiveTools", &|| { old_ctx.set_active_tools(&["read"]); Ok(()) });
+                report("abort", &|| { old_ctx.abort(); Ok(()) });
+                report("sendUserMessage", &|| old_ctx.send_user_message("stale message", ""));
+                report("appendEntry", &|| old_ctx.append_entry("stale-entry", json!({"a": 1})));
+                report("setSessionName", &|| old_ctx.set_session_name("stale-name"));
+                report("setWidgetLines", &|| old_ctx.set_widget("stale", vec!["line".to_string()]));
+                report("setWidgetValue", &|| old_ctx.set_widget_value("stale", json!(["line"]), Some(json!({"placement": "belowEditor"}))));
+                let after = replaced.get_active_tools().unwrap_or_default();
+                let named = replaced.session_manager().get_session_name().map(|v| v == "stale-name").unwrap_or_default();
+                let custom = replaced
+                    .session_manager()
+                    .get_entries()
+                    .ok()
+                    .and_then(|entries| entries.as_array().map(|entries| entries.iter().filter(|entry| entry["type"] == "custom").count()))
+                    .unwrap_or_default();
+                record(&format!("replacement:toolsChanged={} named={named} customEntries={custom} conversation={}", before != after, conversation(replaced)));
+                Ok(())
+            },
+        ))
+    });
+    ext.command("mark", "mark", |ctx, name| {
+        let mut values = marks();
+        values.insert(
+            name.to_string(),
+            session_file(ctx).map(Value::String).unwrap_or(Value::Null),
+        );
+        match std::fs::write(
+            std::env::var("PIG_TEST_2860_MARKS").unwrap_or_default(),
+            Value::Object(values).to_string(),
+        ) {
+            Ok(()) => CommandResult::Ok,
+            Err(error) => CommandResult::Error(error.to_string()),
+        }
+    });
+    ext.command("new", "new", |ctx, _| result(ctx.new_session(json!({}))));
+    ext.command("switch", "switch", |ctx, name| {
+        let target = marks()
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        result(ctx.switch_session(&target, json!({})))
+    });
+    ext.command("switch-it", "switch-it", |ctx, _| {
+        let target = marks()
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let expected = target.clone();
+        result(ctx.switch_session_with(
+            &target,
+            json!({}),
+            move |replaced: &ReplacedSessionContext| {
+                replaced.send_user_message("reply with exactly: switch reply", "")?;
+                record(&format!(
+                    "switched:{}",
+                    session_file(replaced).as_deref() == Some(expected.as_str())
+                ));
+                record(&format!("conversation:{}", conversation(replaced)));
+                Ok(())
+            },
+        ))
+    });
+    if let Err(error) = ext.run() {
+        eprintln!("session-replaced-2860-rs: {error}");
+        std::process::exit(1);
+    }
+}

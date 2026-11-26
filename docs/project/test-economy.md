@@ -1,0 +1,102 @@
+# Test economy
+
+PiG's suites are large: `make test` takes about 7,800 CPU-seconds and 31 minutes on a 196-core host, and `make ci-drift ci-contracts` about 1,400 CPU-seconds. Many agents and developers run tests on one host at the same time. This document defines which tier of tests to run when, and the rules that keep each run's cost proportional to the change. CI and the release preview still run every suite in full. Nothing here removes a test or lowers what CI proves.
+
+## Tiers
+
+| Tier | When | Commands | Cost |
+|---|---|---|---|
+| Inner loop | After each edit | `go test ./<pkg> -run '<Tests>'` for the code you edit | seconds |
+| Change gate | Before each commit you hand off | `make test-changed`, `make lint-changed`, `go vet` and `GOOS=windows go vet` on the packages you touched | minutes |
+| Contract gate | Once before you report a change ready | `make ci-drift ci-contracts`, plus `make parity-family FAMILY=<f>` for each parity family the change reaches | minutes |
+| Full suites | CI, the integrator, and the release preview | `make test`, `make check`, `make verify`, `make parity`, `make vet`, `make lint`, `go test ./...` | tens of minutes |
+
+`make test-changed` tests the packages a change can affect. `automation/ci/changed-packages.py` maps each file changed since the merge base with `TEST_BASE` (default `@{upstream}`, then `main`) to Go packages:
+
+- the package whose directory holds a changed Go file;
+- the package that embeds a changed file;
+- the package whose directory, or a `testdata` directory under it, holds a changed file;
+- a package whose Go source names the changed file's repository path, as one string or as the quoted components of a `filepath.Join` call. A file at the repository root (`Makefile`, `README.md`) also names files of other directories, so its bare name counts only as a relative path (`"../../Makefile"`) or a later `filepath.Join` argument (`root, "Makefile"`).
+
+It then adds every package whose tests import one of those packages, directly or transitively (the reverse closure of `go list -test -deps`). The edited packages run under `-race`; the other affected packages run without it (`TEST_CHANGED_RACE=affected` or `none` changes this). A change to `go.mod`, `go.sum` or `go.work` affects every package. The script names packages that build only under a tag (the parity runner, the integration tier) and files that no package test reads; their own make targets and CI cover them.
+
+`make test-changed` runs a heavy package that CI shards (`SHARDED_SPEC` in `automation/ci/test-grouped.sh`: `ai`, `coding`, `internal/codingagent`, the extension host and conformance packages and others, and cmd/pig in eight shards) in the same shards CI uses, each in its own go test process and package timeout, so a whole-package run does not outlive go test's 10-minute limit on a loaded host. A package the change edits directly runs under `-race`, several times slower, so it runs in `TEST_CHANGED_RACE_SHARDS` times as many shards (default 3): the shard patterns partition a package for any count, and the measured weights apply only to CI's count. Measured on a loaded 196-core host, `test/extension-conformance` under `-race` timed out in all of its 3 CI shards and finished in 9 shards, the slowest in 525 s. A timeout kill skips `TestMain` cleanup, which then shows up as false scratch-directory leaks.
+
+The light pull-request run (`PIG_PR_CI_LIGHT`, `.github/AGENTS.md`) uses the same selection for its test-fast shard: `make ci-test-changed` runs the fast packages the pull request affects against its base branch, without `-race`, and runs the whole `ci-test-fast` when the change touches `go.mod`, `go.sum`, `go.work` or `go.work.sum`, or a file no package test reads. The full run stays the merge gate.
+
+The pull request's `Linux / alloc-ratchet` shard (`make ci-alloc-ratchet`, which is `make alloc-baseline-changed`, in its own job because a change to `ai` or `tui` makes it measure most hot packages, about 22 minutes) runs the nightly's allocation ratchet (`make alloc-baseline`, `automation/ci/allocbase`) for only the hot packages the change touches or imports: `go run ./automation/ci/allocbase -changed-since <base>` measures a package with a changed benchmark file (or a deleted one), a changed or removed baseline row, a changed non-test source, embedded file (the package that embeds it is measured, however deep below its directory the file lies) or data file, or a fixture under its `testdata`, and every hot package of the tool's list that imports (tests included) a package with a changed non-test file, and every hot package when `go.work`, `go.work.sum`, or the `go.mod` or `go.sum` of the root module or of another `go.work` member changed. The verdict is the nightly's for those packages: a benchmark with no row, a count over its row or under it beyond the tolerance, and a row with no benchmark fail. A change that selects no package (documentation, workflows, scripts, a package no hot package imports) measures nothing and passes at once. A benchmark in a package outside the tool's list is not in the nightly's run and owes no row.
+
+`make test-changed` prints each package result, the output of failed tests, and the slowest tests and packages. The raw `go test -json` events stay in `tmp/test-changed/<time>/`.
+
+## Rules for running tests
+
+- Do not pass `-count=1` unless the test reads an input through a child process. The go test cache keys a result on the test binary, the environment variables the test read and the files the test process opened. It does not see what a child process reads: a script, a Node or Python oracle, a fixture build. A test that runs a repository script reads the script itself first (`repoScript` in `test/ci-images`), so an edit to the script reruns it. A test or build whose child process reads other files keeps `-count=1`; the make recipe says why (`docs-drift`, `standard-check`, the parity runner). A failure is never cached.
+- CI runs every test. It restores the Go build cache, test results included, from earlier commits, so `test-grouped.sh`, `test-race.sh` and the Go test recipes pass `-count=1` when `CI` is set.
+- Use `-race` for the packages you edited and for concurrency work, not for the whole module.
+- Do not run `go test ./...` or `make test` to check one change. Use `make test-changed`.
+- Bound fuzzing. `go test -fuzz` starts one worker per `GOMAXPROCS` by default, which on a 196-core host is 196 workers. Pass `-parallel` (at most 4 on a shared host) and `-fuzztime` (at most `2m`). Long fuzzing campaigns run on a dedicated machine.
+- Build with `-trimpath` on a shared host. Without it every package's build-cache key contains its absolute directory, so each checkout recompiles the whole module: 280 CPU-seconds for `go build ./...`, 776 for `go vet ./...` and 921 for `GOOS=windows go vet ./...` in a fresh worktree. With `-trimpath` a second checkout of the same source links only.
+- Set `GOCACHE` and `GOMODCACHE` explicitly. The go command derives both from `HOME`, so a test or script that replaces `HOME` would otherwise compile into an empty cache.
+- Set `RUSTUP_HOME` and `CARGO_HOME` explicitly. rustup and cargo derive both from `HOME`, so a test or script that replaces `HOME` would otherwise find no toolchain default (`rustup could not choose a version of cargo to run`). `automation/ci/with-isolated-pig-home.sh` pins both to the caller's directories, as it does the Go caches.
+- Set `PIG_NODE_MODULES_STORE` to a host directory to share the locked Node trees (`extensions/sdk-ts`, the interface extractor, `durable/interop`) between checkouts. Each checkout otherwise holds its own 333 MB copy.
+- `make port-lint` and `make interface-gaps` replay a stored passing run while no tracked, modified or untracked file has changed (`automation/ci/cached-gate.sh`). A failure always reruns. `PIG_GATE_CACHE=0` forces a run; CI always runs them.
+
+## Rules for writing tests
+
+- Find files from the package directory, not from `runtime.Caller`. `go test` runs every test binary in its package directory; `testenv.PackageDir` and `testenv.ModuleRoot` return it and the module root. Under `-trimpath`, `runtime.Caller` reports a module-relative import path, not a file system path.
+- Start an expensive oracle (a Node or Pi process, a built binary, a type-checked module) once per package with `sync.Once` or `TestMain`, not once per case.
+- Wait on a channel, a file, a process exit or a condition, never on `time.Sleep`. A sleep makes the test slow on an idle host and flaky on a busy one.
+- Stop every process a test starts, on every path. Kill the process group in `t.Cleanup` when the process may start children or ignore signals. `make test` fails a group that leaves a process running under its scratch `TMPDIR` (`automation/ci/reap-test-processes.sh`) and kills it.
+- Scope temporary files. A package whose tests start pig, build binaries or create temporary files outside `t.TempDir()` calls `testenv.RunScoped` or `testenv.ScopeTempDir` from `TestMain`. `make test` fails a group that leaves anything in its scratch `TMPDIR`.
+- A test that runs the go command with a fresh `HOME` writes `go/telemetry/mode` containing `off` into that home's configuration directory. Otherwise the go command starts a detached telemetry child that writes into the directory after the test removed it.
+- Keep CPU-heavy loops (fuzzing, mutation, stress repetition) out of the default run. Gate them behind an explicit flag or environment variable and run them in a dedicated job.
+
+## Test pruning
+
+A test earns its CI minutes by catching a bug. Tests are classified by where their expected values come from:
+
+| Class | Expected values come from | Action |
+|---|---|---|
+| A | Running Pi, Pi's own tests, or a cited Pi source line | Keep. |
+| B | A rule over generated or looped inputs (invariant, property, fuzz) | Keep. |
+| C | PiG's own output: a golden regenerated from PiG, a value copied from a PiG run, an expectation edited to pass when the code changed | Convert to an A test if the behavior is Pi's, to a B test if it is PiG's, and delete it if neither adds coverage. |
+| D | Nothing: it checks that a type, method or field exists | Delete. The interface ledger proves existence. |
+| E | A rule another test already checks: it adds no statement or branch coverage over the A and B tests and the journeys | Delete. |
+
+`go run ./test/parity/cmd/testprune` finds and verifies the candidates:
+
+- `inventory` classifies every Go test function from mechanical signals (it runs Pi, reads a golden, only reflects, cites Pi). The classes are a starting point for review.
+- `history` lists test files whose expected values changed in a commit that also changed production code of the same directory.
+- `redundant -pkg P` runs each test of `P` alone under coverage and lists the tests whose blocks other tests repeat. It never lists a test with no in-package coverage, an A or B test, or the last cover of a block.
+- `redundant -journeys FILE` counts a block that the end-to-end journeys reach as covered by another test (`JOURNEY_PIG_VARIANT=cover JOURNEY_COVERDIR=DIR go test -tags parity ./test/journeys`, then `go tool covdata textfmt -i=DIR -o FILE`). `-only-classes D-shape` limits the candidates to one class. `journeycover -pkg P -tests A,B -journeys FILE` lists the blocks of the named tests that the journeys do not reach, with a verdict per test: `journeys_cover_all_blocks`, `keeps_blocks`, `no_in_package_coverage` (a reflection or declaration guard, which the journeys never stand in for), or `protected` (a class in `-classes` or an oracle, ordering or cancellation name). Build the journey profile from the same commit as the package: a block is matched by file, position and statement count. Executing a block is not asserting on it: a journey asserts the rendered screen, not each edge case of a helper, so a list from these flags is a proposal that a mutation run must confirm, and it never covers tests that port a Pi test.
+- `coverdiff -pkg P -against CHECKOUT` (or `-skip REGEXP`) runs the suite before and after a change and fails when a block loses all coverage. `-also PKGS` counts the tests of those packages as covering `P`. A deletion batch lists its lost blocks, and the list must be empty or covered by A tests, B tests or journeys.
+- `mutate -pkg P -blocks FILE -out TSV` runs a seeded sample of mutants (operator swaps, negated conditions, off-by-one constants, flipped boolean returns) against the suite. Run it in the checkout before the batch and in the checkout after it, with the same seed, then `mutcompare BEFORE AFTER`: a mutant killed before and alive after fails the batch.
+
+A pruning batch covers one package area and reports the test count, the lost-coverage diff, the mutation result and the lane-gate time before and after.
+
+### Ratchet
+
+- `make test-provenance` fails on a golden or snapshot data file that `test/testdata-provenance.toml` does not declare. A Pi golden names the script that regenerates it from Pi. A PiG-owned golden names the invariant test that asserts the rule and says why a value snapshot is needed.
+- `make test-expectation-lint` (and the `Bookkeeping` job of a pull request, for the commits the pull request adds) fails when a commit changes an expected value in a test file together with production code of the same directory, unless the commit cites the Pi source line whose behavior changed: a `Pi-Behavior-Change: <pi file.ts:line>` trailer, or a `name.ts:line` citation on a line the commit adds to the test file. The cited file must be a Pi source or test file that `docs/parity/PORT_MAP.md`, `test/parity/interfaces/test-mapping-v*.json` or `test/parity/upstream-sync/*.toml` names. Adding a test, renaming an identifier, moving a file or package path and refactoring code without changing an expected value pass. A commit that is already merged cannot be given a citation, so a reviewed ledger, `test/parity/testprune-reviewed.toml`, admits it: one row for exactly one commit and one test file, with a reason that states the checkable fact and one of three classes. `CITE` names the Pi `file.ts:line` that governs the change, a file the rule above accepts. `DIVERGENCE` names the record in `docs/parity/divergences/` whose PiG-owned behavior changed. `NOBEHAVIOR` says why no Pi behavior is involved: only failure text changed, an allocation ceiling was tightened, or the test is PiG-original. The ledger is compared both ways: a finding without its row fails, and so does a row whose commit is in the checked range and matches no finding. A row whose commit is not in the range (squash-merged or rewritten) admits nothing and is printed as prunable. An expectation that was changed only to make a test pass gets no row. Commits authored before `expectations_from` in `test/testdata-provenance.toml` are not checked. A test that fails after a code change is a finding about the code until a Pi source line says the behavior changed.
+- Both gates admit the same reviewed rows. `test/parity/testprune-reviewed.toml` holds one row per reviewed finding: the `path` of the test file, the `commit` (at least ten characters) whose change it reviews, a `class` and a `reason`. `CITE` names a Pi `file.ts:line` that a main inventory names, `DIVERGENCE` names a record of `docs/parity/divergences/`, `NOBEHAVIOR` records that no Pi behavior is involved (a PiG-only feature, or a Go-only change inside a ported test) and needs only its reason. `make test-expectation-lint` admits a finding by the row of its commit and path. The pre-flight rule `test-expectation` (`automation/ci/preflight/README.md`) works on the PR's whole diff: it reads the ledger at the PR's head commit and admits a changed test file by a row whose path is the file and whose commit is one of the PR's commits, so the row is added by a later commit of the same PR. Both validate a row with the code of `automation/ci/preflight/reviewed`, and the pre-flight prints a notice naming every row it admits by. Nothing but the review of the ledger diff decides whether a `NOBEHAVIOR` row is true. After a squash merge a row's commit is gone: the line lint reports it as prunable and a maintainer deletes it.
+- A row admits a file only when the commit it names changed that file, in both gates. The pre-flight asks the commit endpoint for the files of each commit a row names for a changed test file (one call per commit, 100 files a page, at most 50 commits per PR: more is a finding that asks to split the PR) and treats a failed call as an error, not as a pass.
+- Both gates take the `[[tooling]]` prefixes of `test/testdata-provenance.toml` (PiG-owned CI tooling) out of the expected-value rule, through one parser and prefix match in `automation/ci/preflight/reviewed`. The pre-flight reads the list from main only, fails closed when it cannot be read, and prints each skip. A ledger row for a file under such a prefix is stale for the line lint and not needed by the pre-flight.
+
+## Top costs measured
+
+Measured on a shared 196-core, 1 TB development host at commit `54220fb62` on 2026-10-07, each command alone in a systemd user scope. CPU is the scope's total CPU time.
+
+| Rank | Cost | CPU-seconds | Wall | Peak memory |
+|---:|---|---:|---:|---:|
+| 1 | `make test`, all groups (fast 2,773; `cmd/pig` 8 shards 2,908; conformance 1,136; subprocess 1,005) | 7,822 | 31 min | 6.6 GB |
+| 2 | A fresh worktree's first build per configuration, without `-trimpath`: `go vet ./...` | 776-940 | 32-36 s | 6.6 GB |
+| 3 | `GOOS=windows go vet ./...` in a fresh worktree | 921 | 35 s | 6.9 GB |
+| 4 | `make ci-contracts` (of which `interface-gaps` 431-512) | 753-794 | 4 min | 6.6 GB |
+| 5 | `make ci-drift` (of which `port-lint` 570) | 612 | 52 s | 7.0 GB |
+| 6 | `go test -race -count=1 ./internal/codingagent ./tui` | 439-651 | 4.5-6 min | 2.7 GB |
+| 7 | `make test` cache warm-up: four `go build ./...` passes that relink every command | 270 per run when warm | 20 s | 2.8 GB |
+| 8 | `go build ./...` in a fresh worktree | 280 | 25 s | 2.8 GB |
+| 9 | golangci-lint on two packages in a fresh worktree | 264 | 26 s | 2.4 GB |
+| 10 | Leaked processes: test binaries, Node extension cells and tmux servers from failed runs, still running hours to days later | 10 to 15 processes at a time | - | - |
+
+In three days of coding-agent sessions on that host, 78% of 5,653 `go test` invocations passed `-count=1`, 26% passed `-race`, and 365 ran `go test ./...`.

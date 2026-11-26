@@ -1,0 +1,491 @@
+package ai
+
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// This file ports packages/ai/src/api/constrained-sampling.ts: the provider-side
+// constrained tool sampling helpers (JSON-schema strict mode and Lark/regex
+// grammar tools). The functions are consumed by the OpenAI completions and
+// responses request builders and stream parsers.
+
+// grammarConstrainedSampling is a resolved grammar request for one tool.
+// Mirrors upstream GrammarConstrainedSampling.
+type grammarConstrainedSampling struct {
+	Format        string // "lark" | "regex"
+	Definition    string
+	InputProperty string
+}
+
+// grammarToolInputJSONBuffer accumulates a grammar tool's streamed string input
+// and reconstructs it as monotonic JSON-argument deltas. Mirrors upstream
+// GrammarToolInputJsonBuffer. It is used through a pointer: the input is a
+// growing buffer, so a delta costs time linear in itself, never in the input
+// so far.
+type grammarToolInputJSONBuffer struct {
+	input   strings.Builder
+	Started bool
+	Closed  bool
+}
+
+// Input is the input streamed so far.
+func (buffer *grammarToolInputJSONBuffer) Input() string { return buffer.input.String() }
+
+// jsonStringJS encodes s the way JavaScript's JSON.stringify does: without Go's
+// default HTML escaping of <, >, & and with U+2028 and U+2029 written raw: so
+// reconstructed grammar deltas are byte-faithful to upstream.
+func jsonStringJS(s string) string {
+	// Encoding a string never fails.
+	encoded, _ := jsstring.MarshalJSON(s)
+	return string(encoded)
+}
+
+// getGrammarToolInput extracts the string input argument for a grammar tool
+// call. Mirrors upstream getGrammarToolInput.
+func getGrammarToolInput(toolName string, arguments map[string]any, inputProperty string) (string, error) {
+	input, ok := arguments[inputProperty].(string)
+	if !ok {
+		return "", fmt.Errorf("Grammar tool call \"%s\" requires argument \"%s\" to be a string.", toolName, inputProperty)
+	}
+	return input, nil
+}
+
+// appendGrammarToolInputJSONDelta appends inputDelta to a streaming grammar tool input and returns the matching piece of its JSON
+// arguments text (ok=false means "no delta", upstream's undefined, for an empty delta). It costs time linear in the delta, never
+// in the input so far. Mirrors upstream appendGrammarToolInputJsonDelta.
+func appendGrammarToolInputJSONDelta(buffer *grammarToolInputJSONBuffer, inputProperty, inputDelta string) (string, bool, error) {
+	if buffer.Closed {
+		return "", false, fmt.Errorf("grammar tool input for property \"%s\" changed after it was closed", inputProperty)
+	}
+	if inputDelta == "" {
+		return "", false, nil
+	}
+	buffer.input.WriteString(inputDelta)
+	// JSON.stringify(inputDelta).slice(1, -1): the escaped body without quotes.
+	encoded := jsonStringJS(inputDelta)
+	return grammarToolInputJSONStart(buffer, inputProperty) + encoded[1:len(encoded)-1], true, nil
+}
+
+// closeGrammarToolInputJSON closes a streaming grammar tool input and returns the rest of its JSON arguments text. finalInput is
+// the complete input when the provider sends one (nil when it does not); it must continue the input streamed so far. Closing again
+// with the same input returns no delta. Mirrors upstream closeGrammarToolInputJson.
+func closeGrammarToolInputJSON(buffer *grammarToolInputJSONBuffer, inputProperty string, finalInput *string) (string, bool, error) {
+	if buffer.Closed {
+		if finalInput == nil || *finalInput == buffer.Input() {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("grammar tool input for property \"%s\" changed after it was closed", inputProperty)
+	}
+	rest := ""
+	if finalInput != nil {
+		current := buffer.Input()
+		if !strings.HasPrefix(*finalInput, current) {
+			return "", false, fmt.Errorf("grammar tool input for property \"%s\" changed non-monotonically", inputProperty)
+		}
+		rest = (*finalInput)[len(current):]
+		buffer.input.WriteString(rest)
+	}
+	buffer.Closed = true
+	encoded := jsonStringJS(rest)
+	return grammarToolInputJSONStart(buffer, inputProperty) + encoded[1:len(encoded)-1] + `"}`, true, nil
+}
+
+// grammarToolInputJSONStart is the opening of the JSON arguments text, once.
+func grammarToolInputJSONStart(buffer *grammarToolInputJSONBuffer, inputProperty string) string {
+	if buffer.Started {
+		return ""
+	}
+	buffer.Started = true
+	return "{" + jsonStringJS(inputProperty) + `:"`
+}
+
+// inferGrammarInputProperty resolves the single required string property that
+// carries a grammar tool's input. Mirrors upstream inferGrammarInputProperty.
+func inferGrammarInputProperty(tool ToolSchema) (string, error) {
+	if t, _ := tool.Parameters["type"].(string); t != "object" {
+		return "", fmt.Errorf("grammar constrained sampling requires an object parameter schema")
+	}
+	required := toStringSlice(tool.Parameters["required"])
+	if len(required) != 1 {
+		return "", fmt.Errorf("grammar constrained sampling requires exactly one required string property")
+	}
+	inputProperty := required[0]
+
+	properties, _ := tool.Parameters["properties"].(map[string]any)
+	prop, ok := properties[inputProperty].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("grammar constrained sampling requires a properties entry for %s", inputProperty)
+	}
+	if pt, _ := prop["type"].(string); pt != "string" {
+		return "", fmt.Errorf("grammar constrained sampling property %s must have type string", inputProperty)
+	}
+	return inputProperty, nil
+}
+
+// toStringSlice returns v as a []string when it is a JSON array of strings
+// ([]any of strings or []string); otherwise nil. Upstream requires
+// Array.isArray && every element a string; a non-array or mixed array yields an
+// empty result that fails the length check.
+func toStringSlice(v any) []string {
+	switch arr := v.(type) {
+	case []string:
+		return arr
+	case []any:
+		out := make([]string, 0, len(arr))
+		for _, e := range arr {
+			s, ok := e.(string)
+			if !ok {
+				return nil
+			}
+			out = append(out, s)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// UnsupportedStrictSchemaKeywordCheck reports whether a provider's strict mode rejects a schema keyword with this
+// value. Mirrors upstream UnsupportedStrictSchemaKeywordCheck.
+type UnsupportedStrictSchemaKeywordCheck func(key string, value any) bool
+
+// unsupportedStrictJSONSchemaError identifies schemas that cannot be converted
+// without changing their accepted language.
+type unsupportedStrictJSONSchemaError struct {
+	reason string
+}
+
+func (err unsupportedStrictJSONSchemaError) Error() string { return err.reason }
+
+var unsupportedStrictSchemaKeys = []string{
+	"$ref", "$defs", "definitions", "allOf", "oneOf", "patternProperties",
+	"dependentSchemas", "dependencies", "unevaluatedProperties", "propertyNames",
+	"contains", "prefixItems", "not", "if", "then", "else",
+}
+
+func strictSchemaError(reason string) error {
+	return unsupportedStrictJSONSchemaError{reason: reason}
+}
+
+// schemaTypeIncludes is `types.includes(name)` over constrained-sampling.ts's type list: a string type is a one-element list, an array is searched as written (non-string elements do not hide a match), anything else is empty.
+func schemaTypeIncludes(schemaType any, name string) bool {
+	switch typed := schemaType.(type) {
+	case string:
+		return typed == name
+	case []any:
+		return slices.Contains(typed, any(name))
+	case []string:
+		return slices.Contains(typed, name)
+	default:
+		return false
+	}
+}
+
+func isStructuredJSONSchema(schema any) bool {
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return false
+	}
+	// `schema.properties !== undefined`: an explicit null counts.
+	return schemaTypeIncludes(object["type"], "object") || schemaTypeIncludes(object["type"], "array") || hasJSONSchemaKey(object, "properties") || hasJSONSchemaKey(object, "items")
+}
+
+func jsonSchemaAllowsNull(schema any) bool {
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return false
+	}
+	if schemaTypeIncludes(object["type"], "null") || object["const"] == nil && hasJSONSchemaKey(object, "const") {
+		return true
+	}
+	if enum, ok := object["enum"].([]any); ok && slices.Contains(enum, any(nil)) {
+		return true
+	}
+	if variants, ok := object["anyOf"].([]any); ok {
+		return slices.ContainsFunc(variants, jsonSchemaAllowsNull)
+	}
+	return false
+}
+
+func hasJSONSchemaKey(schema map[string]any, key string) bool {
+	_, ok := schema[key]
+	return ok
+}
+
+func makeJSONSchemaNodeStrict(value any, order schemaObjectOrder, path string, isUnsupportedKeyword UnsupportedStrictSchemaKeywordCheck) error {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return strictSchemaError("boolean schemas are unsupported")
+	}
+	for _, key := range unsupportedStrictSchemaKeys {
+		if hasJSONSchemaKey(schema, key) {
+			return strictSchemaError(key + " schemas are unsupported")
+		}
+	}
+	if isUnsupportedKeyword != nil {
+		for _, key := range orderedSchemaKeys(schema, order, path) {
+			if isUnsupportedKeyword(key, schema[key]) {
+				// constrained-sampling.ts:65-70: JSON.stringify(value) keeps the authored key order of an object-valued keyword.
+				stringified, err := marshalSchemaWithOrder(schema[key], order, schemaPath(path, key))
+				if err != nil {
+					// JSON.stringify renders a non-finite number as null.
+					stringified = []byte("null")
+				}
+				return strictSchemaError(fmt.Sprintf("%s: %s is unsupported", key, stringified))
+			}
+		}
+	}
+
+	// Pi 406e719a6bff (#12049, post-v1.5.2): OpenAI strict mode rejects a node without a type; a bare enum counts as typed, a bare const does not.
+	// `schema.type === undefined`: an explicit null is a value, so only an absent key counts.
+	if !hasJSONSchemaKey(schema, "type") && !hasJSONSchemaKey(schema, "anyOf") && !hasJSONSchemaKey(schema, "enum") {
+		return strictSchemaError("schemas without a type are unsupported")
+	}
+
+	if variantsValue, exists := schema["anyOf"]; exists {
+		variants, ok := variantsValue.([]any)
+		if !ok || len(variants) == 0 {
+			return strictSchemaError("anyOf must contain at least one schema")
+		}
+		for index, variant := range variants {
+			if isStructuredJSONSchema(variant) {
+				return strictSchemaError("object and array unions are unsupported")
+			}
+			if err := makeJSONSchemaNodeStrict(variant, order, schemaPath(schemaPath(path, "anyOf"), strconv.Itoa(index)), isUnsupportedKeyword); err != nil {
+				return err
+			}
+		}
+	}
+
+	if items, exists := schema["items"]; exists {
+		if _, tuple := items.([]any); tuple {
+			return strictSchemaError("tuple schemas are unsupported")
+		}
+		if err := makeJSONSchemaNodeStrict(items, order, schemaPath(path, "items"), isUnsupportedKeyword); err != nil {
+			return err
+		}
+	}
+
+	isObject := schema["type"] == "object"
+	if _, exists := schema["properties"]; exists && !isObject {
+		return strictSchemaError("properties require type object")
+	}
+	if !isObject {
+		return nil
+	}
+	if additional, exists := schema["additionalProperties"]; exists && additional != false {
+		return strictSchemaError("schema-valued or true additionalProperties is unsupported")
+	}
+	properties := map[string]any{}
+	if value, exists := schema["properties"]; exists {
+		var ok bool
+		properties, ok = value.(map[string]any)
+		if !ok {
+			return strictSchemaError("object properties must be a schema map")
+		}
+	}
+	required := toStringSlice(schema["required"])
+	if _, exists := schema["required"]; exists && required == nil {
+		return strictSchemaError("object required must be a string array")
+	}
+	if required == nil {
+		required = []string{}
+	}
+	for _, name := range required {
+		if _, exists := properties[name]; !exists {
+			return strictSchemaError("required contains an unknown property")
+		}
+	}
+
+	propertyNames := orderedSchemaKeys(properties, order, schemaPath(path, "properties"))
+	if propertyNames == nil {
+		propertyNames = []string{}
+	}
+	for _, name := range propertyNames {
+		property := properties[name]
+		if err := makeJSONSchemaNodeStrict(property, order, schemaPath(schemaPath(path, "properties"), name), isUnsupportedKeyword); err != nil {
+			return err
+		}
+		if !slices.Contains(required, name) && !jsonSchemaAllowsNull(property) {
+			properties[name] = map[string]any{"anyOf": []any{property, map[string]any{"type": "null"}}}
+			wrapSchemaOrder(order, schemaPath(schemaPath(path, "properties"), name))
+		}
+	}
+	// makeJsonSchemaNodeStrict assigns required and then additionalProperties, so a member the schema lacked is created after the others.
+	// An unrecorded object enumerates in the order encoding/json writes it, which is the order those members extend.
+	if _, recorded := order[path]; !recorded {
+		order[path] = orderedSchemaKeys(schema, order, path)
+	}
+	schema["required"] = propertyNames
+	schema["additionalProperties"] = false
+	if members, recorded := order[path]; recorded {
+		for _, key := range [...]string{"required", "additionalProperties"} {
+			if !slices.Contains(members, key) {
+				members = append(slices.Clip(members), key)
+			}
+		}
+		order[path] = members
+	}
+	return nil
+}
+
+// wrapSchemaOrder moves the recorded member order of the schema at path below path/anyOf/0, where `{ anyOf: [property, { type: "null" }] }`
+// puts it (constrained-sampling.ts makeJsonSchemaNodeStrict).
+func wrapSchemaOrder(order schemaObjectOrder, path string) {
+	if order == nil {
+		return
+	}
+	var moved []string
+	for key := range order {
+		if key == path || strings.HasPrefix(key, path+"/") {
+			moved = append(moved, key)
+		}
+	}
+	wrapped := path + "/anyOf/0"
+	for _, key := range moved {
+		members := order[key]
+		delete(order, key)
+		order[wrapped+key[len(path):]] = members
+	}
+	order[path] = []string{"anyOf"}
+	order[path+"/anyOf/1"] = []string{"type"}
+}
+
+// MakeStrictJSONSchema converts a tool schema to the strict subset accepted by provider constrained sampling without mutating the authored schema. A nil isUnsupportedKeyword rejects no keyword. A Go map has no key order, so objects take their keys in sorted order here; a ToolSchema keeps its authored order through resolveJSONSchemaStrictSampling.
+func MakeStrictJSONSchema(parameters map[string]any, isUnsupportedKeyword UnsupportedStrictSchemaKeywordCheck) (map[string]any, error) {
+	parameters, _, err := makeStrictJSONSchemaWithOrder(parameters, nil, isUnsupportedKeyword)
+	return parameters, err
+}
+
+// makeStrictJSONSchemaWithOrder returns the strict schema and the member order JSON.stringify writes for it. The authored order is not
+// modified.
+func makeStrictJSONSchemaWithOrder(parameters map[string]any, order schemaObjectOrder, isUnsupportedKeyword UnsupportedStrictSchemaKeywordCheck) (map[string]any, schemaObjectOrder, error) {
+	body, err := jsstring.MarshalKeepingSurrogates(parameters)
+	if err != nil {
+		return nil, nil, err
+	}
+	var cloned map[string]any
+	if err := jsstring.UnmarshalKeepingSurrogates(body, &cloned); err != nil {
+		return nil, nil, err
+	}
+	if order = maps.Clone(order); order == nil {
+		order = schemaObjectOrder{}
+	}
+	if err := makeJSONSchemaNodeStrict(cloned, order, "", isUnsupportedKeyword); err != nil {
+		return nil, nil, err
+	}
+	if cloned["type"] != "object" {
+		return nil, nil, strictSchemaError("root schema must have type object")
+	}
+	return cloned, order, nil
+}
+
+// prefersJSONSchemaStrictSampling reports whether tool asks for strict JSON-schema sampling only when possible (strict: "prefer").
+// Mirrors upstream prefersJsonSchemaStrictSampling.
+func prefersJSONSchemaStrictSampling(tool ToolSchema) bool {
+	config := tool.ConstrainedSampling
+	return config != nil && config.Type == ConstrainedSamplingJSONSchema && config.Strict == ConstrainedSamplingStrictPrefer
+}
+
+// jsonSchemaToolParameters is the schema getJSONSchemaToolParameters returns, with the member order of its objects.
+type jsonSchemaToolParameters struct {
+	Schema map[string]any
+	order  schemaObjectOrder
+}
+
+// MarshalJSON writes the schema with its objects' member order.
+func (parameters jsonSchemaToolParameters) MarshalJSON() ([]byte, error) {
+	return marshalToolParameters(parameters.Schema, parameters.order)
+}
+
+// getJSONSchemaToolParameters returns the parameters a provider sends for tool: the strict schema when strict is true, else the tool's own.
+func getJSONSchemaToolParameters(tool ToolSchema, strict *bool) (jsonSchemaToolParameters, error) {
+	if strict != nil && *strict {
+		schema, order, err := makeStrictJSONSchemaWithOrder(tool.Parameters, tool.parameterOrder, nil)
+		return jsonSchemaToolParameters{schema, order}, err
+	}
+	return jsonSchemaToolParameters{tool.Parameters, tool.parameterOrder}, nil
+}
+
+// resolveJSONSchemaStrictSampling returns a non-nil *true when a json_schema
+// constrained tool should request strict mode, nil when it should not, and an
+// error when strict is required but unsupported. Mirrors upstream
+// resolveJsonSchemaStrictSampling.
+func resolveJSONSchemaStrictSampling(tool ToolSchema, supportsStrictMode bool, isUnsupportedKeyword UnsupportedStrictSchemaKeywordCheck) (*bool, error) {
+	config := tool.ConstrainedSampling
+	if config == nil || config.Type != ConstrainedSamplingJSONSchema {
+		return nil, nil
+	}
+	if supportsStrictMode {
+		if _, _, err := makeStrictJSONSchemaWithOrder(tool.Parameters, tool.parameterOrder, isUnsupportedKeyword); err != nil {
+			var unsupported unsupportedStrictJSONSchemaError
+			if !errors.As(err, &unsupported) {
+				return nil, err
+			}
+			if config.Strict != ConstrainedSamplingStrictRequire {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("Tool \"%s\" requires JSON-schema constrained sampling, but %s.", tool.Name, unsupported.reason)
+		}
+		t := true
+		return &t, nil
+	}
+	if config.Strict == ConstrainedSamplingStrictRequire {
+		return nil, fmt.Errorf("Tool \"%s\" requires JSON-schema constrained sampling, but strict tools are unsupported.", tool.Name)
+	}
+	return nil, nil
+}
+
+// resolveGrammarConstrainedSampling resolves a grammar tool's request, or nil
+// when the tool is not a grammar tool or grammar tools are unsupported. Mirrors
+// upstream resolveGrammarConstrainedSampling.
+func resolveGrammarConstrainedSampling(tool ToolSchema, supportsOpenAIGrammarTools bool) (*grammarConstrainedSampling, error) {
+	config := tool.ConstrainedSampling
+	if config == nil || config.Type != ConstrainedSamplingGrammar {
+		return nil, nil
+	}
+	if !supportsOpenAIGrammarTools {
+		return nil, nil
+	}
+
+	lark := config.Variants[GrammarFormatOpenAILark]
+	regex := config.Variants[GrammarFormatOpenAIRegex]
+	hasLark := trimJSWhitespace(lark) != ""
+	hasRegex := trimJSWhitespace(regex) != ""
+	if !hasLark && !hasRegex {
+		return nil, fmt.Errorf("Tool \"%s\" cannot use grammar constrained sampling: no supported grammar variant was provided.", tool.Name)
+	}
+
+	inputProperty, err := inferGrammarInputProperty(tool)
+	if err != nil {
+		return nil, fmt.Errorf("Tool \"%s\" cannot use grammar constrained sampling: %s.", tool.Name, err.Error())
+	}
+	format, definition := "regex", regex
+	if hasLark {
+		format, definition = "lark", lark
+	}
+	return &grammarConstrainedSampling{Format: format, Definition: definition, InputProperty: inputProperty}, nil
+}
+
+// createGrammarToolInputProperties maps each grammar tool name to its input
+// property. Mirrors upstream createGrammarToolInputProperties.
+func createGrammarToolInputProperties(tools []ToolSchema, supportsOpenAIGrammarTools bool) (map[string]string, error) {
+	properties := map[string]string{}
+	for _, tool := range tools {
+		grammar, err := resolveGrammarConstrainedSampling(tool, supportsOpenAIGrammarTools)
+		if err != nil {
+			return nil, err
+		}
+		if grammar != nil {
+			properties[tool.Name] = grammar.InputProperty
+		}
+	}
+	return properties, nil
+}

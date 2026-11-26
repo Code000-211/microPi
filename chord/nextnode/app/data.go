@@ -1,0 +1,139 @@
+package app
+
+import (
+	"context"
+	"crypto/subtle"
+	_ "embed"
+	"encoding/json"
+	"strings"
+
+	"github.com/MichaelKinsy/PiG/chord/delta"
+	"github.com/MichaelKinsy/PiG/chord/next/contracts"
+	"github.com/MichaelKinsy/PiG/chord/next/data"
+	"github.com/MichaelKinsy/PiG/chord/next/host"
+	"github.com/MichaelKinsy/PiG/chord/next/store"
+	"github.com/MichaelKinsy/PiG/internal/chord/chordjson"
+)
+
+// Ports packages/chord/src/node/app/data.ts
+//
+// A host's data on its worker (decision "App kit naming and export"): the kit's object a running worker serves, through which the
+// server exports the worker's data without stopping it. The worker packs its own open store (its export holds the commit queue while
+// it reads: one consistent point) and its finished files into the archive at the path the server names. Only the server may ask (its
+// principal); the worker's plugins never see it.
+//
+// The worker has two stores (D462): the kit's own, which its Go host holds, and the plugins', which its NodeHost's process holds, so the
+// worker's export holds the kit's commit queue and reads the plugins' file from a snapshot taken meanwhile (PackRunning): both exports
+// are one point, as Pi's one store's export is, and are written as the one `store.archive` Pi writes.
+//
+// Go forced differences (D460): the generic principal parameter is designed out (a principal is a JSON object). The worker's plugins run in a
+// Node subprocess that serves the worker's address, so HostData is a JavaScript core facet (host_data.mjs) forwarding to a Go local
+// object (HostDataExport) through the bridge.
+
+// HostData is the data of the worker at `address` (its JSON, as AddressParam writes it): `exportTo` packs it at `path`, with the server's part (its records and rows belonging to the address) from the JSONL file `server`.
+var HostData = mustRemote("chord.app.data", contracts.RemoteDeclaration{
+	Version: 1,
+	Params:  contracts.Params{contracts.Prop("address", contracts.Str())},
+	// The address a worker has: the server names it (AddressParam); only its kind and params place the object.
+	HostAddress: func(params *delta.JsonObject) (contracts.Address, error) {
+		text, _ := params.Value("address").(string)
+		return parseAddress(text)
+	},
+	Variants: []contracts.VariantEntry{contracts.Var("main", contracts.VariantDeclaration{Methods: []contracts.MethodEntry{
+		contracts.Meth("exportTo", contracts.NewMethod(contracts.Obj(contracts.Prop("path", contracts.Str()), contracts.Prop("manifest", contracts.Str()), contracts.Prop("server", contracts.Str())))),
+	}})},
+})
+
+func mustRemote(name string, declaration contracts.RemoteDeclaration) *contracts.Contract {
+	contract, err := contracts.Remote(name, declaration)
+	if err != nil {
+		panic(err)
+	}
+	return contract
+}
+
+// addressWire is an address as AddressParam writes it.
+type addressWire struct {
+	Kind   string          `json:"kind"`
+	Params json.RawMessage `json:"params"`
+	Key    string          `json:"key"`
+}
+
+// parseAddress is `JSON.parse(address) as Address`.
+func parseAddress(text string) (contracts.Address, error) {
+	var wire addressWire
+	if err := json.Unmarshal([]byte(text), &wire); err != nil {
+		return contracts.Address{}, err
+	}
+	params := delta.NewJsonObject(0)
+	if len(wire.Params) > 0 {
+		decoded, err := chordjson.Decode(wire.Params)
+		if err != nil {
+			return contracts.Address{}, err
+		}
+		if object, ok := decoded.(*delta.JsonObject); ok {
+			params = object
+		}
+	}
+	return contracts.Address{Kind: wire.Kind, Params: params, Key: wire.Key}, nil
+}
+
+// AddressParam is `address` as HostData's param.
+func AddressParam(address contracts.Address) string {
+	encoded, _ := chordjson.Marshal(delta.JsonObjectOf("kind", address.Kind, "params", address.Params, "key", address.Key))
+	return string(encoded)
+}
+
+// HostDataExport is HostData's body on the worker's Go host: the NodeHost serves the worker's address, so HostData is served there by
+// hostDataModule (a JavaScript core facet) and forwards `exportTo` to this local object, which the NodeHost reaches through the
+// bridge (plugins.BridgedFacet). `token` is the secret of this start that only hostDataModule knows: plugins see the bridged type but
+// never the server's data object (a Go forced difference; Pi's plugins cannot reach the facet at all).
+var HostDataExport = mustLocal("chord.app.data.export", contracts.LocalDeclaration{
+	Version: 1,
+	Params:  contracts.Params{},
+	Members: []contracts.LocalEntry{
+		contracts.Mem("exportTo", contracts.NewMethod(contracts.Obj(contracts.Prop("token", contracts.Str()), contracts.Prop("path", contracts.Str()), contracts.Prop("manifest", contracts.Str()), contracts.Prop("server", contracts.Str())))),
+	},
+})
+
+// hostDataModuleText is the module of the worker's NodeHost serving HostData (hostDataModule's template).
+//
+// pig divergence (D460): HostData is a JavaScript core facet on the worker's NodeHost (which serves the worker's address) forwarding to a Go object.
+//
+//go:embed host_data.mjs
+var hostDataModuleText string
+
+// hostDataModule is the text of the module serving HostData on the NodeHost for the worker whose server principal is server, forwarding
+// to HostDataExport with token.
+func hostDataModule(server data.Principal, token string) string {
+	encoded, _ := chordjson.Marshal(server)
+	quoted, _ := json.Marshal(token) //portlint:allow jsonescape the token is random hex, with no <, > or &
+	return strings.NewReplacer("__SERVER__", string(encoded), "__TOKEN__", string(quoted)).Replace(hostDataModuleText)
+}
+
+// HostDataFacet is the kit's worker facet on the worker's Go host serving HostDataExport for the worker's plugin store, its kit store and its files
+// directory files, to the caller that has token.
+func HostDataFacet(dir string, kit store.Store, token string) host.Facet {
+	return host.DefineFacet(func(h host.FacetHost, _ host.FacetSelf) error {
+		return h.Serve(HostDataExport, func(_ *delta.JsonObject, _ host.Self) (contracts.Implementation, error) {
+			return contracts.Implementation{Members: contracts.VariantImplementation{
+				Methods: map[string]contracts.MethodFunction{
+					"exportTo": func(args delta.JsonValue, ctx context.Context) (delta.JsonValue, error) {
+						object := args.(*delta.JsonObject)
+						if subtle.ConstantTimeCompare([]byte(object.Value("token").(string)), []byte(token)) != 1 {
+							return nil, data.Forbidden("chord.app.data: the server's only")
+						}
+						// The server's own manifest for this address.
+						var manifest ArchiveManifest
+						if err := json.Unmarshal([]byte(object.Value("manifest").(string)), &manifest); err != nil {
+							return nil, err
+						}
+						// The plugins' store is the NodeHost's own file (store.sqlite), read from a snapshot taken while the kit's store (kit.sqlite) is
+						// held: PackRunning.
+						return nil, PackRunning(ctx, dir, kit, manifest, object.Value("server").(string), object.Value("path").(string))
+					},
+				},
+			}}, nil
+		}, host.ServeOptions{})
+	})
+}

@@ -1,0 +1,151 @@
+# Automation
+
+Every script PiG runs outside of Go code lives here. The root `Makefile` is the
+command interface: run `make help` for the everyday targets and
+`make help-parity` for the parity machinery. Call a script directly only when
+no target covers what you need, and add a target when you find yourself doing
+that twice.
+
+| Folder | Holds | Run from |
+|---|---|---|
+| `dev/` | machine setup and local developer tools | `make setup`, `make doctor`, by hand |
+| `ci/` | gates and test runners that CI also calls | `make check`, `make test`, workflows |
+| `portlens/` | the static port health report: pin and ledger health, port map, divergences, bug ledger, evals | `make port-lens` |
+| `pin/` | the upstream Pi pin: derivation, override, bump, oracle build | `make pin-show`, `make pin-bump`, `make pin-check` |
+| `gen/` | generators, vendoring, and the upstream mirror | `make upstream-mirror`, `make model-catalogs`, `make knowledge-graph` |
+| `release/` | release manifest and SBOM checks | release workflow |
+| `porter/` | Pig Porter runners | `make porter*` |
+| `images/` | CI container images | `ci-images` workflow |
+| `make/` | make fragments the root `Makefile` includes | `make help-parity` |
+
+Every script finds the repository root from its own location, so it works from
+any directory.
+
+## Generated files
+
+Run `make generate` from the repository root after changing exported Go API, CLI flags, settings, parity scenarios, or docs mirrors. Use the pinned development toolchain and `.upstream/current` mirror. The command refreshes these committed outputs in dependency order (generated Go catalogs precede the Go inventory):
+
+| Specific target | Outputs |
+|---|---|
+| `interface-proposals` | Pinned package, CLI, behavior-input, Pig Go, and recommendation inventories under `test/parity/interfaces/` |
+| `interface-go` | `test/parity/interfaces/pig-go.json` only |
+| `interface-recommendations-generate` | Pig Go inventory and recommendations |
+| `behavior-input-inventory` | Pinned behavior-input inventory only |
+| `test-inventory-generate` | Pinned upstream test inventory |
+| `custom-factory-ledger` | Generated custom-factory call-surface ledger |
+| `coverage RESULTS=` | `test/parity/generated/coverage.md`, the `AGENTS.md` coverage block, and the parity badge |
+| `model-catalogs` | Text and image model catalogs |
+| `help-text` | `coding/cli/help_upstream.txt` |
+| `knowledge-graph` | Knowledge-graph pages, JSON-LD, Mermaid, and the troubleshooting docs mirror |
+| `additive-list` | The agent docs page `additive-features.md` |
+| `docs-bundle` | The shared pages of the agent docs bundle, `glossary.md` (site and bundle), and the customize chooser blocks |
+
+Review and commit the output. Never hand-edit generated files. `make generate` does not change reviewed mappings, dispositions, or evidence. A contract review failure still needs review; regeneration cannot accept a port. It ignores transient parity results for deterministic coverage. Use `make coverage RESULTS=<path>` separately to include a measured run.
+
+`go run ./test/parity/cmd/gointerfaces` writes the committed inventory by default. Use `-out -` for stdout or `-out <path>` for a separate report. The inventory loads the canonical Linux/amd64 target with cgo disabled and no local build tags on every host; it is not a platform-support claim. Other inventory extractors warn when an omitted output path would only print to stdout.
+
+## Sandboxes, devcontainers, and hosted agents
+
+The automation writes only where the environment allows. Set these when the defaults are not writable or not reachable:
+
+| Variable | Default | Used for |
+|---|---|---|
+| `TMPDIR` | `/tmp` | every temporary file and directory, and the default `RESULTS` path. Scripts pass an explicit `mktemp` template because macOS ignores `TMPDIR` without one. |
+| `XDG_CACHE_HOME` | `~/.cache` | `PIG_DEV_HOME` (the pinned toolchain and `env.mk`) and the upstream tarball cache |
+| `PIG_DEV_HOME` | `$XDG_CACHE_HOME/pig-dev` | toolchains and machine settings from `make setup` |
+| `SSL_CERT_FILE` | system trust | Go TLS behind an intercepting proxy or in a macOS sandbox; `make doctor` prints this fix when Go cannot verify the module proxy |
+| `GOVULNDB` | `https://vuln.go.dev` | a local copy of `vulndb.zip` for `make compliance` offline |
+
+`make doctor` also reports a `GOROOT` or `GOBIN` exported by another installer (mise, asdf, a shell profile); `env.mk` and `env.sh` clear both so the pinned Go is used. `make setup` always re-detects the module proxy from your own Go configuration, so a rerun repairs an earlier fallback. `make compliance` checks that the devcontainer, CI images, and workflows use the same Go, Node, Rust, and Pi versions as their single sources.
+
+## dev
+
+| Script | Purpose |
+|---|---|
+| `setup.sh` | Installs the Go toolchain pinned by `.go-version`, starts the module-proxy fallback when proxy.golang.org is unreachable, and builds `bin/pig`. `--check` reports without changing anything, including a leaked `GOROOT`/`GOBIN` and Go TLS failures. Behind `make setup` and `make doctor`. |
+| `goproxy-github.py` | Serves the Go module proxy protocol from GitHub source archives and verifies every module against `go.sum`. Used only where proxy.golang.org is blocked. |
+| `toolchains.lock` | Pinned toolchain archives and SHA-256 digests: Go for `setup.sh`, TinyGo for `durable/core/budget/build-wasm.sh`. |
+| `login-copilot.sh` | Interactive helper for signing pig in to GitHub Copilot. |
+| `parity-probe` | Launches upstream Pi or pig in tmux for side-by-side behavior checks. |
+| `stage-clipboard-png.sh` | Puts a PNG on the clipboard for manual paste tests. |
+
+## portlens
+
+`make port-lens` renders `build/portlens/index.html` from the repository's own ledgers. It needs no network and no server. See `portlens/README.md`.
+
+## ci
+
+| Script | Purpose |
+|---|---|
+| `test-grouped.sh` | The `make test` scheduler: runs Go packages in groups sized for the machine, and `cmd/pig` in shards. `changed` mode (`make test-changed`) runs only the packages `changed-packages.py` selects. |
+| `changed-packages.py` | Maps the files changed since the merge base with `TEST_BASE` (default `@{upstream}`, then `main`) to the packages that hold, embed or name them, and adds every package whose tests import one (`go list -test -deps` reverse closure). |
+| `test-json-report.py` | Summarizes `go test -json` as it streams: package results, failed-test output, the slowest tests and packages; keeps the raw events. |
+| `reap-test-processes.sh` | Kills and reports processes still running under a test group's scratch `TMPDIR` after `go test` returned; the group fails. Hosts without `/proc` (macOS) read each environment from `ps -E`. |
+| `cached-gate.sh` | Replays a whole-repository gate's passing run while no tracked, modified or untracked file changed (`port-lint`, `interface-gaps`); failures, `CI` and `PIG_GATE_CACHE=0` always run it. |
+| `test-shard-pattern.sh` | Prints the `go test -run` pattern for one shard of a package's tests. `make test-cli` and the Windows `cli-1` to `cli-8` jobs run `cmd/pig` in these shards, each shard in its own parallel job, `go test` process and timeout. |
+| `test-fixtures.sh` | Builds the Go and Rust extension fixtures tests load. |
+| `test-race.sh` | Race and goroutine-leak gate for the TUI concurrency model. |
+| `test-race-nightly.sh` | Whole-package `-race` on every package `race-packages.txt` lists (the agent loop, provider streams, TUI, the extension hosts and SDK module, the session core, the RPC/print/JSON modes, the concurrency libraries, the highlight.js port), one nightly matrix job per group (`PIG_RACE_GROUP`: `ai`, `rest`, `host`, `coding`, `cli`, `libs`, `hljs`, `parity`, `shared`; `PIG_RACE_SHARD=k/n` runs one shard of the single-package `cli` group). A nested module runs as its own module with `GOWORK=off`, or in its workspace when its list entry says `workspace` (apps/p2 and apps/p2desktop, which do not build alone; pig-porter builds against its released dependencies and stays `GOWORK=off`). Behind `make test-race-nightly` and the nightly workflow. Every `go test -race` run it starts, and `make test-changed`'s runs under `-race`, take the timeout of `race-timeout.sh` (`PIG_RACE_TIMEOUT`, default 60m); a plain run keeps go test's default. |
+| `race-packages.txt`, `race-coverage.sh` | The list of concurrency packages with the nightly group of each (or `exempt` and a reason, or `workspace` for a nested module that only builds in a go.work), and the gate (`make race-coverage`, part of `check-core` and `ci-drift`) that fails when a package that starts goroutines or timers and has tests is in none, and when any unit with tests (the `test`, `automation` and `bench` trees included) is neither in a group nor named with a reason in `race-exclusions.txt`. The exclusion file starts with `ceiling N`, its entry count: the list only shrinks, and a new package goes in a group. |
+| `race-timeout.sh` | Sourced by `test-race-nightly.sh` and `test-grouped.sh`: the one place that sets `PIG_RACE_TIMEOUT` (default 60m), the `-timeout` of a run under `-race`. |
+| `fuzz-nightly.sh` | Runs every `Fuzz` target for `PIG_FUZZ_TIME` (default 30s) with `PIG_FUZZ_PARALLEL` workers (default 4); a package whose targets cannot be listed fails the run. Behind `make fuzz-nightly` and the nightly workflow. |
+| `make test-oracle-sweeps-nightly` | Runs the full product of the Pi-oracle sweeps whose fast-tier test runs a covering subset (`PIG_IMAGE_ORACLE_SWEEP=full`: `TestProcessImagePNGMatchesPi`, 7952 cases). The nightly workflow's `Oracle sweeps` job runs it. |
+| `integration-tests.sh` | The tmux integration tier, split by category. |
+| `qc-smoke.sh` | Smoke checks against a freshly built pig. Behind `make qc`. |
+| `parity-resource-limits.sh` | Chooses parity concurrency from CPU and memory. Probed only by targets that schedule parity. |
+| `report-schedule.sh` | Prints the Go-test and parity scheduler buckets. |
+| `check-divergence-consistency.sh` | Every ledger entry has a source marker and every marker has an entry. |
+| `check-divergence-quality.py` | Divergence and additive records are current, enforceable contracts. |
+| `divguard/` | Divergence guard (`make divergence-guard`): syntactic checks for invented limits and timeouts, dropped events, swallowed errors and success on unknown stop reasons, ratcheted by `divguard/baseline.toml`. |
+| `fixtureguard/` | Fixture guard (`make fixture-guard`): refuses test fixtures that look like verbatim provider captures (long encrypted or signature values, billing rows, real-looking ids and timestamps, reasoning text, non-placeholder home paths); reviewed false positives are listed in `fixtureguard/allowlist.go`. Setting `PIG_PRIVATE_TERMS_FILE` to a file outside the repository (one term per line) also fails on any match, printing only file:line and the term's line number. |
+| `portlint/` | Porting anti-pattern analyzers (`make port-lint`): `go/analysis` passes for JS-to-Go semantic drift, goroutine and request lifetime, error identity and test isolation, ratcheted by `portlint/baseline.toml`. |
+| `check-divergence-delta.sh` | A release adds no divergence without its per-entry justification. |
+| `check-coverage-delta.sh`, `check-coverage-drift.py` | Parity coverage did not regress, and `test/parity/generated/coverage.md` and the badge match `docs/parity/PORT_MAP.md`. |
+| `check-public-claims.py` | Public prose makes no claim the evidence contradicts: overclaim phrases, unrecorded governance claims, Pi versions other than the pin, and porting or verification figures that differ from the AGENTS.md coverage block. Runs in `make docs-drift`; pass delivery or blog drafts as extra arguments to audit them too. |
+| `check-generated.sh` | Compares generated bytes and names both the aggregate and specific repair commands. |
+| `check-port-map-drift.py` | `docs/parity/PORT_MAP.md` accounts for every upstream source file. |
+| `check-dco.sh` | Every commit in a pull request carries a DCO sign-off, or a later commit by the same author retroactively signs it off (format in the script header and `.github/CONTRIBUTING.md`; `dco-identities.txt` maps one person's identities). `test_check_dco.py` covers it against disposable repositories. |
+| `check-npm-lock-integrity.py` | npm lockfiles pin integrity hashes. |
+| `npm-locked.py` | Installs locked npm dependencies when manifest content changes; refuses replacement through a shared symlink. With `PIG_NODE_MODULES_STORE` set, installs each manifest once per host under that directory and links `node_modules` to it. |
+| `build-ci-image.sh`, `seed-ci-image-bases.sh` | Build and seed the CI container images in `images/`. |
+
+## pin
+
+| Script | Purpose |
+|---|---|
+| `pin.py` | The upstream Pi pin tool: reads the pin (`.upstream/pin`, overridden by `PI_UPSTREAM_REF`), derives the files that carry it (`sync`, `sync --check`), moves it (`bump`), and installs and checks the Pi oracle of the pin. `make pin-show`, `pin-sync`, `pin-check`, `pin-bump`. See `docs/parity/upstream-pin.md`. |
+| `pinlib.py` | The pin model: parse and validate the pin file, resolve a tag, branch or commit, render `pigversion.go` and its build overlay. |
+| `oracle.py` | Builds Pi from the commit of a commit pin into the shape of a published install and links it as `extensions/sdk-ts/node_modules`. |
+
+## gen
+
+| Script | Purpose |
+|---|---|
+| `mirror-upstream.sh` | Materializes the pinned Pi source under `.upstream/v<version>` and points `.upstream/current` at it (read-only reference). |
+| `generate-model-catalogs.sh` | Regenerates model catalogs from the pinned published Pi package. |
+| `gen-help.sh` | Renders Pi's own `--help` with PiG's identity. |
+| `gen-knowledge-graph.py` | Renders `docs/knowledge-graph/pig.graph.json` into its published forms. |
+| `gen-docs-bundle.py` | Copies the shared site pages into the agent docs bundle with bundle-local links, as `internal/pigdocs/bundle-manifest.json` directs. Renders `glossary.md` from `docs/project/CONTEXT.md` and the customize chooser from `docs/site/fragments/`. `--check` fails on a stale or unclassified page. |
+| `gen-additive-list.py` | Renders `docs/additive-features.md` into the agent docs page `additive-features.md`, filtered by each record's `Audience:` line. |
+| `vendor-pi-dist.sh`, `vendor-typebox.sh` | Vendor the pinned Pi release's pure modules, the third-party packages they import, and TypeBox for the Node extension runtime. |
+
+## release
+
+| Script | Purpose |
+|---|---|
+| `gen-update-manifest.py` | Writes the self-update manifest for a release. |
+| `validate-sbom.py` | Validates SBOM structure and prints a review inventory. |
+
+## porter
+
+| Script | Purpose |
+|---|---|
+| `run-pig-porter.sh` | Runs one bounded Pig Porter task. |
+| `run-pig-porter-campaign.sh` | Runs read-only Porter workers across parity families. |
+| `verify-pig-porter-local.sh` | Verifies the Porter Piglet in TUI and headless modes. |
+
+## Evals and profiling
+
+The eval harness is not here: it lives in `test/evals/` (`pigeval`, stdlib Python)
+with its own README, because it is a measurement tool with tests, not glue.
+`make evals`, `make evals-requests`, `make profile`, and `make pgo` drive it.

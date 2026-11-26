@@ -1,0 +1,493 @@
+// Package extensiontest provides test doubles for the [extension.API]
+// surface. The primary export is [Fake], a no-op [extension.API]
+// implementation that records every call. Use it in unit tests for code
+// that consumes the API surface without standing up a real host.
+//
+// Example:
+//
+//	api := extensiontest.NewFake()
+//	myExtension(api)
+//	if len(api.RegisterToolCalls) != 1 {
+//	    t.Fatalf("expected one tool registered, got %d", len(api.RegisterToolCalls))
+//	}
+package extensiontest
+
+import (
+	"context"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+)
+
+// Fake is a recording, no-op implementation of [extension.API]. Each method
+// appends to a per-method call slice; tests assert on those slices.
+//
+// Fake is NOT goroutine-safe. Tests that drive a fake from multiple
+// goroutines must wrap access with their own synchronisation.
+type Fake struct {
+	// subscriptionIDs holds, for each handler slice, the id of every handler in it (same order), so an unsubscribe removes
+	// the handler it registered even when two handlers are the same function value.
+	subscriptionIDs  map[string][]uint64
+	nextSubscription uint64
+
+	// ── Event subscriptions ──
+	OnProjectTrustHandlers          []extension.ProjectTrustHandler
+	OnResourcesDiscoverHandlers     []func(ctx context.Context, evt extension.ResourcesDiscoverEvent) (extension.ResourcesDiscoverResult, error)
+	OnSessionStartHandlers          []func(ctx context.Context, evt extension.SessionStartEvent) error
+	OnSessionInfoChangedHandlers    []func(ctx context.Context, evt extension.SessionInfoChangedEvent) error
+	OnMcpServersChangeHandlers      []func(ctx context.Context, evt extension.McpServersChangeEvent) error
+	OnProviderStreamEventHandlers   []func(ctx context.Context, evt extension.ProviderStreamEvent) error
+	OnSessionBeforeSwitchHandlers   []func(ctx context.Context, evt extension.SessionBeforeSwitchEvent) (extension.SessionBeforeSwitchResult, error)
+	OnSessionBeforeForkHandlers     []func(ctx context.Context, evt extension.SessionBeforeForkEvent) (extension.SessionBeforeForkResult, error)
+	OnSessionBeforeCompactHandlers  []func(ctx context.Context, evt extension.SessionBeforeCompactEvent) (extension.SessionBeforeCompactResult, error)
+	OnSessionCompactHandlers        []func(ctx context.Context, evt extension.SessionCompactEvent) error
+	OnSessionCompactFailedHandlers  []func(ctx context.Context, evt extension.SessionCompactFailedEvent) error
+	OnSessionShutdownHandlers       []func(ctx context.Context, evt extension.SessionShutdownEvent) error
+	OnSessionBeforeTreeHandlers     []func(ctx context.Context, evt extension.SessionBeforeTreeEvent) (extension.SessionBeforeTreeResult, error)
+	OnSessionTreeHandlers           []func(ctx context.Context, evt extension.SessionTreeEvent) error
+	OnContextHandlers               []func(ctx context.Context, evt extension.ContextEvent) (extension.ContextEventResult, error)
+	OnContextWithSystemHandlers     []func(ctx context.Context, evt extension.ContextWithSystemEvent) (extension.ContextEventResult, error)
+	OnBeforeProviderRequestHandlers []func(ctx context.Context, evt extension.BeforeProviderRequestEvent) (extension.BeforeProviderRequestEventResult, error)
+	OnAfterProviderResponseHandlers []func(ctx context.Context, evt extension.AfterProviderResponseEvent) error
+	OnBeforeProviderHeadersHandlers []func(ctx context.Context, evt extension.BeforeProviderHeadersEvent) error
+	OnBeforeAgentStartHandlers      []func(ctx context.Context, evt extension.BeforeAgentStartEvent) (extension.BeforeAgentStartEventResult, error)
+	OnAgentStartHandlers            []func(ctx context.Context, evt extension.AgentStartEvent) error
+	OnAgentEndHandlers              []func(ctx context.Context, evt extension.AgentEndEvent) error
+	OnAgentBeforeSettleHandlers     []func(ctx context.Context, evt *extension.AgentBeforeSettleEvent) (extension.AgentBeforeSettleEventResult, error)
+	OnAgentSettledHandlers          []func(ctx context.Context, evt extension.AgentSettledEvent) error
+	OnUiPromptStartHandlers         []func(ctx context.Context, evt extension.UIPromptStartEvent) error
+	OnUiPromptEndHandlers           []func(ctx context.Context, evt extension.UIPromptEndEvent) error
+	OnCacheWarmingDecisionHandlers  []func(ctx context.Context, evt extension.CacheWarmingDecisionEvent) (extension.CacheWarmingDecisionEventResult, error)
+	OnTurnStartHandlers             []func(ctx context.Context, evt extension.TurnStartEvent) error
+	OnTurnEndHandlers               []func(ctx context.Context, evt extension.TurnEndEvent) (extension.TurnEndEventResult, error)
+	OnMessageStartHandlers          []func(ctx context.Context, evt extension.MessageStartEvent) error
+	OnMessageUpdateHandlers         []func(ctx context.Context, evt extension.MessageUpdateEvent) error
+	OnMessageEndHandlers            []func(ctx context.Context, evt extension.MessageEndEvent) (extension.MessageEndEventResult, error)
+	OnToolExecutionStartHandlers    []func(ctx context.Context, evt extension.ToolExecutionStartEvent) error
+	OnToolExecutionUpdateHandlers   []func(ctx context.Context, evt extension.ToolExecutionUpdateEvent) error
+	OnToolExecutionEndHandlers      []func(ctx context.Context, evt extension.ToolExecutionEndEvent) error
+	OnModelSelectHandlers           []func(ctx context.Context, evt extension.ModelSelectEvent) error
+	OnThinkingLevelSelectHandlers   []func(ctx context.Context, evt extension.ThinkingLevelSelectEvent) error
+	OnToolCallHandlers              []func(ctx context.Context, evt extension.ToolCallEvent) (extension.ToolCallEventResult, error)
+	OnToolResultHandlers            []func(ctx context.Context, evt extension.ToolResultEvent) (extension.ToolResultEventResult, error)
+	OnUserBashHandlers              []func(ctx context.Context, evt extension.UserBashEvent) (extension.UserBashEventResult, error)
+	OnInputHandlers                 []func(ctx context.Context, evt extension.InputEvent) (extension.InputEventResult, error)
+
+	// ── Registrations ──
+	RegisterToolCalls            []extension.ToolDefinition
+	RegisterCommandCalls         []RegisterCommandCall
+	RegisterShortcutCalls        []RegisterShortcutCall
+	RegisterFlagCalls            []RegisterFlagCall
+	RegisterMessageRendererCalls []RegisterMessageRendererCall
+	RegisterEntryRendererCalls   []RegisterEntryRendererCall
+	RegisterMarkdownTransformers []extension.MarkdownTransformer
+	// RegisterMarkdownTransformerOptions holds the options of each registration, in the order of RegisterMarkdownTransformers (the zero value when it had none).
+	RegisterMarkdownTransformerOptions []extension.MarkdownTransformerOptions
+	OwnThinkingRunsCalls               []bool
+	RegisterToolRenderers              []extension.ToolRendererResolver
+	RegisterProviderCalls              []RegisterProviderCall
+	RegisterNativeProviderCalls        []*ai.ModelsProvider
+	UnregisterProviderCalls            []string
+	RegisterMcpServerCalls             []RegisterMcpServerCall
+	UnregisterMcpServerCalls           []string
+	McpServers                         []extension.RegisteredMcpServer
+	RegisterVirtualModelCalls          []extension.ExtensionVirtualModel
+	UnregisterVirtualModelCalls        []UnregisterVirtualModelCall
+
+	// ── Actions ──
+	SendMessageCalls     []SendMessageCall
+	SendUserMessageCalls []SendUserMessageCall
+	AppendEntryCalls     []AppendEntryCall
+
+	// ── Session metadata ──
+	SessionName         string
+	SetLabelCalls       []SetLabelCall
+	ExecCalls           []ExecCall
+	ActiveTools         []string
+	AllTools            []extension.ToolInfo
+	Commands            []extension.SlashCommandInfo
+	SetActiveToolsCalls [][]string
+	Settings            extension.Settings
+
+	// ── Model + thinking ──
+	CurrentModel          extension.Model
+	SetModelCalls         []extension.Model
+	SetModelReturn        bool
+	ThinkingLevel         extension.ThinkingLevel
+	SetThinkingLevelCalls []extension.ThinkingLevel
+
+	// ── Flags ──
+	Flags map[string]any
+
+	// ── Event bus ──
+	Bus extension.EventBus
+}
+
+// NewFake returns a fresh Fake with a [Bus] backed by [NewMemBus].
+func NewFake() *Fake {
+	return &Fake{
+		Flags: map[string]any{},
+		Bus:   NewMemBus(),
+	}
+}
+
+// ─── Recording call structs ─────────────────────────────────────────────
+
+// RegisterMcpServerCall records one RegisterMcpServer call.
+type RegisterMcpServerCall struct {
+	Name   string
+	Config extension.McpServerConfig
+}
+
+// UnregisterVirtualModelCall records one UnregisterVirtualModel call.
+type UnregisterVirtualModelCall struct {
+	Provider string
+	ID       string
+}
+
+type RegisterCommandCall struct {
+	Name    string
+	Options extension.CommandOptions
+}
+
+type RegisterShortcutCall struct {
+	Shortcut extension.KeyID
+	Options  extension.ShortcutOptions
+}
+
+type RegisterFlagCall struct {
+	Name    string
+	Options extension.FlagOptions
+}
+
+type RegisterMessageRendererCall struct {
+	CustomType string
+	Renderer   extension.MessageRenderer
+}
+
+type RegisterEntryRendererCall struct {
+	CustomType string
+	Renderer   extension.EntryRenderer
+}
+
+type RegisterProviderCall struct {
+	Name   string
+	Config extension.ProviderConfig
+}
+
+type SendMessageCall struct {
+	Message extension.SendMessagePayload
+	Options *extension.SendMessageOptions
+}
+
+type SendUserMessageCall struct {
+	Content any
+	Options *extension.SendUserMessageOptions
+}
+
+type AppendEntryCall struct {
+	CustomType string
+	Data       any
+}
+
+type SetLabelCall struct {
+	EntryID string
+	Label   string
+}
+
+type ExecCall struct {
+	Command string
+	Args    []string
+	Options *extension.ExecOptions
+}
+
+// ─── Event subscription methods ────────────────────────────────────────
+
+func (f *Fake) OnResourcesDiscover(h func(ctx context.Context, evt extension.ResourcesDiscoverEvent) (extension.ResourcesDiscoverResult, error)) func() {
+	return subscribe(f, "OnResourcesDiscoverHandlers", &f.OnResourcesDiscoverHandlers, h)
+}
+func (f *Fake) OnSessionStart(h func(ctx context.Context, evt extension.SessionStartEvent) error) func() {
+	return subscribe(f, "OnSessionStartHandlers", &f.OnSessionStartHandlers, h)
+}
+func (f *Fake) OnSessionInfoChanged(h func(ctx context.Context, evt extension.SessionInfoChangedEvent) error) func() {
+	return subscribe(f, "OnSessionInfoChangedHandlers", &f.OnSessionInfoChangedHandlers, h)
+}
+func (f *Fake) OnSessionBeforeSwitch(h func(ctx context.Context, evt extension.SessionBeforeSwitchEvent) (extension.SessionBeforeSwitchResult, error)) func() {
+	return subscribe(f, "OnSessionBeforeSwitchHandlers", &f.OnSessionBeforeSwitchHandlers, h)
+}
+func (f *Fake) OnSessionBeforeFork(h func(ctx context.Context, evt extension.SessionBeforeForkEvent) (extension.SessionBeforeForkResult, error)) func() {
+	return subscribe(f, "OnSessionBeforeForkHandlers", &f.OnSessionBeforeForkHandlers, h)
+}
+func (f *Fake) OnSessionBeforeCompact(h func(ctx context.Context, evt extension.SessionBeforeCompactEvent) (extension.SessionBeforeCompactResult, error)) func() {
+	return subscribe(f, "OnSessionBeforeCompactHandlers", &f.OnSessionBeforeCompactHandlers, h)
+}
+func (f *Fake) OnProjectTrust(h extension.ProjectTrustHandler) func() {
+	return subscribe(f, "OnProjectTrustHandlers", &f.OnProjectTrustHandlers, h)
+}
+func (f *Fake) OnSessionCompact(h func(ctx context.Context, evt extension.SessionCompactEvent) error) func() {
+	return subscribe(f, "OnSessionCompactHandlers", &f.OnSessionCompactHandlers, h)
+}
+func (f *Fake) OnSessionCompactFailed(h func(ctx context.Context, evt extension.SessionCompactFailedEvent) error) func() {
+	return subscribe(f, "OnSessionCompactFailedHandlers", &f.OnSessionCompactFailedHandlers, h)
+}
+func (f *Fake) OnSessionShutdown(h func(ctx context.Context, evt extension.SessionShutdownEvent) error) func() {
+	return subscribe(f, "OnSessionShutdownHandlers", &f.OnSessionShutdownHandlers, h)
+}
+func (f *Fake) OnSessionBeforeTree(h func(ctx context.Context, evt extension.SessionBeforeTreeEvent) (extension.SessionBeforeTreeResult, error)) func() {
+	return subscribe(f, "OnSessionBeforeTreeHandlers", &f.OnSessionBeforeTreeHandlers, h)
+}
+func (f *Fake) OnSessionTree(h func(ctx context.Context, evt extension.SessionTreeEvent) error) func() {
+	return subscribe(f, "OnSessionTreeHandlers", &f.OnSessionTreeHandlers, h)
+}
+func (f *Fake) OnContext(h func(ctx context.Context, evt extension.ContextEvent) (extension.ContextEventResult, error)) func() {
+	return subscribe(f, "OnContextHandlers", &f.OnContextHandlers, h)
+}
+func (f *Fake) OnContextWithSystem(h func(ctx context.Context, evt extension.ContextWithSystemEvent) (extension.ContextEventResult, error)) func() {
+	return subscribe(f, "OnContextWithSystemHandlers", &f.OnContextWithSystemHandlers, h)
+}
+func (f *Fake) OnBeforeProviderRequest(h func(ctx context.Context, evt extension.BeforeProviderRequestEvent) (extension.BeforeProviderRequestEventResult, error)) func() {
+	return subscribe(f, "OnBeforeProviderRequestHandlers", &f.OnBeforeProviderRequestHandlers, h)
+}
+func (f *Fake) OnMcpServersChange(h func(ctx context.Context, evt extension.McpServersChangeEvent) error) func() {
+	return subscribe(f, "OnMcpServersChangeHandlers", &f.OnMcpServersChangeHandlers, h)
+}
+func (f *Fake) OnProviderStreamEvent(h func(ctx context.Context, evt extension.ProviderStreamEvent) error) func() {
+	return subscribe(f, "OnProviderStreamEventHandlers", &f.OnProviderStreamEventHandlers, h)
+}
+func (f *Fake) OnAfterProviderResponse(h func(ctx context.Context, evt extension.AfterProviderResponseEvent) error) func() {
+	return subscribe(f, "OnAfterProviderResponseHandlers", &f.OnAfterProviderResponseHandlers, h)
+}
+func (f *Fake) OnBeforeProviderHeaders(h func(ctx context.Context, evt extension.BeforeProviderHeadersEvent) error) func() {
+	return subscribe(f, "OnBeforeProviderHeadersHandlers", &f.OnBeforeProviderHeadersHandlers, h)
+}
+func (f *Fake) OnBeforeAgentStart(h func(ctx context.Context, evt extension.BeforeAgentStartEvent) (extension.BeforeAgentStartEventResult, error)) func() {
+	return subscribe(f, "OnBeforeAgentStartHandlers", &f.OnBeforeAgentStartHandlers, h)
+}
+func (f *Fake) OnAgentStart(h func(ctx context.Context, evt extension.AgentStartEvent) error) func() {
+	return subscribe(f, "OnAgentStartHandlers", &f.OnAgentStartHandlers, h)
+}
+func (f *Fake) OnAgentEnd(h func(ctx context.Context, evt extension.AgentEndEvent) error) func() {
+	return subscribe(f, "OnAgentEndHandlers", &f.OnAgentEndHandlers, h)
+}
+func (f *Fake) OnAgentBeforeSettle(h func(ctx context.Context, evt *extension.AgentBeforeSettleEvent) (extension.AgentBeforeSettleEventResult, error)) func() {
+	return subscribe(f, "OnAgentBeforeSettleHandlers", &f.OnAgentBeforeSettleHandlers, h)
+}
+
+func (f *Fake) OnAgentSettled(h func(ctx context.Context, evt extension.AgentSettledEvent) error) func() {
+	return subscribe(f, "OnAgentSettledHandlers", &f.OnAgentSettledHandlers, h)
+}
+func (f *Fake) OnUiPromptStart(h func(ctx context.Context, evt extension.UIPromptStartEvent) error) func() {
+	return subscribe(f, "OnUiPromptStartHandlers", &f.OnUiPromptStartHandlers, h)
+}
+func (f *Fake) OnUiPromptEnd(h func(ctx context.Context, evt extension.UIPromptEndEvent) error) func() {
+	return subscribe(f, "OnUiPromptEndHandlers", &f.OnUiPromptEndHandlers, h)
+}
+func (f *Fake) OnCacheWarmingDecision(h func(ctx context.Context, evt extension.CacheWarmingDecisionEvent) (extension.CacheWarmingDecisionEventResult, error)) func() {
+	return subscribe(f, "OnCacheWarmingDecisionHandlers", &f.OnCacheWarmingDecisionHandlers, h)
+}
+func (f *Fake) OnTurnStart(h func(ctx context.Context, evt extension.TurnStartEvent) error) func() {
+	return subscribe(f, "OnTurnStartHandlers", &f.OnTurnStartHandlers, h)
+}
+func (f *Fake) OnTurnEnd(h func(ctx context.Context, evt extension.TurnEndEvent) (extension.TurnEndEventResult, error)) func() {
+	return subscribe(f, "OnTurnEndHandlers", &f.OnTurnEndHandlers, h)
+}
+func (f *Fake) OnMessageStart(h func(ctx context.Context, evt extension.MessageStartEvent) error) func() {
+	return subscribe(f, "OnMessageStartHandlers", &f.OnMessageStartHandlers, h)
+}
+func (f *Fake) OnMessageUpdate(h func(ctx context.Context, evt extension.MessageUpdateEvent) error) func() {
+	return subscribe(f, "OnMessageUpdateHandlers", &f.OnMessageUpdateHandlers, h)
+}
+func (f *Fake) OnMessageEnd(h func(ctx context.Context, evt extension.MessageEndEvent) (extension.MessageEndEventResult, error)) func() {
+	return subscribe(f, "OnMessageEndHandlers", &f.OnMessageEndHandlers, h)
+}
+func (f *Fake) OnToolExecutionStart(h func(ctx context.Context, evt extension.ToolExecutionStartEvent) error) func() {
+	return subscribe(f, "OnToolExecutionStartHandlers", &f.OnToolExecutionStartHandlers, h)
+}
+func (f *Fake) OnToolExecutionUpdate(h func(ctx context.Context, evt extension.ToolExecutionUpdateEvent) error) func() {
+	return subscribe(f, "OnToolExecutionUpdateHandlers", &f.OnToolExecutionUpdateHandlers, h)
+}
+func (f *Fake) OnToolExecutionEnd(h func(ctx context.Context, evt extension.ToolExecutionEndEvent) error) func() {
+	return subscribe(f, "OnToolExecutionEndHandlers", &f.OnToolExecutionEndHandlers, h)
+}
+func (f *Fake) OnModelSelect(h func(ctx context.Context, evt extension.ModelSelectEvent) error) func() {
+	return subscribe(f, "OnModelSelectHandlers", &f.OnModelSelectHandlers, h)
+}
+func (f *Fake) OnThinkingLevelSelect(h func(ctx context.Context, evt extension.ThinkingLevelSelectEvent) error) func() {
+	return subscribe(f, "OnThinkingLevelSelectHandlers", &f.OnThinkingLevelSelectHandlers, h)
+}
+func (f *Fake) OnToolCall(h func(ctx context.Context, evt extension.ToolCallEvent) (extension.ToolCallEventResult, error)) func() {
+	return subscribe(f, "OnToolCallHandlers", &f.OnToolCallHandlers, h)
+}
+func (f *Fake) OnToolResult(h func(ctx context.Context, evt extension.ToolResultEvent) (extension.ToolResultEventResult, error)) func() {
+	return subscribe(f, "OnToolResultHandlers", &f.OnToolResultHandlers, h)
+}
+func (f *Fake) OnUserBash(h func(ctx context.Context, evt extension.UserBashEvent) (extension.UserBashEventResult, error)) func() {
+	return subscribe(f, "OnUserBashHandlers", &f.OnUserBashHandlers, h)
+}
+func (f *Fake) OnInput(h func(ctx context.Context, evt extension.InputEvent) (extension.InputEventResult, error)) func() {
+	return subscribe(f, "OnInputHandlers", &f.OnInputHandlers, h)
+}
+
+// ─── Registrations ─────────────────────────────────────────────────────
+
+func (f *Fake) RegisterTool(tool extension.ToolDefinition) {
+	f.RegisterToolCalls = append(f.RegisterToolCalls, tool)
+}
+func (f *Fake) RegisterCommand(name string, options extension.CommandOptions) {
+	f.RegisterCommandCalls = append(f.RegisterCommandCalls, RegisterCommandCall{Name: name, Options: options})
+}
+func (f *Fake) RegisterShortcut(shortcut extension.KeyID, options extension.ShortcutOptions) {
+	f.RegisterShortcutCalls = append(f.RegisterShortcutCalls, RegisterShortcutCall{Shortcut: shortcut, Options: options})
+}
+func (f *Fake) RegisterFlag(name string, options extension.FlagOptions) {
+	f.RegisterFlagCalls = append(f.RegisterFlagCalls, RegisterFlagCall{Name: name, Options: options})
+}
+func (f *Fake) GetFlag(name string) any {
+	return f.Flags[name]
+}
+func (f *Fake) RegisterMessageRenderer(customType string, renderer extension.MessageRenderer) {
+	f.RegisterMessageRendererCalls = append(f.RegisterMessageRendererCalls, RegisterMessageRendererCall{CustomType: customType, Renderer: renderer})
+}
+func (f *Fake) RegisterEntryRenderer(customType string, renderer extension.EntryRenderer) {
+	f.RegisterEntryRendererCalls = append(f.RegisterEntryRendererCalls, RegisterEntryRendererCall{CustomType: customType, Renderer: renderer})
+}
+
+func (f *Fake) RegisterToolRenderer(resolver extension.ToolRendererResolver) {
+	f.RegisterToolRenderers = append(f.RegisterToolRenderers, resolver)
+}
+
+func (f *Fake) RegisterMarkdownTransformer(transformer extension.MarkdownTransformer, options ...extension.MarkdownTransformerOptions) {
+	f.RegisterMarkdownTransformers = append(f.RegisterMarkdownTransformers, transformer)
+	var opts extension.MarkdownTransformerOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	f.RegisterMarkdownTransformerOptions = append(f.RegisterMarkdownTransformerOptions, opts)
+}
+
+// OwnThinkingRuns records the calls in order.
+func (f *Fake) OwnThinkingRuns(enabled bool) {
+	f.OwnThinkingRunsCalls = append(f.OwnThinkingRunsCalls, enabled)
+}
+
+func (f *Fake) RegisterProvider(name string, config extension.ProviderConfig) {
+	f.RegisterProviderCalls = append(f.RegisterProviderCalls, RegisterProviderCall{Name: name, Config: config})
+}
+func (f *Fake) RegisterNativeProvider(provider *ai.ModelsProvider) {
+	f.RegisterNativeProviderCalls = append(f.RegisterNativeProviderCalls, provider)
+}
+func (f *Fake) UnregisterProvider(name string) {
+	f.UnregisterProviderCalls = append(f.UnregisterProviderCalls, name)
+}
+
+func (f *Fake) RegisterMcpServer(name string, config extension.McpServerConfig) error {
+	f.RegisterMcpServerCalls = append(f.RegisterMcpServerCalls, RegisterMcpServerCall{Name: name, Config: config})
+	return nil
+}
+func (f *Fake) UnregisterMcpServer(name string) {
+	f.UnregisterMcpServerCalls = append(f.UnregisterMcpServerCalls, name)
+}
+func (f *Fake) GetMcpServers() []extension.RegisteredMcpServer {
+	return f.McpServers
+}
+func (f *Fake) RegisterVirtualModel(model extension.ExtensionVirtualModel) {
+	f.RegisterVirtualModelCalls = append(f.RegisterVirtualModelCalls, model)
+}
+func (f *Fake) UnregisterVirtualModel(provider, id string) {
+	f.UnregisterVirtualModelCalls = append(f.UnregisterVirtualModelCalls, UnregisterVirtualModelCall{Provider: provider, ID: id})
+}
+
+// ─── Actions ───────────────────────────────────────────────────────────
+
+func (f *Fake) SendMessage(message extension.SendMessagePayload, options *extension.SendMessageOptions) {
+	f.SendMessageCalls = append(f.SendMessageCalls, SendMessageCall{Message: message, Options: options})
+}
+func (f *Fake) SendUserMessage(content any, options *extension.SendUserMessageOptions) {
+	f.SendUserMessageCalls = append(f.SendUserMessageCalls, SendUserMessageCall{Content: content, Options: options})
+}
+func (f *Fake) AppendEntry(customType string, data any) {
+	f.AppendEntryCalls = append(f.AppendEntryCalls, AppendEntryCall{CustomType: customType, Data: data})
+}
+
+// ─── Session metadata ──────────────────────────────────────────────────
+
+func (f *Fake) SetSessionName(name string) {
+	f.SessionName = name
+}
+func (f *Fake) GetSessionName() string {
+	return f.SessionName
+}
+func (f *Fake) SetLabel(entryID string, label string) {
+	f.SetLabelCalls = append(f.SetLabelCalls, SetLabelCall{EntryID: entryID, Label: label})
+}
+func (f *Fake) Exec(command string, args []string, options *extension.ExecOptions) (extension.ExecResult, error) {
+	f.ExecCalls = append(f.ExecCalls, ExecCall{Command: command, Args: args, Options: options})
+	return extension.ExecResult{}, nil
+}
+func (f *Fake) GetActiveTools() []string {
+	return f.ActiveTools
+}
+func (f *Fake) GetAllTools() []extension.ToolInfo {
+	return f.AllTools
+}
+func (f *Fake) GetSettings() extension.Settings {
+	return f.Settings
+}
+func (f *Fake) SetActiveTools(toolNames []string) {
+	f.SetActiveToolsCalls = append(f.SetActiveToolsCalls, toolNames)
+	f.ActiveTools = toolNames
+}
+func (f *Fake) GetCommands() []extension.SlashCommandInfo {
+	return f.Commands
+}
+
+// ─── Model + thinking ──────────────────────────────────────────────────
+
+func (f *Fake) SetModel(model extension.Model) (bool, error) {
+	f.SetModelCalls = append(f.SetModelCalls, model)
+	f.CurrentModel = model
+	return f.SetModelReturn, nil
+}
+func (f *Fake) GetThinkingLevel() extension.ThinkingLevel {
+	return f.ThinkingLevel
+}
+func (f *Fake) SetThinkingLevel(level extension.ThinkingLevel) {
+	f.SetThinkingLevelCalls = append(f.SetThinkingLevelCalls, level)
+	f.ThinkingLevel = level
+}
+
+// ─── Event bus ─────────────────────────────────────────────────────────
+
+func (f *Fake) Events() extension.EventBus {
+	return f.Bus
+}
+
+// subscribe records handler in list and returns the idempotent function that removes that registration (pi.on's returned
+// `() => void`); handlers registered later stay in their order.
+func subscribe[H any](f *Fake, key string, list *[]H, handler H) func() {
+	if f.subscriptionIDs == nil {
+		f.subscriptionIDs = map[string][]uint64{}
+	}
+	f.nextSubscription++
+	id := f.nextSubscription
+	*list = append(*list, handler)
+	f.subscriptionIDs[key] = append(f.subscriptionIDs[key], id)
+	removed := false
+	return func() {
+		if removed {
+			return
+		}
+		removed = true
+		ids := f.subscriptionIDs[key]
+		for i, candidate := range ids {
+			if candidate == id {
+				f.subscriptionIDs[key] = append(ids[:i:i], ids[i+1:]...)
+				*list = append((*list)[:i:i], (*list)[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// Compile-time assertion that *Fake implements extension.API.
+var _ extension.API = (*Fake)(nil)

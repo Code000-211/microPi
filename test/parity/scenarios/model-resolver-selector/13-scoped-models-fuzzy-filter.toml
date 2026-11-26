@@ -1,0 +1,58 @@
+# Behavior family: model-resolver-selector
+# Surface: /scoped-models uses Pi's fuzzy ordered-subsequence search rather than
+# literal substring matching.
+#
+# Upstream evidence (Pi 0.84.0): typing `mtw` in the local two-model fixture
+# matches `model-two`, excludes `model-one`, retains the selected model detail,
+# and publishes `Model catalogs refreshed.` before the footer. Pig previously
+# returned `No matching models` because it implemented token substrings, then
+# lacked the 0.84 refresh transaction and status publication.
+#
+# Pi 1.0.0 draws fullscreen by default, so the waits read the visible screen. The wait_contains form counts
+# new occurrences, and the lines this step waits for (model-two, Model Name) are already on screen, so
+# that count never rises. The filtered frame is the one that shows "> mtw" without model-one.
+
+name = "13-scoped-models-fuzzy-filter"
+description = "Scoped-model search matches ordered fuzzy subsequences identically"
+covers = [
+  "packages/coding-agent/src/core/model-runtime.ts",
+  "packages/coding-agent/src/modes/interactive/components/scoped-models-selector.ts",
+  "packages/coding-agent/src/modes/interactive/model-search.ts",
+  "packages/tui/src/utils.ts",
+]
+tags = ["fast", "hermetic", "tui"]
+driver = "interactive-tmux"
+
+[tmux]
+width = 100
+height = 35
+ready_pattern_pig = "(auto)"
+ready_pattern_pi = "(auto)"
+ready_timeout_seconds = 20
+capture_start = "Model Configuration"
+capture_end = "all enabled"
+
+[[tmux.steps]]
+keys = ["/scoped-models", "Enter"]
+# Both binaries refresh the catalogs asynchronously after the selector opens (interactive-mode.ts showScopedModelsSelector: the selector shows "Refreshing model catalogs…" until refreshModelCatalogs settles, then "Model catalogs refreshed."). under load Pi's capture came first once ("pi output missing Model catalogs refreshed."): a step that is done at "> mtw" does not wait for the refresh. Typing starts after the status is published, so the captured screen does not depend on which of the two came first.
+wait_visible_contains = ["Model Configuration", "Model catalogs refreshed."]
+wait_timeout_seconds = 15
+
+[[tmux.steps]]
+keys = ["mtw"]
+wait_visible_contains = ["> mtw", "model-two", "Model Name: Model Two", "Model catalogs refreshed."]
+wait_not_contains = ["model-one"]
+wait_timeout_seconds = 15
+
+[env]
+pig = ["PIG_CODING_AGENT_DIR=testdata/pig-agent-local"]
+pi = ["PI_CODING_AGENT_DIR=testdata/pi-agent-local", "PI_SKIP_VERSION_CHECK=1"]
+pig_args = ["--no-extensions", "--offline", "--session-dir", "{{TEMP}}/sessions"]
+pi_args = ["--no-extensions", "--offline", "--session-dir", "{{TEMP}}/sessions"]
+
+[assert]
+both_reach_ready = true
+both_contain = ["> mtw", "model-two", "Model Name: Model Two", "Model catalogs refreshed.", "all enabled"]
+both_not_contain = ["model-one", "No matching models", "panic:", "goroutine "]
+output_equal = true
+runs = 3

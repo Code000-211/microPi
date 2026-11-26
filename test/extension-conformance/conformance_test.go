@@ -1,0 +1,4531 @@
+// Package extensionconformance is a cross-transport behavioral gate: it
+// records observable extension behavior through the in-process runner and
+// through the subprocess host, then asserts the two recordings are
+// byte-identical. Drift between the transports is a wire-format / dispatch
+// regression even when the per-transport unit tests still pass.
+//
+// Scope (intentionally focused: see pig/AGENTS.md "Behavioral
+// testing rule: SDK wire format round-trips"):
+//
+//   - tool calls: success, thrown errors, and structured is_error results.
+//   - commands: success, immediate and awaited errors, completion ordering,
+//     ui.Notify/ui.SetStatus side effects, and
+//     host action calls for sendMessage/sendUserMessage/setSessionName/appendEntry.
+//   - lifecycle events: session_start/session_shutdown.
+//
+// The suite compares in-process Go and the Go, Node/TypeScript, Rust, and
+// Python subprocess runtimes so SDK or wire-protocol drift is caught at the
+// transport boundary.
+package extensionconformance
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+	"unicode/utf16"
+
+	jsjson "github.com/MichaelKinsy/PiG/extensions/sdk/json"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/fusepack"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
+	"github.com/MichaelKinsy/PiG/extensions/sdk"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/orderedjson"
+	"github.com/MichaelKinsy/PiG/internal/testbudget"
+	"github.com/MichaelKinsy/PiG/internal/toolchain"
+	"github.com/MichaelKinsy/PiG/test/extension-conformance/testfixture"
+	"github.com/MichaelKinsy/PiG/tui"
+)
+
+// recording is the normalized cross-transport observation that gets
+// compared byte-for-byte. Anything that could legitimately differ between
+// transports (timing, identifiers, paths) is excluded by construction.
+type recording struct {
+	EchoContent             string              `json:"echo_content"`
+	PreparedContent         string              `json:"prepared_content"`
+	EchoIsError             bool                `json:"echo_is_error"`
+	ToolError               string              `json:"tool_error"`
+	ToolIsErrorContent      string              `json:"tool_is_error_content"`
+	ToolIsError             bool                `json:"tool_is_error"`
+	CommandError            string              `json:"command_error"`
+	CommandNotify           []string            `json:"command_notify"`
+	StatusUpdates           []string            `json:"status_updates"`
+	ActionCalls             []string            `json:"action_calls"`
+	SessionEventNotify      []string            `json:"session_event_notify"`
+	AgentBeforeSettle       string              `json:"agent_before_settle"`
+	AgentBeforeSettleDrafts string              `json:"agent_before_settle_drafts"`
+	ProjectTrustDecision    string              `json:"project_trust_decision"`
+	ProjectTrustErrors      []string            `json:"project_trust_errors"`
+	RegisteredToolNames     []string            `json:"registered_tool_names"`
+	RegisteredCommandNames  []string            `json:"registered_command_names"`
+	ToolPromptGuidelines    map[string][]string `json:"tool_prompt_guidelines"`    // tool name → guidelines
+	ToolConstrainedSampling map[string]string   `json:"tool_constrained_sampling"` // tool name → canonical constrained sampling JSON
+	ContextProbe            string              `json:"context_probe"`             // ctx.mode + ctx.getSystemPromptOptions() summary
+	SessionLogProbe         string              `json:"session_log_probe"`
+	DialogProbe             string              `json:"dialog_probe"`
+	UIPromptEvents          []string            `json:"ui_prompt_events"`
+	FocusedProbe            string              `json:"focused_probe"`
+	MessageRenderer         []string            `json:"message_renderer"`
+	ToolRenderer            []string            `json:"tool_renderer"`
+	ArgumentCompletions     []string            `json:"argument_completions"`
+	EntryRenderer           []string            `json:"entry_renderer"`
+	MarkdownTransform       string              `json:"markdown_transform"`
+	LoginDefinition         string              `json:"login_definition"`
+	LoginError              string              `json:"login_error"`
+	SpriteDefinition        string              `json:"sprite_definition"`
+	SpriteError             string              `json:"sprite_error"`
+	StatusBurst             []string            `json:"status_burst"`
+	RichContent             string              `json:"rich_content"`
+	RichImages              []ai.ImageContent   `json:"rich_images"`
+	RichTerminate           bool                `json:"rich_terminate"`
+}
+
+// conformanceHostInfo is the host configuration every harness host sends its extensions in PIG_EXT_HOST_INFO; the zero value sends nothing.
+// TestConformance_HostConfigurationAgreesAcrossSDKs sets it for its run (that test is not parallel, so it owns the value while it runs).
+var conformanceHostInfo subprocess.HostInfo
+
+// conformanceCellRegistry, when set, is the cell registry every harness host joins (TestConformance_SharedCellsIsolatePerHostInstances sets it for its run; that test is not parallel, so it owns the value while it runs). nil keeps each host's cells to itself.
+var conformanceCellRegistry *subprocess.CellRegistry
+
+// conformanceCellCwd, when set beside conformanceCellRegistry, is the working directory every harness host runs in: a registry shares a process only between Hosts of one cwd.
+var conformanceCellCwd string
+
+func harnessHostCwd(t *testing.T) string {
+	if conformanceCellCwd != "" {
+		return conformanceCellCwd
+	}
+	return t.TempDir()
+}
+
+type harness struct {
+	runner  *inproc.Runner
+	host    *subprocess.Host
+	notify  *[]string
+	status  *[]string
+	actions *[]string
+	ui      *recordingUI
+	bridge  *subprocess.UIBridge
+	// wire records the calls the extension sends while recording is on;
+	// nil for inproc-go.
+	wire    *wireTap
+	cleanup func()
+}
+
+type harnessCase struct {
+	name    string
+	make    func(*testing.T) *harness
+	extName string
+}
+
+func allHarnessCases() []harnessCase {
+	return []harnessCase{
+		{name: "inproc-go", make: makeInprocGoHarness, extName: inprocFixtureName},
+		{name: "subprocess-go", make: makeSubprocessGoHarness, extName: "sdk-fixture"},
+		{name: "subprocess-node", make: makeSubprocessNodeHarness, extName: "node-sdk-fixture"},
+		{name: "subprocess-node-packed", make: makeSubprocessNodePackedHarness, extName: "node-sdk-fixture"},
+		{name: "subprocess-rust", make: makeSubprocessRustHarness, extName: "rust-sdk-fixture"},
+		{name: "subprocess-python", make: makeSubprocessPythonHarness, extName: "python-sdk-fixture"},
+		{name: "subprocess-lisp", make: makeSubprocessLispHarness, extName: lispFixtureName},
+		{name: "fused-go", make: makeFusedGoHarness, extName: "sdk-fixture"},
+	}
+}
+
+func sdkHarnessCases() []harnessCase {
+	cases := allHarnessCases()
+	return cases[1:]
+}
+
+// packedSDKHarnessCases are the Go, Rust, Python and Lisp SDKs loaded into one shared runtime cell beside a peer extension, through the production
+// factory builder. Node's packed case is in allHarnessCases.
+func packedSDKHarnessCases() []harnessCase {
+	var cases []harnessCase
+	for _, language := range []string{"go", "rust", "python", "lisp"} {
+		extName := map[string]string{"go": "sdk-fixture", "rust": "rust-sdk-fixture", "python": "python-sdk-fixture", "lisp": lispFixtureName}[language]
+		cases = append(cases, harnessCase{name: "subprocess-" + language + "-packed", extName: extName, make: func(t *testing.T) *harness { return makePackedUIHarness(t, language) }})
+	}
+	return cases
+}
+
+type conformanceLinesComponent struct {
+	lines []string
+}
+
+// conformanceWidthComponent renders one line naming the width it is drawn at.
+type conformanceWidthComponent struct {
+	line func(width int) string
+	// drawn is the line Render returned last: what a later run of the card's renderer reads as lastComponent.
+	drawn string
+}
+
+func (c *conformanceWidthComponent) Render(width int) []string {
+	c.drawn = c.line(width)
+	return []string{c.drawn}
+}
+
+// lastDrawn is the line the component the card's renderer returned before drew, or "none" on the card's first run: Pi's ToolRenderContext.lastComponent.
+func lastDrawn(previous extension.Component) string {
+	if component, ok := previous.(*conformanceWidthComponent); ok && component.drawn != "" {
+		return component.drawn
+	}
+	return "none"
+}
+func (*conformanceWidthComponent) Invalidate() {}
+
+func (c *conformanceLinesComponent) Render(int) []string { return append([]string(nil), c.lines...) }
+func (*conformanceLinesComponent) Invalidate()           {}
+
+// Pi: packages/coding-agent/src/core/extensions/runner.ts:797 (Runner.getEntryRenderer).
+func TestConformance_TransportsMatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixture)")
+	}
+	t.Parallel()
+
+	cases := allHarnessCases()
+
+	// record is one row's work: the row's harness, its recording and the checks every row passes.
+	record := func(t *testing.T, tc harnessCase) recording {
+		t.Helper()
+		h := tc.make(t)
+		defer func() {
+			if h.cleanup != nil {
+				h.cleanup()
+			}
+			if h.host != nil {
+				h.host.Shutdown("test done")
+			}
+		}()
+		got := captureRecording(t, h)
+		// Pi hands extensions the collection-complete options (system-prompt.ts:37-64): every empty collection is present. An SDK or host that drops empty collections reports "absent".
+		const wantShape = "spo_shape=selectedTools:array:2,toolSnippets:object:0,toolGuidelines:object:1,promptGuidelines:array:0,appendSystemPrompt:string:0,sections:object:0,contextFiles:array:0,skills:array:1"
+		if !strings.Contains(got.ContextProbe, wantShape) {
+			t.Fatalf("%s: context probe = %q, want it to contain %q", tc.name, got.ContextProbe, wantShape)
+		}
+		// packages/coding-agent/src/core/extensions/types.ts:1692-1715 (ExtensionAPI.sendMessage, sendUserMessage, appendEntry, setSessionName): each
+		// call reaches the host with the arguments the extension passed, in every SDK, not only the same as the baseline transport's recording.
+		for _, wantAction := range []string{
+			"sendMessage:notice:hello-custom:steer:true",
+			"sendMessage:notice:default:unset:unset",
+			"sendMessage:notice:no-turn:unset:false",
+			"sendUserMessage:hello-user:followUp",
+			"setSessionName:conformance-session",
+			"appendEntry:conformance-entry:hello-entry",
+		} {
+			if !slices.Contains(got.ActionCalls, wantAction) {
+				t.Errorf("%s: host action %q was not recorded; got %v", tc.name, wantAction, got.ActionCalls)
+			}
+		}
+		// packages/coding-agent/src/core/extensions/types.ts:1676-1682 (ExtensionAPI.registerMessageRenderer, registerEntryRenderer): the renderer an extension
+		// registers for a custom type draws the host's message and entry at width 72 in every SDK.
+		if want := []string{"renderer:hello:expanded=true:width=72"}; !slices.Equal(got.MessageRenderer, want) {
+			t.Errorf("%s: registerMessageRenderer lines = %q, want %q", tc.name, got.MessageRenderer, want)
+		}
+		if want := []string{"entryrenderer:hi-entry:expanded=true:width=72"}; !slices.Equal(got.EntryRenderer, want) {
+			t.Errorf("%s: registerEntryRenderer lines = %q, want %q", tc.name, got.EntryRenderer, want)
+		}
+		// packages/coding-agent/src/core/extensions/types.ts:735-789 (pi.on session_start, session_shutdown, session_info_changed, session_before_compact,
+		// session_compact, session_compact_failed) and :680 (pi.on project_trust), :994 (pi.on agent_before_settle), :1006-1014 (pi.on ui_prompt_start, ui_prompt_end):
+		// each SDK's handler receives the event the host emitted with its payload fields, so the recording is the literal below and not only the baseline's.
+		wantSessionEvents := []string{
+			"session_start:startup:info", "session_shutdown:quit:info", "session_info_changed:conformance-session:info",
+			"session_before_compact:threshold:true:info", "session_compact:threshold:true:true:info",
+			"session_compact_failed:overflow:recovery failed:false:false:true:info", "turn_end:assistant-entry:tool-entry:info",
+		}
+		if !slices.Equal(got.SessionEventNotify, wantSessionEvents) {
+			t.Errorf("%s: session events = %q, want %q", tc.name, got.SessionEventNotify, wantSessionEvents)
+		}
+		if !strings.HasPrefix(got.AgentBeforeSettle, "agent_before_settle:completed:") {
+			t.Errorf("%s: agent_before_settle = %q", tc.name, got.AgentBeforeSettle)
+		}
+		// A handler's null and omitted draft members reach the host, and the next handler, as written (wantBoundaryDrafts).
+		if got.AgentBeforeSettleDrafts != wantBoundaryDrafts {
+			t.Errorf("%s: agent_before_settle drafts = %q, want %q", tc.name, got.AgentBeforeSettleDrafts, wantBoundaryDrafts)
+		}
+		if got.ProjectTrustDecision != "yes" {
+			t.Errorf("%s: project_trust decision = %q, want yes", tc.name, got.ProjectTrustDecision)
+		}
+		for _, promptEvent := range []string{"ui_prompt:ui_prompt_start:ui_prompt:select:Pick:info", "ui_prompt:ui_prompt_end:ui_prompt:select:Pick:info"} {
+			if !slices.Contains(got.UIPromptEvents, promptEvent) {
+				t.Errorf("%s: ui_prompt events lack %q: %q", tc.name, promptEvent, got.UIPromptEvents)
+			}
+		}
+		return got
+	}
+
+	// The first row is the reference. It records it, and so does the first later row when -run leaves it out.
+	baseline := referenceRow[recording]{name: cases[0].name}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if i == 0 {
+				baseline.set(t, record(t, tc))
+				return
+			}
+			want := baseline.get(t, func() recording { return record(t, cases[0]) })
+			got := record(t, tc)
+			if !reflect.DeepEqual(got, want) {
+				gb, _ := json.MarshalIndent(got, "", "  ")
+				wb, _ := json.MarshalIndent(want, "", "  ")
+				t.Fatalf("transport %q diverged from %q baseline\n--- baseline (%s) ---\n%s\n--- got (%s) ---\n%s",
+					tc.name, cases[0].name, cases[0].name, wb, tc.name, gb)
+			}
+		})
+	}
+}
+
+func TestModelStreamingSDKsMatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping model stream conformance in short mode (builds subprocess fixtures)")
+	}
+	cases := sdkHarnessCases()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t) // building a subprocess fixture can take minutes: the call's own deadline starts after it
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			var mu sync.Mutex
+			var identities []string
+			var requests []map[string]any
+			h.bridge.SetHostAction("streamModel", func(_ context.Context, model map[string]any, request map[string]any) (*ai.AssistantMessageEventStream, error) {
+				provider, _ := model["provider"].(string)
+				modelID, _ := model["modelId"].(string)
+				if modelID == "" {
+					modelID, _ = model["id"].(string)
+				}
+				mu.Lock()
+				identities = append(identities, provider+"/"+modelID)
+				requests = append(requests, request)
+				mu.Unlock()
+				if modelID == "protocol-error" {
+					return nil, errors.New("transport boom")
+				}
+				if modelID == "unknown" {
+					stream := ai.NewAssistantMessageEventStream()
+					errMessage := &ai.AssistantMessage{Provider: provider, Model: modelID, StopReason: ai.StopReasonError, ErrorMessage: "unknown model"}
+					if err := stream.Push(ai.ErrorEvent{Reason: ai.StopReasonError, Error: errMessage}); err != nil {
+						return nil, err
+					}
+					return stream, nil
+				}
+				return conformanceModelStream(provider, modelID)
+			})
+			command, ok := findCommand(h.runner, "model-stream-probe")
+			if !ok {
+				t.Fatal("model-stream-probe command not registered")
+			}
+			if err := command.Handler(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("model stream command exceeded bounded context: %v", err)
+			}
+			waitFor(t, func() bool {
+				return slices.Contains(h.ui.Recorded(), "model-stream=ok:info")
+			})
+			mu.Lock()
+			got := append([]string(nil), identities...)
+			gotRequests := append([]map[string]any(nil), requests...)
+			mu.Unlock()
+			if len(got) != 6 {
+				t.Fatalf("model calls = %v, want four declared, one unknown, and one protocol error", got)
+			}
+			for i, request := range gotRequests {
+				if !reflect.DeepEqual(request, conformanceFieldRichModelRequest()) {
+					t.Fatalf("model request %d = %#v, want %#v", i, request, conformanceFieldRichModelRequest())
+				}
+			}
+			for i, identity := range got {
+				want := "conformance/declared"
+				if i == 4 {
+					want = "conformance/unknown"
+				}
+				if i == 5 {
+					want = "conformance/protocol-error"
+				}
+				if identity != want {
+					t.Fatalf("model call %d identity = %q, want %q", i, identity, want)
+				}
+			}
+		})
+	}
+}
+
+type productionToolProvider struct{ calls int }
+
+func (*productionToolProvider) ID() string   { return "production-tool-provider" }
+func (*productionToolProvider) Close() error { return nil }
+func (provider *productionToolProvider) Stream(context.Context, ai.TranscriptContext, ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+	provider.calls++
+	stream := ai.NewAssistantMessageEventStream()
+	if provider.calls == 1 {
+		arguments := ai.JsonObject{"path": "x", "nested": ai.JsonObject{"depth": float64(2)}}
+		call := ai.ToolCall{ID: "production-call", Name: "production_tool", Arguments: arguments}
+		partial := &ai.AssistantMessage{Provider: provider.ID(), Model: "production-model", Content: []ai.AssistantContentBlock{call}, StopReason: ai.StopReasonPending}
+		terminal := &ai.AssistantMessage{Provider: provider.ID(), Model: "production-model", Content: []ai.AssistantContentBlock{call}, StopReason: ai.StopReasonToolUse}
+		for _, event := range []ai.AssistantMessageEvent{
+			ai.StartEvent{Partial: partial},
+			ai.ToolCallStartEvent{ContentIndex: 0, Partial: partial},
+			ai.ToolCallDeltaEvent{ContentIndex: 0, Delta: `{"path":"x","nested":{"depth":2}}`, Partial: partial},
+			ai.ToolCallEndEvent{ContentIndex: 0, ToolCall: call, Partial: partial},
+			ai.DoneEvent{Reason: ai.StopReasonToolUse, Message: terminal},
+		} {
+			if err := stream.Push(event); err != nil {
+				return nil, err
+			}
+		}
+		return stream, nil
+	}
+	partial := &ai.AssistantMessage{Provider: provider.ID(), Model: "production-model", Content: []ai.AssistantContentBlock{ai.TextContent{Text: "finished"}}, StopReason: ai.StopReasonPending}
+	terminal := &ai.AssistantMessage{Provider: provider.ID(), Model: "production-model", Content: []ai.AssistantContentBlock{ai.TextContent{Text: "finished"}}, StopReason: ai.StopReasonStop}
+	for _, event := range []ai.AssistantMessageEvent{
+		ai.StartEvent{Partial: partial},
+		ai.TextStartEvent{ContentIndex: 0, Partial: partial},
+		ai.TextDeltaEvent{ContentIndex: 0, Delta: "finished", Partial: partial},
+		ai.TextEndEvent{ContentIndex: 0, Content: "finished", Partial: partial},
+		ai.DoneEvent{Reason: ai.StopReasonStop, Message: terminal},
+	} {
+		if err := stream.Push(event); err != nil {
+			return nil, err
+		}
+	}
+	return stream, nil
+}
+
+type productionTool struct{}
+
+func (productionTool) Name() string                           { return "production_tool" }
+func (productionTool) Label() string                          { return "Production tool" }
+func (productionTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeSequential }
+func (productionTool) Schema() ai.ToolSchema {
+	return ai.ToolSchema{Name: "production_tool", Description: "Production tool", Parameters: map[string]any{"type": "object"}}
+}
+func (productionTool) Execute(_ context.Context, _ string, _ json.RawMessage, update agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
+	update(agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "working"}}, Details: map[string]any{"progress": float64(1)}})
+	return agent.AgentToolResult{
+		Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "done"}, ai.ImageContent{Data: "aW1n", MimeType: "image/png"}},
+		Details: map[string]any{"nested": map[string]any{"value": "kept"}},
+		IsError: true,
+	}, nil
+}
+
+func runProductionToolExecution(t *testing.T, runner *inproc.Runner) agent.ToolResultMessage {
+	t.Helper()
+	services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: t.TempDir(), AgentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &productionToolProvider{}
+	session, err := coding.NewSession(services, coding.SessionOptions{
+		Model: &ai.Model{ID: "production-model", Provider: provider, ProviderMeta: ai.ProviderMetadata{ProviderID: provider.ID()}},
+		Tools: []agent.AgentTool{productionTool{}}, SkipBuiltinTools: true, Runner: runner,
+		SessionDir: t.TempDir(), EventBufferSize: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	if _, err := session.Send(context.Background(), "run the production tool"); err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range session.Inner().BuildContext(nil) {
+		if message.ToolResult != nil && message.ToolResult.ToolCallID == "production-call" {
+			return *message.ToolResult
+		}
+	}
+	t.Fatal("persisted ToolResultMessage not found")
+	return agent.ToolResultMessage{}
+}
+
+func TestProductionToolExecutionPayloadsMatchAcrossSDKs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping production extension event conformance in short mode")
+	}
+	t.Parallel()
+	cases := allHarnessCases()
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			h := test.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			h.ui.ClearRecorded()
+			persisted := runProductionToolExecution(t, h.runner)
+			if len(persisted.Content) != 2 {
+				t.Fatalf("persisted content = %#v, want ordered text and image", persisted.Content)
+			}
+			text, textOK := persisted.Content[0].(ai.TextContent)
+			image, imageOK := persisted.Content[1].(ai.ImageContent)
+			// The persisted message holds the details object as the raw JSON the session stored, so its members keep their order.
+			details, detailsOK := orderedjson.Map(persisted.Details)
+			nested, nestedOK := details["nested"].(map[string]any)
+			if !textOK || !imageOK || !detailsOK || !nestedOK {
+				t.Fatalf("persisted ToolResultMessage lost typed payload: %#v", persisted)
+			}
+			want := []string{
+				"tool-update=production_tool:x:2:working:1:info",
+				fmt.Sprintf("tool-end=production_tool:%s:%d:%s:%s:%v:%t:info", text.Text, len(persisted.Content), image.Data, image.MimeType, nested["value"], persisted.IsError),
+			}
+			toolEvents := func() []string {
+				var result []string
+				for _, event := range h.ui.Recorded() {
+					if strings.HasPrefix(event, "tool-update=") || strings.HasPrefix(event, "tool-end=") {
+						result = append(result, event)
+					}
+				}
+				return result
+			}
+			waitFor(t, func() bool { return len(toolEvents()) >= len(want) })
+			got := toolEvents()
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("production tool events = %#v, persisted oracle = %#v", got, want)
+			}
+		})
+	}
+}
+
+// Pi: packages/coding-agent/src/core/extensions/types.ts:1068 (ToolExecutionUpdateEvent.type); packages/coding-agent/src/core/extensions/types.ts:1069 (ToolExecutionUpdateEvent.toolCallId); packages/coding-agent/src/core/extensions/types.ts:1079 (ToolExecutionEndEvent.type).
+func TestModelEventPayloadsMatchAcrossSDKs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping extension event conformance in short mode")
+	}
+	cases := sdkHarnessCases()
+	want := []string{
+		"message-update=text_delta:2:delta:false:info",
+		"tool-update=read:{\"path\":\"x\"}:working:1:info",
+		"tool-end=read:2:aW1n:kept:true:info",
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			h := test.make(t)
+			// The deadline starts after make: a harness may first build its fixture, which can outlast it, and an emit under an expired context delivers nothing yet reports no error.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			h.ui.ClearRecorded()
+			events := []extension.ExtensionEvent{
+				extension.MessageUpdateEvent{Type: "message_update", Message: wireAgentMessage(map[string]any{"role": "assistant"}), AssistantMessageEvent: ai.TextDeltaEvent{ContentIndex: 2, Delta: "delta"}},
+				extension.ToolExecutionUpdateEvent{Type: "tool_execution_update", ToolCallID: "call", ToolName: "read", Args: map[string]any{"path": "x"}, PartialResult: map[string]any{"content": []any{map[string]any{"type": "text", "text": "working"}}, "details": map[string]any{"progress": 1}}},
+				extension.ToolExecutionEndEvent{Type: "tool_execution_end", ToolCallID: "call", ToolName: "read", Result: map[string]any{"content": []any{map[string]any{"type": "text", "text": "done"}, map[string]any{"type": "image", "data": "aW1n", "mimeType": "image/png"}}, "details": map[string]any{"nested": map[string]any{"value": "kept"}}}, IsError: true},
+			}
+			for _, event := range events {
+				if _, err := h.runner.Emit(ctx, event); err != nil {
+					t.Fatalf("emit %T: %v", event, err)
+				}
+			}
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("the emit context ended before every event was delivered: %v", err)
+			}
+			waitFor(t, func() bool { return len(h.ui.Recorded()) >= len(want) })
+			if got := h.ui.Recorded(); !reflect.DeepEqual(got, want) {
+				t.Fatalf("event payloads = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func conformanceFieldRichModelRequest() map[string]any {
+	zeta := "last-first"
+	middle := "middle"
+	return map[string]any{
+		"systemPrompt": "conformance-system",
+		"messages": []any{
+			map[string]any{
+				"role":    "system",
+				"content": []any{map[string]any{"type": "text", "text": "signed system", "textSignature": "system-signature"}},
+				"sections": ai.OrderedSections{
+					{Name: "zeta", Value: &zeta},
+					{Name: "alpha", Value: nil},
+					{Name: "middle", Value: &middle},
+				},
+				"timestamp": float64(41),
+			},
+			map[string]any{"role": "user", "content": "hello", "timestamp": float64(42)},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "prior", "textSignature": "signed"}}, "api": "openai-responses", "provider": "prior-provider", "model": "prior-model", "usage": map[string]any{"input": float64(1), "output": float64(2), "cacheRead": float64(3), "cacheWrite": float64(4), "totalTokens": float64(10), "cost": map[string]any{"input": 0.1, "output": 0.2, "cacheRead": 0.3, "cacheWrite": 0.4, "total": 1.0}}, "stopReason": "stop", "timestamp": float64(43)},
+		},
+		"tools": []any{map[string]any{
+			"name": "lookup", "description": "lookup", "parameters": map[string]any{"type": "object"},
+			"constrainedSampling": map[string]any{"type": "grammar", "variants": map[string]any{"openai_lark": "start: NUMBER"}},
+		}},
+		"timeoutMs": float64(0), "websocketConnectTimeoutMs": float64(1234), "maxRetries": float64(2), "maxRetryDelayMs": float64(3000),
+		"maxTokens": float64(321), "temperature": 0.65, "samplingParams": map[string]any{"topP": 0.8},
+		"thinkingBudgets": map[string]any{"minimal": float64(11), "low": float64(22), "medium": float64(33), "high": float64(44)},
+		"reasoning":       "high", "isReasoning": true, "env": map[string]any{"WIRE_ENV": "request-value", "SECOND_ENV": "distinct-value"},
+		"headers": map[string]any{"X-Wire": "yes", "X-Remove": nil}, "sessionId": "conformance-session", "transport": "sse",
+	}
+}
+
+func conformanceModelStream(provider, model string) (*ai.AssistantMessageEventStream, error) {
+	stream := ai.NewAssistantMessageEventStream()
+	partial := &ai.AssistantMessage{API: ai.API("faux"), Provider: provider, Model: model, Content: []ai.AssistantContentBlock{ai.TextContent{Text: "streamed"}}, StopReason: ai.StopReasonPending}
+	terminal := &ai.AssistantMessage{API: ai.API("faux"), Provider: provider, Model: model, Content: []ai.AssistantContentBlock{ai.TextContent{Text: "streamed"}}, StopReason: ai.StopReasonStop}
+	for _, event := range []ai.AssistantMessageEvent{
+		ai.StartEvent{Partial: partial},
+		ai.TextStartEvent{ContentIndex: 0, Partial: partial},
+		ai.TextDeltaEvent{ContentIndex: 0, Delta: "streamed", Partial: partial},
+		ai.TextEndEvent{ContentIndex: 0, Content: "streamed", Partial: partial},
+		ai.DoneEvent{Reason: ai.StopReasonStop, Message: terminal},
+		ai.TextDeltaEvent{ContentIndex: 0, Delta: "ignored", Partial: partial},
+	} {
+		if err := stream.Push(event); err != nil {
+			return nil, err
+		}
+	}
+	return stream, nil
+}
+
+func TestRemoteComponentInvalidationSDKsMatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	t.Parallel()
+
+	cases := sdkHarnessCases()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			h.ui.ClearRecorded()
+			command, ok := findCommand(h.runner, "timer-focused-probe")
+			if !ok {
+				t.Fatal("timer-focused-probe command not registered")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := command.Handler(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			var others []string
+			waitFor(t, func() bool {
+				_, others = splitPromptNotifications(h.ui.Recorded())
+				return len(others) > 0
+			})
+			got := others[0]
+			var frame int
+			if _, err := fmt.Sscanf(got, "timer=%d disposed=true detached=true:info", &frame); err != nil {
+				t.Fatalf("timer lifecycle recording = %q: %v", got, err)
+			}
+			if frame < 2 {
+				t.Fatalf("timer rendered frame %d, want at least 2 without input", frame)
+			}
+		})
+	}
+}
+
+// captureRecording drives the same scenario through whichever transport
+// `h` wraps, then returns the normalized observation.
+func captureRecording(t *testing.T, h *harness) recording {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	registeredToolNames := toolNames(h.runner)
+	registeredCommandNames := commandNames(h.runner)
+
+	tool, ok := findTool(h.runner, "echo")
+	if !ok {
+		t.Fatal("echo tool not registered")
+	}
+	result, err := tool.Definition.Execute(ctx, "tc-conformance-1",
+		json.RawMessage(`{"text":"hello"}`), nil)
+	if err != nil {
+		t.Fatalf("echo execute: %v", err)
+	}
+	tr, ok := result, true
+	if !ok {
+		t.Fatalf("echo result type = %T, want agent.AgentToolResult", result)
+	}
+
+	richTool, ok := findTool(h.runner, "rich_tool")
+	if !ok {
+		t.Fatal("rich_tool not registered")
+	}
+	richResult, err := richTool.Definition.Execute(ctx, "tc-conformance-rich", json.RawMessage(`{}`), nil)
+	if err != nil {
+		t.Fatalf("rich_tool execute: %v", err)
+	}
+	rich, ok := richResult, true
+	if !ok {
+		t.Fatalf("rich_tool result type = %T, want agent.AgentToolResult", richResult)
+	}
+	assertOrderedRichToolResult(t, rich)
+
+	// agent-loop.ts:707-716: prepareArguments runs before the host validates, so the row goes through the agent's dispatch
+	// (a legacy shape the schema rejects) instead of calling Definition.PrepareArguments and Definition.Execute by hand.
+	prepared := dispatchToolCalls(t, h, []ai.FauxContentBlock{ai.FauxToolCall("prepared_tool", map[string]any{"legacy": "hello"}, &ai.FauxToolCallOptions{ID: "tc-conformance-prepare"})})
+	if len(prepared) != 1 || prepared[0].IsError {
+		t.Fatalf("prepared_tool results = %s", describeToolResults(prepared))
+	}
+
+	toolErrDef, ok := findTool(h.runner, "tool_error")
+	if !ok {
+		t.Fatal("tool_error tool not registered")
+	}
+	_, toolErr := toolErrDef.Definition.Execute(ctx, "tc-conformance-err", json.RawMessage(`{}`), nil)
+	if toolErr == nil {
+		t.Fatal("tool_error execute error = nil")
+	}
+
+	softErrDef, ok := findTool(h.runner, "tool_is_error")
+	if !ok {
+		t.Fatal("tool_is_error tool not registered")
+	}
+	softResult, err := softErrDef.Definition.Execute(ctx, "tc-conformance-soft", json.RawMessage(`{}`), nil)
+	if err != nil {
+		t.Fatalf("tool_is_error execute: %v", err)
+	}
+	softTR, ok := softResult, true
+	if !ok {
+		t.Fatalf("tool_is_error result type = %T, want agent.AgentToolResult", softResult)
+	}
+
+	h.ui.ClearRecorded()
+	h.ui.ClearStatuses()
+	cmd, ok := findCommand(h.runner, "ping")
+	if !ok {
+		t.Fatal("ping command not registered")
+	}
+	if err := cmd.Handler(ctx, ""); err != nil {
+		t.Fatalf("ping command: %v", err)
+	}
+
+	commandErrDef, ok := findCommand(h.runner, "command_error")
+	if !ok {
+		t.Fatal("command_error command not registered")
+	}
+	commandErr := commandErrDef.Handler(ctx, "")
+	if commandErr == nil {
+		t.Fatal("command_error error = nil")
+	}
+
+	awaitedCommand, ok := findCommand(h.runner, "command_awaited_error")
+	if !ok {
+		t.Fatal("command_awaited_error command not registered")
+	}
+	awaitedStart := time.Now()
+	awaitedErr := awaitedCommand.Handler(ctx, "")
+	if elapsed := time.Since(awaitedStart); elapsed < 100*time.Millisecond {
+		t.Fatalf("command_awaited_error returned after %v, before awaited work completed", elapsed)
+	}
+	if awaitedErr == nil || !strings.Contains(awaitedErr.Error(), "awaited command exploded") {
+		t.Fatalf("command_awaited_error error = %v", awaitedErr)
+	}
+
+	statusCmd, ok := findCommand(h.runner, "status")
+	if !ok {
+		t.Fatal("status command not registered")
+	}
+	if err := statusCmd.Handler(ctx, ""); err != nil {
+		t.Fatalf("status command: %v", err)
+	}
+	waitFor(t, func() bool { return len(h.ui.Recorded()) > 0 && len(h.ui.Statuses()) > 0 })
+	commandNotify := append([]string(nil), h.ui.Recorded()...)
+	statusUpdates := h.ui.Statuses()
+
+	statusBurst := captureStatusBurst(ctx, t, h)
+
+	// The paged-log read runs before append_entry below: the harness serves a fixed three-entry log and records appends without adding them, while Pi's pi.appendEntry adds the entry to the log the next read sees (agent-session.ts:3406-3411), as the Node runtime now does.
+	h.ui.ClearRecorded()
+	sessionLogCtx := ctx
+	if h.host == nil {
+		cc := h.runner.CreateCommandContext()
+		sessionLogCtx = extension.WithCommandContext(extension.WithContext(ctx, cc.Context), cc)
+	}
+	sessionLogCmd, ok := findCommand(h.runner, "session-log-probe")
+	if !ok {
+		t.Fatal("session-log-probe command not registered")
+	}
+	if err := sessionLogCmd.Handler(sessionLogCtx, ""); err != nil {
+		t.Fatalf("session-log-probe command: %v", err)
+	}
+	waitFor(t, func() bool { return len(h.ui.Recorded()) > 0 })
+	sessionLogProbe := h.ui.Recorded()[0]
+
+	*h.actions = nil
+	for _, name := range []string{"send_message", "send_message_default", "send_message_no_turn", "send_user_message", "set_session_name", "append_entry"} {
+		cmd, ok := findCommand(h.runner, name)
+		if !ok {
+			t.Fatalf("%s command not registered", name)
+		}
+		if err := cmd.Handler(ctx, ""); err != nil {
+			t.Fatalf("%s command: %v", name, err)
+		}
+	}
+	waitFor(t, func() bool { return len(*h.actions) >= 6 })
+	actionCalls := append([]string(nil), (*h.actions)...)
+	h.ui.ClearRecorded()
+	loginCmd, ok := findCommand(h.runner, "login-probe")
+	if !ok {
+		t.Fatal("login-probe command not registered")
+	}
+	if err := loginCmd.Handler(ctx, ""); err != nil {
+		t.Fatalf("login-probe command: %v", err)
+	}
+	waitFor(t, func() bool { return len(h.ui.LoginDefinitions()) == 1 && len(h.ui.Recorded()) > 0 })
+	loginDefinitions := h.ui.LoginDefinitions()
+	loginDefinition := loginDefinitions[0]
+	loginError := h.ui.Recorded()[0]
+
+	h.ui.ClearRecorded()
+	spriteCmd, ok := findCommand(h.runner, "sprite-probe")
+	if !ok {
+		t.Fatal("sprite-probe command not registered")
+	}
+	recordedBefore := len(h.ui.Recorded())
+	if err := spriteCmd.Handler(ctx, ""); err != nil {
+		t.Fatalf("sprite-probe command: %v", err)
+	}
+	waitFor(t, func() bool { return len(h.ui.SpriteDefinitions()) == 1 && len(h.ui.Recorded()) > recordedBefore })
+	spriteDefinition := h.ui.SpriteDefinitions()[0]
+	spriteError := h.ui.Recorded()[recordedBefore]
+
+	h.ui.ClearRecorded()
+	if _, err := h.runner.Emit(ctx, extension.SessionStartEvent{Type: "session_start", Reason: "startup"}); err != nil {
+		t.Fatalf("session_start emit: %v", err)
+	}
+	if _, err := h.runner.Emit(ctx, extension.SessionShutdownEvent{Type: "session_shutdown", Reason: "quit"}); err != nil {
+		t.Fatalf("session_shutdown emit: %v", err)
+	}
+	if _, err := h.runner.Emit(ctx, extension.SessionInfoChangedEvent{Type: "session_info_changed", Name: "conformance-session"}); err != nil {
+		t.Fatalf("session_info_changed emit: %v", err)
+	}
+	if _, err := h.runner.Emit(ctx, extension.SessionBeforeCompactEvent{Type: "session_before_compact", Reason: "threshold", WillRetry: true}); err != nil {
+		t.Fatalf("session_before_compact emit: %v", err)
+	}
+	if _, err := h.runner.Emit(ctx, extension.SessionCompactEvent{Type: "session_compact", Reason: "threshold", WillRetry: true, FromExtension: true}); err != nil {
+		t.Fatalf("session_compact emit: %v", err)
+	}
+	if _, err := h.runner.Emit(ctx, extension.SessionCompactFailedEvent{Type: "session_compact_failed", Reason: "overflow", ErrorMessage: "recovery failed", Aborted: false, WillRetry: false, FromExtension: true}); err != nil {
+		t.Fatalf("session_compact_failed emit: %v", err)
+	}
+	if _, err := h.runner.Emit(ctx, extension.TurnEndEvent{Type: "turn_end", Message: wireAgentMessage(map[string]any{"role": "assistant", "content": []any{}}), MessageEntryID: "assistant-entry", ToolResultEntryIds: []string{"tool-entry"}}); err != nil {
+		t.Fatalf("turn_end emit: %v", err)
+	}
+	waitFor(t, func() bool { return len(h.ui.Recorded()) >= 7 })
+	sessionEventNotify := append([]string(nil), h.ui.Recorded()...)
+
+	h.ui.ClearRecorded()
+	var boundaryErrors []*extension.ExtensionError
+	removeBoundaryListener := h.runner.AddErrorListener(func(err *extension.ExtensionError) { boundaryErrors = append(boundaryErrors, err) })
+	boundary, err := h.runner.EmitBoundary(ctx, &extension.AgentBeforeSettleEvent{Type: "agent_before_settle", Outcome: extension.AgentActivityCompleted},
+		func(entries []extension.SessionBoundaryDraft) (extension.BoundaryContextPreview, error) {
+			return extension.BoundaryContextPreview{
+				ContextEntries: make([]extension.ProjectedSessionEntry, len(entries)),
+				CanContinue:    len(entries) > 0,
+			}, nil
+		})
+	removeBoundaryListener()
+	if err != nil {
+		t.Fatalf("agent_before_settle emit: %v", err)
+	}
+	if len(boundaryErrors) != 1 {
+		t.Fatalf("boundary must surface only the deliberate handler failure: %+v", boundaryErrors)
+	}
+	if !boundary.Valid || !boundary.Continue || len(boundary.Entries) != 6 || boundary.Entries[0].CustomType != "conformance-boundary" {
+		t.Fatalf("boundary mutation/error/result chain: %+v", boundary)
+	}
+	waitFor(t, func() bool { return len(h.ui.Recorded()) > 1 })
+	agentBeforeSettle := fmt.Sprintf("%s:result=%d:%t", h.ui.Recorded()[0], len(boundary.Entries), boundary.Continue)
+	// The drafts as the host decoded them, after the handler's own report of the drafts it was handed: a null member and an absent one stay apart both ways.
+	agentBeforeSettleDrafts := boundaryDraftsLine(t, h.ui.Recorded()[1], boundary.Entries)
+
+	projectTrust, projectTrustErrors, err := inproc.EmitProjectTrust(h.runner, ctx, extension.ProjectTrustEvent{
+		Type: "project_trust",
+		Cwd:  "/fixture/project",
+	}, extension.ProjectTrustContext{})
+	if err != nil {
+		t.Fatalf("project_trust emit: %v", err)
+	}
+	if len(projectTrustErrors) != 1 {
+		t.Fatalf("project_trust errors: %+v", projectTrustErrors)
+	}
+	projectTrustErrorMessages := []string{projectTrustErrors[0].Error}
+	if projectTrust == nil {
+		t.Fatal("project_trust returned no decisive result")
+	}
+	projectTrustDecision := string(projectTrust.Trusted)
+
+	// ctx.mode + ctx.getSystemPromptOptions() (#40/#41). The probe command
+	// reads both and notifies a deterministic summary. The inproc baseline
+	// dispatches command handlers directly, so attach a CommandContext
+	// (the subprocess SDKs build their own Context over the wire).
+	h.ui.ClearRecorded()
+	probeCmd, ok := findCommand(h.runner, "context-probe")
+	if !ok {
+		t.Fatal("context-probe command not registered")
+	}
+	probeCtx := ctx
+	if h.host == nil {
+		cc := h.runner.CreateCommandContext()
+		probeCtx = extension.WithCommandContext(extension.WithContext(ctx, cc.Context), cc)
+	}
+	if err := probeCmd.Handler(probeCtx, ""); err != nil {
+		t.Fatalf("context-probe command: %v", err)
+	}
+	waitFor(t, func() bool { return len(h.ui.Recorded()) > 0 })
+	contextProbe := h.ui.Recorded()[0]
+
+	// Each dialog reports ui_prompt_start/ui_prompt_end without awaiting
+	// handlers, so the reports arrive alongside the command's own summary.
+	h.ui.ClearRecorded()
+	dialogCmd, ok := findCommand(h.runner, "dialog-probe")
+	if !ok {
+		t.Fatal("dialog-probe command not registered")
+	}
+	if err := dialogCmd.Handler(probeCtx, ""); err != nil {
+		t.Fatalf("dialog-probe command: %v", err)
+	}
+	waitFor(t, func() bool {
+		prompts, others := splitPromptNotifications(h.ui.Recorded())
+		return len(others) > 0 && len(prompts) >= 8
+	})
+	uiPromptEvents, dialogOthers := splitPromptNotifications(h.ui.Recorded())
+	dialogProbe := dialogOthers[0]
+
+	h.ui.ClearRecorded()
+	focusedCmd, ok := findCommand(h.runner, "focused-probe")
+	if !ok {
+		t.Fatal("focused-probe command not registered")
+	}
+	if err := focusedCmd.Handler(probeCtx, ""); err != nil {
+		t.Fatalf("focused-probe command: %v", err)
+	}
+	waitFor(t, func() bool {
+		prompts, others := splitPromptNotifications(h.ui.Recorded())
+		return len(others) > 0 && len(prompts) >= 2
+	})
+	focusedPrompts, focusedOthers := splitPromptNotifications(h.ui.Recorded())
+	focusedProbe := focusedOthers[0]
+	uiPromptEvents = append(uiPromptEvents, focusedPrompts...)
+	// Upstream runner.ts queues void emit(event): cross-event completion is unordered.
+	wantPromptCompletions := slices.Clone(wantUIPromptEvents)
+	slices.Sort(wantPromptCompletions)
+	slices.Sort(uiPromptEvents)
+	if !slices.Equal(uiPromptEvents, wantPromptCompletions) {
+		t.Fatalf("ui_prompt events =\n%s\nwant\n%s", strings.Join(uiPromptEvents, "\n"), strings.Join(wantUIPromptEvents, "\n"))
+	}
+
+	renderer := h.runner.MessageRenderer("conformance-message")
+	if renderer == nil {
+		t.Fatal("conformance-message renderer not registered")
+	}
+	component, ok := renderer(extension.CustomMessage{
+		CustomType: "conformance-message",
+		Content:    "hello",
+		Display:    true,
+	}, extension.MessageRenderOptions{Expanded: true}, nil).(interface {
+		Render(int) []string
+		Invalidate()
+	})
+	if !ok {
+		t.Fatal("message renderer did not return a component")
+	}
+	var messageRenderer []string
+	waitFor(t, func() bool {
+		messageRenderer = component.Render(72)
+		return len(messageRenderer) == 1 && messageRenderer[0] == "renderer:hello:expanded=true:width=72"
+	})
+
+	entryRenderer := h.runner.EntryRenderer("conformance-entry")
+	if entryRenderer == nil {
+		t.Fatal("conformance-entry renderer not registered")
+	}
+	entryComponent, ok := entryRenderer(
+		extension.CustomEntry{CustomType: "conformance-entry", Data: "hi-entry"},
+		extension.EntryRenderOptions{Expanded: true}, nil,
+	).(interface {
+		Render(int) []string
+		Invalidate()
+	})
+	if !ok {
+		t.Fatal("entry renderer did not return a component")
+	}
+	var entryRendererLines []string
+	waitFor(t, func() bool {
+		entryRendererLines = entryComponent.Render(72)
+		return len(entryRendererLines) == 1 && entryRendererLines[0] == "entryrenderer:hi-entry:expanded=true:width=72"
+	})
+
+	transformers := h.runner.GetMarkdownTransformers()
+	if len(transformers) != 1 {
+		t.Fatalf("markdown transformers = %d, want 1", len(transformers))
+	}
+	// A subprocess transformer answers off the render loop: the first call
+	// keeps the input, and a later call returns the extension's answer.
+	var markdownTransform string
+	waitFor(t, func() bool {
+		markdownTransform = transformers[0]("hello *md*", extension.MarkdownTransformContext{
+			MessageType: extension.MarkdownMessageAssistant, IsStreaming: true, AvailableWidth: 72,
+		})
+		return markdownTransform != "hello *md*"
+	})
+
+	renderProbe, ok := h.runner.GetToolDefinition("render_probe")
+	if !ok || renderProbe.RenderShell != extension.ToolRenderShellSelf || renderProbe.RenderCall == nil || renderProbe.RenderResult == nil {
+		t.Fatalf("render_probe definition = %+v, want a self shell with both renderers", renderProbe)
+	}
+	renderContext := extension.ToolRenderContext{
+		Args: json.RawMessage(`{"topic":"alpha"}`), ToolCallID: "render-probe-1", Card: "conformance-card",
+		State: map[string]any{}, Invalidate: func() {}, ExecutionStarted: true, ArgsComplete: true,
+		// A value no SDK defaults to: an SDK that drops the field renders duration=none.
+		DurationMs: new(int64(4200)),
+	}
+	probeResult := agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "out"}}, Details: map[string]any{"k": "v"}}
+	isProbeLine := func(line string) bool { return strings.HasPrefix(line, "toolrender:") }
+	renderCall, ok := renderProbe.RenderCall(json.RawMessage(`{"topic":"alpha"}`), nil, renderContext).(interface{ Render(int) []string })
+	if !ok {
+		t.Fatal("renderCall did not return a component")
+	}
+	callLine := expectRenderedLine(t, renderCall, isProbeLine, "toolrender:call:alpha:partial=false:calls=1:width=72:last=none")
+	toolRenderer := []string{callLine}
+	renderResult, ok := renderProbe.RenderResult(probeResult, extension.ToolRenderResultOptions{Expanded: true}, nil, renderContext).(interface{ Render(int) []string })
+	if !ok {
+		t.Fatal("renderResult did not return a component")
+	}
+	resultLine := expectRenderedLine(t, renderResult, isProbeLine, "toolrender:result:out:v:expanded=true:calls=1:width=72:duration=4200:last=none")
+	toolRenderer = append(toolRenderer, resultLine)
+
+	// ToolRenderContext.lastComponent: a second run of each phase on the same card receives what that phase's renderer returned on the first
+	// (tool-execution.ts hands the card's callRendererComponent and resultRendererComponent back). Each last= is a line no SDK's fallback (an
+	// absent component reads "none") produces, and the call and result slots are separate: a swapped slot reads the other phase's line. The second
+	// runs change an input (expanded, topic) so that their own line is told from the first run's, which the same component still shows until the
+	// answer arrives; a wrong last= then fails with both lines at once.
+	renderContext.LastComponent = renderResult.(extension.Component)
+	renderResultAgain, ok := renderProbe.RenderResult(probeResult, extension.ToolRenderResultOptions{Expanded: false}, nil, renderContext).(interface{ Render(int) []string })
+	if !ok {
+		t.Fatal("second renderResult did not return a component")
+	}
+	resultAgain := expectRenderedLine(t, renderResultAgain, func(line string) bool { return strings.Contains(line, ":expanded=false:") },
+		"toolrender:result:out:v:expanded=false:calls=1:width=72:duration=4200:last="+resultLine)
+	toolRenderer = append(toolRenderer, resultAgain)
+	renderContext.LastComponent = renderCall.(extension.Component)
+	renderCallAgain, ok := renderProbe.RenderCall(json.RawMessage(`{"topic":"beta"}`), nil, renderContext).(interface{ Render(int) []string })
+	if !ok {
+		t.Fatal("second renderCall did not return a component")
+	}
+	callAgain := expectRenderedLine(t, renderCallAgain, func(line string) bool { return strings.HasPrefix(line, "toolrender:call:beta:") },
+		"toolrender:call:beta:partial=false:calls=2:width=72:last="+callLine)
+	toolRenderer = append(toolRenderer, callAgain)
+	renderContext.LastComponent = nil
+
+	argumentCompletions := commandArgumentCompletions(t, h.runner, "complete_probe", " a", "zz")
+
+	return recording{
+		ToolRenderer:            toolRenderer,
+		ArgumentCompletions:     argumentCompletions,
+		EchoContent:             tr.Text(),
+		PreparedContent:         prepared[0].Text(),
+		EchoIsError:             tr.IsError,
+		ToolError:               toolErr.Error(),
+		ToolIsErrorContent:      softTR.Text(),
+		ToolIsError:             softTR.IsError,
+		CommandError:            commandErr.Error(),
+		CommandNotify:           commandNotify,
+		StatusUpdates:           statusUpdates,
+		ActionCalls:             actionCalls,
+		SessionEventNotify:      sessionEventNotify,
+		AgentBeforeSettle:       agentBeforeSettle,
+		AgentBeforeSettleDrafts: agentBeforeSettleDrafts,
+		ProjectTrustDecision:    projectTrustDecision,
+		ProjectTrustErrors:      projectTrustErrorMessages,
+		RegisteredToolNames:     registeredToolNames,
+		RegisteredCommandNames:  registeredCommandNames,
+		ToolPromptGuidelines:    toolGuidelines(h.runner),
+		ToolConstrainedSampling: toolConstrainedSampling(h.runner),
+		ContextProbe:            contextProbe,
+		SessionLogProbe:         sessionLogProbe,
+		DialogProbe:             dialogProbe,
+		UIPromptEvents:          uiPromptEvents,
+		FocusedProbe:            focusedProbe,
+		MessageRenderer:         messageRenderer,
+		EntryRenderer:           entryRendererLines,
+		MarkdownTransform:       markdownTransform,
+		LoginDefinition:         loginDefinition,
+		LoginError:              loginError,
+		SpriteDefinition:        spriteDefinition,
+		SpriteError:             spriteError,
+		StatusBurst:             statusBurst,
+		RichContent:             rich.Text(),
+		RichImages:              rich.Images(),
+		RichTerminate:           rich.Terminate,
+	}
+}
+
+// statusBurstCount is how many unawaited ui.setStatus calls status_burst makes.
+// Upstream applies them in program order, so the burst reads back 0..N-1.
+const statusBurstCount = 200
+
+// captureStatusBurst runs the status_burst command, whose handler sets one
+// status key statusBurstCount times without awaiting, and returns the updates
+// for that key in the order the UI applied them.
+func captureStatusBurst(ctx context.Context, t *testing.T, h *harness) []string {
+	t.Helper()
+	h.ui.ClearStatuses()
+	burst, ok := findCommand(h.runner, "status_burst")
+	if !ok {
+		t.Fatal("status_burst command not registered")
+	}
+	if err := burst.Handler(ctx, ""); err != nil {
+		t.Fatalf("status_burst command: %v", err)
+	}
+	var updates []string
+	waitFor(t, func() bool {
+		updates = updates[:0]
+		for _, update := range h.ui.Statuses() {
+			if strings.HasPrefix(update, "burst:") {
+				updates = append(updates, update)
+			}
+		}
+		return len(updates) >= statusBurstCount
+	})
+	return updates
+}
+
+// ── inproc transport ─────────────────────────────────────────────────────────
+
+// inprocFixtureName is the source name for the in-process conformance fixture.
+// Matches what upstream loader.ts would stamp as extension.sourceInfo on every
+// tool. All inproc fixture tools set SourceInfo to this value (except tools
+// with explicit source overrides like sourced_tool).
+const inprocFixtureName = "inproc-conformance-fixture"
+
+// conformanceKnownModel is the one model the conformance host can switch to; setModel of any other reports false.
+const conformanceKnownModel = "conformance/known-model"
+
+// conformanceThinkingLevel and conformanceHostCommands are the host's thinking level and slash commands. Neither is an SDK's
+// empty fallback, so an SDK that never asks the host cannot report them.
+const conformanceThinkingLevel = "xhigh"
+
+var conformanceHostCommands = []subprocess.CommandInfo{
+	{Name: "conformance-listed", Description: "Listed by the host", Source: "prompt"},
+	{Name: "review", Description: "Review the diff", Source: "prompt", SourceInfo: extension.SourceInfo{Path: "/prompts/review.md", Source: "local", Scope: "project", Origin: "top-level"}},
+	{Name: "lint", Source: "skill", SourceInfo: extension.SourceInfo{Path: "/skills/lint/SKILL.md", Source: "local", Scope: "user", Origin: "top-level"}},
+}
+
+func makeInprocGoHarness(t *testing.T) *harness {
+	t.Helper()
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	runner := inproc.NewRunner([]extension.Extension{makeInprocFixture(ui, actions)}, t.TempDir())
+	runner.SetUIContext(ui, extension.ExtensionMode(conformanceMode))
+	// Mirror the subprocess host's mode + getSystemPromptOptions wiring so
+	// the context-probe recording matches across all transports (#40/#41).
+	options := conformanceSystemPromptOptions()
+	runner.BindCore(extension.ExtensionActions{}, extension.ContextActions{
+		GetSystemPromptOptions: func() *extension.BuildSystemPromptOptions { return &options },
+		IsProjectTrusted:       func() bool { return conformanceProjectTrusted },
+	}, nil)
+	return &harness{runner: runner, notify: notify, status: status, actions: actions, ui: ui}
+}
+
+// conformanceMode is the fixed ctx.mode all transports report for the
+// context-probe (#40).
+const conformanceMode = "tui"
+
+// rpcRowMode, when set, is the mode every harness host runs in. TestConformance_RPCModeDropsFrameWidgetsInEverySDK sets it for its run; that test
+// is not parallel, so it owns the value while it runs. Empty keeps conformanceMode.
+var rpcRowMode string
+
+func harnessHostMode() string {
+	if rpcRowMode != "" {
+		return rpcRowMode
+	}
+	return conformanceMode
+}
+
+// conformanceProjectTrusted is the fixed ctx.isProjectTrusted() every
+// transport reports for the context-probe.
+//
+// Deliberately false: every SDK falls back to trusted when it cannot reach the
+// host, so binding true would let an SDK that never makes the call agree with
+// the reference by accident.
+const conformanceProjectTrusted = false
+
+// conformanceSystemPromptOptions is the fixed ctx.getSystemPromptOptions()
+// payload all transports return for the context-probe (#41).
+func conformanceSystemPromptOptions() extension.BuildSystemPromptOptions {
+	return extension.BuildSystemPromptOptions{
+		CustomPrompt:      "conformance-prompt",
+		ForceSystemPrompt: new(""),
+		SelectedTools:     []string{"read", "bash"},
+		ToolGuidelines:    map[string][]string{"read": {"Read carefully."}},
+		Skills: []extension.SystemPromptSkill{{
+			Name: "review", BaseDir: "/review", FilePath: "/review/SKILL.md",
+			SourceInfo: extension.SourceInfo{Scope: "project", Source: "local"},
+		}},
+		Cwd: "/probe-cwd",
+	}
+}
+
+// makeInprocFixture is the in-process equivalent of testfixture.Extension. It must
+// expose **exactly the same observable behavior** for the conformance gate
+// to be meaningful.
+func conformanceLoginDefinition() extension.LoginDefinition {
+	return extension.LoginDefinition{
+		Brand:       slices.Repeat([]string{strings.Repeat("A", 41)}, 5),
+		Hero:        slices.Repeat([]string{strings.Repeat("A", 32)}, 14),
+		Mascot:      slices.Repeat([]string{strings.Repeat("A", 16)}, 14),
+		Palette:     map[string]string{"A": "#123ABC"},
+		Name:        "Conformance Pig",
+		Description: "Cross-language login fixture",
+		Tagline:     "One canonical definition across every SDK",
+	}
+}
+
+func conformanceSpriteDefinition() extension.SpriteDefinition {
+	return extension.SpriteDefinition{
+		ID:      "conformance-pig",
+		Name:    "Conformance Pig",
+		Tagline: "One canonical sprite across every SDK",
+		Mascot:  slices.Repeat([]string{strings.Repeat("A", 16)}, 14),
+		Palette: map[string]string{"A": "#123ABC"},
+	}
+}
+
+// registerInprocSprite is what the host does with a subprocess extension's ui.registerSprite (UIBridge
+// handleRegisterSprite): validate, then hand the sprite to a UI that keeps sprites.
+func registerInprocSprite(ui extension.UIContext, owner string, definition extension.SpriteDefinition) error {
+	validated, err := extension.ValidateSpriteDefinition(definition)
+	if err != nil {
+		return fmt.Errorf("invalid_sprite: %w", err)
+	}
+	if registrar, ok := ui.(extension.SpriteRegistrar); ok {
+		if err := registrar.RegisterSprite(owner, validated); err != nil {
+			return fmt.Errorf("ui_error: register sprite: %w", err)
+		}
+	}
+	return nil
+}
+
+// inprocSharedTool is one of the shared-cells tools of the in-process fixture; its answer is run's text.
+func inprocSharedTool(name, description, schema string, run func(json.RawMessage) string) extension.RegisteredTool {
+	return extension.RegisteredTool{
+		Definition: extension.ToolDefinition{
+			Name: name, Description: description, Parameters: json.RawMessage(schema),
+			Execute: func(_ context.Context, _ string, params json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+				return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: run(params)}}}, nil
+			},
+		},
+		Source: inprocFixtureName,
+	}
+}
+
+func makeInprocFixture(ui extension.UIContext, actions *[]string) extension.Extension {
+	var termUnsub func()
+	var abortObserved atomic.Bool
+	var inprocStartedCalls atomic.Int64
+	var sharedCalls atomic.Int64
+	var sharedMu sync.Mutex
+	var sharedHeard []string
+	update := func(onUpdate extension.AgentToolUpdateCallback, text string) {
+		if cb := onUpdate; cb != nil {
+			cb(agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: text}}})
+		}
+	}
+	flags := conformanceFlagDeclarations()
+	schemaRejected := testfixture.ReferenceToolSchemaRejected()
+	clickCards := &inprocClickCards{}
+	return extension.Extension{
+		Flags:        flags,
+		Path:         "inproc-conformance-fixture",
+		ResolvedPath: "inproc-conformance-fixture",
+		MessageRenderers: map[string]extension.MessageRenderer{
+			"conformance-click-message": clickCards.messageRenderer,
+			// Test fixture, Pi 9376c8d1 (#4748): KeyText and KeyHint on the message options. The content is the keybinding id.
+			"keyhints-message": func(message extension.CustomMessage, options extension.MessageRenderOptions, _ extension.Theme) extension.Component {
+				id, _ := message.Content.(string)
+				return &conformanceLinesComponent{lines: []string{options.KeyText(id) + " | " + options.KeyHint(id, "to expand")}}
+			},
+			"conformance-message": func(message extension.CustomMessage, options extension.MessageRenderOptions, _ extension.Theme) extension.Component {
+				custom := message
+				if custom.Content == "padding-options" {
+					wire, _ := json.Marshal(options)
+					return &conformanceLinesComponent{lines: []string{string(wire)}}
+				}
+				return &conformanceLinesComponent{lines: []string{fmt.Sprintf("renderer:%v:expanded=%t:width=72", custom.Content, options.Expanded)}}
+			},
+		},
+		EntryRenderers: map[string]extension.EntryRenderer{
+			"conformance-click-entry": clickCards.entryRenderer,
+			// Test fixture, Pi 9376c8d1 (#4748): KeyText and KeyHint on the entry options. The data is the keybinding id.
+			"keyhints-entry": func(entry extension.CustomEntry, options extension.EntryRenderOptions, _ extension.Theme) extension.Component {
+				id, _ := entry.Data.(string)
+				return &conformanceLinesComponent{lines: []string{options.KeyText(id) + " | " + options.KeyHint(id, "to expand")}}
+			},
+			"conformance-entry": func(entry extension.CustomEntry, options extension.EntryRenderOptions, _ extension.Theme) extension.Component {
+				return &conformanceLinesComponent{lines: []string{fmt.Sprintf("entryrenderer:%v:expanded=%t:width=72", entry.Data, options.Expanded)}}
+			},
+		},
+		MarkdownTransformer: extension.NewMarkdownTransformerRegistration(func(markdown string, context extension.MarkdownTransformContext) string {
+			return fmt.Sprintf("md:%s:%s:streaming=%t:width=%d", markdown, context.MessageType, context.IsStreaming, context.AvailableWidth)
+		}, []extension.MarkdownMessageType{extension.MarkdownMessageUser, extension.MarkdownMessageAssistant, extension.MarkdownMessageAssistantThinking, extension.MarkdownMessageCustom, extension.MarkdownMessageSummary, extension.MarkdownMessageChangelog}),
+		ToolRenderers: []extension.ToolRendererResolver{func(tool string, next func() *extension.ToolRenderers) *extension.ToolRenderers {
+			line := func(prefix string) extension.ToolRenderCallFunc {
+				return func(args json.RawMessage, _ extension.Theme, _ extension.ToolRenderContext) extension.Component {
+					var parsed map[string]any
+					_ = json.Unmarshal(args, &parsed)
+					return &conformanceLinesComponent{lines: []string{fmt.Sprintf("%s:%s:%v", prefix, tool, parsed["q"])}}
+				}
+			}
+			switch tool {
+			case "conformance_tool_renderer":
+				return &extension.ToolRenderers{RenderCall: line("resolved")}
+			case "conformance_keyhints":
+				return &extension.ToolRenderers{RenderCall: func(args json.RawMessage, _ extension.Theme, render extension.ToolRenderContext) extension.Component {
+					var parsed map[string]any
+					_ = json.Unmarshal(args, &parsed)
+					id, _ := parsed["q"].(string)
+					return &conformanceLinesComponent{lines: []string{render.KeyText(id) + " | " + render.KeyHint(id, "to expand")}}
+				}}
+			case "conformance_no_renderer":
+				return nil
+			case "conformance_fill":
+				if renderers := next(); renderers != nil {
+					return renderers
+				}
+				return &extension.ToolRenderers{RenderCall: line("filled")}
+			case "conformance_wrap":
+				wrapped := *next()
+				wrapped.RenderCall = line("wrapped")
+				return &wrapped
+			}
+			return next()
+		}},
+		Tools: map[string]extension.RegisteredTool{
+			"render_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "render_probe",
+					Description: "Render its own tool card",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					RenderShell: extension.ToolRenderShellSelf,
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "render ok"}}}, nil
+					},
+					RenderCall: func(args json.RawMessage, _ extension.Theme, render extension.ToolRenderContext) extension.Component {
+						state := render.State.(map[string]any)
+						calls, _ := state["calls"].(int)
+						state["calls"] = calls + 1
+						var input map[string]any
+						_ = json.Unmarshal(args, &input)
+						last := lastDrawn(render.LastComponent)
+						return &conformanceWidthComponent{line: func(width int) string {
+							return fmt.Sprintf("toolrender:call:%v:partial=%t:calls=%d:width=%d:last=%s", input["topic"], render.IsPartial, calls+1, width, last)
+						}}
+					},
+					RenderResult: func(result extension.AgentToolResult, options extension.ToolRenderResultOptions, _ extension.Theme, render extension.ToolRenderContext) extension.Component {
+						value := result
+						details, _ := value.Details.(map[string]any)
+						calls := render.State.(map[string]any)["calls"]
+						last := lastDrawn(render.LastComponent)
+						return &conformanceWidthComponent{line: func(width int) string {
+							duration := "none"
+							if render.DurationMs != nil {
+								duration = fmt.Sprint(*render.DurationMs)
+							}
+							return fmt.Sprintf("toolrender:result:%v:%v:expanded=%t:calls=%v:width=%d:duration=%s:last=%s", value.Text(), details["k"], options.Expanded, calls, width, duration, last)
+						}}
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"update_tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "update_tool",
+					Description: "Stream two partial results",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(_ context.Context, _ string, _ json.RawMessage, onUpdate extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						update(onUpdate, "step 1")
+						update(onUpdate, "step 2")
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "done"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"big_out": {
+				Definition: extension.ToolDefinition{
+					Name:        "big_out",
+					Description: "Return text of the size in the argument",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(_ context.Context, _ string, args json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						var params struct {
+							N int `json:"n"`
+						}
+						if err := json.Unmarshal(args, &params); err != nil {
+							return agent.AgentToolResult{}, err
+						}
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: strings.Repeat("a", params.N)}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			// lone_decl: the declaration of testfixture/fixture.go, whose text holds a lone UTF-16 surrogate
+			// (TestConformance_ToolDeclarationLoneSurrogatesAgreeAcrossSDKs): every transport registers it, so this baseline does too.
+			"lone_decl": {
+				Definition: extension.ToolDefinition{
+					Name:        "lone_decl",
+					Description: "D[\xed\xa0\xbd]",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"K[\ude00\ud83d]":{"type":"string","description":"PD[\ud83d]","enum":["E[\ude00]"],"default":"DF[\ud83d]"}}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "lone"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"echo_params": {
+				Definition: extension.ToolDefinition{
+					Name:        "echo_params",
+					Description: "Return the arguments as the result details",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(_ context.Context, _ string, args json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "echoed"}}, Details: args}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"nan_out": {
+				Definition: extension.ToolDefinition{
+					Name:        "nan_out",
+					Description: "Return details holding NaN and Infinity",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(_ context.Context, _ string, _ json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						details := map[string]any{"n": math.NaN(), "i": math.Inf(-1), "l": []any{math.NaN(), 2, map[string]any{"d": math.Inf(1)}}, "ok": 1}
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "nan"}}, Details: details}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"ordered_details": {
+				Definition: extension.ToolDefinition{
+					Name:        "ordered_details",
+					Description: "Return details whose members are not in alphabetical order",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(_ context.Context, _ string, _ json.RawMessage, onUpdate extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						details := json.RawMessage(`{"zeta":1,"alpha":{"yy":2,"bb":3},"mid":[{"qq":1,"aa":2}]}`)
+						if cb := onUpdate; cb != nil {
+							cb(agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "partial"}}, Details: details})
+						}
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "done"}}, Details: details}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"ordered_result": {
+				Definition: extension.ToolDefinition{
+					Name:        "ordered_result",
+					Description: "Return a result whose members are not in the declared order",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(_ context.Context, _ string, _ json.RawMessage, onUpdate extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						if cb := onUpdate; cb != nil {
+							cb(agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "partial"}}, Details: map[string]any{"k": 1}})
+						}
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "done"}}, Details: map[string]any{"k": 1}, IsError: true}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"abort_tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "abort_tool",
+					Description: "Wait for the abort signal",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(ctx context.Context, _ string, _ json.RawMessage, onUpdate extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						update(onUpdate, "waiting")
+						<-ctx.Done()
+						abortObserved.Store(true)
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "aborted"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"hang_tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "hang_tool",
+					Description: "Ignore the abort signal",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(_ context.Context, _ string, _ json.RawMessage, onUpdate extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						update(onUpdate, "waiting")
+						time.Sleep(8 * time.Second)
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "late"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			// The two probes of TestToolAbortKeepsTheToolsHostCalls run in the SDK fixtures; the in-process baseline lists them so every transport registers the same tools.
+			"signal_host_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "signal_host_probe",
+					Description: "Await host dialogs across the abort",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			// session_actions_tool exists here only so the transports' tool lists match this reference. The SDK fixtures call the command-only session actions through the tool's context
+			// and report the refusals. An in-process tool's context is *extension.Context (FromContext, coding/extension/context.go:413), which has no such member: WaitForIdle, NewSession,
+			// Fork, NavigateTree, SwitchSession and Reload are methods of *CommandContext only (context.go:492-566), so the probe cannot be written here. The tool answers with an error that
+			// says so, and never with an empty success that a row could take for a report.
+			"session_actions_tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "session_actions_tool",
+					Description: "Call the session actions through the tool's context",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{}, errors.New("session_actions_tool: the in-process fixture does not implement the probe; it is registered only so the transports' tool lists match")
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"aborted_entry_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "aborted_entry_probe",
+					Description: "Report the signal a tool starts with",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"signal_nested_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "signal_nested_probe",
+					Description: "Run abort_tool as a nested tool call",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"rich_tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "rich_tool",
+					Description: "Return text, image, and terminate",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{
+							Content:   []ai.ToolResultMessageContent{ai.TextContent{Text: "  padded  "}, ai.ImageContent{Data: "aW1n", MimeType: "image/png"}, ai.TextContent{Text: "tail\n"}},
+							Terminate: true,
+						}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"echo": {
+				Definition: extension.ToolDefinition{
+					Name:        "echo",
+					Description: "Echo back the input",
+					Parameters: json.RawMessage(
+						`{"type":"object","required":["text"],` +
+							`"properties":{"text":{"type":"string","description":"Text to echo"},"offset":{"type":"number"}}}`,
+					),
+					Execute: func(
+						_ context.Context,
+						_ string,
+						params json.RawMessage,
+						_ extension.AgentToolUpdateCallback,
+					) (extension.AgentToolResult, error) {
+						var input struct {
+							Text string `json:"text"`
+						}
+						_ = json.Unmarshal(params, &input)
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "echo: " + input.Text}}},
+
+							nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"type-schema-tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "type-schema-tool",
+					Description: "Parameters built with Type",
+					Parameters:  typeSchemaToolParameters(),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"type-engine-tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "type-engine-tool",
+					Description: "Parameters built with the engine members of Type",
+					Parameters:  typeEngineToolParameters(),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"refine-probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "refine-probe",
+					Description: "Arguments checked by refinements",
+					Parameters:  refineProbeParameters(),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"counter": inprocSharedTool("counter", "This instance's call count", `{"type":"object","properties":{}}`, func(json.RawMessage) string { return strconv.Itoa(int(sharedCalls.Add(1))) }),
+			"ping": inprocSharedTool("ping", "Emit on the shared-cells channel", `{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}`, func(params json.RawMessage) string {
+				var input struct {
+					Name string `json:"name"`
+				}
+				_ = json.Unmarshal(params, &input)
+				sharedMu.Lock()
+				sharedHeard = append(sharedHeard, input.Name)
+				sharedMu.Unlock()
+				return "pinged"
+			}),
+			"received": inprocSharedTool("received", "What this instance heard on shared-cells", `{"type":"object","properties":{}}`, func(json.RawMessage) string {
+				sharedMu.Lock()
+				defer sharedMu.Unlock()
+				return "received=" + strings.Join(sharedHeard, ",")
+			}),
+			"prepared_tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "prepared_tool",
+					Description: "Transform legacy arguments before execution",
+					Parameters:  json.RawMessage(`{"type":"object","required":["text"],"properties":{"text":{"type":"string"}}}`),
+					PrepareArguments: func(raw json.RawMessage) (json.RawMessage, error) {
+						var input map[string]any
+						if err := json.Unmarshal(raw, &input); err != nil {
+							return nil, err
+						}
+						return json.Marshal(map[string]any{"text": input["legacy"]})
+					},
+					Execute: func(_ context.Context, _ string, raw json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						var input struct {
+							Text string `json:"text"`
+						}
+						if err := json.Unmarshal(raw, &input); err != nil {
+							return extension.AgentToolResult{}, err
+						}
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "prepared:" + input.Text}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"start_order": {
+				Definition: extension.ToolDefinition{
+					Name:        "start_order",
+					Description: "Report the order in which calls start",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"n":{"type":"number"}}}`),
+					Execute: func(_ context.Context, _ string, raw json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						var input struct {
+							N json.Number `json:"n"`
+						}
+						if err := json.Unmarshal(raw, &input); err != nil {
+							return extension.AgentToolResult{}, err
+						}
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: fmt.Sprintf("start#%d n=%s", inprocStartedCalls.Add(1), input.N)}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"dialog_order": {
+				Definition: extension.ToolDefinition{
+					Name:        "dialog_order",
+					Description: "Open a select dialog titled by the call and report the answer",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string"}}}`),
+					Execute: func(_ context.Context, _ string, raw json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						var input struct {
+							Title string `json:"title"`
+						}
+						if err := json.Unmarshal(raw, &input); err != nil {
+							return extension.AgentToolResult{}, err
+						}
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "dialog:" + input.Title + "=a"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"order_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "order_probe",
+					Description: "Make a host call and an update in the first tick",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"n":{"type":"number"}}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "order-done"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"mutation_order_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "mutation_order_probe",
+					Description: "Take the file mutation queue in the first statement and append a tag to the file",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"file":{"type":"string"},"tag":{"type":"string"}}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "mutation-done"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"mutation_order_ctx_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "mutation_order_ctx_probe",
+					Description: "Make getter calls, take the file mutation queue through the context and append a tag to the file",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"file":{"type":"string"},"tag":{"type":"string"},"calls":{"type":"number"}}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "mutation-done"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"timer_defer": {
+				Definition: extension.ToolDefinition{
+					Name:        "timer_defer",
+					Description: "Notify inline and from deferred work",
+					Parameters:  json.RawMessage(`{"type":"object"}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "queued"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"timer_stale": {
+				Definition: extension.ToolDefinition{
+					Name:        "timer_stale",
+					Description: "Await a host call made through an earlier request's context",
+					Parameters:  json.RawMessage(`{"type":"object"}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "applied"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"timer_release": {
+				Definition: extension.ToolDefinition{
+					Name:        "timer_release",
+					Description: "Release the deferred work",
+					Parameters:  json.RawMessage(`{"type":"object"}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "released"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"throw_probe": {
+				Definition: extension.ToolDefinition{
+					Name:        "throw_probe",
+					Description: "Throw a value of the requested kind",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"kind":{"type":"string"}}}`),
+					Execute: func(_ context.Context, _ string, args json.RawMessage, _ extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						var params struct{ Kind string }
+						if err := json.Unmarshal(args, &params); err != nil {
+							return extension.AgentToolResult{}, err
+						}
+						switch params.Kind {
+						case "unicode":
+							return extension.AgentToolResult{}, errors.New("é😀 \n x")
+						case "empty":
+							return extension.AgentToolResult{}, errors.New("")
+						case "long":
+							return extension.AgentToolResult{}, errors.New(strings.Repeat("x", 100000))
+						}
+						return extension.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "ok"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"tool_error": {
+				Definition: extension.ToolDefinition{
+					Name:        "tool_error",
+					Description: "Return a thrown tool error",
+					Parameters:  json.RawMessage(`{"type":"object"}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return extension.AgentToolResult{}, errors.New("tool exploded")
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"tool_is_error": {
+				Definition: extension.ToolDefinition{
+					Name:        "tool_is_error",
+					Description: "Return a structured tool error result",
+					Parameters:  json.RawMessage(`{"type":"object"}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "soft tool error"}}, IsError: true}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"guided_tool": {
+				Definition: extension.ToolDefinition{
+					Name:             "guided_tool",
+					Description:      "Tool with prompt guidelines",
+					Parameters:       json.RawMessage(`{"type":"object"}`),
+					PromptSnippet:    " \ufeffGuided\r\n tool\t summary ",
+					PromptGuidelines: []string{"Use guided_tool when the user asks for guided behavior."},
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "guided"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"sourced_tool": {
+				Definition: extension.ToolDefinition{
+					Name:             "sourced_tool",
+					Description:      "Tool with explicit source",
+					Parameters:       json.RawMessage(`{"type":"object"}`),
+					PromptGuidelines: []string{"Use sourced_tool to test per-tool source attribution."},
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "sourced"}}}, nil
+					},
+				},
+				Source: "mcp:test-server",
+			},
+			"sampling_disabled": {
+				Definition: extension.ToolDefinition{
+					Name: "sampling_disabled", Label: "sampling_disabled", Description: "Disable constrained sampling", Parameters: json.RawMessage(`{"type":"object"}`), ConstrainedSampling: json.RawMessage(`false`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "disabled"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+			"grammar_tool": {
+				Definition: extension.ToolDefinition{
+					Name:        "grammar_tool",
+					Description: "Tool with a grammar constrained sampling request",
+					Parameters:  json.RawMessage(`{"type":"object"}`),
+					ConstrainedSampling: json.RawMessage(
+						`{"type":"grammar","variants":{"openai_lark":"start: NUMBER"}}`),
+					Execute: func(context.Context, string, json.RawMessage, extension.AgentToolUpdateCallback) (extension.AgentToolResult, error) {
+						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "grammar"}}}, nil
+					},
+				},
+				Source: inprocFixtureName,
+			},
+		},
+		Commands: map[string]extension.RegisteredCommand{
+			"term_subscribe": {
+				Name: "term_subscribe",
+				Handler: func(context.Context, string) error {
+					termUnsub = ui.OnTerminalInput(func(data string) extension.TerminalInputResult {
+						switch data {
+						case "\xed\xa0\xbd", "\xed\xb8\x80", "😀":
+							rewritten := "seen:" + data
+							return extension.TerminalInputResult{Data: &rewritten}
+						case terminalInputStateSentinel:
+							encoded, _ := jsjson.Marshal([]any{ui.GetEditorText(), ui.GetToolsExpanded()})
+							state := string(encoded)
+							return extension.TerminalInputResult{Data: &state}
+						case terminalInputRewriteSentinel:
+							rewritten := "rewritten"
+							return extension.TerminalInputResult{Data: &rewritten}
+						case terminalInputSlowSentinel:
+							time.Sleep(200 * time.Millisecond)
+							return extension.TerminalInputResult{Consume: true}
+						default:
+							return extension.TerminalInputResult{Consume: data == terminalInputSentinel}
+						}
+					})
+					return nil
+				},
+			},
+			"term_unsubscribe": {
+				Name: "term_unsubscribe",
+				Handler: func(context.Context, string) error {
+					if termUnsub != nil {
+						termUnsub()
+						termUnsub = nil
+					}
+					return nil
+				},
+			},
+			"schema-probe": {
+				Name: "schema-probe", Description: "Report schema rejection",
+				Handler: func(context.Context, string) error {
+					ui.Notify(fmt.Sprintf("schema-rejected:%t", schemaRejected), "info")
+					return nil
+				},
+			},
+			"flag-probe": {
+				Name: "flag-probe", Description: "Report registered flag values",
+				Handler: func(ctx context.Context, _ string) error {
+					values := []any{}
+					for _, name := range conformanceFlagNames {
+						var value any
+						if _, registered := flags[name]; registered {
+							value = extension.FromContext(ctx).GetFlagValue(name)
+						}
+						values = append(values, value)
+					}
+					wire, err := json.Marshal(values)
+					if err != nil {
+						return err
+					}
+					ui.Notify(string(wire), "info")
+					return nil
+				},
+			},
+			"abort_probe": {
+				Name:        "abort_probe",
+				Description: "Report whether abort_tool saw its abort signal",
+				Handler: func(context.Context, string) error {
+					ui.Notify(fmt.Sprintf("abort:%t", abortObserved.Load()), "info")
+					return nil
+				},
+			},
+			"complete_probe": {
+				Name:        "complete_probe",
+				Description: "Complete its arguments",
+				GetArgumentCompletions: func(prefix string) ([]extension.AutocompleteItem, error) {
+					var items []extension.AutocompleteItem
+					for _, item := range []extension.AutocompleteItem{{Value: "alpha", Label: "alpha — first"}, {Value: "apple", Description: "fruit"}, {Value: "beta"}} {
+						if strings.HasPrefix(item.Value, strings.TrimSpace(prefix)) {
+							items = append(items, item)
+						}
+					}
+					return items, nil
+				},
+				Handler: func(context.Context, string) error { return nil },
+			},
+			"ping": {
+				Name:        "ping",
+				Description: "Respond with pong",
+				Handler: func(_ context.Context, _ string) error {
+					ui.Notify("pong", "info")
+					return nil
+				},
+			},
+			"liveness_host_call": {
+				Name: "liveness_host_call", Description: "Exercise an awaited host call",
+				Handler: func(context.Context, string) error { return nil },
+			},
+			"liveness_user_call": {
+				Name: "liveness_user_call", Description: "Exercise an interactive host call",
+				Handler: func(context.Context, string) error { return nil },
+			},
+			"liveness_fire_call": {
+				Name: "liveness_fire_call", Description: "Exercise a no-result UI host call",
+				Handler: func(context.Context, string) error { return nil },
+			},
+			"command_error": {
+				Name:        "command_error",
+				Description: "Return a command error",
+				Handler: func(context.Context, string) error {
+					return errors.New("command exploded")
+				},
+			},
+			"command_awaited_error": {
+				Name:        "command_awaited_error",
+				Description: "Return an error after awaited work",
+				Handler: func(context.Context, string) error {
+					time.Sleep(150 * time.Millisecond)
+					return errors.New("awaited command exploded")
+				},
+			},
+			"status": {
+				Name:        "status",
+				Description: "Set a status entry",
+				Handler: func(_ context.Context, _ string) error {
+					ui.SetStatus("conformance", "ok")
+					return nil
+				},
+			},
+			"status_burst": {
+				Name:        "status_burst",
+				Description: "Set one status repeatedly without awaiting",
+				Handler: func(_ context.Context, _ string) error {
+					for i := range statusBurstCount {
+						ui.SetStatus("burst", strconv.Itoa(i))
+					}
+					return nil
+				},
+			},
+			"send_message": {
+				Name:        "send_message",
+				Description: "Send a custom message",
+				Handler: func(context.Context, string) error {
+					*actions = append(*actions, "sendMessage:notice:hello-custom:steer:true")
+					return nil
+				},
+			},
+			"send_message_default": {
+				Name:        "send_message_default",
+				Description: "Send a custom message with default options",
+				Handler: func(context.Context, string) error {
+					*actions = append(*actions, "sendMessage:notice:default:unset:unset")
+					return nil
+				},
+			},
+			"send_message_no_turn": {
+				Name:        "send_message_no_turn",
+				Description: "Send a custom message that never starts a turn",
+				Handler: func(context.Context, string) error {
+					*actions = append(*actions, "sendMessage:notice:no-turn:unset:false")
+					return nil
+				},
+			},
+			"send_user_message": {
+				Name:        "send_user_message",
+				Description: "Send a user message",
+				Handler: func(_ context.Context, args string) error {
+					var content any = "hello-user"
+					if args != "" {
+						if err := json.Unmarshal([]byte(args), &content); err != nil {
+							return err
+						}
+					}
+					return recordUserContent(actions, content, "followUp", nil)
+				},
+			},
+			"send_user_message_delivery": {
+				Name:        "send_user_message_delivery",
+				Description: "Send a user message with the delivery named by the argument",
+				Handler: func(_ context.Context, args string) error {
+					deliverAs := args
+					if args == "absent" {
+						deliverAs = ""
+					}
+					return recordUserContent(actions, "delivery-"+args, deliverAs, nil)
+				},
+			},
+			"send_user_message_expand": {
+				Name:        "send_user_message_expand",
+				Description: "Send a user message with expandPromptTemplates set to the argument",
+				Handler: func(_ context.Context, args string) error {
+					expand := args == "true"
+					return recordUserContent(actions, "expand-user", "followUp", &expand)
+				},
+			},
+			"set_session_name": {
+				Name:        "set_session_name",
+				Description: "Set the session name",
+				Handler: func(context.Context, string) error {
+					*actions = append(*actions, "setSessionName:conformance-session")
+					return nil
+				},
+			},
+			"set_model": {
+				Name:        "set_model",
+				Description: "Switch to the model in the arguments",
+				Handler: func(_ context.Context, args string) error {
+					*actions = append(*actions, "setModel:"+args)
+					ui.Notify(fmt.Sprintf("setModel=%t", args == conformanceKnownModel), "info")
+					return nil
+				},
+			},
+			"append_entry": {
+				Name:        "append_entry",
+				Description: "Append a custom entry",
+				Handler: func(context.Context, string) error {
+					*actions = append(*actions, "appendEntry:conformance-entry:hello-entry")
+					return nil
+				},
+			},
+			"sprite-probe": {
+				Name:        "sprite-probe",
+				Description: "Exercise sprite registration and host errors",
+				Handler: func(context.Context, string) error {
+					definition := conformanceSpriteDefinition()
+					if err := registerInprocSprite(ui, "inproc", definition); err != nil {
+						return err
+					}
+					definition.Mascot[0] = definition.Mascot[0][:15]
+					err := registerInprocSprite(ui, "inproc", definition)
+					if err == nil {
+						return errors.New("invalid sprite definition was accepted")
+					}
+					ui.Notify(err.Error(), "error")
+					return nil
+				},
+			},
+			"login-probe": {
+				Name:        "login-probe",
+				Description: "Exercise semantic login submission and host errors",
+				Handler: func(context.Context, string) error {
+					definition := conformanceLoginDefinition()
+					if err := ui.SetLogin(definition); err != nil {
+						return err
+					}
+					definition.Brand[0] = definition.Brand[0][:40]
+					err := ui.SetLogin(definition)
+					if err == nil {
+						return errors.New("invalid login definition was accepted")
+					}
+					ui.Notify(err.Error(), "error")
+					return nil
+				},
+			},
+			"scoped-models-probe": {
+				Name: "scoped-models-probe", Description: "Report the model scope",
+				Handler: func(ctx context.Context, _ string) error {
+					models, err := extension.FromContext(ctx).ScopedModels()
+					if err != nil {
+						return err
+					}
+					data, err := json.Marshal(scopedModelsWireValue(models))
+					if err != nil {
+						return err
+					}
+					ui.Notify(string(data), "info")
+					return nil
+				},
+			},
+			"ui-availability": {
+				Name:        "ui-availability",
+				Description: "Probe bound UI and headless defaults",
+				Handler: func(ctx context.Context, _ string) error {
+					c := extension.FromContext(ctx)
+					hasUI, err := c.HasUI()
+					if err != nil {
+						return err
+					}
+					dialogs := commandUI(ctx, ui)
+					selected, err := dialogs.Select(ctx, "Pick", []string{"first", "second"}, extension.ExtensionUIDialogOptions{})
+					if err != nil {
+						return err
+					}
+					dialogs.Notify("availability-notify", "info")
+					*actions = append(*actions, fmt.Sprintf("appendEntry:ui-availability:hasUI=%t selected=%s", hasUI, selected))
+					return nil
+				},
+			},
+			// The SDK rows in timeout_numbers_test.go read the timeouts at the host's exec and dialog decoders; the in-process reference has no such decoder.
+			"timeout-probe": {
+				Name: "timeout-probe", Description: "Send JavaScript-number timeouts",
+				Handler: func(context.Context, string) error { return nil },
+			},
+			// The in-process reference for exec_rejection_test.go's SDK rows: the host's own ExecCommand.
+			// The in-process reference for exec_abort_test.go's SDK rows: the host's own ExecCommand under a cancelled context, which that test runs itself.
+			"exec-abort-probe": {
+				Name: "exec-abort-probe", Description: "Abort a running exec through its signal",
+				Handler: func(context.Context, string) error { return nil },
+			},
+			// The in-process reference for exec_limits_test.go's SDK rows: the host's own ExecCommand, which that test runs itself.
+			"exec-limits-probe": {
+				Name: "exec-limits-probe", Description: "Exec with a maxBuffer",
+				Handler: func(context.Context, string) error { return nil },
+			},
+			"exec-reject-probe": {
+				Name: "exec-reject-probe", Description: "Report exec outcomes",
+				Handler: func(ctx context.Context, args string) error {
+					var commands []string
+					if err := json.Unmarshal([]byte(args), &commands); err != nil {
+						return err
+					}
+					for _, command := range commands {
+						ui.Notify(execOutcome(extension.ExecCommand(ctx, "", command, nil, nil)), "info")
+					}
+					return nil
+				},
+			},
+			"session-identity": {
+				Name: "session-identity", Description: "Read context identity accessors",
+				Handler: func(ctx context.Context, _ string) error {
+					manager, err := extension.FromContext(ctx).SessionManager()
+					if err != nil {
+						return err
+					}
+					session, ok := manager.(*codingagent.Session)
+					if !ok {
+						return fmt.Errorf("session manager not bound: %T", manager)
+					}
+					leaf := ""
+					if value := session.GetLeafID(); value != nil {
+						leaf = *value
+					}
+					optional := func(value string) *string {
+						if value == "" {
+							return nil
+						}
+						return &value
+					}
+					id := session.GetSessionId()
+					data, err := json.Marshal([]*string{&id, optional(session.Path()), optional(leaf), optional(session.GetSessionName())})
+					if err != nil {
+						return err
+					}
+					ui.Notify(string(data), "info")
+					return nil
+				},
+			},
+			"registry-session": {
+				Name:        "registry-session",
+				Description: "Read registry and session facades",
+				Handler: func(context.Context, string) error {
+					value, err := registryProbeReference()
+					if err != nil {
+						return err
+					}
+					data, err := json.Marshal(value)
+					if err != nil {
+						return err
+					}
+					ui.Notify(string(data), "info")
+					return nil
+				},
+			},
+			"ui-state-barrier": {
+				Name: "ui-state-barrier",
+				Handler: func(ctx context.Context, _ string) error {
+					ui, err := extension.FromContext(ctx).UI()
+					if err != nil {
+						return err
+					}
+					selected, err := ui.Select(ctx, "expand", []string{"chosen"}, extension.ExtensionUIDialogOptions{})
+					if err != nil {
+						return err
+					}
+					named, err := ui.GetTheme("light")
+					if err != nil {
+						return err
+					}
+					missing, err := ui.GetTheme("missing")
+					if err != nil {
+						return err
+					}
+					result := ui.SetTheme(extension.ThemeName("missing"))
+					ui.Notify(fmt.Sprintf("selected=%s expanded=%t named=%s missing=%t success=%t error=%s", selected, ui.GetToolsExpanded(), named.(map[string]any)["name"], missing == nil, result.Success, result.Error), "info")
+					return nil
+				},
+			},
+			"autocomplete-register": {Name: "autocomplete-register", Handler: autocompleteReferenceCommand},
+			"signal-probe": {
+				Name:        "signal-probe",
+				Description: "Report ctx.signal",
+				Handler: func(ctx context.Context, _ string) error {
+					signal, err := extension.FromContext(ctx).Signal()
+					if err != nil {
+						return err
+					}
+					state := "none"
+					if signal != nil {
+						state = "live"
+						if signal.Err() != nil {
+							state = "aborted"
+						}
+					}
+					ui.Notify("signal:"+state, "info")
+					return nil
+				},
+			},
+			"signal-abort": {
+				Name:        "signal-abort",
+				Description: "Abort the run and report ctx.signal",
+				Handler: func(ctx context.Context, _ string) error {
+					state := func(signal context.Context) string {
+						switch {
+						case signal == nil:
+							return "none"
+						case signal.Err() != nil:
+							return "aborted"
+						}
+						return "live"
+					}
+					held, err := extension.FromContext(ctx).Signal()
+					if err != nil {
+						return err
+					}
+					if err := extension.FromContext(ctx).Abort(); err != nil {
+						return err
+					}
+					after, err := extension.FromContext(ctx).Signal()
+					if err != nil {
+						return err
+					}
+					ui.Notify("abort:"+state(held)+":"+state(after), "info")
+					return nil
+				},
+			},
+			"signal-wait": {
+				Name:        "signal-wait",
+				Description: "Wait for ctx.signal to abort",
+				Handler: func(ctx context.Context, _ string) error {
+					signal, err := extension.FromContext(ctx).Signal()
+					if err != nil {
+						return err
+					}
+					if signal == nil {
+						ui.Notify("wait:none", "info")
+						return nil
+					}
+					ui.Notify("wait:start", "info")
+					select {
+					case <-signal.Done():
+						ui.Notify("wait:aborted", "info")
+					case <-time.After(10 * time.Second):
+						ui.Notify("wait:timeout", "info")
+					}
+					return nil
+				},
+			},
+			"signal-poll": {
+				Name:        "signal-poll",
+				Description: "Poll ctx.signal until it is live or none, as a timer that reads it between requests does",
+				Handler: func(ctx context.Context, args string) error {
+					ui.Notify("poll:start", "info")
+					deadline := time.Now().Add(10 * time.Second)
+					for time.Now().Before(deadline) {
+						signal, err := extension.FromContext(ctx).Signal()
+						if err != nil {
+							return err
+						}
+						if (signal != nil) == (args == "live") {
+							ui.Notify("poll:"+args, "info")
+							return nil
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+					ui.Notify("poll:timeout", "info")
+					return nil
+				},
+			},
+			"usage-probe": {
+				Name: "usage-probe",
+				Handler: func(ctx context.Context, _ string) error {
+					usage, err := extension.FromContext(ctx).GetContextUsage()
+					if err != nil {
+						return err
+					}
+					data, err := json.Marshal(usage)
+					if err != nil {
+						return err
+					}
+					ui.Notify(string(data), "info")
+					return nil
+				},
+			},
+			"context-probe": {
+				Name:        "context-probe",
+				Description: "Report ctx.mode + ctx.getSystemPromptOptions()",
+				Handler: func(ctx context.Context, _ string) error {
+					mode := ""
+					trusted := true
+					if c := extension.FromContext(ctx); c != nil {
+						if m, err := c.Mode(); err == nil {
+							mode = string(m)
+						}
+						if tr, err := c.IsProjectTrusted(); err == nil {
+							trusted = tr
+						}
+					}
+					opts := &extension.BuildSystemPromptOptions{}
+					if cc := extension.CommandContextFromContext(ctx); cc != nil {
+						opts, _ = cc.GetSystemPromptOptions()
+					}
+					skillSource := ""
+					if len(opts.Skills) > 0 {
+						skillSource = opts.Skills[0].SourceInfo.Scope
+					}
+					// normalizeBuildSystemPromptOptions (system-prompt.ts:48-64): every collection is present, empty or not.
+					shapes := fmt.Sprintf("selectedTools:array:%d,toolSnippets:object:%d,toolGuidelines:object:%d,promptGuidelines:array:%d,appendSystemPrompt:string:%d,sections:object:%d,contextFiles:array:%d,skills:array:%d",
+						len(opts.SelectedTools), len(opts.ToolSnippets), len(opts.ToolGuidelines), len(opts.PromptGuidelines), len(utf16.Encode([]rune(opts.AppendSystemPrompt))), sectionCount(opts.Sections), len(opts.ContextFiles), len(opts.Skills))
+					ui.Notify(fmt.Sprintf("mode=%s trusted=%t spo_prompt=%s spo_cwd=%s spo_tools=%s spo_shape=%s spo_guidelines=%s spo_skill_scope=%s spo_force_empty=%t spo_custom_present=%t",
+						mode, trusted, opts.CustomPrompt, opts.Cwd, strings.Join(opts.SelectedTools, ","), shapes, strings.Join(opts.ToolGuidelines["read"], ","), skillSource, opts.ForceSystemPrompt != nil && *opts.ForceSystemPrompt == "", opts.CustomPromptSet || opts.CustomPrompt != ""), "info")
+					return nil
+				},
+			},
+			"session-log-probe": {
+				Name:        "session-log-probe",
+				Description: "Read a paged session log",
+				Handler: func(context.Context, string) error {
+					ui.Notify("session entries=3 branch=3", "info")
+					return nil
+				},
+			},
+			"dialog-probe": {
+				Name:        "dialog-probe",
+				Description: "Exercise interactive dialog responses",
+				Handler: func(ctx context.Context, _ string) error {
+					dialogs := commandUI(ctx, ui)
+					selected, selectErr := dialogs.Select(ctx, "Pick", []string{"first", "second"}, extension.ExtensionUIDialogOptions{})
+					input, inputErr := dialogs.Input(ctx, "Input", "placeholder", extension.ExtensionUIDialogOptions{})
+					edited, editorErr := dialogs.Editor(ctx, "Editor", "prefill")
+					confirmed, confirmErr := dialogs.Confirm(ctx, "Confirm", "message", extension.ExtensionUIDialogOptions{})
+					if selectErr != nil || inputErr != nil || editorErr != nil || confirmErr != nil {
+						return errors.Join(selectErr, inputErr, editorErr, confirmErr)
+					}
+					ui.Notify(fmt.Sprintf("select=%s input=%s editor=%s confirm=%t",
+						selected, input, edited, confirmed), "info")
+					return nil
+				},
+			},
+			"dialog-stack-probe": {
+				Name:        "dialog-stack-probe",
+				Description: "Open concurrent dialogs from one command",
+				Handler: func(ctx context.Context, scenario string) error {
+					dialogs := commandUI(ctx, ui)
+					// A dismissed dialog answers "cancelled" (a confirm "false"), as the SDK fixtures report it.
+					text := func(value string, err error) (string, error) {
+						if errors.Is(err, context.Canceled) {
+							return "cancelled", nil
+						}
+						return value, err
+					}
+					confirm := func(title string) (string, error) {
+						confirmed, err := dialogs.Confirm(ctx, title, "message", extension.ExtensionUIDialogOptions{})
+						if errors.Is(err, context.Canceled) {
+							return "false", nil
+						}
+						return strconv.FormatBool(confirmed), err
+					}
+					open := map[string]func() (string, error){
+						"A": func() (string, error) {
+							return text(dialogs.Select(ctx, "A", []string{"a1", "a2"}, extension.ExtensionUIDialogOptions{}))
+						},
+						"B": func() (string, error) { return confirm("B") },
+						"S": func() (string, error) {
+							return text(dialogs.Select(ctx, "S", []string{"s1", "s2"}, extension.ExtensionUIDialogOptions{}))
+						},
+						"C": func() (string, error) { return confirm("C") },
+						"I": func() (string, error) {
+							return text(dialogs.Input(ctx, "I", "placeholder", extension.ExtensionUIDialogOptions{}))
+						},
+						"E": func() (string, error) { return text(dialogs.Editor(ctx, "E", "prefill")) },
+					}
+					names := []string{"A", "B"}
+					if scenario == "mix" {
+						names = []string{"S", "C", "I", "E"}
+					}
+					errs := make([]error, len(names))
+					var wg sync.WaitGroup
+					for index, name := range names {
+						wg.Go(func() {
+							value, err := open[name]()
+							if err != nil {
+								errs[index] = err
+								return
+							}
+							ui.Notify("stack settled "+name+"="+value, "info")
+						})
+					}
+					wg.Wait()
+					if err := errors.Join(errs...); err != nil {
+						return err
+					}
+					ui.Notify("stack done", "info")
+					return nil
+				},
+			},
+			"focused-probe": {
+				Name:        "focused-probe",
+				Description: "Exercise focused subprocess UI",
+				Handler: func(ctx context.Context, _ string) error {
+					selected, err := commandUI(ctx, ui).Custom(ctx, nil, nil)
+					if err != nil {
+						return err
+					}
+					ui.Notify(fmt.Sprintf("focused=%v disposed=true", selected), "info")
+					return nil
+				},
+			},
+			"kit-probe": {
+				Name:        "kit-probe",
+				Description: "Exercise the component kit (D107)",
+				Handler: func(ctx context.Context, _ string) error {
+					result, err := commandUI(ctx, ui).Custom(ctx, extension.CustomFactory(newInprocKitProbe), nil)
+					if err != nil {
+						return err
+					}
+					ui.Notify(fmt.Sprintf("kit=%v", result), "info")
+					return nil
+				},
+			},
+		},
+		Handlers: map[string][]extension.HandlerFn{
+			"user_bash": {func(args ...any) (any, error) {
+				return conformanceUserBashResult(args[0].(extension.UserBashEvent).Command), nil
+			}},
+			"tool_execution_update": {
+				func(args ...any) (any, error) {
+					event := args[0].(extension.ToolExecutionUpdateEvent)
+					structured, _ := event.Args.(map[string]any)
+					nested, _ := structured["nested"].(map[string]any)
+					partial, _ := event.PartialResult.(map[string]any)
+					details, _ := partial["details"].(map[string]any)
+					var text any
+					if blocks, _ := partial["content"].([]any); len(blocks) > 0 {
+						block, _ := blocks[0].(map[string]any)
+						text = block["text"]
+					}
+					ui.Notify(fmt.Sprintf("tool-update=%s:%v:%v:%v:%v", event.ToolName, structured["path"], nested["depth"], text, details["progress"]), "info")
+					return nil, nil
+				},
+			},
+			"tool_execution_end": {
+				func(args ...any) (any, error) {
+					event := args[0].(extension.ToolExecutionEndEvent)
+					result, _ := event.Result.(map[string]any)
+					content, _ := result["content"].([]any)
+					var text, image map[string]any
+					if len(content) > 0 {
+						text, _ = content[0].(map[string]any)
+					}
+					if len(content) > 1 {
+						image, _ = content[1].(map[string]any)
+					}
+					details, _ := result["details"].(map[string]any)
+					nested, _ := details["nested"].(map[string]any)
+					ui.Notify(fmt.Sprintf("tool-end=%s:%v:%d:%v:%v:%v:%t", event.ToolName, text["text"], len(content), image["data"], image["mimeType"], nested["value"], event.IsError), "info")
+					return nil, nil
+				},
+			},
+			// Tool events: the Session emits CustomToolCallEvent for every tool, so the in-process reference reads the bash and PowerShell calls from it.
+			"tool_call": {
+				func(args ...any) (any, error) {
+					var name string
+					var input map[string]any
+					switch event := args[0].(type) {
+					case extension.CustomToolCallEvent:
+						if event.ToolName == "bash" || event.ToolName == "powershell" {
+							name, input = event.ToolName, event.Input
+							break
+						}
+						// The in-process handler edits event.Input in place, as Pi's handler edits event.input. It receives the event by value, so it has no way to give the tool another object: rewrite_reassign_probe leaves the input as it was.
+						if event.ToolName != "rewrite_probe" && event.ToolName != "rewrite_block_probe" {
+							return nil, nil
+						}
+						if event.Input["command"] == "git status" || event.ToolName == "rewrite_block_probe" {
+							event.Input["command"] = "git status --short"
+							delete(event.Input, "drop")
+							event.Input["added"] = true
+							event.Input["nested"] = map[string]any{"depth": 2.0}
+						}
+						if event.ToolName == "rewrite_block_probe" {
+							return &extension.ToolCallEventResult{Block: true, Reason: "blocked after rewrite"}, nil
+						}
+						return nil, nil
+					default:
+						return nil, nil
+					}
+					ui.Notify(fmt.Sprintf("tool-call=%s:%v:%v", name, input["command"], input["timeout"]), "info")
+					if input["command"] == "blocked-command" {
+						return &extension.ToolCallEventResult{Block: true, Reason: "blocked " + name}, nil
+					}
+					return nil, nil
+				},
+			},
+			"tool_result": {
+				func(args ...any) (any, error) {
+					if event, ok := args[0].(extension.ToolResultEvent); ok {
+						var held []string
+						for _, guard := range []struct {
+							name string
+							is   func(extension.ToolResultEvent) bool
+						}{{"bash", extension.IsBashToolResult}, {"powershell", extension.IsPowerShellToolResult}, {"read", extension.IsReadToolResult}, {"edit", extension.IsEditToolResult}, {"write", extension.IsWriteToolResult}, {"grep", extension.IsGrepToolResult}, {"find", extension.IsFindToolResult}, {"ls", extension.IsLsToolResult}} {
+							if guard.is(event) {
+								held = append(held, guard.name)
+							}
+						}
+						ui.Notify("tool-result-guards="+strings.Join(held, ","), "info")
+					}
+					var name string
+					var content []any
+					var details *extension.BashToolDetails
+					switch event := args[0].(type) {
+					case extension.PowerShellToolResultEvent:
+						name, content, details = event.ToolName, event.Content, event.Details
+					case extension.BashToolResultEvent:
+						name, content, details = event.ToolName, event.Content, event.Details
+					default:
+						return nil, nil
+					}
+					var path any
+					var lines any
+					if details != nil {
+						path = details.FullOutputPath
+						if details.Truncation != nil {
+							lines = details.Truncation.TotalLines
+						}
+					}
+					var text any
+					if len(content) > 0 {
+						text = asMap(content[0])["text"]
+					}
+					ui.Notify(fmt.Sprintf("tool-result=%s:%v:%v:%v", name, path, lines, text), "info")
+					return &extension.ToolResultEventResult{Content: []any{map[string]any{"type": "text", "text": name + " redacted"}}}, nil
+				},
+			},
+			"project_trust": {
+				func(...any) (any, error) {
+					return nil, errors.New("trust-boom")
+				},
+				func(...any) (any, error) {
+					return extension.ProjectTrustEventResult{Trusted: extension.ProjectTrustUndecided}, nil
+				},
+				func(...any) (any, error) {
+					return extension.ProjectTrustEventResult{Trusted: extension.ProjectTrustYes, Remember: new(true)}, nil
+				},
+			},
+			"ui_prompt_start": {
+				func(args ...any) (any, error) {
+					event := args[0].(extension.UIPromptStartEvent)
+					ui.Notify(inprocPromptNotification(event.Type, event.Reason, event.Kind, event.Title), "info")
+					return nil, nil
+				},
+			},
+			"ui_prompt_end": {
+				func(args ...any) (any, error) {
+					event := args[0].(extension.UIPromptEndEvent)
+					ui.Notify(inprocPromptNotification(event.Type, event.Reason, event.Kind, event.Title), "info")
+					return nil, nil
+				},
+			},
+			"cache_warming_decision": {func(args ...any) (any, error) {
+				event := args[0].(extension.CacheWarmingDecisionEvent)
+				if event.WarmCost != 0.05 || event.MissCost != 0.5 || event.ContinuationProbability != 0.15 || event.Action != extension.CacheWarmingActionWarm {
+					return nil, fmt.Errorf("unexpected cache decision: %+v", event)
+				}
+				return &extension.CacheWarmingDecisionEventResult{Action: new(extension.CacheWarmingActionStop)}, nil
+			}},
+			"agent_before_settle": {
+				func(args ...any) (any, error) {
+					event := args[0].(*extension.AgentBeforeSettleEvent)
+					ui.Notify(fmt.Sprintf("agent_before_settle:%s:%d:%t:%d:%t", event.Outcome, len(event.Entries), event.Continue, len(event.Context.ContextEntries), event.Context.CanContinue), "info")
+					event.Entries = append(event.Entries, extension.SessionBoundaryDraft{Type: "custom", CustomType: "kept"})
+					return nil, nil
+				},
+				func(args ...any) (any, error) {
+					event := args[0].(*extension.AgentBeforeSettleEvent)
+					event.Entries = append(event.Entries, extension.SessionBoundaryDraft{Type: "custom", CustomType: "before-error"})
+					return nil, errors.New("boundary failed")
+				},
+				func(args ...any) (any, error) {
+					event := args[0].(*extension.AgentBeforeSettleEvent)
+					if len(event.Entries) != 2 || len(event.Context.ContextEntries) != 2 || event.Entries[0].CustomType != "kept" || event.Entries[1].CustomType != "before-error" {
+						return nil, errors.New("lost boundary mutation or preview")
+					}
+					// One draft with a null replacement, one without the member, and a compaction that keeps nothing.
+					entries := []extension.SessionBoundaryDraft{
+						{Type: "custom", CustomType: "conformance-boundary"},
+						{Type: "context_edit", TargetID: "conformance-failed-attempt"},
+						{Type: "context_edit", TargetID: "conformance-omitted-member", ReplacementUndefined: true},
+						{Type: "compaction", Summary: "conformance-summary", Details: map[string]any{"format": "conformance-checkpoint"}, UsageNull: true},
+						// A data, a details and (above) a usage member written as null: Pi's file holds each as null.
+						{Type: "custom", CustomType: "conformance-null-data", Data: json.RawMessage("null")},
+						{Type: "custom_message", CustomType: "conformance-null-details", Content: "x", Details: json.RawMessage("null")},
+					}
+					continued := true
+					return extension.BoundaryResult{Entries: &entries, Continue: &continued}, nil
+				},
+				func(args ...any) (any, error) {
+					event := args[0].(*extension.AgentBeforeSettleEvent)
+					if len(event.Entries) != 6 {
+						return nil, fmt.Errorf("boundary result reached the next handler as %d entries", len(event.Entries))
+					}
+					replacement := func(draft extension.SessionBoundaryDraft) string {
+						switch {
+						case draft.ReplacementUndefined:
+							return "absent"
+						case len(draft.Replacement) == 0 || string(draft.Replacement) == "null":
+							return "null"
+						}
+						return "value"
+					}
+					firstKept := "null"
+					if event.Entries[3].FirstKeptEntryID != nil {
+						firstKept = "value"
+					}
+					details, _ := event.Entries[3].Details.(map[string]any)
+					member := func(value any) string {
+						if value == nil {
+							return "absent"
+						}
+						if raw, ok := value.(json.RawMessage); ok && string(raw) == "null" {
+							return "null"
+						}
+						return "value"
+					}
+					usage := "absent"
+					if event.Entries[3].UsageNull {
+						usage = "null"
+					} else if event.Entries[3].Usage != nil {
+						usage = "value"
+					}
+					ui.Notify(fmt.Sprintf("agent_before_settle_drafts:%d:%s:%s:%s:%v:%s:%s:%s:%s", len(event.Entries), replacement(event.Entries[1]), replacement(event.Entries[2]), firstKept, details["format"], member(event.Entries[0].Data), usage, member(event.Entries[4].Data), member(event.Entries[5].Details)), "info")
+					return nil, nil
+				},
+			},
+			"session_start": {
+				func(args ...any) (any, error) {
+					if event, ok := args[0].(extension.SessionStartEvent); ok {
+						ui.Notify("session_start:"+event.Reason, "info")
+						if event.PreviousSessionFile != "" {
+							ui.Notify("previous:"+event.PreviousSessionFile, "info")
+						}
+					}
+					return nil, nil
+				},
+			},
+			"session_shutdown": {
+				func(args ...any) (any, error) {
+					if event, ok := args[0].(extension.SessionShutdownEvent); ok {
+						ui.Notify("session_shutdown:"+event.Reason, "info")
+						if event.TargetSessionFile != "" {
+							ui.Notify("target:"+event.TargetSessionFile, "info")
+						}
+					}
+					return nil, nil
+				},
+			},
+			"after_provider_response": {
+				func(args ...any) (any, error) {
+					event := args[0].(extension.AfterProviderResponseEvent)
+					ui.Notify(fmt.Sprintf("provider-response=%s:%d:%s", event.Type, event.Status, event.Headers["x-probe"]), "info")
+					return map[string]any{"cancel": true}, nil
+				},
+				func(...any) (any, error) { ui.Notify("provider-response=second", "info"); return nil, nil },
+			},
+			"session_info_changed": {
+				func(args ...any) (any, error) {
+					if event, ok := args[0].(extension.SessionInfoChangedEvent); ok {
+						ui.Notify("session_info_changed:"+event.Name, "info")
+					}
+					return nil, nil
+				},
+			},
+			"session_before_compact": {
+				func(args ...any) (any, error) {
+					if event, ok := args[0].(extension.SessionBeforeCompactEvent); ok {
+						ui.Notify(fmt.Sprintf("session_before_compact:%s:%t", event.Reason, event.WillRetry), "info")
+					}
+					return nil, nil
+				},
+			},
+			"session_compact": {
+				func(args ...any) (any, error) {
+					if event, ok := args[0].(extension.SessionCompactEvent); ok {
+						ui.Notify(fmt.Sprintf("session_compact:%s:%t:%t", event.Reason, event.WillRetry, event.FromExtension), "info")
+					}
+					return nil, nil
+				},
+			},
+			"session_compact_failed": {
+				func(args ...any) (any, error) {
+					if event, ok := args[0].(extension.SessionCompactFailedEvent); ok {
+						ui.Notify(fmt.Sprintf("session_compact_failed:%s:%s:%t:%t:%t", event.Reason, event.ErrorMessage, event.Aborted, event.WillRetry, event.FromExtension), "info")
+					}
+					return nil, nil
+				},
+			},
+			"turn_end": {
+				mutateTurnBoundary, snapshotTurnBoundary,
+				func(args ...any) (any, error) {
+					if event, ok := args[0].(extension.TurnEndEvent); ok {
+						ui.Notify(fmt.Sprintf("turn_end:%s:%s", event.MessageEntryID, event.ToolResultEntryIds[0]), "info")
+					}
+					return nil, nil
+				},
+			},
+		},
+	}
+}
+
+// commandUI returns the UI surface the runner bound to a command context, so
+// in-process dialogs pass through the runner's ui_prompt scope exactly as an
+// upstream extension's ctx.ui does. The fixture's own surface is the fallback.
+func commandUI(ctx context.Context, fallback extension.UIContext) extension.UIContext {
+	if c := extension.FromContext(ctx); c != nil {
+		if ui, err := c.UI(); err == nil {
+			return ui
+		}
+	}
+	return fallback
+}
+
+// inprocPromptNotification renders a ui_prompt event as every SDK fixture
+// does. An empty title is absent on the wire.
+func inprocPromptNotification(eventType, reason string, kind extension.UIPromptKind, title string) string {
+	if title == "" {
+		title = "(none)"
+	}
+	return fmt.Sprintf("ui_prompt:%s:%s:%s:%s", eventType, reason, kind, title)
+}
+
+// uiPromptPrefix marks the fixtures' ui_prompt_start/ui_prompt_end reports.
+const uiPromptPrefix = "ui_prompt:"
+
+// splitPromptNotifications separates the asynchronous ui_prompt reports from
+// the notifications a command sends itself.
+func splitPromptNotifications(records []string) (prompts, others []string) {
+	for _, record := range records {
+		if strings.HasPrefix(record, uiPromptPrefix) {
+			prompts = append(prompts, record)
+		} else {
+			others = append(others, record)
+		}
+	}
+	return prompts, others
+}
+
+// wantUIPromptEvents is the upstream-derived sequence for dialog-probe then
+// focused-probe: one start/end pair per outermost prompt, title only where
+// the prompt has one, and no title for custom (runner.ts wrapUIPromptContext).
+var wantUIPromptEvents = []string{
+	"ui_prompt:ui_prompt_start:ui_prompt:select:Pick:info", "ui_prompt:ui_prompt_end:ui_prompt:select:Pick:info",
+	"ui_prompt:ui_prompt_start:ui_prompt:input:Input:info", "ui_prompt:ui_prompt_end:ui_prompt:input:Input:info",
+	"ui_prompt:ui_prompt_start:ui_prompt:editor:Editor:info", "ui_prompt:ui_prompt_end:ui_prompt:editor:Editor:info",
+	"ui_prompt:ui_prompt_start:ui_prompt:confirm:Confirm:info", "ui_prompt:ui_prompt_end:ui_prompt:confirm:Confirm:info",
+	"ui_prompt:ui_prompt_start:ui_prompt:custom:(none):info", "ui_prompt:ui_prompt_end:ui_prompt:custom:(none):info",
+}
+
+// recordingUI records notifications and mutable UI values used by the conformance fixtures.
+type recordingUI struct {
+	// theme is the active theme a test publishes as the UI's (Theme); without it the UI has none.
+	theme func() extension.Theme
+	// runOverlay replaces RunRemoteOverlay when a test supplies its own mounted-overlay behaviour.
+	runOverlay func(extension.RemoteOverlayOptions, extension.RemoteOverlayHost, func(extension.RemoteOverlayHandle)) (any, bool)
+	// showOverlay answers ShowRemoteOverlay (a factory's tui.showOverlay) when a test supplies it; without it the UI shows none.
+	showOverlay   func(extension.RemoteOverlayOptions, extension.RemoteOverlayHost) (extension.RemoteOverlayHandle, <-chan struct{}, bool)
+	notify        *[]string
+	status        *[]string
+	logins        []string
+	sprites       []string
+	editorText    string
+	editor        extension.RemoteEditor
+	toolsExpanded bool
+
+	// dialogs, when a test sets it, holds every select, confirm, input and editor the host receives until the test answers or dismisses it.
+	dialogs *dialogGate
+
+	// terminalInput captures the raw-input handler an extension registers, so
+	// the conformance gate can feed keystrokes through each transport.
+	terminalInputMu sync.Mutex
+	terminalInput   extension.RemoteTerminalInputHandler
+
+	// footers and headers are the frames the host received, oldest first; a
+	// cleared surface records a nil frame.
+	footers []*extension.WidthLines
+	headers []*extension.WidthLines
+	// footerViews and headerViews hold, per recorded frame, the view a
+	// frame drawn from a view (D107) carries, nil for a lines frame.
+	footerViews []*extension.FramedView
+	headerViews []*extension.FramedView
+
+	// recordMu guards notify and status. The host calls Notify from the
+	// goroutine servicing the extension socket while the test body reads the
+	// slices, so the append and the read are on different goroutines.
+	recordMu sync.Mutex
+	// calls holds the working, paste, editor-text and tools-expanded calls the host forwarded, in arrival order.
+	calls []string
+	// surfaces holds the title and widget calls the host forwarded, in arrival order.
+	surfaces []string
+	// applyDelay is how long a notify, status, title, widget or editor-text call takes to apply, a consumer that is slow to write (a terminal, a pipe).
+	applyDelay atomic.Int64
+	// stall holds every effect call at its apply until the gate's release channel closes: a consumer that is blocked.
+	stall atomic.Pointer[stallGate]
+}
+
+func newRecordingUI(notify, status *[]string) *recordingUI {
+	return &recordingUI{notify: notify, status: status}
+}
+
+func (u *recordingUI) Select(ctx context.Context, title string, _ []string, _ extension.ExtensionUIDialogOptions) (string, error) {
+	if u.dialogs != nil {
+		return u.dialogs.hold(ctx, "select", title)
+	}
+	return "second", nil
+}
+
+func (u *recordingUI) Confirm(ctx context.Context, title, _ string, _ extension.ExtensionUIDialogOptions) (bool, error) {
+	if u.dialogs != nil {
+		answer, err := u.dialogs.hold(ctx, "confirm", title)
+		return answer == "true", err
+	}
+	return true, nil
+}
+
+func (u *recordingUI) Input(ctx context.Context, title, _ string, _ extension.ExtensionUIDialogOptions) (string, error) {
+	if u.dialogs != nil {
+		return u.dialogs.hold(ctx, "input", title)
+	}
+	return "typed", nil
+}
+
+func (u *recordingUI) Notify(message, level string) {
+	u.slow()
+	defer hostEffects.notify()
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	*u.notify = append(*u.notify, message+":"+level)
+}
+
+// Recorded returns a copy of the messages seen so far. Tests must read through
+// this rather than dereferencing the slice, which races with Notify.
+func (u *recordingUI) Recorded() []string {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return append([]string(nil), (*u.notify)...)
+}
+
+func (u *recordingUI) ClearRecorded() {
+	u.recordMu.Lock()
+	*u.notify = nil
+	u.recordMu.Unlock()
+}
+
+// RecordNotify lets a test's own bridge callback share the recorder's lock, so
+// a bridge-level notify hook does not reintroduce the race Notify avoids.
+func (u *recordingUI) RecordNotify(message, level string) {
+	u.Notify(message, level)
+}
+
+func (u *recordingUI) OnTerminalInput(handler extension.TerminalInputHandler) func() {
+	return u.OnRemoteTerminalInput("", func(_ context.Context, data string) extension.TerminalInputResult {
+		return handler(data)
+	})
+}
+
+// OnRemoteTerminalInput is the registration every subprocess transport uses.
+func (u *recordingUI) OnRemoteTerminalInput(_ string, handler extension.RemoteTerminalInputHandler) func() {
+	u.terminalInputMu.Lock()
+	u.terminalInput = handler
+	u.terminalInputMu.Unlock()
+	return func() {
+		u.terminalInputMu.Lock()
+		u.terminalInput = nil
+		u.terminalInputMu.Unlock()
+	}
+}
+
+// sendTerminalInput feeds one chunk to the registered handler, reporting
+// whether an extension consumed it. ok is false when nothing is subscribed.
+func (u *recordingUI) sendTerminalInput(data string) (consumed, ok bool) {
+	result, ok := u.terminalInputVerdict(data)
+	return result.Consume, ok
+}
+
+// terminalInputVerdict feeds one chunk to the registered handler and returns
+// the extension's full verdict.
+func (u *recordingUI) terminalInputVerdict(data string) (extension.TerminalInputResult, bool) {
+	u.terminalInputMu.Lock()
+	handler := u.terminalInput
+	u.terminalInputMu.Unlock()
+	if handler == nil {
+		return extension.TerminalInputResult{}, false
+	}
+	return handler(context.Background(), data), true
+}
+func (u *recordingUI) SetStatus(key, text string) {
+	u.slow()
+	defer hostEffects.notify()
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	*u.status = append(*u.status, key+":"+text)
+}
+
+// Statuses returns a copy of the status updates seen so far.
+func (u *recordingUI) Statuses() []string {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return append([]string(nil), (*u.status)...)
+}
+
+// ClearStatuses forgets the status updates seen so far.
+func (u *recordingUI) ClearStatuses() {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	*u.status = nil
+}
+func (u *recordingUI) SetWorkingMessage(message string) { u.recordCall("workingMessage:" + message) }
+func (u *recordingUI) ClearWorkingMessage()             { u.recordCall("workingMessage:<default>") }
+func (u *recordingUI) SetWorkingVisible(visible bool) {
+	u.recordCall(fmt.Sprintf("workingVisible:%t", visible))
+}
+func (u *recordingUI) SetWorkingIndicator(options extension.WorkingIndicatorOptions) {
+	wire, _ := json.Marshal(options)
+	u.recordCall("workingIndicator:" + string(wire))
+}
+
+// recordCall notes a UI call the host forwarded; RecordedCalls returns them in order.
+func (u *recordingUI) recordCall(call string) {
+	defer hostEffects.notify()
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	u.calls = append(u.calls, call)
+}
+
+// RecordedCalls returns the UI calls recorded by recordCall so far.
+func (u *recordingUI) RecordedCalls() []string {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return append([]string(nil), u.calls...)
+}
+func (u *recordingUI) SetHiddenThinkingLabel(label string) {
+	u.recordCall("hiddenThinkingLabel:" + label)
+}
+func (u *recordingUI) ClearHiddenThinkingLabel() { u.recordCall("hiddenThinkingLabel:<default>") }
+func (u *recordingUI) SetWidgetFactory(string, extension.WidgetFactory, *extension.ExtensionWidgetOptions) {
+}
+func (u *recordingUI) SetWidget(key string, lines []string, _ *extension.ExtensionWidgetOptions) {
+	u.recordSurface1("widget:" + key + ":" + strings.Join(lines, "|"))
+}
+func (u *recordingUI) SetFooter(build extension.FooterFactory) {
+	factory := frameOf(build, 3)
+	u.recordSurface(&u.footers, &u.footerViews, factory)
+}
+func (u *recordingUI) SetHeader(build extension.HeaderFactory) {
+	factory := frameOf(build, 2)
+	u.recordSurface(&u.headers, &u.headerViews, factory)
+}
+
+func (u *recordingUI) recordSurface(frames *[]*extension.WidthLines, views *[]*extension.FramedView, factory any) {
+	var frame *extension.WidthLines
+	var view *extension.FramedView
+	switch v := factory.(type) {
+	case []string:
+		frame = &extension.WidthLines{Lines: v}
+	case extension.WidthLines:
+		frame = &v
+	case extension.FramedView:
+		frame, view = &extension.WidthLines{Width: v.Width}, &v
+	}
+	defer hostEffects.notify()
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	*frames = append(*frames, frame)
+	*views = append(*views, view)
+}
+
+// SurfaceView returns the view of the latest footer or header frame, or nil
+// when that frame is not drawn from a view.
+func (u *recordingUI) SurfaceView(header bool) *extension.FramedView {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	views := u.footerViews
+	if header {
+		views = u.headerViews
+	}
+	if len(views) == 0 {
+		return nil
+	}
+	return views[len(views)-1]
+}
+
+// SurfaceFrames returns the footer or header frames received so far.
+func (u *recordingUI) SurfaceFrames(header bool) []*extension.WidthLines {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	if header {
+		return slices.Clone(u.headers)
+	}
+	return slices.Clone(u.footers)
+}
+func (u *recordingUI) SetLogin(definition extension.LoginDefinition) error {
+	if _, err := extension.ValidateLoginDefinition(definition); err != nil {
+		return fmt.Errorf("invalid_login: %w", err)
+	}
+	encoded, err := json.Marshal(definition)
+	if err != nil {
+		return err
+	}
+	u.recordMu.Lock()
+	u.logins = append(u.logins, string(encoded))
+	u.recordMu.Unlock()
+	return nil
+}
+
+var _ extension.SpriteRegistrar = (*recordingUI)(nil)
+
+// RegisterSprite records the sprite as its canonical wire value, so every SDK's registration compares equal.
+func (u *recordingUI) RegisterSprite(owner string, definition extension.ValidatedSpriteDefinition) error {
+	palette := map[string]string{}
+	for symbol, value := range definition.Palette() {
+		palette[string(symbol)] = fmt.Sprintf("#%02X%02X%02X", value.R, value.G, value.B)
+	}
+	encoded, err := json.Marshal(extension.SpriteDefinition{
+		ID: definition.ID(), Name: definition.Name(), Tagline: definition.Tagline(),
+		Mascot: definition.Mascot(), Palette: palette,
+	})
+	if err != nil {
+		return err
+	}
+	u.recordMu.Lock()
+	u.sprites = append(u.sprites, string(encoded))
+	u.recordMu.Unlock()
+	return nil
+}
+
+func (u *recordingUI) UnregisterSprites(string) {}
+
+func (u *recordingUI) SpriteDefinitions() []string {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return append([]string(nil), u.sprites...)
+}
+
+func (u *recordingUI) LoginDefinitions() []string {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return append([]string(nil), u.logins...)
+}
+func (u *recordingUI) SetTitle(title string) { u.recordSurface1("title:" + title) }
+
+// slow models a consumer that is slow to apply an effect: the call returns once it applied it.
+func (u *recordingUI) slow() {
+	if gate := u.stall.Load(); gate != nil {
+		gate.enter()
+	}
+	if delay := u.applyDelay.Load(); delay > 0 {
+		time.Sleep(time.Duration(delay))
+	}
+}
+
+// stallGate holds the effect calls of a recordingUI: entered closes when the first call is held, open lets every held call apply. A test that fails while the gate is closed opens it
+// from its cleanup, so the harness's shutdown does not wait for a consumer that nobody will release.
+type stallGate struct {
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+	openOnce sync.Once
+}
+
+func newStallGate() *stallGate {
+	return &stallGate{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *stallGate) enter() {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+}
+
+// open lets every held call apply, and every later one; it may be called more than once.
+func (g *stallGate) open() { g.openOnce.Do(func() { close(g.release) }) }
+
+// recordSurface1 keeps a title or widget call. Surfaces returns the calls so far.
+func (u *recordingUI) recordSurface1(call string) {
+	u.slow()
+	defer hostEffects.notify()
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	u.surfaces = append(u.surfaces, call)
+}
+
+// Surfaces returns a copy of the title and widget calls seen so far.
+func (u *recordingUI) Surfaces() []string {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return append([]string(nil), u.surfaces...)
+}
+func (u *recordingUI) Custom(context.Context, extension.CustomFactory, *extension.CustomOptions) (any, error) {
+	return "gamma", nil
+}
+func (u *recordingUI) PasteToEditor(text string) { u.recordCall("paste:" + text) }
+func (u *recordingUI) SetEditorText(text string) {
+	u.slow()
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	u.editorText = text
+	u.calls = append(u.calls, "editorText:"+text)
+}
+func (u *recordingUI) GetEditorText() string {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return u.editorText
+}
+func (u *recordingUI) Editor(ctx context.Context, title, _ string) (string, error) {
+	if u.dialogs != nil {
+		return u.dialogs.hold(ctx, "editor", title)
+	}
+	return "edited", nil
+}
+func (u *recordingUI) AddAutocompleteProvider(extension.AutocompleteProviderFactory) error {
+	return nil
+}
+func (u *recordingUI) SetEditorComponent(factory extension.EditorFactory) {
+	editor := remoteEditorOfFactory(factory)
+	u.recordMu.Lock()
+	u.editor = editor
+	u.recordMu.Unlock()
+}
+func (u *recordingUI) installedEditor() extension.RemoteEditor {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return u.editor
+}
+func (u *recordingUI) GetEditorComponent() extension.EditorFactory { return nil }
+func (u *recordingUI) Theme() extension.Theme {
+	if u.theme != nil {
+		return u.theme()
+	}
+	return nil
+}
+func (u *recordingUI) GetAllThemes() []extension.ThemeMeta      { return nil }
+func (u *recordingUI) GetTheme(string) (extension.Theme, error) { return nil, nil }
+func (u *recordingUI) SetTheme(extension.ThemeSelection) extension.SetThemeResult {
+	return extension.SetThemeResult{Success: true}
+}
+func (u *recordingUI) GetToolsExpanded() bool {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	return u.toolsExpanded
+}
+func (u *recordingUI) SetToolsExpanded(expanded bool) {
+	u.recordMu.Lock()
+	defer u.recordMu.Unlock()
+	u.toolsExpanded = expanded
+	u.calls = append(u.calls, fmt.Sprintf("toolsExpanded:%t", expanded))
+}
+func (u *recordingUI) RunRemoteOverlay(opts extension.RemoteOverlayOptions, host extension.RemoteOverlayHost, onHandle func(extension.RemoteOverlayHandle)) (any, bool) {
+	if u.runOverlay != nil {
+		return u.runOverlay(opts, host, onHandle)
+	}
+	handle := &conformanceOverlayHandle{closed: make(chan struct{}), changed: make(chan struct{}, 1)}
+	onHandle(handle)
+	if opts.Title == "Timer" {
+		deadline := time.After(5 * time.Second)
+		for {
+			lines := handle.Lines()
+			if len(lines) > 0 && strings.HasPrefix(lines[0], "timer frame=") &&
+				!strings.Contains(lines[0], "timer frame=0 ") && !strings.Contains(lines[0], "timer frame=1 ") {
+				break
+			}
+			select {
+			case <-handle.changed:
+			case <-deadline:
+				return nil, false
+			}
+		}
+		host.OnInput("\r")
+	} else {
+		host.OnInput("\x1b[6~")
+		host.OnInput("\r")
+	}
+	select {
+	case <-handle.closed:
+		return handle.result, true
+	case <-time.After(5 * time.Second):
+		return nil, false
+	}
+}
+
+func (u *recordingUI) ShowRemoteOverlay(opts extension.RemoteOverlayOptions, host extension.RemoteOverlayHost) (extension.RemoteOverlayHandle, <-chan struct{}, bool) {
+	if u.showOverlay == nil {
+		return nil, nil, false
+	}
+	return u.showOverlay(opts, host)
+}
+
+func (u *recordingUI) HideTopOverlay(context.Context) (any, error) { return nil, nil }
+
+func (u *recordingUI) SetRemoteFocus(context.Context, extension.RemoteOverlayFocusTarget) (any, error) {
+	return nil, nil
+}
+
+type conformanceOverlayHandle struct {
+	mu      sync.Mutex
+	result  any
+	lines   []string
+	closed  chan struct{}
+	changed chan struct{}
+}
+
+func (h *conformanceOverlayHandle) UpdateLines(lines []string) {
+	h.mu.Lock()
+	h.lines = append([]string(nil), lines...)
+	h.mu.Unlock()
+	select {
+	case h.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (h *conformanceOverlayHandle) Lines() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.lines...)
+}
+
+func (h *conformanceOverlayHandle) Close(result any) {
+	h.mu.Lock()
+	h.result = result
+	select {
+	case <-h.closed:
+	default:
+		close(h.closed)
+	}
+	h.mu.Unlock()
+}
+
+// ── subprocess-go transport ──────────────────────────────────────────────────
+
+func makeSubprocessGoHarness(t *testing.T) *harness {
+	t.Helper()
+
+	binPath := buildSDKFixture(t)
+
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	bridge := subprocess.NewUIBridge(hostEffects.notify)
+	bridge.SetUIContext(ui)
+	bridge.SetNotifyFunc(ui.RecordNotify)
+	bridge.SetActions(conformanceActions(actions))
+
+	h := subprocess.NewHost(harnessHostCwd(t))
+	h.SetMode(harnessHostMode())
+	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
+	h.SetUIBridge(bridge)
+	wire := observeWire(t, h)
+
+	// IMPORTANT: do NOT bind subprocess lifetime to a function-scoped
+	// context. Host.Load passes ctx into exec.CommandContext via a
+	// derived context.WithCancel; cancelling the load context kills the
+	// extension binary. The conformance test reuses the loaded
+	// extension across captureRecording, so the load context must
+	// outlive the helper function. Lifetime is bound to host.Shutdown
+	// via t.Cleanup in the caller.
+	ext, err := h.Load(context.Background(), subprocess.ExtConfig{
+		Name:    "sdk-fixture",
+		Path:    binPath,
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("subprocess Load: %v", err)
+	}
+
+	runner := inproc.NewRunner([]extension.Extension{*ext}, t.TempDir())
+	bridge.SetUIPromptScope(runner)
+	return &harness{runner: runner, host: h, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
+}
+
+func makeFusedGoHarness(t *testing.T) *harness {
+	t.Helper()
+
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	bridge := subprocess.NewUIBridge(hostEffects.notify)
+	bridge.SetUIContext(ui)
+	bridge.SetNotifyFunc(ui.RecordNotify)
+	bridge.SetActions(conformanceActions(actions))
+
+	host := subprocess.NewHost(harnessHostCwd(t))
+	host.SetMode(harnessHostMode())
+	host.SetHostInfo(conformanceHostInfo)
+	host.ShareCells(conformanceCellRegistry)
+	host.SetUIBridge(bridge)
+	wire := observeWire(t, host)
+	// A Piglet Binary installs the host's parsers before any fused factory runs (fusepack.Register).
+	sdk.SetHostHelpers(fusepack.HostHelpers())
+	// The factory runs inside the serve function, as a Piglet Binary's fused registry (fusepack) runs it.
+	loaded, err := host.LoadInProcess(context.Background(), subprocess.ExtConfig{
+		Name:    "sdk-fixture",
+		Enabled: true,
+	}, func(conn net.Conn) error { return testfixture.Extension().RunWithConn(conn) })
+	if err != nil {
+		host.Shutdown("load failed")
+		t.Fatalf("fused LoadInProcess: %v", err)
+	}
+
+	runner := inproc.NewRunner([]extension.Extension{*loaded}, t.TempDir())
+	bridge.SetUIPromptScope(runner)
+	return &harness{runner: runner, host: host, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
+}
+
+func conformanceModel(id, name string) map[string]any {
+	return map[string]any{
+		"provider": "conformance", "id": id, "modelId": id, "api": "openai-responses", "name": name,
+		"baseUrl": "https://models.invalid/v1", "reasoning": false, "input": []string{},
+		"inputLimits":      map[string]any{"maxRequestBytes": 12345.0, "images": map[string]any{"maxPerMessage": 7.0, "maxPerRequest": 11.0, "resize": map[string]any{"maxWidth": 321.0, "maxHeight": 123.0, "maxBytes": 45678.0, "jpegQuality": 67.0}}},
+		"cost":             map[string]any{"input": 0.0, "output": 7.0, "cacheRead": 0.5, "cacheWrite": 1.5, "tiers": []map[string]any{{"inputTokensAbove": 1000.0, "input": 1.0, "output": 2.0, "cacheRead": 0.0, "cacheWrite": 0.0}}},
+		"thinkingLevelMap": map[string]any{"high": "configured-high"}, "promptCache": map[string]any{"short": 120.0},
+		"contextWindow": 321000.0, "maxTokens": 1234.0, "samplingParams": map[string]any{"temperature": 0.0},
+		"headers": map[string]any{"X-Test": "value"}, "compat": map[string]any{"supportsStrictMode": false},
+	}
+}
+
+func conformanceActions(actions *[]string) *subprocess.HostCallbacks {
+	return &subprocess.HostCallbacks{
+		GetSystemPromptOptions: conformanceSystemPromptOptions,
+		IsProjectTrusted:       func() bool { return conformanceProjectTrusted },
+		GetModelInfo: func() json.RawMessage {
+			return modelJSON(conformanceModel("current", "Current"))
+		},
+		GetModel: func(providerID, modelID string) json.RawMessage {
+			if providerID != "conformance" || (modelID != "current" && modelID != "declared" && modelID != "org/model/name") {
+				return nil
+			}
+			return modelJSON(conformanceModel(modelID, strings.ToUpper(modelID[:1])+modelID[1:]))
+		},
+		GetModels: func() []json.RawMessage {
+			return modelJSONs(
+				conformanceModel("current", "Current"),
+				conformanceModel("declared", "Declared"),
+				conformanceModel("org/model/name", "Slash model"),
+			)
+		},
+		GetModelAuth: func(ctx context.Context, providerID, modelID string) map[string]any {
+			extension.CallInitiated(ctx)
+			if providerID != "conformance" || modelID != "declared" {
+				return map[string]any{"ok": false, "error": "model auth not found"}
+			}
+			return map[string]any{
+				"ok": true, "apiKey": "conformance-key", "headers": map[string]any{"X-Conformance-Auth": "yes"},
+				"baseUrl": "https://models.invalid/v1", "env": map[string]any{"CONFORMANCE_AUTH": "yes"},
+			}
+		},
+		GetSessionID:   func() string { return "conformance-session-id" },
+		GetSessionFile: func() string { return "" },
+		GetLeafID:      func() string { return "e3" },
+		GetEntriesPage: func(cursor, _ int) ([]json.RawMessage, int, bool, string) {
+			entries := []json.RawMessage{
+				json.RawMessage(`{"id":"e1","type":"message","message":{"role":"user","content":"hello"}}`),
+				json.RawMessage(`{"id":"e2","parentId":"e1","type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm "},{"type":"text","text":"let me look"},{"type":"toolCall","id":"c1","name":"read","arguments":{"path":"a.txt"}}],"provider":"p","model":"m","usage":{"input":3,"output":4,"cacheRead":5,"cacheWrite":6,"totalTokens":18,"cost":{"total":0.5}}}}`),
+				json.RawMessage(`{"id":"e3","parentId":"e2","type":"message","message":{"role":"user","content":[{"type":"text","text":"thanks"}]}}`),
+			}
+			if cursor < 0 || cursor > len(entries) {
+				cursor = 0
+			}
+			if cursor == len(entries) {
+				return nil, cursor, false, "e3"
+			}
+			next := cursor + 1
+			return entries[cursor:next], next, next < len(entries), "e3"
+		},
+		SendMessage: func(msg extension.CustomMessageRef, opts subprocess.SendMessageOptions) error {
+			triggerTurn := "unset"
+			if opts.TriggerTurn != nil {
+				triggerTurn = strconv.FormatBool(*opts.TriggerTurn)
+			}
+			deliverAs := opts.DeliverAs
+			if deliverAs == "" {
+				deliverAs = "unset"
+			}
+			*actions = append(*actions, fmt.Sprintf("sendMessage:%s:%v:%s:%s", msg.CustomType, msg.Content, deliverAs, triggerTurn))
+			return nil
+		},
+		SendUserMessage: func(content any, opts subprocess.SendUserMessageOptions) error {
+			return recordUserContent(actions, content, opts.DeliverAs, opts.ExpandPromptTemplates)
+		},
+		SetSessionName: func(name string) error {
+			*actions = append(*actions, "setSessionName:"+name)
+			return nil
+		},
+		GetThinkingLevel: func() string { return conformanceThinkingLevel },
+		GetCommands:      func() []subprocess.CommandInfo { return conformanceHostCommands },
+		SetModel: func(_ context.Context, object *ai.Model) (bool, error) {
+			model := modelSpec(object)
+			*actions = append(*actions, "setModel:"+model)
+			return model == conformanceKnownModel, nil
+		},
+		ResolveModel: specModel,
+		AppendEntry: func(customType string, data any, _ *subprocess.DirectEntryAppend) error {
+			if customType == "effect_probe_fails" {
+				return errors.New("append refused")
+			}
+			*actions = append(*actions, fmt.Sprintf("appendEntry:%s:%v", customType, data))
+			return nil
+		},
+		SetLabel: func(entryID string, label *string, null bool) error {
+			text := "undefined"
+			switch {
+			case label != nil:
+				text = *label
+			case null:
+				text = "null"
+			}
+			*actions = append(*actions, "setLabel:"+entryID+":"+text)
+			return nil
+		},
+	}
+}
+
+func makeSubprocessNodeHarness(t *testing.T) *harness {
+	t.Helper()
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Fatalf("node is required for SDK conformance: %v", err)
+	}
+
+	modRoot := findModuleRoot(t)
+	path := filepath.Join(modRoot, "test", "extension-conformance", "testdata", "node-sdk-fixture", "main.mjs")
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	bridge := subprocess.NewUIBridge(hostEffects.notify)
+	bridge.SetUIContext(ui)
+	bridge.SetNotifyFunc(ui.RecordNotify)
+	bridge.SetActions(conformanceActions(actions))
+
+	h := subprocess.NewHost(harnessHostCwd(t))
+	h.SetMode(harnessHostMode())
+	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
+	h.SetUIBridge(bridge)
+	wire := observeWire(t, h)
+
+	ext, err := h.Load(context.Background(), subprocess.ExtConfig{
+		Name:    "node-sdk-fixture",
+		Source:  path,
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("node subprocess Load: %v", err)
+	}
+
+	runner := inproc.NewRunner([]extension.Extension{*ext}, t.TempDir())
+	bridge.SetUIPromptScope(runner)
+	return &harness{runner: runner, host: h, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
+}
+
+// makeSubprocessNodePackedHarness is makeSubprocessNodeHarness's packed-cell
+// counterpart: it loads the same node-sdk-fixture through Host.LoadAll
+// alongside a second, empty Node factory extension, so the two are classified
+// as packable (isPackableNode) and PlanCells packs them into one shared Node
+// cell (CellStrategyPackedNode) instead of makeSubprocessNodeHarness's
+// isolated Host.Load. The peer extension registers no tools, commands, or
+// renderers, so it cannot change captureRecording's output; its only purpose
+// is to force real packed-cell hosting so the conformance suite's Node cases
+// prove packed and isolated are observationally identical, not just isolated.
+func makeSubprocessNodePackedHarness(t *testing.T) *harness {
+	return makeSubprocessNodePackedHarnessWithPeer(t, "export default function () {}\n")
+}
+
+// makeSubprocessNodePackedHarnessWithPeer is makeSubprocessNodePackedHarness with the source of the peer extension the node-sdk-fixture shares its cell with.
+func makeSubprocessNodePackedHarnessWithPeer(t *testing.T, peerSource string) *harness {
+	t.Helper()
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Fatalf("node is required for SDK conformance: %v", err)
+	}
+
+	modRoot := findModuleRoot(t)
+	path := filepath.Join(modRoot, "test", "extension-conformance", "testdata", "node-sdk-fixture", "main.mjs")
+	peer := filepath.Join(t.TempDir(), "node-cell-peer.mjs")
+	if err := os.WriteFile(peer, []byte(peerSource), 0o600); err != nil {
+		t.Fatalf("write Node cell peer fixture: %v", err)
+	}
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	bridge := subprocess.NewUIBridge(hostEffects.notify)
+	bridge.SetUIContext(ui)
+	bridge.SetNotifyFunc(ui.RecordNotify)
+	bridge.SetActions(conformanceActions(actions))
+
+	h := subprocess.NewHost(harnessHostCwd(t))
+	h.SetMode(harnessHostMode())
+	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
+	h.SetUIBridge(bridge)
+	wire := observeWire(t, h)
+
+	exts, errs := h.LoadAll(context.Background(), []subprocess.ExtConfig{
+		{Name: "node-sdk-fixture", Source: path, Enabled: true},
+		{Name: "node-cell-peer", Source: peer, Enabled: true},
+	})
+	if len(errs) != 0 || len(exts) != 2 {
+		t.Fatalf("packed Node LoadAll: %d loaded, %v", len(exts), errs)
+	}
+
+	runner := inproc.NewRunner(exts, t.TempDir())
+	bridge.SetUIPromptScope(runner)
+	return &harness{runner: runner, host: h, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
+}
+
+// makeSubprocessNodeLoneCellHarness loads the node-sdk-fixture through Host.LoadAll with no peer, so a Host of a shared registry runs it as the only Node realm of its process and keeps its pi.events listeners in that process's own bus.
+func makeSubprocessNodeLoneCellHarness(t *testing.T) *harness {
+	t.Helper()
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Fatalf("node is required for SDK conformance: %v", err)
+	}
+	path := filepath.Join(findModuleRoot(t), "test", "extension-conformance", "testdata", "node-sdk-fixture", "main.mjs")
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	bridge := subprocess.NewUIBridge(hostEffects.notify)
+	bridge.SetUIContext(ui)
+	bridge.SetNotifyFunc(ui.RecordNotify)
+	bridge.SetActions(conformanceActions(actions))
+
+	h := subprocess.NewHost(harnessHostCwd(t))
+	h.SetMode(harnessHostMode())
+	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
+	h.SetUIBridge(bridge)
+	wire := observeWire(t, h)
+
+	exts, errs := h.LoadAll(context.Background(), []subprocess.ExtConfig{{Name: "node-sdk-fixture", Source: path, Enabled: true, RuntimeKind: "subprocess", RuntimeLanguage: "node", EntrypointKind: "factory", SDKName: "pi-node"}})
+	if len(errs) != 0 || len(exts) != 1 {
+		t.Fatalf("lone Node LoadAll: %d loaded, %v", len(exts), errs)
+	}
+	runner := inproc.NewRunner(exts, t.TempDir())
+	bridge.SetUIPromptScope(runner)
+	return &harness{runner: runner, host: h, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
+}
+
+func makeSubprocessPythonHarness(t *testing.T) *harness {
+	t.Helper()
+
+	path := buildPythonSDKFixture(t)
+
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	bridge := subprocess.NewUIBridge(hostEffects.notify)
+	bridge.SetUIContext(ui)
+	bridge.SetNotifyFunc(ui.RecordNotify)
+	bridge.SetActions(conformanceActions(actions))
+
+	h := subprocess.NewHost(harnessHostCwd(t))
+	h.SetMode(harnessHostMode())
+	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
+	h.SetUIBridge(bridge)
+	wire := observeWire(t, h)
+
+	ext, err := h.Load(context.Background(), subprocess.ExtConfig{
+		Name:            "python-sdk-fixture",
+		Path:            path,
+		Enabled:         true,
+		RuntimeLanguage: "python",
+	})
+	if err != nil {
+		t.Fatalf("python subprocess Load: %v", err)
+	}
+
+	runner := inproc.NewRunner([]extension.Extension{*ext}, t.TempDir())
+	bridge.SetUIPromptScope(runner)
+	return &harness{runner: runner, host: h, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
+}
+
+func makeSubprocessRustHarness(t *testing.T) *harness {
+	t.Helper()
+
+	binPath := buildRustSDKFixture(t)
+
+	notify := &[]string{}
+	status := &[]string{}
+	actions := &[]string{}
+	ui := newRecordingUI(notify, status)
+	bridge := subprocess.NewUIBridge(hostEffects.notify)
+	bridge.SetUIContext(ui)
+	bridge.SetNotifyFunc(ui.RecordNotify)
+	bridge.SetActions(conformanceActions(actions))
+
+	h := subprocess.NewHost(harnessHostCwd(t))
+	h.SetMode(harnessHostMode())
+	h.SetHostInfo(conformanceHostInfo)
+	h.ShareCells(conformanceCellRegistry)
+	h.SetUIBridge(bridge)
+	wire := observeWire(t, h)
+
+	ext, err := h.Load(context.Background(), subprocess.ExtConfig{
+		Name:    "rust-sdk-fixture",
+		Path:    binPath,
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("rust subprocess Load: %v", err)
+	}
+
+	runner := inproc.NewRunner([]extension.Extension{*ext}, t.TempDir())
+	bridge.SetUIPromptScope(runner)
+	return &harness{runner: runner, host: h, notify: notify, status: status, actions: actions, ui: ui, bridge: bridge, wire: wire}
+}
+
+// buildSDKFixture builds the same factory linked by the fused harness, or uses
+// its dedicated prebuilt binary from the grouped verifier. Host integration
+// tests use a separate fixture and prebuild.
+func buildSDKFixture(t *testing.T) string {
+	t.Helper()
+	if p := os.Getenv("PIG_TEST_CONFORMANCE_SDK_FIXTURE_BIN"); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("PIG_TEST_CONFORMANCE_SDK_FIXTURE_BIN=%q does not exist: %v", p, err)
+		}
+		return p
+	}
+	binPath, err := sdkFixtureBinary.Do(t, buildSDKFixtureBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binPath
+}
+
+func buildPythonSDKFixture(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath(testPythonExecutable()); err != nil {
+		t.Fatalf("%s is required for SDK conformance: %v", testPythonExecutable(), err)
+	}
+	modRoot := findModuleRoot(t)
+	// Python extensions are launched through an explicit interpreter, so the
+	// checked-in fixture does not need an executable bit and tests must not
+	// mutate the source tree to add one.
+	return filepath.Join(modRoot, "test", "extension-conformance", "testdata", "python-sdk-fixture", "main.py")
+}
+
+func buildRustSDKFixture(t *testing.T) string {
+	t.Helper()
+	if p := os.Getenv("PIG_TEST_RUST_SDK_FIXTURE_BIN"); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("PIG_TEST_RUST_SDK_FIXTURE_BIN=%q does not exist: %v", p, err)
+		}
+		return p
+	}
+	binPath, err := rustFixtureBinary.Do(t, buildRustFixtureBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binPath
+}
+
+// ── shared plumbing ──────────────────────────────────────────────────────────
+
+// hostEffects wakes waiters when a harness sees an extension's effect: a UI
+// call the recordingUI keeps, or a repaint the host requests through a
+// harness bridge's invalidate callback. Harnesses run in parallel and share
+// it, so a waiter re-checks its own condition on every wake.
+var hostEffects effectSignal
+
+type effectSignal struct {
+	mu   sync.Mutex
+	wake chan struct{}
+}
+
+// next returns a channel that the first notify after this call closes.
+func (s *effectSignal) next() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wake == nil {
+		s.wake = make(chan struct{})
+	}
+	return s.wake
+}
+
+func (s *effectSignal) notify() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wake != nil {
+		close(s.wake)
+		s.wake = nil
+	}
+}
+
+// effectRecheck bounds how long a waiter goes without re-checking its
+// condition: some state an extension changes (a widget frame, a registry)
+// reaches the host with no callback a harness can observe.
+const effectRecheck = 25 * time.Millisecond
+
+// awaitCondition waits until cond holds or ctx ends, and reports whether cond
+// held. It re-checks cond on every host effect and at least every
+// effectRecheck.
+func awaitCondition(ctx context.Context, cond func() bool) bool {
+	recheck := time.NewTicker(effectRecheck)
+	defer recheck.Stop()
+	for {
+		woken := hostEffects.next()
+		if cond() {
+			return true
+		}
+		select {
+		case <-woken:
+		case <-recheck.C:
+		case <-ctx.Done():
+			return cond()
+		}
+	}
+}
+
+// waitFor waits until pred holds. An extension's work only gets slower when
+// the machine is loaded, so the wait ends at the test's hang bound
+// (testbudget), never at a fixed wall-clock deadline.
+// expectRenderedLine waits until the component has drawn a line that arrived accepts, then compares that line with want: a wrong value fails with
+// both lines at once, not as a wait that ran out. It returns the line.
+func expectRenderedLine(t *testing.T, component interface{ Render(int) []string }, arrived func(line string) bool, want string) string {
+	t.Helper()
+	var got string
+	waitFor(t, func() bool {
+		lines := component.Render(72)
+		if len(lines) != 1 || !arrived(lines[0]) {
+			return false
+		}
+		got = lines[0]
+		return true
+	})
+	if got != want {
+		t.Fatalf("rendered line:\n got %q\nwant %q", got, want)
+	}
+	return got
+}
+
+func waitFor(t *testing.T, pred func() bool) {
+	t.Helper()
+	if !awaitCondition(testbudget.Context(t), pred) {
+		t.Fatalf("condition not satisfied within the test's wait budget (%s)", testbudget.Env)
+	}
+}
+
+func toolNames(r *inproc.Runner) []string {
+	tools := r.Tools()
+	out := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, tool.Definition.Name)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// commandArgumentCompletions records a command's getArgumentCompletions for
+// each prefix as "value|label|description" items, or "none".
+func commandArgumentCompletions(t *testing.T, r *inproc.Runner, name string, prefixes ...string) []string {
+	t.Helper()
+	command, ok := r.Command(name)
+	if !ok || command.GetArgumentCompletions == nil {
+		t.Fatalf("%s has no argument completions: %+v", name, command)
+	}
+	var out []string
+	for _, prefix := range prefixes {
+		items, err := command.GetArgumentCompletions(prefix)
+		if err != nil {
+			t.Fatalf("%s argument completions for %q: %v", name, prefix, err)
+		}
+		if len(items) == 0 {
+			out = append(out, prefix+":none")
+		}
+		for _, item := range items {
+			out = append(out, prefix+":"+item.Value+"|"+item.Label+"|"+item.Description)
+		}
+	}
+	return out
+}
+
+func commandNames(r *inproc.Runner) []string {
+	commands := r.Commands()
+	wanted := map[string]struct{}{"ping": {}, "command_error": {}, "status": {}}
+	out := make([]string, 0, len(commands))
+	for _, cmd := range commands {
+		if _, ok := wanted[cmd.Name]; ok {
+			out = append(out, cmd.Name)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func findTool(r *inproc.Runner, name string) (extension.RegisteredTool, bool) {
+	for _, tool := range r.Tools() {
+		if tool.Definition.Name == name {
+			return tool, true
+		}
+	}
+	return extension.RegisteredTool{}, false
+}
+
+// toolGuidelines collects prompt_guidelines from all registered tools.
+// Returns a map of tool name → guidelines (only for tools that have them).
+func toolGuidelines(r *inproc.Runner) map[string][]string {
+	out := map[string][]string{}
+	for _, tool := range r.Tools() {
+		if len(tool.Definition.PromptGuidelines) > 0 {
+			out[tool.Definition.Name] = tool.Definition.PromptGuidelines
+		}
+	}
+	return out
+}
+
+// toolConstrainedSampling gathers each tool's constrained sampling request as
+// canonical JSON (map round-trip sorts keys), so every transport is compared on
+// the same normalized shape regardless of the SDK's serialization order.
+func toolConstrainedSampling(r *inproc.Runner) map[string]string {
+	out := map[string]string{}
+	for _, tool := range r.Tools() {
+		raw := tool.Definition.ConstrainedSampling
+		if len(raw) == 0 {
+			continue
+		}
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			out[tool.Definition.Name] = "invalid:" + string(raw)
+			continue
+		}
+		norm, err := json.Marshal(v)
+		if err != nil {
+			out[tool.Definition.Name] = "invalid:" + string(raw)
+			continue
+		}
+		out[tool.Definition.Name] = string(norm)
+	}
+	return out
+}
+
+func findCommand(r *inproc.Runner, name string) (extension.RegisteredCommand, bool) {
+	for _, cmd := range r.Commands() {
+		if cmd.Name == name {
+			return cmd.RegisteredCommand, true
+		}
+	}
+	return extension.RegisteredCommand{}, false
+}
+
+func requireConformanceTool(t *testing.T, name string) string {
+	t.Helper()
+	path, err := exec.LookPath(name)
+	if err == nil {
+		return path
+	}
+	if os.Getenv("PIG_REQUIRE_EXTENSION_TOOLCHAINS") == "1" {
+		t.Fatalf("required extension tool %s is unavailable: %v", name, err)
+	}
+	t.Skipf("%s not found: %v", name, err)
+	return ""
+}
+
+func testExecutableName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
+}
+
+func testPythonExecutable() string {
+	return toolchain.PythonExecutable(runtime.GOOS, exec.LookPath)
+}
+
+func findModuleRoot(t testing.TB) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, statErr := os.Stat(filepath.Join(dir, "go.mod")); statErr == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("go.mod not found")
+		}
+		dir = parent
+	}
+}
+
+// TestConformance_SourceMetadata verifies that per-tool Source flows correctly
+// through every transport. Unlike the recording-based conformance gate (which
+// compares transport-invariant outputs), this test checks transport-specific
+// source attribution:
+//   - Every tool must have a non-empty SourceInfo (buildExtension default or explicit)
+//   - sourced_tool must have SourceInfo = "mcp:test-server" (explicit override)
+//   - Non-sourced tools must have SourceInfo = extension name (default stamping)
+//
+// This is a proper verification of D23 source metadata plumbing.
+func TestConformance_SourceMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping source metadata test in short mode (builds fixtures)")
+	}
+
+	cases := allHarnessCases()
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+
+			tools := h.runner.Tools()
+			if len(tools) == 0 {
+				t.Fatal("no tools registered")
+			}
+
+			for _, tool := range tools {
+				name := tool.Definition.Name
+				source := tool.Source
+				if source == "" {
+					t.Errorf("tool %q has empty/nil SourceInfo", name)
+					continue
+				}
+
+				if name == "sourced_tool" {
+					if source != "mcp:test-server" {
+						t.Errorf("sourced_tool: SourceInfo = %q, want %q", source, "mcp:test-server")
+					}
+				} else {
+					// All non-sourced tools should get the extension name as default source.
+					if source != tc.extName {
+						t.Errorf("tool %q: SourceInfo = %q, want default %q", name, source, tc.extName)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestConformance_TerminalInput checks consume/rewrite ordering, lifetime, and callback-time UI values against the in-process reference and every SDK transport.
+func TestConformance_TerminalInput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	t.Parallel()
+
+	cases := allHarnessCases()
+	for _, language := range []string{"go", "rust", "python", "lisp"} {
+		cases = append(cases, harnessCase{name: "packed-" + language, make: func(t *testing.T) *harness { return makePackedUIHarness(t, language) }})
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+
+			if _, ok := h.ui.sendTerminalInput(terminalInputSentinel); ok {
+				t.Fatal("host forwarded input before the extension subscribed")
+			}
+
+			runConformanceCommand(t, h, "term_subscribe")
+			consumed, ok := h.ui.sendTerminalInput(terminalInputSentinel)
+			if !ok {
+				t.Fatal("extension subscribed but the host registered no input handler")
+			}
+			if !consumed {
+				t.Error("sentinel chunk was not consumed by the subscribed extension")
+			}
+			if verdict, _ := h.ui.terminalInputVerdict("a"); verdict.Consume || verdict.Data != nil {
+				t.Errorf("ordinary keystroke verdict = %+v; the editor must see it unchanged", verdict)
+			}
+			// Upstream applies a handler's data as the new input.
+			if verdict, _ := h.ui.terminalInputVerdict(terminalInputRewriteSentinel); verdict.Consume || verdict.Data == nil || *verdict.Data != "rewritten" {
+				t.Errorf("rewrite verdict = %+v, want data \"rewritten\"", verdict)
+			}
+			// Pi exposes each UTF-16 half from StdinBuffer independently; every transport must receive and return the same unit.
+			for _, data := range []string{"\xed\xa0\xbd", "\xed\xb8\x80", "😀"} {
+				verdict, ok := h.ui.terminalInputVerdict(data)
+				if !ok || verdict.Consume || verdict.Data == nil || *verdict.Data != "seen:"+data {
+					t.Fatalf("UTF-16 verdict for %x = %+v, want seen: plus original units", data, verdict)
+				}
+			}
+			// Upstream's listener is synchronous with no deadline: a handler
+			// that takes longer than any fixed input budget still decides, as
+			// often as it runs, and keeps its subscription.
+			for range 6 {
+				if consumed, ok := h.ui.sendTerminalInput(terminalInputSlowSentinel); !ok || !consumed {
+					t.Fatalf("slow handler verdict dropped: consumed=%v subscribed=%v", consumed, ok)
+				}
+			}
+
+			// A retained subscription sees live values, including reset to empty/false, rather than its registration-time snapshot.
+			for _, state := range []struct {
+				text     string
+				expanded bool
+			}{{"current draft", true}, {"", false}, {"A\xed\xa0\xbd", true}, {"\xed\xb8\x80", false}, {"replacement draft", false}} {
+				h.ui.SetEditorText(state.text)
+				h.ui.SetToolsExpanded(state.expanded)
+				want, err := jsjson.Marshal([]any{state.text, state.expanded})
+				if err != nil {
+					t.Fatal(err)
+				}
+				verdict, ok := h.ui.terminalInputVerdict(terminalInputStateSentinel)
+				if !ok || verdict.Consume || verdict.Data == nil || *verdict.Data != string(want) {
+					t.Fatalf("callback UI state = %+v, want %s", verdict, want)
+				}
+			}
+			runConformanceCommand(t, h, "term_unsubscribe")
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				if _, ok := h.ui.sendTerminalInput(terminalInputSentinel); !ok {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("host kept forwarding input after unsubscribe")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
+}
+
+// terminalInputSentinel is the one chunk every SDK fixture consumes.
+const terminalInputSentinel = "\x1b[99~"
+
+// terminalInputRewriteSentinel is the chunk every SDK fixture rewrites to
+// "rewritten".
+const terminalInputRewriteSentinel = "\x1b[98~"
+
+// terminalInputSlowSentinel is the chunk every SDK fixture consumes after
+// 200 ms.
+const terminalInputSlowSentinel = "\x1b[97~"
+
+// terminalInputStateSentinel asks a retained listener to read the current UI.
+const terminalInputStateSentinel = "\x1b[96~"
+
+// runConformanceCommand invokes a fixture command, failing the test if it is
+// missing or errors.
+func runConformanceCommand(t *testing.T, h *harness, name string) {
+	t.Helper()
+	cmd, ok := findCommand(h.runner, name)
+	if !ok {
+		t.Fatalf("%s command not registered", name)
+	}
+	if err := cmd.Handler(context.Background(), ""); err != nil {
+		t.Fatalf("%s command: %v", name, err)
+	}
+}
+
+// TestConformance_Geometry pins that every SDK reports the same terminal
+// geometry from the ready payload and updates it on a height_change
+// notification. Width plumbing has existed since the first subprocess
+// extension; height was added later and initially only reached the Go and node
+// SDKs, so the Rust and Python surfaces silently returned nothing. A widget
+// that reflows on height would have behaved differently per SDK.
+func TestConformance_Geometry(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+
+	cases := sdkHarnessCases()
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+
+			// Height reaches the extension only via the notification, so a
+			// missing dispatch arm shows up as the pre-change value.
+			h.host.NotifyHeight(37)
+
+			var got string
+			pollUntilConformance(t, "geometry never reported", func() bool {
+				h.ui.ClearRecorded()
+				runConformanceCommand(t, h, "report_geometry")
+				for _, n := range h.ui.Recorded() {
+					if strings.HasPrefix(n, "geometry:") {
+						got = n
+						return true
+					}
+				}
+				return false
+			})
+
+			if !strings.HasSuffix(got, "x37:info") {
+				t.Errorf("%s reported %q, want height 37 from the height_change notification", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestConformance_WidthHandlerHostCall pins that a width handler completes a host call in every SDK. Pi runs handlers in one process and a handler can always await a host call; the Python and Rust SDKs ran width handlers on the thread that reads the host's replies, so a handler's call waited for a reply nothing could read. The handler notifies twice and the second notify exists only once the first call returned; its text carries the width the host sent, which no SDK fallback produces.
+func TestConformance_WidthHandlerHostCall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	t.Parallel()
+	for _, tc := range sdkHarnessCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			runConformanceCommand(t, h, "arm_width_probe")
+			h.host.NotifyWidth(91)
+			pollUntilConformance(t, "the width handler's host call never returned", func() bool {
+				return slices.Contains(h.ui.Recorded(), "width-probe-returned:91:info")
+			})
+		})
+	}
+}
+
+// pollUntilConformance waits until fn holds, as waitFor does, and names what
+// it waited for when the test's wait budget ends first.
+func pollUntilConformance(t *testing.T, msg string, fn func() bool) {
+	t.Helper()
+	if !awaitCondition(testbudget.Context(t), fn) {
+		t.Fatalf("not satisfied within the test's wait budget (%s): %s", testbudget.Env, msg)
+	}
+}
+
+// A tool's `details` and each partial result are the objects the tool wrote (agent-loop.ts:778-786, 912-919): whichever language wrote them, the agent and everything downstream sees their members in the order written, never a map's sorted order. Every realization runs the same tool; the value is not alphabetical, so a realization that decodes it into a map fails. The Python and Rust tools write `zeta` as the float 1.0, which their encoders send as `1.0`; the host holds what JSON.stringify writes for it, `1`, as it does for the Node, Go and in-process tools.
+func TestToolDetailsKeepMemberOrderAcrossSDKs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	const details = `{"zeta":1,"alpha":{"yy":2,"bb":3},"mid":[{"qq":1,"aa":2}]}`
+	for _, tc := range allHarnessCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			tool, ok := findTool(h.runner, "ordered_details")
+			if !ok {
+				t.Fatal("ordered_details not registered")
+			}
+			var partials []agent.AgentToolResult
+			var onUpdate agent.ToolUpdateCallback = func(partial agent.AgentToolResult) { partials = append(partials, partial) }
+			result, err := tool.Definition.Execute(ctx, "tc-ordered", json.RawMessage(`{}`), onUpdate)
+			if err != nil {
+				t.Fatalf("ordered_details: %v", err)
+			}
+			final := result
+			if encoded, err := json.Marshal(final.Details); err != nil || string(encoded) != details {
+				t.Errorf("result details = %s, %v, want %s", encoded, err, details)
+			}
+			if len(partials) != 1 {
+				t.Fatalf("partials = %#v, want one", partials)
+			}
+			if encoded, err := json.Marshal(partials[0].Details); err != nil || string(encoded) != details {
+				t.Errorf("partial details = %s, %v, want %s", encoded, err, details)
+			}
+		})
+	}
+}
+
+// Upstream passes every tool a live AbortSignal and an onUpdate that streams
+// partial results. Each realization streams two updates in order before its
+// result, and a tool waiting on its signal observes the caller's cancellation.
+func TestToolSignalAndUpdatesSDKsMatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	cases := []struct {
+		name string
+		make func(*testing.T) *harness
+	}{
+		{"inproc-go", makeInprocGoHarness},
+		{"subprocess-go", makeSubprocessGoHarness},
+		{"subprocess-node", makeSubprocessNodeHarness},
+		{"subprocess-rust", makeSubprocessRustHarness},
+		{"subprocess-python", makeSubprocessPythonHarness},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+
+			tool, ok := findTool(h.runner, "update_tool")
+			if !ok {
+				t.Fatal("update_tool not registered")
+			}
+			var updates []string
+			var onUpdate agent.ToolUpdateCallback = func(partial agent.AgentToolResult) { updates = append(updates, partial.Text()) }
+			result, err := tool.Definition.Execute(ctx, "tc-update", json.RawMessage(`{}`), onUpdate)
+			if err != nil {
+				t.Fatalf("update_tool: %v", err)
+			}
+			if final := result; final.Text() != "done" || !slices.Equal(updates, []string{"step 1", "step 2"}) {
+				t.Fatalf("update_tool updates = %q result = %#v, want [step 1 step 2] then done", updates, result)
+			}
+
+			abortTool, ok := findTool(h.runner, "abort_tool")
+			if !ok {
+				t.Fatal("abort_tool not registered")
+			}
+			toolCtx, cancelTool := context.WithCancel(ctx)
+			waiting := make(chan struct{})
+			var once sync.Once
+			var onWaiting agent.ToolUpdateCallback = func(agent.AgentToolResult) { once.Do(func() { close(waiting) }) }
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = abortTool.Definition.Execute(toolCtx, "tc-abort", json.RawMessage(`{}`), onWaiting)
+			}()
+			select {
+			case <-waiting:
+			case <-ctx.Done():
+				t.Fatal("abort_tool never reported that it was waiting")
+			}
+			cancelTool()
+			<-done
+			// The host returns at cancellation; the extension observes its
+			// signal asynchronously, so probe until it reports.
+			waitFor(t, func() bool {
+				h.ui.ClearRecorded()
+				runConformanceCommand(t, h, "abort_probe")
+				return slices.Contains(h.ui.Recorded(), "abort:true:info")
+			})
+		})
+	}
+}
+
+func sectionCount(sections *ai.OrderedSections) int {
+	if sections == nil {
+		return 0
+	}
+	return len(*sections)
+}
+
+// Pi 0.87.1 renders a footer or header component at the host's current width
+// every frame (interactive-mode.ts:2418-2480). Every SDK's subprocess form must
+// therefore deliver rows laid out for the width the host reports, re-laid out
+// when the width changes, tagged with that width so the host never paints rows
+// for another one (public issue #104). Widths 72 and 53 differ from every
+// SDK's fallback (120 from the host, 80 in the Node runtime), so an SDK that
+// never re-renders cannot pass by defaulting.
+func TestConformance_FooterAndHeaderFollowHostWidth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	for _, tc := range sdkHarnessCases() {
+		for _, surface := range []string{"footer", "header"} {
+			t.Run(tc.name+"/"+surface, func(t *testing.T) {
+				h := tc.make(t)
+				t.Cleanup(func() {
+					if h.cleanup != nil {
+						h.cleanup()
+					}
+					if h.host != nil {
+						h.host.Shutdown("test done")
+					}
+				})
+				h.host.NotifyWidth(72)
+				last := func() *extension.WidthLines {
+					frames := h.ui.SurfaceFrames(surface == "header")
+					if len(frames) == 0 {
+						return nil
+					}
+					return frames[len(frames)-1]
+				}
+				waitFor := func(width int) {
+					t.Helper()
+					want := fmt.Sprintf("%s@%d", surface, width)
+					pollUntilConformance(t, fmt.Sprintf("no %s frame at width %d; last = %+v", surface, width, last()), func() bool {
+						frame := last()
+						return frame != nil && frame.Width == width && slices.Equal(frame.Lines, []string{want})
+					})
+				}
+				// The command may run before the SDK has stored width 72, so
+				// install until a frame at 72 arrives, then require the SDK to
+				// follow later resizes with no further command.
+				pollUntilConformance(t, "renderer never laid out at width 72", func() bool {
+					runConformanceCommand(t, h, "surface_"+surface)
+					time.Sleep(50 * time.Millisecond)
+					frame := last()
+					return frame != nil && frame.Width == 72
+				})
+				waitFor(72)
+				h.host.NotifyWidth(53)
+				waitFor(53)
+				h.host.NotifyWidth(114)
+				waitFor(114)
+			})
+		}
+	}
+}
+
+// A static footer is tagged with the SDK's current width, so a frame pushed for
+// one width is never painted at another.
+func TestConformance_StaticFooterRowsCarryTheirWidth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	for _, tc := range sdkHarnessCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			h.host.NotifyWidth(72)
+			pollUntilConformance(t, "static footer never tagged with width 72", func() bool {
+				runConformanceCommand(t, h, "surface_static_footer")
+				time.Sleep(50 * time.Millisecond)
+				frames := h.ui.SurfaceFrames(false)
+				if len(frames) == 0 || frames[len(frames)-1] == nil {
+					return false
+				}
+				frame := frames[len(frames)-1]
+				return frame.Width == 72 && slices.Equal(frame.Lines, []string{"static@72"})
+			})
+		})
+	}
+}
+
+// Pi 1.1.0 types.ts:208 and interactive-mode.ts:2551-2580: ctx.ui.setHeader installs a component that the TUI renders at the
+// terminal width. Pre-rendered header rows are tagged with the SDK's current width exactly as static footer rows are, so
+// ctx.ui.setHeader with rows reaches the host in every SDK with the rows and the width the SDK holds.
+func TestConformance_StaticHeaderRowsCarryTheirWidth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	for _, tc := range sdkHarnessCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			h.host.NotifyWidth(72)
+			pollUntilConformance(t, "static header never tagged with width 72", func() bool {
+				// Each attempt checks the newest frame, which an earlier attempt may have pushed.
+				runConformanceCommand(t, h, "surface_static_header")
+				frames := h.ui.SurfaceFrames(true)
+				if len(frames) == 0 || frames[len(frames)-1] == nil {
+					return false
+				}
+				frame := frames[len(frames)-1]
+				return frame.Width == 72 && slices.Equal(frame.Lines, []string{"static@72"})
+			})
+		})
+	}
+}
+
+// Pi 1.1.0 interactive-mode.ts:2420-2428 lays out a string[] widget as Text(line, 1, 0) rows. The Rust SDK's JSON-content widget
+// call (Context::set_widget_value, ctx.ui.setWidget(key, string[])) reaches the host as the same rows as the string-list helper
+// every SDK is checked against in TestConformance_StringWidgetUsesPiTextLayoutInEverySDK.
+func TestConformance_RustWidgetValueUsesPiTextLayout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	want := []string{" " + strings.Repeat("A", 38) + " ", " " + strings.Repeat("A", 22) + " tail            ", " short                                  "}
+	for _, tc := range sdkHarnessCases() {
+		if tc.name != "subprocess-rust" {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			h.host.NotifyWidth(40)
+			pollUntilConformance(t, "widget set through set_widget_value never rendered as Pi's Text layout at width 40", func() bool {
+				// Each attempt checks the widget an earlier attempt may have set.
+				runConformanceCommand(t, h, "surface_widget_value")
+				proxy := h.bridge.GetWidget(tc.extName, "wide")
+				return proxy != nil && slices.Equal(proxy.Render(40), want)
+			})
+		})
+	}
+}
+
+// Pi 0.87.1 interactive-mode.ts:2321-2336: a string[] widget is laid out by
+// Text(line, 1, 0) at the host width, so a row wider than the pane wraps. Every
+// SDK's string list widget must reach the host as the same rows.
+func TestConformance_StringWidgetUsesPiTextLayoutInEverySDK(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping conformance suite in short mode (builds subprocess fixtures)")
+	}
+	want := []string{" " + strings.Repeat("A", 38) + " ", " " + strings.Repeat("A", 22) + " tail            ", " short                                  "}
+	for _, tc := range sdkHarnessCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			h.host.NotifyWidth(40)
+			pollUntilConformance(t, "string widget never rendered as Pi's Text layout at width 40", func() bool {
+				runConformanceCommand(t, h, "surface_widget")
+				time.Sleep(50 * time.Millisecond)
+				proxy := h.bridge.GetWidget(tc.extName, "wide")
+				return proxy != nil && slices.Equal(proxy.Render(40), want)
+			})
+		})
+	}
+}
+
+// remoteEditorOfFactory is the editor in an extension's process that factory builds (extension.RemoteEditorFactory); nil for a nil factory.
+func remoteEditorOfFactory(factory extension.EditorFactory) extension.RemoteEditor {
+	if factory == nil {
+		return nil
+	}
+	editor, _ := extension.RemoteEditorOf(factory(nil, tui.EditorTheme{}, nil))
+	return editor
+}

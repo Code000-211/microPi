@@ -1,0 +1,243 @@
+package tui
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+type asyncEditorProbe struct {
+	editor       *Editor
+	tasks        chan func()
+	errors       []error
+	inputPending int
+}
+
+func newAsyncEditorProbe(t *testing.T, provider *AsyncAutocompleteProvider) *asyncEditorProbe {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	var workers sync.WaitGroup
+	p := &asyncEditorProbe{editor: NewEditor(), tasks: make(chan func(), 64)}
+	schedule := func(fn func()) {
+		select {
+		case p.tasks <- fn:
+		case <-ctx.Done():
+		}
+	}
+	report := func(err error) { p.errors = append(p.errors, err) }
+	input := func(work AutocompleteWork) {
+		p.inputPending++
+		workers.Go(func() {
+			apply, err := work(ctx)
+			schedule(func() {
+				p.inputPending--
+				if err != nil {
+					report(err)
+				} else if apply != nil {
+					apply()
+				}
+			})
+		})
+	}
+	p.editor.SetAsyncApply(schedule)
+	p.editor.SetAsyncAutocomplete(provider, ctx, workers.Go, input, report)
+	t.Cleanup(func() { cancel(); workers.Wait() })
+	return p
+}
+
+func (p *asyncEditorProbe) drain() {
+	for {
+		synctest.Wait()
+		select {
+		case task := <-p.tasks:
+			task()
+		default:
+			return
+		}
+	}
+}
+
+// Pi editor.ts only starts natural requests in slash/trigger contexts, and resets custom triggers when its provider changes.
+func TestAsyncAutocompleteNaturalTriggers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		provider := &AsyncAutocompleteProvider{GetSuggestions: func(context.Context, []string, int, int, bool) (*AutocompleteSuggestions, error) {
+			calls.Add(1)
+			return nil, nil
+		}}
+		p := newAsyncEditorProbe(t, provider)
+		p.editor.HandleInput("plain text$")
+		p.drain()
+		if calls.Load() != 0 {
+			t.Fatalf("plain text queried provider %d times", calls.Load())
+		}
+		provider.TriggerCharacters = []string{"$"}
+		p.editor.Clear()
+		p.editor.SetAsyncAutocomplete(provider, p.editor.autocompleteLifetime, p.editor.startAutocompleteTask, p.editor.startAutocompleteInput, p.editor.autocompleteError)
+		p.editor.HandleInput("$x")
+		if calls.Load() != 0 {
+			t.Fatal("trigger request was not debounced")
+		}
+		time.Sleep(attachmentAutocompleteDebounce)
+		p.drain()
+		if calls.Load() != 1 {
+			t.Fatalf("custom trigger calls=%d, want one debounced request", calls.Load())
+		}
+	})
+}
+
+// Pi editor.ts insertCharacter queries with the popup closed only for "/" at the start of the message, for a trigger character in a trigger token, and for a letter, digit, ".", "-", "_" or CJK character in a slash command or trigger token; the extension provider chain follows the same gate, so a space or "é" after "/cmd" asks nothing.
+func TestAsyncAutocompleteClosedPopupQueriesOnlyForTheCharactersPiTriggersOn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		provider := &AsyncAutocompleteProvider{GetSuggestions: func(context.Context, []string, int, int, bool) (*AutocompleteSuggestions, error) {
+			calls.Add(1)
+			return nil, nil
+		}}
+		p := newAsyncEditorProbe(t, provider)
+		for _, row := range []struct {
+			typed string
+			want  int32
+		}{{"/", 1}, {"c", 1}, {"m", 1}, {" ", 0}, {"é", 0}, {"/", 0}, {"-", 1}, {"日", 1}, {"!", 0}, {"7", 1}} {
+			calls.Store(0)
+			p.editor.HandleInput(row.typed)
+			p.drain()
+			if calls.Load() != row.want {
+				t.Fatalf("typing %q after %q queried the provider %d times, want %d", row.typed, p.editor.Text()[:len(p.editor.Text())-len(row.typed)], calls.Load(), row.want)
+			}
+		}
+	})
+}
+
+// Pi editor.ts:2284-2335 awaits suggestions without blocking new input; only synchronous completion and trigger callbacks hold input. A key that triggers nothing touches no request (insertCharacter):
+// the request that started is not aborted, it finishes, and its answer is dropped because the text moved on (isAutocompleteRequestCurrent).
+func TestForcedAutocompleteQueryDoesNotHoldInput(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered, release, aborted := make(chan struct{}), make(chan struct{}), make(chan bool, 1)
+		provider := &AsyncAutocompleteProvider{GetSuggestions: func(ctx context.Context, _ []string, _, _ int, force bool) (*AutocompleteSuggestions, error) {
+			if !force {
+				return nil, nil
+			}
+			close(entered)
+			<-release
+			aborted <- ctx.Err() != nil
+			return &AutocompleteSuggestions{Items: []AutocompleteItem{{Value: "xa", Label: "xa"}}, Prefix: "x"}, nil
+		}}
+		p := newAsyncEditorProbe(t, provider)
+		p.editor.HandleInput("x")
+		p.editor.HandleInput("\t")
+		// The forced request starts at the end of the read (Pi's Promise job), which the probe's task queue stands in for.
+		p.drain()
+		select {
+		case <-entered:
+		default:
+			t.Fatal("forced query did not start")
+		}
+		if p.inputPending != 0 {
+			t.Fatalf("a pending suggestion Promise holds input: %d", p.inputPending)
+		}
+		p.editor.HandleInput("y")
+		p.drain()
+		close(release)
+		p.drain()
+		select {
+		case wasAborted := <-aborted:
+			if wasAborted {
+				t.Fatal("typing a character that triggers nothing aborted the forced query; Pi lets it finish")
+			}
+		default:
+			t.Fatal("the forced query did not finish")
+		}
+		if p.editor.AutocompleteOpen() {
+			t.Fatal("the answer for the text before the key was published")
+		}
+		if len(p.errors) != 0 {
+			t.Fatalf("the finished request displayed %v", p.errors)
+		}
+	})
+}
+
+// Pi editor.ts:2425-2430 chooses an exact value, then the first prefix match, before the user accepts an unfiltered argument list.
+func TestAsyncAutocompleteSelectsBestPrefixAndAppliesProvider(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		provider := &AsyncAutocompleteProvider{
+			GetSuggestions: func(_ context.Context, lines []string, _, _ int, _ bool) (*AutocompleteSuggestions, error) {
+				_, prefix, _ := strings.Cut(lines[0], " ")
+				return &AutocompleteSuggestions{Items: []AutocompleteItem{{Value: "one"}, {Value: "two"}, {Value: "three"}}, Prefix: prefix}, nil
+			},
+			ApplyCompletion: func(_ context.Context, _ []string, _, _ int, item AutocompleteItem, _ string) ([]string, int, int, error) {
+				text := "/argtest " + item.Value
+				return []string{text}, 0, len(text), nil
+			},
+		}
+		p := newAsyncEditorProbe(t, provider)
+		p.editor.HandleInput("/argtest tw")
+		p.drain()
+		if p.editor.autocompleteCursor != 1 {
+			t.Fatalf("selection=%d, want two", p.editor.autocompleteCursor)
+		}
+		called := false
+		p.editor.AcceptAutocomplete(func(submit bool) {
+			called = true
+			if submit {
+				t.Error("argument completion submitted")
+			}
+		})
+		p.drain()
+		if !called || p.editor.Text() != "/argtest two" {
+			t.Fatalf("completion=%q called=%t", p.editor.Text(), called)
+		}
+	})
+}
+
+func TestAsyncAutocompleteProviderErrorIsVisible(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := newAsyncEditorProbe(t, &AsyncAutocompleteProvider{GetSuggestions: func(context.Context, []string, int, int, bool) (*AutocompleteSuggestions, error) {
+			return nil, errors.New("provider exploded")
+		}})
+		p.editor.HandleInput("/")
+		p.drain()
+		if len(p.errors) != 1 || p.errors[0].Error() != "provider exploded" {
+			t.Fatalf("errors=%v", p.errors)
+		}
+	})
+}
+
+// Pi editor.ts:2289-2299 asks the provider's optional shouldTriggerFileCompletion before a forced (Tab) request, with the editor lines and cursor, and starts no request when it returns false.
+func TestForcedAutocompleteAsksShouldTriggerFileCompletion(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			var queried []bool
+			var asked [][3]any
+			provider := &AsyncAutocompleteProvider{
+				GetSuggestions: func(_ context.Context, _ []string, _, _ int, force bool) (*AutocompleteSuggestions, error) {
+					queried = append(queried, force)
+					return nil, nil
+				},
+				ShouldTriggerFileCompletion: func(_ context.Context, lines []string, line, col int) (bool, error) {
+					asked = append(asked, [3]any{strings.Join(lines, "\n"), line, col})
+					return allow, nil
+				},
+			}
+			p := newAsyncEditorProbe(t, provider)
+			p.editor.HandleInput("src")
+			p.drain()
+			p.editor.HandleInput("\t")
+			p.drain()
+			if len(asked) != 1 || asked[0] != [3]any{"src", 0, 3} {
+				t.Fatalf("allow=%t: shouldTriggerFileCompletion calls=%v, want one with (src, 0, 3)", allow, asked)
+			}
+			if allow && (len(queried) != 1 || !queried[0]) {
+				t.Fatalf("allowed forced request queried=%v, want one forced query", queried)
+			}
+			if !allow && len(queried) != 0 {
+				t.Fatalf("rejected forced request still queried the provider: %v", queried)
+			}
+		})
+	}
+}

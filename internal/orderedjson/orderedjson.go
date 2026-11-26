@@ -1,0 +1,165 @@
+// Package orderedjson holds JSON objects that keep their keys in the order
+// they were read or set, the way a JavaScript object does. MCP schemas and
+// tool arguments cross the client unchanged, so their key order must survive
+// a merge such as `{...schema, type: "object"}`.
+package orderedjson
+
+import (
+	"bytes"
+	"cmp"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
+	"slices"
+
+	"github.com/MichaelKinsy/PiG/internal/jsonopts"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// Object is a JSON object with its keys in JavaScript enumeration order: the array-index keys ("0", "7", "42") in ascending order, then the other keys in insertion order.
+// Values stay raw, so numbers and nested objects keep their exact text.
+type Object struct {
+	keys []string
+	// indexKeys is the number of array-index keys at the front of keys.
+	indexKeys int
+	values    map[string]json.RawMessage
+}
+
+// New returns an empty object.
+func New() *Object { return &Object{values: map[string]json.RawMessage{}} }
+
+// Parse decodes data as a JSON object. It returns an error for any other JSON
+// value, including null.
+func Parse(data []byte) (*Object, error) {
+	o := New()
+	if err := o.UnmarshalJSON(data); err != nil {
+		return nil, err
+	}
+	return o, nil
+}
+
+// IsObject reports whether data is a JSON object.
+func IsObject(data []byte) bool {
+	data = bytes.TrimSpace(data)
+	return len(data) > 0 && data[0] == '{' && json.Valid(data)
+}
+
+// UnmarshalJSON reads an object and keeps its key order. A repeated key keeps
+// its first position and its last value, as JSON.parse does.
+func (o *Object) UnmarshalJSON(data []byte) error {
+	dec := jsontext.NewDecoder(bytes.NewReader(data), jsonopts.Parse)
+	token, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	if token.Kind() != '{' {
+		return errors.New("orderedjson: value is not an object")
+	}
+	o.keys, o.indexKeys, o.values = nil, 0, map[string]json.RawMessage{}
+	for dec.PeekKind() != '}' {
+		key, err := jsonopts.ReadName(dec) // the JavaScript key, not Token.String(): see jsonopts.ReadName
+		if err != nil {
+			return err
+		}
+		value, err := dec.ReadValue()
+		if err != nil {
+			return err
+		}
+		o.Set(key, json.RawMessage(bytes.Clone(value)))
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// MarshalJSON writes the keys in order.
+func (o *Object) MarshalJSON() ([]byte, error) {
+	if o == nil {
+		return []byte("null"), nil
+	}
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, key := range o.keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		name, err := jsstring.MarshalKeepingSurrogates(key) // a lone-surrogate key is held as WTF-8; json.Marshal would write three U+FFFD
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(name)
+		buf.WriteByte(':')
+		buf.Write(o.values[key])
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+// Len is the number of keys.
+func (o *Object) Len() int { return len(o.keys) }
+
+// Keys returns the keys in order.
+func (o *Object) Keys() []string { return append([]string(nil), o.keys...) }
+
+// Has reports whether key is present, even with a null value.
+func (o *Object) Has(key string) bool { _, ok := o.values[key]; return ok }
+
+// Get returns the raw value of key.
+func (o *Object) Get(key string) (json.RawMessage, bool) {
+	value, ok := o.values[key]
+	return value, ok
+}
+
+// Set replaces the value of an existing key in place or adds a new key: after the other keys, or among the array-index keys at its ascending place.
+func (o *Object) Set(key string, value json.RawMessage) {
+	if _, ok := o.values[key]; !ok {
+		if index, ok := arrayIndexKey(key); ok {
+			at, _ := slices.BinarySearchFunc(o.keys[:o.indexKeys], index, func(existing string, index uint64) int {
+				n, _ := arrayIndexKey(existing)
+				return cmp.Compare(n, index)
+			})
+			o.keys = slices.Insert(o.keys, at, key)
+			o.indexKeys++
+		} else {
+			o.keys = append(o.keys, key)
+		}
+	}
+	o.values[key] = value
+}
+
+// SetValue marshals value and sets it under key.
+func (o *Object) SetValue(key string, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	o.Set(key, raw)
+	return nil
+}
+
+// Delete removes key.
+func (o *Object) Delete(key string) {
+	if _, ok := o.values[key]; !ok {
+		return
+	}
+	delete(o.values, key)
+	for i, existing := range o.keys {
+		if existing == key {
+			o.keys = append(o.keys[:i], o.keys[i+1:]...)
+			if i < o.indexKeys {
+				o.indexKeys--
+			}
+			return
+		}
+	}
+}
+
+// Clone returns a copy that shares no key storage.
+func (o *Object) Clone() *Object {
+	c := New()
+	for _, key := range o.keys {
+		c.Set(key, o.values[key])
+	}
+	return c
+}

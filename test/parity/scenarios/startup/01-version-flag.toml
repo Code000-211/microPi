@@ -1,0 +1,33 @@
+# Behavior family: startup
+# Surface: executable entrypoint --version passthrough
+#
+# Upstream evidence (pi v0.69.0, current loop probe):
+#   command: pi --version
+#   raw upstream output:
+#     0.69.0
+#
+# This locks the cli.ts entrypoint contract to the strongest observable
+# available without entering the TUI: invoking the executable with
+# --version must hand argv through to main and exit immediately. pi prints
+# its bare version, and pig prints the same bytes: the pinned Pi package
+# version. PiG's own release is in `pig version`, not here.
+
+name = "01-version-flag"
+description = "pig --version prints exactly what pi --version prints (Pi's bare version), byte for byte, and exits immediately."
+covers = [
+  "packages/coding-agent/src/cli.ts",
+]
+tags = ["fast", "hermetic"]
+driver = "cli-mode"
+
+[cli]
+args = ["--version"]
+timeout_seconds = 15
+
+[assert]
+exit_code = 0
+output_equal = true
+both_match_regex = ["(?m)^{{UPSTREAM_VERSION}}$"]
+both_not_contain = ["panic:", "goroutine ", "Error:"]
+runtime_ratio_max = 0.25
+runs = 3

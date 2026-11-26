@@ -46,6 +46,22 @@ NPM_REGISTRY="${MICROPI_NPM_REGISTRY:-https://registry.npmjs.org}"
 
 main() {
 	set -eu
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		-h | --help)
+			printf 'Usage: install.sh [-y|--yes] [-h|--help]\n'
+			return 0
+			;;
+		-y | --yes)
+			MICROPI_YES=1
+			shift
+			;;
+		*)
+			printf 'error: unknown option: %s\nUsage: install.sh [-y|--yes] [-h|--help]\n' "$1" >&2
+			return 2
+			;;
+		esac
+	done
 	if [ "$(uname -s)" = Darwin ]; then PLATFORM=darwin; else PLATFORM=linux; fi
 	VERSION="${MICROPI_VERSION:-latest}"
 	INSTALL="${MICROPI_INSTALL:-$HOME/.micropi}"

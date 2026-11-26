@@ -1,0 +1,223 @@
+package export
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+)
+
+// Ports packages/coding-agent/test/export-html-skill-block.test.ts with the same source assertions.
+func TestExportHTMLSkillBlock(t *testing.T) {
+	js := mustReadAsset("assets/template.js")
+	for _, tc := range []struct {
+		name     string
+		patterns []string
+	}{
+		{"strips skill wrapper XML from user message rendering", []string{`parseSkillBlock`, `skillBlock\.userMessage`}},
+		{"renders skill invocation and user message as separate sibling blocks", []string{`skill-invocation`, `hasUserContent`}},
+		{"renders skill content as markdown, not raw text", []string{`safeMarkedParse\(skillBlock\.content\)`}},
+		{"shows skill name and user message in the sidebar tree", []string{`tree-role-skill`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, pattern := range tc.patterns {
+				if !regexp.MustCompile(pattern).MatchString(js) {
+					t.Errorf("missing %s", pattern)
+				}
+			}
+		})
+	}
+}
+
+// Ports packages/coding-agent/test/export-html-xss.test.ts with all nine cases and the same positive/negative assertions.
+func TestExportHTMLMarkdownSanitization(t *testing.T) {
+	js := mustReadAsset("assets/template.js")
+	for _, tc := range []struct {
+		name         string
+		want, reject []string
+	}{
+		{"link scheme allow-list", []string{`link\s*\(\s*token\s*\)`, `sanitizeMarkdownUrl\(token\.href\)`, `\^\(https\?\|mailto\|tel\|ftp\)`}, nil},
+		{"image scheme allow-list", []string{`image\s*\(\s*token\s*\)`, `sanitizeMarkdownUrl\(token\.href\)`}, nil},
+		{"C0 controls", []string{regexp.QuoteMeta(`replace(/[\x00-\x1f\x7f]/g, '')`)}, []string{`(?i)\^\\s\*\(javascript\|vbscript\|data\):`}},
+		{"href attributes", []string{`escapeHtml\(href\)`}, nil},
+		{"image mimeType attributes", []string{`escapeHtml\(img\.mimeType`}, []string{`\$\{img\.mimeType\}`}},
+		{"image data attributes", []string{`;base64,\$\{escapeHtml\(img\.data \|\| (?:''|"")\)\}"`}, []string{`;base64,\$\{img\.data\}"`}},
+		{"entry IDs", []string{`entry-\$\{escapeHtml\(entry\.id\)\}`, `data-entry-id="\$\{escapeHtml\(entryId\)\}"`}, []string{`id="\$\{entryId\}"`, `data-entry-id="\$\{entryId\}"`}},
+		{"tree metadata", []string{`\$\{escapeHtml\(msg\.toolName \|\| 'tool'\)\}`, `\$\{escapeHtml\(msg\.role\)\}`, `\$\{escapeHtml\(entry\.modelId\)\}`, `\$\{escapeHtml\(entry\.thinkingLevel\)\}`, `\$\{escapeHtml\(entry\.type\)\}`}, []string{`\[\$\{msg\.toolName \|\| 'tool'\}\]`, `\[\$\{msg\.role\}\]`, `\[model: \$\{entry\.modelId\}\]`, `\[thinking: \$\{entry\.thinkingLevel\}\]`, `\[\$\{entry\.type\}\]`}},
+		{"header models", []string{`\$\{escapeHtml\(globalStats\.models\.join\(', '\) \|\| 'unknown'\)\}`}, []string{`\$\{globalStats\.models\.join\(', '\) \|\| 'unknown'\}`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, pattern := range tc.want {
+				if !regexp.MustCompile(pattern).MatchString(js) {
+					t.Errorf("missing %s", pattern)
+				}
+			}
+			for _, pattern := range tc.reject {
+				if regexp.MustCompile(pattern).MatchString(js) {
+					t.Errorf("unsafe pattern %s", pattern)
+				}
+			}
+		})
+	}
+}
+
+// Ports packages/coding-agent/test/export-html-whitespace.test.ts: ANSI line boundaries carry no source whitespace.
+func TestAnsiLinesToHTMLNoSourceWhitespace(t *testing.T) {
+	got := ansiLinesToHTML([]string{"one", "two"})
+	want := `<div class="ansi-line">one</div><div class="ansi-line">two</div>`
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// Ports packages/coding-agent/test/export-html-whitespace.test.ts: trim the renderer's surrounding TUI spacing.
+func TestCustomToolResultHTMLTrimsSpacing(t *testing.T) {
+	tools := []extension.RegisteredTool{{Definition: extension.ToolDefinition{
+		Name: "custom", Label: "custom", Description: "custom",
+		RenderResult: func(extension.AgentToolResult, extension.ToolRenderResultOptions, extension.Theme, extension.ToolRenderContext) extension.Component {
+			return testComponent{lines: []string{"", "\x1b[31mone\x1b[0m", "two", ""}}
+		},
+	}}}
+	renderer := newToolHTMLRenderer(ToolRenderersOf(tools), "/tmp", 100)
+	got := renderer.renderResult("id", "custom", agent.AgentToolResult{})
+	want := `<div class="ansi-line"><span style="color:#800000">one</span></div><div class="ansi-line">two</div>`
+	if got.ResultHTMLExpanded != want || got.ResultHTMLCollapsed != "" {
+		t.Fatalf("got %+v, want only expanded %q", got, want)
+	}
+}
+
+// These are the reviewed upstream Pi source assets, not hashes of Pig's generated output.
+// Refresh from .upstream/current/packages/coding-agent/src/core/export-html with sha256sum when the upstream pin changes.
+func TestExportHTMLPinnedAssets(t *testing.T) {
+	for name, want := range map[string]string{
+		"template.html":                     "47d208235b066c856dae69c60281a3b99d164b99be9b81153d880375c9327105",
+		"template.css":                      "c9d26cc314336192021d604c0f1a4a63115172b24d03500571379f9172c06fc9",
+		"template.js":                       "f04404c88e557a24c84d3e938d9f6b0521e2127c68ba401cc328315e59719417",
+		"vendor/marked.min.js":              "438eedfcf932a414d0d0bfeea32dc365c063563b8ca713b4687fc8f8b501e5e4",
+		"vendor/marked-cjk-friendly.min.js": "93d2c938754cb24eef5b9ffecc268a98ef6beeb75dad614b0e874176aeeba565",
+		"vendor/highlight.min.js":           "837a6fa5b0c736b52bbde2b2b6190f305da3fc9ed41681db5321507057b5c846",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := fmt.Sprintf("%x", sha256.Sum256([]byte(mustReadAsset("assets/"+name))))
+			if got != want {
+				t.Fatalf("asset differs from pinned Pi: got %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestExportHTMLPayloadPreservesText(t *testing.T) {
+	// index.ts:161 encodes JSON.stringify, not HTML-escaped JSON, inside base64.
+	for _, text := range []string{"", "<skill> & </skill>", "line\u2028paragraph\u2029", `literal \u2028`} {
+		header := `{"type":"session","version":3,"id":"test","cwd":"/tmp"}`
+		sd, err := FromJSONL([]byte(header))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sd.SystemPrompt = &text
+		html := ToHTML(sd)
+		payload, err := base64.StdEncoding.DecodeString(extractSessionDataBase64(t, html))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `{"header":` + header + `,"entries":[],"leafId":null`
+		// JSON.stringify keeps a defined empty systemPrompt and omits only undefined.
+		quoted := strings.ReplaceAll(text, `\`, `\\`)
+		want += `,"systemPrompt":"` + quoted + `"`
+		want += `}`
+		if string(payload) != want {
+			t.Errorf("text %q: got %s, want %s", text, payload, want)
+		}
+	}
+}
+
+func TestExportHTMLRendering(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(input, []byte(`{"type":"session","version":3,"id":"test","cwd":"/tmp"}
+{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"ordinary"}}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := ExportFromFile(input, filepath.Join(dir, "out.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), "node", "testdata/render.cjs", output)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("export rendering: %v\n%s", err, output)
+	}
+}
+
+// Ports packages/coding-agent/test/export-html-system-messages.test.ts (Pi #11261): the template's system-message helpers.
+func TestExportHTMLSystemMessages(t *testing.T) {
+	template, err := filepath.Abs("assets/src/template.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.CommandContext(t.Context(), "node", "testdata/system_messages.cjs", template).CombinedOutput(); err != nil {
+		t.Fatalf("system message helpers: %v\n%s", err, output)
+	}
+}
+
+// Ports packages/coding-agent/test/export-html-deep-tree.test.ts (Pi #11225): a single-child chain deeper than the call stack.
+func TestExportHTMLDeepSessionTree(t *testing.T) {
+	const depth = 20_000
+	dir := t.TempDir()
+	var lines strings.Builder
+	fmt.Fprintf(&lines, `{"type":"session","version":3,"id":"deep-test","timestamp":"1970-01-01T00:00:00.000Z","cwd":%q}`+"\n", dir)
+	for i := range depth {
+		parent := "null"
+		if i > 0 {
+			parent = fmt.Sprintf(`"e%d"`, i-1)
+		}
+		fmt.Fprintf(&lines, `{"type":"message","id":"e%d","parentId":%s,"timestamp":%q,"message":{"role":"user","content":"x","timestamp":%d}}`+"\n",
+			i, parent, time.UnixMilli(int64(i)*1000).UTC().Format("2006-01-02T15:04:05.000Z"), i*1000)
+	}
+	input := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(input, []byte(lines.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := ExportFromFile(input, filepath.Join(dir, "out.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.CommandContext(t.Context(), "node", "testdata/deep_tree.cjs", output, fmt.Sprint(depth)).CombinedOutput(); err != nil {
+		t.Fatalf("deep session tree: %v\n%s", err, out)
+	}
+}
+
+func BenchmarkToHTML(b *testing.B) {
+	sd := SessionData{Header: json.RawMessage(`{"type":"session","version":3,"id":"bench","cwd":"/tmp"}`)}
+	for i := range 1000 {
+		sd.Entries = append(sd.Entries, json.RawMessage(fmt.Sprintf(`{"type":"message","id":"u%d","message":{"role":"user","content":"<skill name=\"review\" location=\"/skills/SKILL.md\">\nReview **code**.\n</skill>\n\nReview this change."}}`, i)))
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = ToHTML(sd)
+	}
+}
+
+func TestJsReplaceOnlyFirstOccurrence(t *testing.T) {
+	// packages/coding-agent/src/core/export-html/index.ts:164-177 uses non-global String.replace.
+	for _, replacement := range []string{"literal", "$$ $& $` $'"} {
+		got := jsReplace("before {{X}} after {{X}}", "{{X}}", replacement)
+		want := "before literal after {{X}}"
+		if strings.Contains(replacement, "$") {
+			want = "before $ {{X}} before   after {{X}} after {{X}}"
+		}
+		if got != want {
+			t.Errorf("replacement %q: got %q, want %q", replacement, got, want)
+		}
+	}
+}

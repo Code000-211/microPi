@@ -1,0 +1,72 @@
+// Type-check the upstream examples against the candidate API: the examples run unmodified (CONTRACT section 6), so every
+// export they use must have pi-durable's declaration. The reference is the FOLLOW pin's source mirror (`.upstream/current`, which
+// `make upstream-mirror` materializes and `make durable-core-host-check` runs first: packages/durable/src and test/examples at the Pi the facade's types come from), not the
+// corpus pin's checkout (durable/contract/PIN), which is older. The temporary tree is the reference's `packages/durable` with the
+// candidate's index.ts and storage modules over it; `@earendil-works/pi-durable` (the facade's type source) maps to the
+// reference's own index, so both sides of every type are one declaration tree.
+//
+//   node tools/check-examples-types.mjs [--keep]      DURABLE_EXAMPLES_PI_SOURCE names another reference checkout
+import { execFileSync } from "node:child_process"
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { dirname, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
+
+const cf = resolve(dirname(fileURLToPath(import.meta.url)), "..")
+const repo = resolve(cf, "..", "..", "..", "..")
+const pi = resolve(process.env.DURABLE_EXAMPLES_PI_SOURCE ?? join(repo, ".upstream", "current"))
+const durable = join(pi, "packages", "durable")
+if (!existsSync(join(durable, "src", "index.ts"))) { console.error(`reference checkout not found at ${pi}; run make upstream-mirror or set DURABLE_EXAMPLES_PI_SOURCE`); process.exit(2) }
+
+const work = mkdtempSync(join(tmpdir(), "durable-examples-types-"))
+cpSync(join(durable, "src"), join(work, "src"), { recursive: true })
+cpSync(join(durable, "test", "examples"), join(work, "test", "examples"), { recursive: true })
+// The mirror is read-only (mirror-upstream.sh chmod -R u-w) and cpSync keeps its modes; the temporary tree is ours to rewrite.
+execFileSync("chmod", ["-R", "u+w", work])
+renameSync(join(work, "src", "index.ts"), join(work, "src", "ref-index.ts"))
+const marks = { "@@FACADE@@": join(cf, "src", "facade"), "@@HOST@@": join(cf, "src") }
+const fill = text => Object.entries(marks).reduce((t, [k, v]) => t.replaceAll(k, v), text)
+writeFileSync(join(work, "src", "index.ts"), `export * from ${JSON.stringify(join(cf, "src", "facade", "index.ts"))}\nexport { MemoryStorage } from "./storage/memory.ts"\n`)
+for (const rel of ["storage/memory.ts", "storage/sqlite/node.ts", "storage/jsonl/node.ts"]) {
+	mkdirSync(dirname(join(work, "src", rel)), { recursive: true })
+	writeFileSync(join(work, "src", rel), fill(readFileSync(join(cf, "candidate", rel), "utf8")))
+}
+// Skip examples that durable/contract/corpus.toml marks pending (unported upstream features, e.g. v1.6.0 signals/parks):
+// every ready example must type-check against the facade.
+const pendingExamples = new Set()
+const corpusText = readFileSync(join(repo, "durable", "contract", "corpus.toml"), "utf8")
+for (const block of corpusText.split(/^\[\[scenario\]\]$/m).slice(1)) {
+	const src = /^source\s*=\s*"(packages\/durable\/test\/examples\/[^"]+)"/m.exec(block)?.[1]
+	const st = /^status\s*=\s*"([^"]+)"/m.exec(block)?.[1]
+	if (src && st === "pending") pendingExamples.add(src.slice("packages/durable/".length))
+}
+const examples = readdirSync(join(work, "test", "examples"))
+	.filter(f => f.endsWith(".ts") && !pendingExamples.has(`test/examples/${f}`))
+	.sort()
+	.map(f => `test/examples/${f}`)
+const modules = join(cf, "node_modules")
+symlinkSync(modules, join(work, "node_modules"))
+writeFileSync(join(work, "tsconfig.json"), JSON.stringify({
+	compilerOptions: {
+		target: "ES2024", module: "ESNext", moduleResolution: "Bundler", strict: true, noEmit: true, allowImportingTsExtensions: true, skipLibCheck: true,
+		types: ["node", "workers-types"], typeRoots: [join(modules, "@types"), join(modules, "@cloudflare")], lib: ["ES2024"],
+		paths: { "@earendil-works/pi-durable": [join(work, "src", "ref-index.ts")], "@earendil-works/pi-durable/*": [join(durable, "src", "*", "index.ts")],
+			// pi-schema is a dependency of the reference's own sources, not of the host: its source mirror.
+			"@earendil-works/pi-schema": [join(pi, "packages", "schema", "src", "index.ts")], "@earendil-works/pi-schema/formats": [join(pi, "packages", "schema", "src", "formats", "index.ts")] },
+	},
+	include: examples,
+}))
+let status = 0
+try {
+	execFileSync(join(modules, ".bin", "tsc"), ["-p", work], { stdio: "pipe", encoding: "utf8" })
+} catch (e) {
+	// Errors in the reference's own sources and in the host under check are reported; only the examples decide the exit status.
+	const lines = String(e.stdout).split("\n").filter(l => /error TS/.test(l))
+	const mine = lines.filter(l => l.includes("/test/examples/"))
+	console.log(lines.join("\n"))
+	console.log(`${mine.length} errors in the examples, ${lines.length - mine.length} elsewhere`)
+	status = mine.length ? 1 : 0
+}
+if (process.argv.includes("--keep")) console.log(work)
+else rmSync(work, { recursive: true, force: true })
+process.exitCode = status

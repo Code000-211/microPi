@@ -1,0 +1,442 @@
+package llama
+
+// pi: packages/coding-agent/src/extensions/llama/client.ts
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// Ports packages/coding-agent/test/llama-extension.test.ts client cases.
+
+// sseHub registers /models/sse responses and broadcasts events to them, like
+// the upstream test's `streams` set plus `send`.
+//
+// A stream joins streams when the goroutine serving its connection reaches
+// serve, at any time after the client wrote the request, and an event sent
+// before that reaches no stream. send therefore holds an event until a stream
+// has registered, so a test sees it however late its server goroutine runs.
+type sseHub struct {
+	mu         sync.Mutex
+	streams    map[http.ResponseWriter]chan string
+	joined     sync.Once
+	registered chan struct{} // closed when the first stream joins streams
+}
+
+func newSSEHub() *sseHub {
+	return &sseHub{streams: map[http.ResponseWriter]chan string{}, registered: make(chan struct{})}
+}
+
+func (h *sseHub) serve(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	w.(http.Flusher).Flush()
+	events := make(chan string, 16)
+	h.mu.Lock()
+	h.streams[w] = events
+	h.mu.Unlock()
+	h.joined.Do(func() { close(h.registered) })
+	defer func() {
+		h.mu.Lock()
+		delete(h.streams, w)
+		h.mu.Unlock()
+	}()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event := <-events:
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", event)
+			w.(http.Flusher).Flush()
+		}
+	}
+}
+
+// send broadcasts event to the registered streams once there is one. It
+// reports false when ctx ends first.
+func (h *sseHub) send(ctx context.Context, event any) bool {
+	select {
+	case <-h.registered:
+	case <-ctx.Done():
+		return false
+	}
+	data, _ := json.Marshal(event)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, events := range h.streams {
+		events <- string(data)
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func listen(t *testing.T, handler http.HandlerFunc) string {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		server.CloseClientConnections()
+		server.Close()
+	})
+	return server.URL
+}
+
+func TestNormalizeLlamaServerURL(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"http://127.0.0.1:9931/v1/", "http://127.0.0.1:9931"},
+		{"https://example.com/prefix/v1", "https://example.com/prefix"},
+		{"\thttp://HOST:80/\n", "http://host"},
+		{"http://host/a//v1", "http://host/a"},
+	}
+	for _, test := range cases {
+		got, err := NormalizeLlamaServerURL(test.input)
+		if err != nil || got != test.want {
+			t.Errorf("NormalizeLlamaServerURL(%q) = %q, %v; want %q", test.input, got, err, test.want)
+		}
+	}
+	if _, err := NormalizeLlamaServerURL("file:///tmp/llama"); err == nil || !strings.Contains(err.Error(), "http or https") {
+		t.Fatalf("file URL error = %v, want http or https", err)
+	}
+	if _, err := NormalizeLlamaServerURL("127.0.0.1:9931"); err == nil || err.Error() != "Invalid URL" {
+		t.Fatalf("schemeless URL error = %v, want Invalid URL", err)
+	}
+	if got, _ := LlamaInferenceURL("http://localhost:9931/v1"); got != "http://localhost:9931/v1" {
+		t.Fatalf("LlamaInferenceURL = %q", got)
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	cases := map[float64]string{
+		512:                                    "512 B",
+		1024:                                   "1.00 KiB",
+		1152:                                   "1.13 KiB", // 1.125 is an exact tie; toFixed rounds up.
+		10 * 1024:                              "10.0 KiB",
+		5 * 1024 * 1024:                        "5.00 MiB",
+		3.5 * 1024 * 1024 * 1024 * 1024 * 1024: "3584.0 TiB",
+	}
+	for input, want := range cases {
+		if got := FormatBytes(input); got != want {
+			t.Errorf("FormatBytes(%v) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestLoadAndWaitReportsSSEProgressAndWaitsForLoadedCatalogState(t *testing.T) {
+	// ctx only ends a hang when the stage report never comes; a passing run waits on nothing but the client's own poll.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	status := "unloaded"
+	hub := newSSEHub()
+	reported := make(chan struct{})
+	report := sync.OnceFunc(func() { close(reported) })
+	polled := make(chan struct{})
+	poll := sync.OnceFunc(func() { close(polled) })
+	url := listen(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/models/sse":
+			hub.serve(w, r)
+		case r.URL.Path == "/models/load" && r.Method == http.MethodPost:
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["model"] != "test-model" || r.Header.Get("Content-Type") != "application/json" {
+				t.Errorf("load body = %v, content type %q", body, r.Header.Get("Content-Type"))
+			}
+			mu.Lock()
+			status = "loading"
+			mu.Unlock()
+			writeJSON(w, map[string]any{"success": true})
+			go func() {
+				// The loading state is held until the client has reported its stage: the event goes out once the
+				// client is polling and the stream is registered, and the catalog says "loading" until the report
+				// has arrived.
+				select {
+				case <-polled:
+				case <-ctx.Done():
+					return
+				}
+				if !hub.send(ctx, map[string]any{"model": "test-model", "event": "status_change", "data": map[string]any{
+					"status":   "loading",
+					"progress": map[string]any{"stages": []string{"text_model", "mmproj_model"}, "current": "text_model", "value": 0.5},
+				}}) {
+					return
+				}
+				select {
+				case <-reported:
+				case <-ctx.Done():
+					return
+				}
+				mu.Lock()
+				status = "loaded"
+				mu.Unlock()
+				hub.send(ctx, map[string]any{"model": "test-model", "event": "status_change", "data": map[string]any{"status": "loaded"}})
+			}()
+		case r.URL.Path == "/models":
+			mu.Lock()
+			current := status
+			mu.Unlock()
+			poll()
+			writeJSON(w, map[string]any{"data": []any{map[string]any{"id": "test-model", "status": map[string]any{"value": current}}}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	client, err := NewLlamaClient(url, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress []LlamaProgress
+	model, err := client.LoadAndWait(ctx, "test-model", func(entry LlamaProgress) {
+		progress = append(progress, entry)
+		if entry.Message == "Loading text model" {
+			report()
+		}
+	})
+	if err != nil {
+		select {
+		case <-reported:
+		default:
+			if ctx.Err() != nil {
+				t.Fatalf("the client never reported the stage Loading text model (progress so far: %+v): %v", progress, err)
+			}
+		}
+		t.Fatalf("LoadAndWait: %v; progress = %+v", err, progress)
+	}
+	if model.Status.Value != LlamaModelStatusLoaded {
+		t.Fatalf("status = %q, want loaded", model.Status.Value)
+	}
+	index := slices.IndexFunc(progress, func(entry LlamaProgress) bool { return entry.Message == "Loading text model" })
+	if index < 0 {
+		t.Fatalf("progress = %+v, want Loading text model", progress)
+	}
+	if ratio := progress[index].Ratio; ratio == nil || *ratio != 0.25 {
+		t.Fatalf("stage ratio = %v, want 0.25", ratio)
+	}
+}
+
+func TestDownloadAndWaitReportsByteProgressAndReturnsRefreshedCatalog(t *testing.T) {
+	// ctx only ends a hang when the byte report never comes; a passing run waits on nothing but the client's own poll.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	half := 0.5
+	wantProgress := LlamaProgress{Message: "Downloading model", Ratio: &half, Detail: "512 B / 1.00 KiB", keys: progressRatioKey | progressDetailKey}
+	var mu sync.Mutex
+	status := "missing"
+	hub := newSSEHub()
+	reported := make(chan struct{})
+	report := sync.OnceFunc(func() { close(reported) })
+	polled := make(chan struct{})
+	poll := sync.OnceFunc(func() { close(polled) })
+	var reloadQueries []string
+	url := listen(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/models/sse":
+			hub.serve(w, r)
+		case r.URL.Path == "/models" && r.Method == http.MethodPost:
+			mu.Lock()
+			status = "downloading"
+			mu.Unlock()
+			writeJSON(w, map[string]any{"success": true})
+			go func() {
+				// The half-way state is held until the client has reported its bytes: the event goes out once the
+				// client is polling and the stream is registered, and the catalog says "downloading" until the
+				// byte report has arrived.
+				select {
+				case <-polled:
+				case <-ctx.Done():
+					return
+				}
+				if !hub.send(ctx, map[string]any{"model": "owner/repo:Q4_K_M", "event": "download_progress", "data": map[string]any{
+					"progress": map[string]any{"https://example/model.gguf": map[string]any{"done": 512, "total": 1024}},
+				}}) {
+					return
+				}
+				select {
+				case <-reported:
+				case <-ctx.Done():
+					return
+				}
+				mu.Lock()
+				status = "unloaded"
+				mu.Unlock()
+				hub.send(ctx, map[string]any{"model": "owner/repo:Q4_K_M", "event": "download_finished", "data": map[string]any{}})
+			}()
+		case strings.HasPrefix(r.URL.Path, "/models"):
+			mu.Lock()
+			current := status
+			reloadQueries = append(reloadQueries, r.URL.RawQuery)
+			mu.Unlock()
+			poll()
+			data := []any{}
+			if current != "missing" {
+				data = append(data, map[string]any{"id": "owner/repo:Q4_K_M", "status": map[string]any{"value": current}})
+			}
+			writeJSON(w, map[string]any{"data": data})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	client, err := NewLlamaClient(url, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress []LlamaProgress
+	models, err := client.DownloadAndWait(ctx, "owner/repo:Q4_K_M", func(entry LlamaProgress) {
+		progress = append(progress, entry)
+		if entry.Ratio != nil {
+			report()
+		}
+	})
+	if err != nil {
+		select {
+		case <-reported:
+		default:
+			if ctx.Err() != nil {
+				t.Fatalf("the client never reported the byte progress %s (progress so far: %+v): %v", wantProgress.Detail, progress, err)
+			}
+		}
+		t.Fatalf("DownloadAndWait: %v; progress = %+v", err, progress)
+	}
+	want := []LlamaModelInfo{{ID: "owner/repo:Q4_K_M", Status: LlamaModelInfoStatus{Value: LlamaModelStatusUnloaded}}}
+	if !reflect.DeepEqual(models, want) {
+		t.Fatalf("models = %+v, want %+v", models, want)
+	}
+	if !slices.ContainsFunc(progress, func(entry LlamaProgress) bool { return reflect.DeepEqual(entry, wantProgress) }) {
+		t.Fatalf("progress = %+v, want %+v", progress, wantProgress)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if last := reloadQueries[len(reloadQueries)-1]; last != "reload=1" {
+		t.Fatalf("final catalog query = %q, want reload=1", last)
+	}
+}
+
+func TestLoadAndWaitReportsExitCodeAndCancellation(t *testing.T) {
+	url := listen(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models/sse":
+			w.WriteHeader(http.StatusNotFound)
+		case "/models/load":
+			writeJSON(w, map[string]any{"success": true})
+		case "/models":
+			writeJSON(w, map[string]any{"data": []any{map[string]any{"id": "m", "status": map[string]any{"value": "unloaded", "failed": true, "exit_code": 3}}}})
+		}
+	})
+	client, _ := NewLlamaClient(url, "")
+	if _, err := client.LoadAndWait(context.Background(), "m", func(LlamaProgress) {}); err == nil || err.Error() != "Model exited with code 3" {
+		t.Fatalf("error = %v, want exit code 3", err)
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errors.New("Cancelled"))
+	if _, err := client.LoadAndWait(ctx, "m", func(LlamaProgress) {}); err == nil || err.Error() != "Cancelled" {
+		t.Fatalf("cancelled error = %v, want Cancelled", err)
+	}
+}
+
+func TestClientRequestErrorsMirrorFetch(t *testing.T) {
+	url := listen(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		switch r.URL.Path {
+		case "/models":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeJSON(w, map[string]any{"error": map[string]any{"message": "Loading model"}})
+		case "/props":
+			w.WriteHeader(http.StatusTeapot)
+		}
+	})
+	client, _ := NewLlamaClient(url, "secret")
+	if _, err := client.List(context.Background(), false); err == nil || err.Error() != "Loading model" {
+		t.Fatalf("list error = %v, want payload message", err)
+	}
+	if _, err := client.Props(context.Background(), ""); err == nil || err.Error() != "llama.cpp returned HTTP 418" {
+		t.Fatalf("props error = %v, want HTTP 418", err)
+	}
+
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closedURL := closed.URL
+	closed.Close()
+	offline, _ := NewLlamaClient(closedURL, "")
+	var failure *fetchError
+	// Pi ea0f49a36 (#11745, llama-extension.test.ts "names the server and the cause when it cannot be reached"): the error names the server and the transport
+	// error. Node's text is `connect ECONNREFUSED 127.0.0.1:<port>`; Go's is `dial tcp 127.0.0.1:<port>: connect: connection refused`.
+	_, err := offline.List(context.Background(), false)
+	host := strings.TrimPrefix(closedURL, "http://")
+	if want := "Could not reach llama.cpp server at " + closedURL + ": dial tcp " + host + ": connect: connection refused"; err == nil || err.Error() != want || !errors.As(err, &failure) {
+		t.Fatalf("connection error = %v, want %q wrapping the fetch error", err, want)
+	}
+	if _, err := offline.List(context.Background(), false); strings.Contains(err.Error(), "fetch failed") {
+		t.Fatalf("connection error %q still reads fetch failed", err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := offline.List(cancelled, false); err == nil || strings.Contains(err.Error(), "Could not reach") {
+		t.Fatalf("aborted request error = %v, want the abort rethrown unchanged", err)
+	}
+}
+
+func TestListRejectsCatalogsOutsideRouterMode(t *testing.T) {
+	payload := map[string]any{"data": []any{map[string]any{"id": "single"}}}
+	url := listen(t, func(w http.ResponseWriter, r *http.Request) { writeJSON(w, payload) })
+	client, _ := NewLlamaClient(url, "")
+	if _, err := client.List(context.Background(), false); err == nil || err.Error() != "Server is not running in llama.cpp router mode" {
+		t.Fatalf("error = %v", err)
+	}
+	payload = map[string]any{"object": "list"}
+	if _, err := client.List(context.Background(), false); err == nil || err.Error() != "llama.cpp returned an invalid model catalog" {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestDispatchFramesHandlesSplitAndMalformedEvents(t *testing.T) {
+	var events []LlamaModelEvent
+	var decoder utf8StreamDecoder
+	buffer := ""
+	for _, chunk := range []string{"\uFEFFdata: {\"model\":\"m\",\"event\":\"e\",\"data\":{\"x\":\"\xc3", "\xa9\"}}\r\n\r\ndata: nope\n\n", "data: {\"model\":1}\n\n"} {
+		buffer += strings.ReplaceAll(decoder.decode([]byte(chunk)), "\r\n", "\n")
+		buffer = dispatchFrames(buffer, func(event LlamaModelEvent) { events = append(events, event) })
+	}
+	if len(events) != 1 || events[0].Model != "m" || events[0].Event != "e" {
+		t.Fatalf("events = %+v", events)
+	}
+	if x, _ := stringField(events[0].Data, "x"); x != "é" {
+		t.Fatalf("split multibyte payload = %q", x)
+	}
+}
+
+// Pi ea0f49a36 (#11745): fetchServer also wraps the connection error of the models SSE request (`watch()`), naming the server and the cause; an aborted request
+// is rethrown unchanged.
+func TestWatchNamesTheServerAndTheCauseWhenTheSSEConnectionFails(t *testing.T) {
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closedURL := closed.URL
+	closed.Close()
+	offline, _ := NewLlamaClient(closedURL, "")
+	var failure *fetchError
+	err := offline.Watch(context.Background(), func(LlamaModelEvent) {})
+	host := strings.TrimPrefix(closedURL, "http://")
+	if want := "Could not reach llama.cpp server at " + closedURL + ": dial tcp " + host + ": connect: connection refused"; err == nil || err.Error() != want || !errors.As(err, &failure) {
+		t.Fatalf("watch error = %v, want %q wrapping the fetch error", err, want)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := offline.Watch(cancelled, func(LlamaModelEvent) {}); err == nil || strings.Contains(err.Error(), "Could not reach") {
+		t.Fatalf("aborted watch error = %v, want the abort rethrown unchanged", err)
+	}
+}

@@ -1,0 +1,393 @@
+package codingagent
+
+import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+
+	"github.com/MichaelKinsy/PiG/internal/lazyregexp"
+	"github.com/MichaelKinsy/PiG/internal/nodefs"
+	"github.com/MichaelKinsy/PiG/internal/resolvepath"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/frontmatter"
+)
+
+// PromptTemplate is one loaded `.md` file.
+type PromptTemplate struct {
+	Name         string // basename without .md
+	Description  string // from frontmatter, or first non-empty body line truncated to 60
+	ArgumentHint string // from frontmatter `argument-hint`, optional
+	Content      string // body (without frontmatter)
+	FilePath     string // absolute path on disk
+	Scope        string // "user" | "project" | "extra"
+	// SourceInfo is prompt-templates.ts PromptTemplate.sourceInfo, set by a resource loader from the resolved resource's metadata.
+	SourceInfo PiSourceInfo
+}
+
+// ─── Argument parsing ────────────────────────────────────────────────────────
+
+// ParsePromptArgs splits arguments using ECMAScript whitespace outside single- and double-quoted runs. A quote only opens a quoted
+// argument at the start of an argument, so an apostrophe inside a word stays text; a quote with no closing match is kept as text and the
+// rest is parsed normally. Inside a quoted argument a backslash before that argument's quote character gives a literal quote, and every
+// other backslash is kept as typed. Empty quoted strings are arguments.
+// Upstream: packages/coding-agent/src/core/prompt-templates.ts parseCommandArgs (Pi main 96667f342).
+func ParsePromptArgs(s string) []string {
+	runes := []rune(s)
+	args := make([]string, 0, 4)
+	var cur strings.Builder
+	var quote rune // 0 = not in quotes
+	// quoteStart is where the open quote started, so an unclosed quote can be re-read as literal text.
+	quoteStart := 0
+	// hasToken records that a token has started, so quoted empty strings ("" or '') are kept as arguments (Pi 9fe3f371).
+	hasToken := false
+	for i := 0; i < len(runes); i++ {
+		char := runes[i]
+		switch {
+		case quote != 0:
+			switch {
+			case char == '\\' && i+1 < len(runes) && runes[i+1] == quote:
+				// A backslash before the open quote's character keeps it as text: "say \"hi\"" gives say "hi".
+				cur.WriteRune(quote)
+				i++
+			case char == quote:
+				quote = 0
+			default:
+				cur.WriteRune(char)
+			}
+		case (char == '"' || char == '\'') && !hasToken:
+			// Quotes only open at the start of an argument, so apostrophes inside words stay literal.
+			quote = char
+			quoteStart = i
+			hasToken = true
+		case isJSWhitespace(char):
+			if hasToken {
+				args = append(args, cur.String())
+				cur.Reset()
+				hasToken = false
+			}
+		default:
+			cur.WriteRune(char)
+			hasToken = true
+		}
+		if quote != 0 && i == len(runes)-1 {
+			// Unclosed quote: keep the quote character as text and parse the rest normally (cur was empty when the quote opened,
+			// because quotes only open a new argument).
+			quote = 0
+			cur.Reset()
+			cur.WriteRune(runes[quoteStart])
+			i = quoteStart
+		}
+	}
+	if hasToken {
+		args = append(args, cur.String())
+	}
+	return args
+}
+
+// Pre-compiled substitution regexes. Mirrors upstream order:
+// 1. positional `$1`,`$2`,... (digit immediately after `$`)
+// 2. bash-style slice `${@:N}` and `${@:N:L}`
+// 3. `$ARGUMENTS` (alias)
+// 4. `$@`
+// Replacement happens on the template only: argument values are NOT
+// re-scanned for `$N` patterns. Upstream rationale (v0.69.0:55-66).
+var (
+	// reSubstitute matches, in one left-to-right non-overlapping pass:
+	//   ${N:-default} ${@:-default} ${ARGUMENTS:-default}  (g1 target, g2 default)
+	//   ${@:N} ${@:N:L}                                     (g3 start, g4 length)
+	//   $ARGUMENTS $@ $N                                    (g5 simple)
+	// A single pass matches upstream substituteArgs: inserted argument values
+	// are never re-scanned for further patterns.
+	reSubstitute = lazyregexp.New(`\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)`)
+)
+
+// SubstitutePromptArgs returns content with `$1`, `${1:-default}`, `${@:N:L}`,
+// `${@:-default}`, `$ARGUMENTS`, `$@` expanded against args. Mirrors upstream
+// `substituteArgs` (core/prompt-templates.ts). A `:-default` value is used when
+// the target arg is missing or empty. Substitution runs in a single pass, so
+// argument values are NOT re-scanned for `$N`/`$@`/`$ARGUMENTS` patterns.
+func SubstitutePromptArgs(content string, args []string) string {
+	allArgs := strings.Join(args, " ")
+	return reSubstitute.ReplaceAllStringFunc(content, func(match string) string {
+		m := reSubstitute.FindStringSubmatch(match)
+		defaultTarget, defaultValue := m[1], m[2]
+		sliceStart, sliceLength := m[3], m[4]
+		simple := m[5]
+
+		if defaultTarget != "" {
+			var value string
+			if defaultTarget == "@" || defaultTarget == "ARGUMENTS" {
+				value = allArgs
+			} else if n, err := strconv.Atoi(defaultTarget); err == nil && n >= 1 && n <= len(args) { //portlint:allow numbers the group is \d+ (ASCII digits in RE2 and JS): Atoi differs from parseInt only on overflow (error, saturated max vs a huge float), and both exceed len(args) and take the same out-of-range branch (node differential, 798 cases)
+				value = args[n-1]
+			}
+			if value == "" {
+				return defaultValue
+			}
+			return value
+		}
+
+		if sliceStart != "" {
+			//portlint:allow numbers the group is \d+ (ASCII digits in RE2 and JS): Atoi differs from parseInt only on overflow (error, saturated max vs a huge float), and both exceed len(args) and take the same out-of-range branch (node differential, 798 cases)
+			start, _ := strconv.Atoi(sliceStart)
+			start-- // 1-indexed -> 0-indexed
+			if start < 0 {
+				start = 0
+			}
+			if start >= len(args) {
+				return ""
+			}
+			if sliceLength != "" {
+				//portlint:allow numbers the group is \d+ (ASCII digits in RE2 and JS): Atoi differs from parseInt only on overflow (error, saturated max vs a huge float), and both exceed len(args) and take the same out-of-range branch (node differential, 798 cases)
+				length, _ := strconv.Atoi(sliceLength)
+				// args.slice(start, start + length): a length past the end (up to Atoi's saturated maximum) takes the rest without overflowing.
+				end := len(args)
+				if length < len(args)-start {
+					end = start + length
+				}
+				return strings.Join(args[start:end], " ")
+			}
+			return strings.Join(args[start:], " ")
+		}
+
+		if simple == "ARGUMENTS" || simple == "@" {
+			return allArgs
+		}
+		//portlint:allow numbers the group is \d+ (ASCII digits in RE2 and JS): Atoi differs from parseInt only on overflow (error, saturated max vs a huge float), and both exceed len(args) and take the same out-of-range branch (node differential, 798 cases)
+		if n, err := strconv.Atoi(simple); err == nil && n >= 1 && n <= len(args) {
+			return args[n-1]
+		}
+		return ""
+	})
+}
+
+// ─── Loader ──────────────────────────────────────────────────────────────────
+
+// LoadPromptTemplatesResult carries loaded commands and file-read or YAML warnings.
+type LoadPromptTemplatesResult struct {
+	Templates   []PromptTemplate
+	Diagnostics []extension.ResourceDiagnostic
+}
+
+// LoadPromptTemplatesOptions are upstream's LoadPromptTemplatesOptions.
+type LoadPromptTemplatesOptions struct {
+	// Cwd is the working directory for project-local templates.
+	Cwd string
+	// AgentDir is the agent config directory for global templates.
+	AgentDir string
+	// PromptPaths are explicit prompt template paths (files or directories).
+	PromptPaths []string
+	// IncludeDefaults includes the default prompt directories.
+	IncludeDefaults bool
+}
+
+// LoadPromptTemplatesFromOptions loads prompt templates from the global `<agentDir>/prompts/` and project `<cwd>/<config dir>/prompts/` directories when IncludeDefaults is set, then from the explicit paths. Every template is returned, the same name more than once: collisions belong to the resource loader.
+//
+// upstream: prompt-templates.ts:217-266 (loadPromptTemplates)
+func LoadPromptTemplatesFromOptions(options LoadPromptTemplatesOptions) LoadPromptTemplatesResult {
+	return loadPromptTemplates(options.Cwd, options.AgentDir, options.IncludeDefaults, options.IncludeDefaults, options.PromptPaths)
+}
+
+// LoadPromptTemplates loads the user and project prompt directories when the agent directory and the working directory are given, then the explicit paths, and keeps the first template of each name, reporting the others as collisions as the resource loader does ([DedupePromptTemplates]).
+func LoadPromptTemplates(cwd, agentDir string, extraPaths ...string) LoadPromptTemplatesResult {
+	loaded := loadPromptTemplates(cwd, agentDir, agentDir != "", cwd != "", extraPaths)
+	templates, collisions := DedupePromptTemplates(loaded.Templates)
+	return LoadPromptTemplatesResult{Templates: templates, Diagnostics: append(loaded.Diagnostics, collisions...)}
+}
+
+// DedupePromptTemplates keeps the first template of each name, in order, and reports each later one as a collision with the first.
+//
+// Ports packages/coding-agent/src/core/resource-loader.ts (dedupePrompts).
+// upstream: resource-loader.ts:1156-1181 (dedupePrompts)
+func DedupePromptTemplates(templates []PromptTemplate) ([]PromptTemplate, []extension.ResourceDiagnostic) {
+	var kept []PromptTemplate
+	var diagnostics []extension.ResourceDiagnostic
+	byName := make(map[string]PromptTemplate, len(templates))
+	for _, template := range templates {
+		if winner, seen := byName[template.Name]; seen {
+			diagnostics = append(diagnostics, extension.ResourceDiagnostic{
+				Type: "collision", Message: `name "/` + template.Name + `" collision`, Path: template.FilePath,
+				Collision: &extension.ResourceCollision{ResourceType: "prompt", Name: template.Name, WinnerPath: winner.FilePath, LoserPath: template.FilePath},
+			})
+			continue
+		}
+		byName[template.Name] = template
+		kept = append(kept, template)
+	}
+	return kept, diagnostics
+}
+
+func loadPromptTemplates(cwd, agentDir string, userDefaults, projectDefaults bool, promptPaths []string) LoadPromptTemplatesResult {
+	resolvedCwd, resolvedAgentDir := cwd, agentDir
+	if cwd != "" {
+		resolvedCwd, _ = resolvepath.Resolve(cwd, "")
+	}
+	if agentDir != "" {
+		resolvedAgentDir, _ = resolvepath.Resolve(agentDir, "")
+	}
+	var result LoadPromptTemplatesResult
+	add := func(loaded LoadPromptTemplatesResult) {
+		result.Templates = append(result.Templates, loaded.Templates...)
+		result.Diagnostics = append(result.Diagnostics, loaded.Diagnostics...)
+	}
+	globalPromptsDir := ""
+	if resolvedAgentDir != "" {
+		globalPromptsDir = filepath.Join(resolvedAgentDir, "prompts")
+	}
+	projectPromptsDir := ""
+	if resolvedCwd != "" {
+		projectPromptsDir = filepath.Join(resolvedCwd, ConfigDirName(), "prompts")
+	}
+	sources := promptSourceResolver{global: globalPromptsDir, project: projectPromptsDir}
+	if userDefaults && globalPromptsDir != "" {
+		add(loadTemplatesFromDir(globalPromptsDir, "user", sources))
+	}
+	if projectDefaults && projectPromptsDir != "" {
+		add(loadTemplatesFromDir(projectPromptsDir, "project", sources))
+	}
+	for _, rawPath := range promptPaths {
+		if rawPath == "" {
+			continue
+		}
+		path, err := resolvepath.ResolveTrimmed(rawPath, resolvedCwd)
+		if err != nil {
+			path = rawPath
+		}
+		add(loadTemplatesFromPath(path, "extra", sources))
+	}
+	return result
+}
+
+// promptSourceResolver is getSourceInfo of loadPromptTemplates: a path under the global prompts directory is a user resource, under the project prompts directory a project resource, and anything else a temporary resource based at its own directory.
+type promptSourceResolver struct{ global, project string }
+
+func (r promptSourceResolver) sourceInfo(path string) (PiSourceInfo, error) {
+	if r.global != "" && isUnderPath(path, r.global) {
+		return PiSourceInfo{Path: path, Source: "local", Scope: "user", Origin: "top-level", BaseDir: r.global}, nil
+	}
+	if r.project != "" && isUnderPath(path, r.project) {
+		return PiSourceInfo{Path: path, Source: "local", Scope: "project", Origin: "top-level", BaseDir: r.project}, nil
+	}
+	baseDir := filepath.Dir(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return PiSourceInfo{}, err
+	}
+	if info.IsDir() {
+		baseDir = path
+	}
+	return CreateSyntheticSourceInfo(path, SyntheticSourceInfoOptions{Source: "local", BaseDir: baseDir}), nil
+}
+
+func promptWarning(path string, err error) LoadPromptTemplatesResult {
+	return LoadPromptTemplatesResult{Diagnostics: []extension.ResourceDiagnostic{{Type: "warning", Message: err.Error(), Path: path}}}
+}
+
+func loadTemplatesFromPath(path, scope string, sources promptSourceResolver) LoadPromptTemplatesResult {
+	info, err := os.Stat(path)
+	if err != nil {
+		return LoadPromptTemplatesResult{}
+	}
+	if info.IsDir() {
+		return loadTemplatesFromDir(path, scope, sources)
+	}
+	if !info.Mode().IsRegular() || !strings.HasSuffix(path, ".md") {
+		return LoadPromptTemplatesResult{}
+	}
+	return loadTemplateFromFile(path, scope, sources)
+}
+
+func loadTemplatesFromDir(dir, scope string, sources promptSourceResolver) LoadPromptTemplatesResult {
+	var result LoadPromptTemplatesResult
+	entries, err := nodefs.ReadDir(dir)
+	if err != nil {
+		return result
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		// The entry type comes from the directory entry, as in Pi; only a symlink is stat'ed, and a name Node decoded no longer names its file.
+		_, isFile, ok := nodefs.EntryKind(dir, entry)
+		if !ok {
+			continue
+		}
+		if !isFile || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		// Pi resolves the source before it reads the file; a throw there (a path that no longer exists, such as a name Node decoded) ends the directory and keeps what was collected.
+		if _, err := sources.sourceInfo(path); err != nil {
+			return result
+		}
+		loaded := loadTemplateFromFile(path, scope, sources)
+		result.Templates = append(result.Templates, loaded.Templates...)
+		result.Diagnostics = append(result.Diagnostics, loaded.Diagnostics...)
+	}
+	return result
+}
+
+func parsePromptFrontmatter(content string) (map[string]any, string, error) {
+	doc := frontmatter.Parse(content)
+	return doc.Frontmatter, doc.Body, doc.Err
+}
+
+func loadTemplateFromFile(path, scope string, sources promptSourceResolver) LoadPromptTemplatesResult {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return LoadPromptTemplatesResult{Diagnostics: []extension.ResourceDiagnostic{{Type: "warning", Message: tools.NodeFSError(err, "open", path), Path: path}}}
+	}
+	fields, body, err := parsePromptFrontmatter(string(data))
+	if err != nil {
+		return promptWarning(path, err)
+	}
+	description, _ := fields["description"].(string)
+	if description == "" {
+		for line := range strings.SplitSeq(body, "\n") {
+			if jsTrim(line) != "" {
+				description = truncatePromptDescription(line)
+				break
+			}
+		}
+	}
+	hint, _ := fields["argument-hint"].(string)
+	source, err := sources.sourceInfo(path)
+	if err != nil {
+		return promptWarning(path, err)
+	}
+	return LoadPromptTemplatesResult{Templates: []PromptTemplate{{Name: strings.TrimSuffix(filepath.Base(path), ".md"), Description: description, ArgumentHint: hint, Content: body, FilePath: path, Scope: scope, SourceInfo: source}}}
+}
+
+// truncatePromptDescription is `line.slice(0, 60)` plus "..." when `line.length > 60`: both count UTF-16 code units.
+func truncatePromptDescription(line string) string {
+	if jsstring.Length(line) <= 60 {
+		return line
+	}
+	return jsstring.Slice(line, 0, 60) + "..."
+}
+
+// ─── Expansion ───────────────────────────────────────────────────────────────
+
+// ExpandPromptTemplate consumes a /name command separated from its arguments by ECMAScript whitespace. A matching template returns its expanded body and true; a non-command or unknown name returns an empty string and false.
+// Upstream: packages/coding-agent/src/core/prompt-templates.ts:318-334.
+func ExpandPromptTemplate(line string, templates []PromptTemplate) (string, bool) {
+	if !strings.HasPrefix(line, "/") {
+		return "", false
+	}
+	rest := line[1:]
+	var name, argsStr string
+	if i := strings.IndexFunc(rest, isJSWhitespace); i >= 0 {
+		name = rest[:i]
+		argsStr = strings.TrimLeftFunc(rest[i:], isJSWhitespace)
+	} else {
+		name = rest
+	}
+	for _, t := range templates {
+		if t.Name == name {
+			return SubstitutePromptArgs(t.Content, ParsePromptArgs(argsStr)), true
+		}
+	}
+	return "", false
+}

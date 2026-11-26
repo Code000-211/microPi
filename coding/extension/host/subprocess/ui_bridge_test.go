@@ -1,0 +1,2167 @@
+package subprocess
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+)
+
+// mockUIContext records calls for verification.
+type mockUIContext struct {
+	notifyCalls        []struct{ msg, kind string }
+	statusCalls        []struct{ key, text string }
+	titleCalls         []string
+	workingMsgCalls    []string
+	thinkingLabelCalls []string
+	pasteToEditorCalls []string
+	setEditorTextCalls []string
+	editorText         string
+	toolsExpanded      bool
+	footerCleared      bool
+	footerValue        any
+	footerCalls        []any
+	headerCleared      bool
+	headerCalls        []any
+	loginCalls         []extension.LoginDefinition
+	loginErr           error
+	editorCompCleared  bool
+	workingIndCalls    []any
+
+	selectResult  string
+	selectErr     error
+	confirmResult bool
+	confirmErr    error
+	inputResult   string
+	inputErr      error
+	editorResult  string
+	editorErr     error
+	themeResult   extension.SetThemeResult
+	theme         extension.Theme
+	namedTheme    extension.Theme
+	allThemes     []extension.ThemeMeta
+}
+
+func (m *mockUIContext) Notify(msg, kind string) {
+	m.notifyCalls = append(m.notifyCalls, struct{ msg, kind string }{msg, kind})
+}
+func (m *mockUIContext) SetStatus(key, text string) {
+	m.statusCalls = append(m.statusCalls, struct{ key, text string }{key, text})
+}
+func (m *mockUIContext) SetTitle(title string) { m.titleCalls = append(m.titleCalls, title) }
+func (m *mockUIContext) ClearWorkingMessage() {
+	m.workingMsgCalls = append(m.workingMsgCalls, "<default>")
+}
+func (m *mockUIContext) SetWorkingMessage(msg string) {
+	m.workingMsgCalls = append(m.workingMsgCalls, msg)
+}
+func (m *mockUIContext) SetWorkingVisible(bool) {}
+func (m *mockUIContext) ClearHiddenThinkingLabel() {
+	m.thinkingLabelCalls = append(m.thinkingLabelCalls, "<default>")
+}
+func (m *mockUIContext) SetHiddenThinkingLabel(label string) {
+	m.thinkingLabelCalls = append(m.thinkingLabelCalls, label)
+}
+func (m *mockUIContext) SetWorkingIndicator(opts extension.WorkingIndicatorOptions) {
+	m.workingIndCalls = append(m.workingIndCalls, opts)
+}
+func (m *mockUIContext) PasteToEditor(text string) {
+	m.pasteToEditorCalls = append(m.pasteToEditorCalls, text)
+}
+func (m *mockUIContext) SetEditorText(text string) {
+	m.setEditorTextCalls = append(m.setEditorTextCalls, text)
+}
+func (m *mockUIContext) GetEditorText() string { return m.editorText }
+func (m *mockUIContext) SetFooter(build extension.FooterFactory) {
+	factory := frameOf(build, 3)
+	m.footerValue = factory
+	m.footerCalls = append(m.footerCalls, factory)
+	if factory == nil {
+		m.footerCleared = true
+	}
+}
+func (m *mockUIContext) SetHeader(build extension.HeaderFactory) {
+	factory := frameOf(build, 2)
+	m.headerCalls = append(m.headerCalls, factory)
+	if lines, ok := factory.([]string); factory == nil || ok && len(lines) == 0 {
+		m.headerCleared = true
+	}
+}
+func (m *mockUIContext) SetLogin(definition extension.LoginDefinition) error {
+	m.loginCalls = append(m.loginCalls, definition)
+	return m.loginErr
+}
+func (m *mockUIContext) SetEditorComponent(factory extension.EditorFactory) {
+	if factory == nil {
+		m.editorCompCleared = true
+	}
+}
+func (m *mockUIContext) GetEditorComponent() extension.EditorFactory { return nil }
+func (m *mockUIContext) GetToolsExpanded() bool                      { return m.toolsExpanded }
+func (m *mockUIContext) SetToolsExpanded(expanded bool)              { m.toolsExpanded = expanded }
+func (m *mockUIContext) RunRemoteOverlay(extension.RemoteOverlayOptions, extension.RemoteOverlayHost, func(extension.RemoteOverlayHandle)) (any, bool) {
+	return nil, false
+}
+func (m *mockUIContext) OnRemoteTerminalInput(string, extension.RemoteTerminalInputHandler) func() {
+	return func() {}
+}
+func (m *mockUIContext) Select(_ context.Context, _ string, _ []string, _ extension.ExtensionUIDialogOptions) (string, error) {
+	return m.selectResult, m.selectErr
+}
+func (m *mockUIContext) Confirm(_ context.Context, _, _ string, _ extension.ExtensionUIDialogOptions) (bool, error) {
+	return m.confirmResult, m.confirmErr
+}
+func (m *mockUIContext) Input(_ context.Context, _, _ string, _ extension.ExtensionUIDialogOptions) (string, error) {
+	return m.inputResult, m.inputErr
+}
+func (m *mockUIContext) Editor(_ context.Context, _, _ string) (string, error) {
+	return m.editorResult, m.editorErr
+}
+func (m *mockUIContext) SetTheme(theme extension.ThemeSelection) extension.SetThemeResult {
+	return m.themeResult
+}
+func (m *mockUIContext) Theme() extension.Theme              { return m.theme }
+func (m *mockUIContext) GetAllThemes() []extension.ThemeMeta { return m.allThemes }
+func (m *mockUIContext) GetTheme(name string) (extension.Theme, error) {
+	if m.namedTheme == nil {
+		return nil, nil
+	}
+	return m.namedTheme, nil
+}
+func (m *mockUIContext) SetWidget(string, []string, *extension.ExtensionWidgetOptions) {}
+func (m *mockUIContext) SetWidgetFactory(string, extension.WidgetFactory, *extension.ExtensionWidgetOptions) {
+}
+func (m *mockUIContext) OnTerminalInput(extension.TerminalInputHandler) func() { return func() {} }
+func (m *mockUIContext) Custom(context.Context, extension.CustomFactory, *extension.CustomOptions) (any, error) {
+	return nil, nil
+}
+func (m *mockUIContext) AddAutocompleteProvider(extension.AutocompleteProviderFactory) error {
+	return nil
+}
+
+func newTestBridge(ui extension.UIContext) *UIBridge {
+	b := NewUIBridge(func() {})
+	b.SetUIContext(ui)
+	return b
+}
+
+func call(b *UIBridge, method, argsJSON string) (*CallResultPayload, error) {
+	return b.HandleCall("test-ext", &CallPayload{
+		Method: method,
+		Args:   json.RawMessage(argsJSON),
+	})
+}
+
+func TestUIBridge_HandleCall_Notify(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+	// notify uses notifyFunc if set
+	var notified struct{ msg, level string }
+	b.SetNotifyFunc(func(msg, level string) { notified.msg = msg; notified.level = level })
+
+	res, err := call(b, "ui.notify", `{"message":"hello","level":"warn"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("unexpected error: %s", res.Error.Message)
+	}
+	if notified.msg != "hello" || notified.level != "warn" {
+		t.Errorf("got notify(%q, %q), want (hello, warn)", notified.msg, notified.level)
+	}
+}
+
+// ExtensionUIContext.notify's type is optional (types.ts); an omitted one reaches the UI context empty, which shows it as info and which RPC writes without notifyType (rpc-mode.ts notify).
+func TestUIBridge_HandleCall_Notify_OmittedLevelStaysEmpty(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+	// No notifyFunc set: falls back to ui.Notify
+
+	_, err := call(b, "ui.notify", `{"message":"test"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.notifyCalls) != 1 || mock.notifyCalls[0].kind != "" {
+		t.Errorf("expected the omitted level to stay empty, got %+v", mock.notifyCalls)
+	}
+}
+
+func TestUIBridge_HandleCall_SetStatus(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+
+	res, err := call(b, "ui.setStatus", `{"key":"k","text":"v"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatal(res.Error.Message)
+	}
+	if len(mock.statusCalls) != 1 || mock.statusCalls[0].key != "k" || mock.statusCalls[0].text != "v" {
+		t.Errorf("unexpected: %+v", mock.statusCalls)
+	}
+}
+
+// TestUIBridge_HandleCall_SetStatus_BroadcastsStateChange mirrors upstream's
+// setExtensionStatus (interactive-mode.ts:2203-2205), which updates the
+// footer data provider and calls this.ui.requestRender() synchronously in
+// the same in-process runtime. A subprocess footer factory that reads
+// footerData.getExtensionStatuses() cannot observe that update on its own:
+// it only re-renders when the host pushes a fresh state_update. Before the
+// fix, ui.setStatus never notified the host to push one, so a footer
+// composed from getExtensionStatuses() (as in
+// test/parity/scenarios/extensions-runtime/testdata/ext/footer-status.mjs) could
+// go stale forever after the initial render, most visibly across /reload
+// (scenario 15-footer-status-reload-composition) where no other state
+// transition happens to trigger an incidental re-render.
+func TestUIBridge_HandleCall_SetStatus_BroadcastsStateChange(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+
+	var broadcasts int
+	b.OnStateChanged = func() { broadcasts++ }
+
+	if _, err := call(b, "ui.setStatus", `{"key":"k","text":"v"}`); err != nil {
+		t.Fatal(err)
+	}
+	if broadcasts != 1 {
+		t.Fatalf("OnStateChanged called %d times, want 1", broadcasts)
+	}
+}
+
+// pig additive (D107): SetFrontend reaches every snapshot as
+// StatePayload.frontend and pushes one state_update per change, never one for
+// a repeated value.
+func TestUIBridge_SetFrontendPushesTheFlagOncePerChange(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	t.Cleanup(b.StopFrontendPushes)
+	pushed := make(chan string, 8)
+	b.OnStateChanged = func() {
+		encoded, err := json.Marshal(map[string]any{"state": b.Snapshot(nil, 0, false)})
+		if err != nil {
+			t.Error(err)
+		}
+		pushed <- string(encoded)
+	}
+	next := func() string {
+		t.Helper()
+		select {
+		case got := <-pushed:
+			return got
+		case <-time.After(5 * time.Second):
+			t.Fatal("no state_update was pushed")
+			return ""
+		}
+	}
+	if b.Snapshot(nil, 0, false).Frontend {
+		t.Fatal("a bridge without a frontend reported one")
+	}
+	b.SetFrontend(true)
+	if got := next(); !strings.Contains(got, `"frontend":true`) {
+		t.Fatalf("state_update after SetFrontend(true) = %s", got)
+	}
+	b.SetFrontend(true)
+	b.SetFrontend(false)
+	if got := next(); strings.Contains(got, `"frontend"`) {
+		t.Fatalf("state_update after SetFrontend(false) = %s", got)
+	}
+	select {
+	case got := <-pushed:
+		t.Fatalf("a repeated value pushed state: %s", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestUIBridge_HandleCall_GetFlag(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{
+		GetFlag: func(extName, name string) any {
+			if extName == "test-ext" && name == "plan" {
+				return "auto"
+			}
+			return nil
+		},
+	})
+
+	res, err := call(b, "getFlag", `{"name":"plan"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["value"] != "auto" {
+		t.Fatalf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_SetTitle(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+
+	_, err := call(b, "ui.setTitle", `{"title":"my title"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.titleCalls) != 1 || mock.titleCalls[0] != "my title" {
+		t.Errorf("got %v", mock.titleCalls)
+	}
+}
+
+func TestUIBridge_HandleCall_SetWorkingMessage(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+
+	_, err := call(b, "ui.setWorkingMessage", `{"message":"loading..."}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.workingMsgCalls) != 1 || mock.workingMsgCalls[0] != "loading..." {
+		t.Errorf("got %v", mock.workingMsgCalls)
+	}
+}
+
+// Pi's setWorkingMessage(message?: string) shows `message ?? default` (interactive-mode.ts:2644): an absent or null message restores the default label and an
+// empty string is a message. The bridge must hand the UI that distinction.
+func TestUIBridge_HandleCall_SetWorkingMessageDistinguishesAbsentFromEmpty(t *testing.T) {
+	for _, tc := range []struct{ args, want string }{
+		{`{"message":""}`, ""},
+		{`{"message":"x"}`, "x"},
+		{`{}`, "<default>"},
+		{`{"message":null}`, "<default>"},
+	} {
+		mock := &mockUIContext{}
+		if _, err := call(newTestBridge(mock), "ui.setWorkingMessage", tc.args); err != nil {
+			t.Fatal(err)
+		}
+		if len(mock.workingMsgCalls) != 1 || mock.workingMsgCalls[0] != tc.want {
+			t.Errorf("%s reached the UI as %q, want one call %q", tc.args, mock.workingMsgCalls, tc.want)
+		}
+	}
+}
+
+// Pi's setHiddenThinkingLabel(label?: string) shows `label ?? defaultHiddenThinkingLabel` (interactive-mode.ts:2383): an absent or null label restores the default and an empty
+// string is a label. The bridge hands the UI that distinction, and a UIContext without the clearer receives the empty string for an absent label.
+func TestUIBridge_HandleCall_SetHiddenThinkingLabelDistinguishesAbsentFromEmpty(t *testing.T) {
+	for _, tc := range []struct{ args, want string }{
+		{`{"label":""}`, ""},
+		{`{"label":"x"}`, "x"},
+		{`{}`, "<default>"},
+		{`{"label":null}`, "<default>"},
+	} {
+		mock := &mockUIContext{}
+		if _, err := call(newTestBridge(mock), "ui.setHiddenThinkingLabel", tc.args); err != nil {
+			t.Fatal(err)
+		}
+		if len(mock.thinkingLabelCalls) != 1 || mock.thinkingLabelCalls[0] != tc.want {
+			t.Errorf("%s reached the UI as %q, want one call %q", tc.args, mock.thinkingLabelCalls, tc.want)
+		}
+	}
+	mock := &mockUIContext{}
+	if _, err := call(newTestBridge(plainWorkingUI{mock}), "ui.setHiddenThinkingLabel", `{}`); err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.thinkingLabelCalls) != 1 || mock.thinkingLabelCalls[0] != "" {
+		t.Errorf("an absent label reached a plain UIContext as %q, want one empty label", mock.thinkingLabelCalls)
+	}
+}
+
+// plainWorkingUI exposes only the UIContext interface, as a UIContext written before WorkingMessageClearer existed does: the mock's ClearWorkingMessage is hidden.
+type plainWorkingUI struct{ extension.UIContext }
+
+// A UIContext that does not implement WorkingMessageClearer keeps its old behavior: an absent message reaches it as the empty string.
+func TestUIBridge_HandleCall_SetWorkingMessageWithoutAClearerFallsBackToEmpty(t *testing.T) {
+	mock := &mockUIContext{}
+	if _, err := call(newTestBridge(plainWorkingUI{mock}), "ui.setWorkingMessage", `{}`); err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.workingMsgCalls) != 1 || mock.workingMsgCalls[0] != "" {
+		t.Errorf("an absent message reached a plain UIContext as %q, want one empty message", mock.workingMsgCalls)
+	}
+}
+
+func TestUIBridge_HandleCall_Select(t *testing.T) {
+	mock := &mockUIContext{selectResult: "b"}
+	b := newTestBridge(mock)
+
+	res, err := call(b, "ui.select", `{"title":"Pick","options":["a","b"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["selected"] != "b" || out["ok"] != true {
+		t.Errorf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_Select_Error(t *testing.T) {
+	mock := &mockUIContext{selectErr: errors.New("dialog failed")}
+	b := newTestBridge(mock)
+
+	res, _ := call(b, "ui.select", `{"title":"Pick","options":["a"]}`)
+	if res.Error == nil || res.Error.Code != "ui_error" || res.Error.Message != "dialog failed" {
+		t.Fatalf("expected specific UI error, got %+v", res)
+	}
+}
+
+func TestUIBridge_HandleCall_Select_Cancelled(t *testing.T) {
+	mock := &mockUIContext{selectErr: context.Canceled}
+	b := newTestBridge(mock)
+
+	res, _ := call(b, "ui.select", `{"title":"Pick","options":["a"]}`)
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["ok"] != false {
+		t.Errorf("expected ok=false, got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_Confirm(t *testing.T) {
+	mock := &mockUIContext{confirmResult: true}
+	b := newTestBridge(mock)
+
+	res, err := call(b, "ui.confirm", `{"title":"Sure?","message":"really?"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["confirmed"] != true {
+		t.Errorf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_Input(t *testing.T) {
+	mock := &mockUIContext{inputResult: "typed"}
+	b := newTestBridge(mock)
+
+	res, err := call(b, "ui.input", `{"title":"Name","placeholder":"enter"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["text"] != "typed" || out["ok"] != true {
+		t.Errorf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_Editor(t *testing.T) {
+	mock := &mockUIContext{editorResult: "edited text"}
+	b := newTestBridge(mock)
+
+	res, err := call(b, "ui.editor", `{"title":"Edit","prefill":"initial"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["text"] != "edited text" || out["ok"] != true {
+		t.Errorf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_UnknownMethod(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+
+	res, err := call(b, "nonexistent", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == nil || res.Error.Code != "unknown_method" {
+		t.Errorf("expected unknown_method error, got %+v", res.Error)
+	}
+}
+
+func TestUIBridge_HandleCall_GetEditorText(t *testing.T) {
+	mock := &mockUIContext{editorText: "current text"}
+	b := newTestBridge(mock)
+
+	res, err := call(b, "ui.getEditorText", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["text"] != "current text" {
+		t.Errorf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_SetEditorText(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+
+	_, err := call(b, "ui.setEditorText", `{"text":"new text"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.setEditorTextCalls) != 1 || mock.setEditorTextCalls[0] != "new text" {
+		t.Errorf("got %v", mock.setEditorTextCalls)
+	}
+}
+
+func TestUIBridge_HandleCall_PasteToEditor(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+
+	_, err := call(b, "ui.pasteToEditor", `{"text":"pasted"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.pasteToEditorCalls) != 1 || mock.pasteToEditorCalls[0] != "pasted" {
+		t.Errorf("got %v", mock.pasteToEditorCalls)
+	}
+}
+
+func TestUIBridge_HandleWidgetPush_ViaCall(t *testing.T) {
+	invalidated := false
+	b := NewUIBridge(func() { invalidated = true })
+	b.SetUIContext(&mockUIContext{})
+
+	b.HandleWidgetPush("ext1", nil, &WidgetPushPayload{Key: "w1", Lines: []string{"line1", "line2"}})
+
+	proxy := b.GetWidget("ext1", "w1")
+	if proxy == nil {
+		t.Fatal("expected proxy, got nil")
+	}
+	lines := proxy.Lines()
+	if len(lines) != 2 || lines[0] != "line1" {
+		t.Errorf("got %v", lines)
+	}
+	if !invalidated {
+		t.Error("expected invalidateTUI to be called")
+	}
+}
+
+// A widget pushed before replacing the interactive render callback uses the
+// live callback on later pushes, rather than retaining the previous callback.
+func TestUIBridge_WidgetPushedBeforeSetInvalidateUsesLiveCallback(t *testing.T) {
+	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
+	b.HandleWidgetPush("ext1", nil, &WidgetPushPayload{Key: "clock", Lines: []string{"12:00"}})
+
+	var renders atomic.Int32
+	b.SetInvalidate(func() { renders.Add(1) })
+	b.HandleWidgetPush("ext1", nil, &WidgetPushPayload{Key: "clock", Lines: []string{"12:01"}})
+	if got := renders.Load(); got != 1 {
+		t.Fatalf("update of an early widget requested %d renders, want 1", got)
+	}
+	b.GetWidget("ext1", "clock").Clear()
+	if got := renders.Load(); got != 2 {
+		t.Fatalf("clearing an early widget requested %d renders in total, want 2", got)
+	}
+}
+
+func TestUIBridge_ClearExtension_AllKeys(t *testing.T) {
+	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
+	b.HandleWidgetPush("ext1", nil, &WidgetPushPayload{Key: "a", Lines: []string{"x"}})
+	b.HandleWidgetPush("ext1", nil, &WidgetPushPayload{Key: "b", Lines: []string{"y"}})
+	b.HandleWidgetPush("ext2", nil, &WidgetPushPayload{Key: "c", Lines: []string{"z"}})
+
+	b.ClearExtension("ext1")
+
+	if b.GetWidget("ext1", "a") != nil || b.GetWidget("ext1", "b") != nil {
+		t.Error("ext1 widgets should be cleared")
+	}
+	if b.GetWidget("ext2", "c") == nil {
+		t.Error("ext2 widget should remain")
+	}
+}
+
+func TestUIBridge_SetUIContext(t *testing.T) {
+	b := NewUIBridge(func() {})
+	// Initially noop: SetTitle does nothing
+	_, _ = call(b, "ui.setTitle", `{"title":"x"}`)
+
+	mock := &mockUIContext{}
+	b.SetUIContext(mock)
+	_, _ = call(b, "ui.setTitle", `{"title":"y"}`)
+
+	if len(mock.titleCalls) != 1 || mock.titleCalls[0] != "y" {
+		t.Errorf("expected title after SetUIContext, got %v", mock.titleCalls)
+	}
+}
+
+func TestUIBridgeReplaysCurrentStateAcrossContextUpgrade(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	bridge.SetUIContext(&mockUIContext{})
+
+	if _, err := bridge.handleSetStatus(json.RawMessage(`{"key":"build","text":"ready"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.handleSetFooter("test-ext", nil, json.RawMessage(`{"lines":["footer"]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.handleSetHeader("test-ext", nil, json.RawMessage(`{"clear":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	current := &mockUIContext{}
+	bridge.SetUIContext(current)
+
+	if len(current.statusCalls) != 1 || current.statusCalls[0].text != "ready" {
+		t.Fatalf("status calls = %#v", current.statusCalls)
+	}
+	lines, ok := current.footerValue.([]string)
+	if !ok || len(lines) != 1 || lines[0] != "footer" {
+		t.Fatalf("footer = %#v", current.footerValue)
+	}
+	if !current.headerCleared {
+		t.Fatal("header clear was not replayed to replacement context")
+	}
+}
+
+func TestUIBridge_HandleCall_SetTheme(t *testing.T) {
+	mock := &mockUIContext{themeResult: extension.SetThemeResult{Success: true}}
+	b := newTestBridge(mock)
+
+	res, err := call(b, "ui.setTheme", `{"theme":"dark"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["success"] != true {
+		t.Errorf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_GetToolsExpanded(t *testing.T) {
+	mock := &mockUIContext{toolsExpanded: true}
+	b := newTestBridge(mock)
+
+	res, err := call(b, "ui.getToolsExpanded", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["expanded"] != true {
+		t.Errorf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_SetToolsExpanded(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+
+	_, err := call(b, "ui.setToolsExpanded", `{"expanded":true}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mock.toolsExpanded {
+		t.Error("expected toolsExpanded=true")
+	}
+}
+
+func TestUIBridge_HandleCall_SetWidget_Clear(t *testing.T) {
+	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
+	// First set a widget
+	_, _ = call(b, "ui.setWidget", `{"key":"w","lines":["a","b"]}`)
+	if b.GetWidget("test-ext", "w") == nil {
+		t.Fatal("widget should exist")
+	}
+	// Now clear it (lines=null)
+	_, _ = call(b, "ui.setWidget", `{"key":"w","lines":null}`)
+	if b.GetWidget("test-ext", "w") != nil {
+		t.Error("widget should be cleared")
+	}
+}
+
+// Pi: packages/coding-agent/src/core/extensions/types.ts:127 (ExtensionWidgetOptions.placement).
+func TestUIBridge_HandleCall_SetWidget_RequestObserverPreservesPlacement(t *testing.T) {
+	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
+	var key string
+	var lines []string
+	var placement string
+	var cachedUpdates int
+	b.SetWidgetSyncFunc(func(map[string]*PushProxy) { cachedUpdates++ })
+	b.SetWidgetRequestFunc(func(_ string, gotKey string, gotLines []string, opts *extension.ExtensionWidgetOptions) {
+		key = gotKey
+		lines = gotLines
+		if opts != nil {
+			placement = string(opts.Placement)
+		}
+	})
+	if _, err := call(b, "ui.setWidget", `{"key":"w","content":["a","b"],"options":{"placement":"belowEditor"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if key != "w" || !slices.Equal(lines, []string{"a", "b"}) || placement != "belowEditor" {
+		t.Fatalf("widget request = key:%q lines:%v placement:%q", key, lines, placement)
+	}
+	if cachedUpdates != 0 || b.GetWidget("test-ext", "w") != nil {
+		t.Fatal("serialized RPC widget request must not also publish a cached TUI widget")
+	}
+}
+
+// upstream: packages/coding-agent/src/core/extensions/types.ts:122-128 placement is "aboveEditor" (default) or "belowEditor".
+func TestUIBridge_HandleCall_SetWidget_PlacementOptions(t *testing.T) {
+	for _, tc := range []struct{ name, options, want string }{
+		{"absent options", ``, "aboveEditor"},
+		{"empty options", `,"options":{}`, "aboveEditor"},
+		{"above", `,"options":{"placement":"aboveEditor"}`, "aboveEditor"},
+		{"below", `,"options":{"placement":"belowEditor"}`, "belowEditor"},
+		{"unknown placement stays above", `,"options":{"placement":"sideways"}`, "aboveEditor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newTestBridge(&mockUIContext{})
+			if _, err := call(b, "ui.setWidget", `{"key":"w","content":["a"]`+tc.options+`}`); err != nil {
+				t.Fatal(err)
+			}
+			proxy := b.GetWidget("test-ext", "w")
+			if proxy == nil || proxy.placement != tc.want {
+				t.Fatalf("widget = %+v, want placement %q", proxy, tc.want)
+			}
+		})
+	}
+}
+
+func TestUIBridge_HandleCall_SendMessage_NotReady(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	// No actions set
+
+	res, err := call(b, "sendMessage", `{"message":{"role":"assistant","content":"hi"},"options":{}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == nil || res.Error.Code != "not_ready" {
+		t.Errorf("expected not_ready, got %+v", res.Error)
+	}
+}
+
+func TestUIBridge_HandleCall_SendMessage(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	var gotMsg extension.CustomMessageRef
+	var gotOpts SendMessageOptions
+	b.SetActions(&HostCallbacks{
+		SendMessage: func(msg extension.CustomMessageRef, opts SendMessageOptions) error {
+			gotMsg = msg
+			gotOpts = opts
+			return nil
+		},
+	})
+
+	res, err := call(b, "sendMessage", `{"message":{"customType":"notice","content":"hi","display":false,"details":{"a":1}},"options":{"triggerTurn":true,"deliverAs":"steer"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("unexpected error: %s", res.Error.Message)
+	}
+	if gotMsg.CustomType != "notice" || gotMsg.Content != "hi" || gotMsg.Display != false {
+		t.Fatalf("message = %+v", gotMsg)
+	}
+	if gotOpts.TriggerTurn == nil || !*gotOpts.TriggerTurn || gotOpts.DeliverAs != "steer" {
+		t.Fatalf("options = %+v", gotOpts)
+	}
+}
+
+func TestUIBridge_HandleCall_SendUserMessage(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	var gotContent any
+	var gotOpts SendUserMessageOptions
+	b.SetActions(&HostCallbacks{
+		SendUserMessage: func(content any, opts SendUserMessageOptions) error {
+			gotContent = content
+			gotOpts = opts
+			return nil
+		},
+	})
+
+	res, err := call(b, "sendUserMessage", `{"content":"hello","options":{"deliverAs":"followUp"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("unexpected error: %s", res.Error.Message)
+	}
+	if gotContent != "hello" || gotOpts.DeliverAs != "followUp" {
+		t.Fatalf("got content/options = %q/%+v", gotContent, gotOpts)
+	}
+}
+
+func TestUIBridge_HandleCall_AppendEntry(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	var gotType string
+	var gotData any
+	b.SetActions(&HostCallbacks{
+		AppendEntry: func(customType string, data any, _ *DirectEntryAppend) error {
+			gotType = customType
+			gotData = data
+			return nil
+		},
+	})
+
+	res, err := call(b, "appendEntry", `{"customType":"note","data":"hello"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("unexpected error: %s", res.Error.Message)
+	}
+	if gotType != "note" || gotData != "hello" {
+		t.Fatalf("got type/data = %q/%v", gotType, gotData)
+	}
+}
+
+func TestUIBridge_HandleCall_SetSessionNamePropagatesError(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{
+		SetSessionName: func(string) error { return errors.New("cannot set name") },
+	})
+
+	res, err := call(b, "setSessionName", `{"name":"work"}`)
+	if err == nil || !strings.Contains(err.Error(), "cannot set name") {
+		t.Fatalf("err = %v, result = %+v; want propagated setSessionName error", err, res)
+	}
+}
+
+func TestUIBridge_HandleCall_GetSessionName(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{
+		GetSessionName: func() string { return "my-session" },
+	})
+
+	res, err := call(b, "getSessionName", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["name"] != "my-session" {
+		t.Errorf("got %v", out)
+	}
+}
+
+func TestUIBridge_HandleCall_SetModel(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	var modelSet *ai.Model
+	b.SetActions(&HostCallbacks{
+		SetModel: func(_ context.Context, m *ai.Model) (bool, error) { modelSet = m; return true, nil },
+		ResolveModel: func(_ context.Context, spec string) (*ai.Model, error) {
+			if spec != "openai/gpt-4" {
+				return nil, errors.New("no model named " + spec)
+			}
+			return &ai.Model{ID: "gpt-4", ProviderMeta: ai.ProviderMetadata{ProviderID: "openai", API: ai.APIOpenAICompletions}, Capabilities: ai.ModelCapabilities{ContextWindow: 8192}}, nil
+		},
+	})
+
+	// The model object reaches the action with the members the extension left on it, including one no catalog has.
+	res, err := call(b, "setModel", `{"model":{"id":"gpt-4","name":"GPT 4","provider":"openai","api":"openai-completions","baseUrl":"http://127.0.0.1:9/v1","contextWindow":4321,"maxTokens":77}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out SetModelResult
+	_ = json.Unmarshal(res.Result, &out)
+	if !out.Success || modelSet == nil || modelSet.ID != "gpt-4" || modelSet.ProviderMeta.ProviderID != "openai" || modelSet.ProviderMeta.BaseURL != "http://127.0.0.1:9/v1" || modelSet.Capabilities.ContextWindow != 4321 || modelSet.Capabilities.MaxOutputTokens != 77 {
+		t.Errorf("got %+v, model=%+v", out, modelSet)
+	}
+
+	// The wire has one shape for a model: the name an SDK older than the object form sends is rejected, and no model is set.
+	modelSet = nil
+	for _, args := range []string{`{"model":"openai/gpt-4"}`, `{"model":null}`, `{}`, `{"model":{"provider":"openai"}}`, `{"model":{"type":"image","id":"i","provider":"openai"}}`} {
+		if res, err := call(b, "setModel", args); err == nil || modelSet != nil {
+			t.Errorf("setModel %s = %v, %v (model %v), want a rejection and no model set", args, res, err, modelSet)
+		}
+	}
+
+	// resolveModel answers the object of a name, or the error of building it as the result's error.
+	res, err = call(b, CallResolveModel, `{"spec":"openai/gpt-4"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resolved ResolveModelResult
+	_ = json.Unmarshal(res.Result, &resolved)
+	var object struct {
+		ID, Provider  string
+		ContextWindow int
+	}
+	_ = json.Unmarshal(resolved.Model, &object)
+	if resolved.Error != "" || object.ID != "gpt-4" || object.Provider != "openai" || object.ContextWindow != 8192 {
+		t.Errorf("resolveModel = %s (error %q)", resolved.Model, resolved.Error)
+	}
+	res, err = call(b, CallResolveModel, `{"spec":"nonesuch/x"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved = ResolveModelResult{}
+	_ = json.Unmarshal(res.Result, &resolved)
+	if resolved.Error != "no model named nonesuch/x" || len(resolved.Model) != 0 {
+		t.Errorf("resolveModel of an unknown name = %s (error %q), want the build error and no model", resolved.Model, resolved.Error)
+	}
+}
+
+func TestUIBridge_HandleCall_Custom_Unsupported(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+
+	// SDK Go/Rust extensions pass no key and are still treated as
+	// upstream-incompatible (factory closures can't cross a socket).
+	res, err := call(b, "ui.custom", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == nil || res.Error.Code != "unsupported" {
+		t.Errorf("expected unsupported, got %+v", res.Error)
+	}
+}
+
+func TestFocusedInputDeliveryFailureClosesOverlay(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	proxy := bridge.customOverlayProxy("ext", "focused")
+	target := &recordingRemoteOverlayHandle{closed: make(chan struct{})}
+	proxy.SetTarget(target)
+
+	bridge.sendCustomInput(t.Context(), "ext", nil, "focused", "x")
+	select {
+	case <-target.closed:
+	case <-time.After(time.Second):
+		t.Fatal("focused overlay remained open after input delivery failed")
+	}
+	if _, ok := target.result.(remoteOverlayError); !ok {
+		t.Fatalf("close result = %#v, want remoteOverlayError", target.result)
+	}
+}
+
+func TestRegisterExtConnPublishesBootstrapOnlyToNewConnection(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	bridge.SetHostAction("getModels", func() []json.RawMessage {
+		return modelJSONs(map[string]any{"provider": "test", "id": "model"})
+	})
+	oldHost, oldPeer := net.Pipe()
+	defer func() { _ = oldHost.Close() }()
+	defer func() { _ = oldPeer.Close() }()
+	oldConn := NewConn("old", oldHost)
+	bridge.RegisterExtConn("old", oldConn, true)
+	select {
+	case <-oldConn.outCh:
+	case <-time.After(time.Second):
+		t.Fatal("old connection did not receive its bootstrap catalog")
+	}
+
+	newHost, newPeer := net.Pipe()
+	defer func() { _ = newHost.Close() }()
+	defer func() { _ = newPeer.Close() }()
+	newConn := NewConn("new", newHost)
+	bridge.RegisterExtConn("new", newConn, true)
+	select {
+	case <-newConn.outCh:
+	case <-time.After(time.Second):
+		t.Fatal("new connection did not receive its bootstrap catalog")
+	}
+	select {
+	case <-oldConn.outCh:
+		t.Fatal("registering a new connection republished bootstrap state to an existing connection")
+	default:
+	}
+}
+
+// Building a catalog resolves every model's auth, so publishing to nobody is
+// pure startup cost: interactive startup publishes when it wires model
+// operations and again after refreshing catalogs, often with no extension
+// connected.
+func TestPublishModelCatalogBuildsNothingWithoutConnections(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	builds := 0
+	bridge.SetHostAction("getModels", func() []json.RawMessage {
+		builds++
+		return modelJSONs(map[string]any{"provider": "test", "id": "model"})
+	})
+	bridge.PublishModelCatalog()
+	bridge.PublishModelCatalog()
+	if builds != 0 {
+		t.Fatalf("catalog builds without connections = %d, want 0", builds)
+	}
+
+	host, peer := net.Pipe()
+	defer func() { _ = host.Close() }()
+	defer func() { _ = peer.Close() }()
+	conn := NewConn("ext", host)
+	bridge.RegisterExtConn("ext", conn, true)
+	<-conn.outCh
+	bridge.PublishModelCatalog()
+	select {
+	case <-conn.outCh:
+	case <-time.After(time.Second):
+		t.Fatal("connected extension did not receive the published catalog")
+	}
+	if builds != 2 {
+		t.Fatalf("catalog builds = %d, want bootstrap plus one publication", builds)
+	}
+}
+
+func TestFocusedReloadCleanupCannotCloseReplacementGeneration(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	oldHost, oldPeer := net.Pipe()
+	defer func() { _ = oldHost.Close() }()
+	defer func() { _ = oldPeer.Close() }()
+	newHost, newPeer := net.Pipe()
+	defer func() { _ = newHost.Close() }()
+	defer func() { _ = newPeer.Close() }()
+	oldConn := NewConn("old", oldHost)
+	newConn := NewConn("new", newHost)
+	bridge.RegisterExtConn("ext", oldConn, false)
+	oldTarget := &recordingRemoteOverlayHandle{closed: make(chan struct{})}
+	bridge.customOverlayProxyFor("ext", oldConn, "focused").SetTarget(oldTarget)
+	bridge.RegisterExtConn("ext", newConn, false)
+	newTarget := &recordingRemoteOverlayHandle{closed: make(chan struct{})}
+	bridge.customOverlayProxyFor("ext", newConn, "focused").SetTarget(newTarget)
+
+	bridge.ClearExtensionConn("ext", oldConn)
+	select {
+	case <-oldTarget.closed:
+	default:
+		t.Fatal("old focused generation remained open")
+	}
+	select {
+	case <-newTarget.closed:
+		t.Fatal("old cleanup closed the replacement focused generation")
+	default:
+	}
+	if bridge.extConns["ext"] != newConn {
+		t.Fatal("old cleanup removed the replacement connection")
+	}
+}
+
+type serialFocusedUI struct {
+	extension.UIContext
+	entered chan string
+	release chan struct{}
+}
+
+func (u *serialFocusedUI) Select(ctx context.Context, title string, _ []string, _ extension.ExtensionUIDialogOptions) (string, error) {
+	u.entered <- title
+	select {
+	case <-u.release:
+		return "selected", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (u *serialFocusedUI) RunRemoteOverlay(opts extension.RemoteOverlayOptions, _ extension.RemoteOverlayHost, onHandle func(extension.RemoteOverlayHandle)) (any, bool) {
+	onHandle(&capturingRemoteOverlayHandle{})
+	u.entered <- opts.Title
+	<-u.release
+	return opts.Title, true
+}
+
+// Pi 1.2.0 interactive-mode.ts:2966-3043: showExtensionCustom has no cross-call mutex. A second custom component, overlay or not, opens
+// while the first is shown and goes over it; none waits for another to close. Focus and input then follow the TUI's focus stack: the
+// component on top reads the keys, and focus returns to the one below when it closes (internal/codingagent ext_ui_custom_stack_test.go).
+func TestFocusedCustomComponentsStack(t *testing.T) {
+	ui := &serialFocusedUI{
+		UIContext: extension.NoopUIContext,
+		entered:   make(chan string, 3),
+		release:   make(chan struct{}, 3),
+	}
+	bridge := NewUIBridge(func() {})
+	bridge.SetUIContext(ui)
+	type outcome struct {
+		value any
+		err   error
+	}
+	open := func(key, title string, overlay bool) <-chan outcome {
+		done := make(chan outcome, 1)
+		args, err := json.Marshal(RemoteOverlayOpenPayload{Key: key, Title: title, Overlay: overlay})
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			result, err := bridge.handleCall(context.Background(), "ext", nil, &CallPayload{Method: CallUICustom, Args: args})
+			if err == nil && result.Error != nil {
+				err = result.Error.ToError()
+			}
+			var value any
+			if err == nil {
+				var decoded struct {
+					Result any `json:"result"`
+				}
+				err = json.Unmarshal(result.Result, &decoded)
+				value = decoded.Result
+			}
+			done <- outcome{value, err}
+		}()
+		return done
+	}
+	// Every component is released at the end, whatever the assertions found, so no call outlives the test.
+	var calls []<-chan outcome
+	defer func() {
+		for range calls {
+			ui.release <- struct{}{}
+		}
+	}()
+	for _, component := range []struct {
+		title   string
+		overlay bool
+	}{{"back", true}, {"middle", false}, {"front", true}} {
+		calls = append(calls, open("custom-"+component.title, component.title, component.overlay))
+		select {
+		case got := <-ui.entered:
+			if got != component.title {
+				t.Fatalf("custom component shown = %q, want %q", got, component.title)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("custom component %q waited for the one below it to close instead of opening over it", component.title)
+		}
+	}
+	for range calls {
+		ui.release <- struct{}{}
+	}
+	shown := map[any]bool{}
+	for _, call := range calls {
+		got := <-call
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		shown[got.value] = true
+	}
+	calls = nil
+	if !shown["back"] || !shown["middle"] || !shown["front"] {
+		t.Fatalf("custom results = %v, want back, middle and front", shown)
+	}
+}
+
+// dialogOverOverlayUI answers its selector on answer, apart from the custom component it releases on release.
+type dialogOverOverlayUI struct {
+	serialFocusedUI
+	answer chan struct{}
+}
+
+func (u *dialogOverOverlayUI) Select(ctx context.Context, title string, _ []string, _ extension.ExtensionUIDialogOptions) (string, error) {
+	u.entered <- title
+	select {
+	case <-u.answer:
+		return "selected", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// Pi 1.2.0 interactive-mode.ts:2690-2857: a dialog that opens while a focused custom component holds the terminal shows at once and takes
+// focus from it (this.ui.setFocus(dialog)); the TUI hands focus back to the component when the dialog closes (tui.ts:598-665). The bridge
+// opens the dialog without waiting for the component, and the component stays open, its call pending, until it closes itself.
+func TestInteractiveDialogOpensOverFocusedOverlay(t *testing.T) {
+	ui := &dialogOverOverlayUI{
+		UIContext: extension.NoopUIContext,
+		entered:   make(chan string, 2),
+		release:   make(chan struct{}, 1),
+		answer:    make(chan struct{}, 1),
+	}
+	bridge := NewUIBridge(func() {})
+	bridge.SetUIContext(ui)
+	customArgs, _ := json.Marshal(RemoteOverlayOpenPayload{Key: "custom-1", Title: "runner"})
+	customDone := make(chan struct{})
+	go func() {
+		_, _ = bridge.handleCall(context.Background(), "ext", nil, &CallPayload{Method: CallUICustom, Args: customArgs})
+		close(customDone)
+	}()
+	select {
+	case <-ui.entered:
+	case <-time.After(time.Second):
+		t.Fatal("focused overlay did not acquire focus")
+	}
+
+	selectArgs := json.RawMessage(`{"title":"selector","options":["selected"]}`)
+	selectDone := make(chan *CallResultPayload, 1)
+	go func() {
+		result, _ := bridge.handleCall(context.Background(), "other", nil, &CallPayload{Method: "ui.select", Args: selectArgs})
+		selectDone <- result
+	}()
+	select {
+	case got := <-ui.entered:
+		if got != "selector" {
+			t.Fatalf("dialog title = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("selector waited for the focused custom component instead of opening at once")
+	}
+	ui.answer <- struct{}{}
+	select {
+	case result := <-selectDone:
+		if result == nil || result.Error != nil {
+			t.Fatalf("selector result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("selector did not resolve")
+	}
+	select {
+	case <-customDone:
+		t.Fatal("the custom component closed with the dialog")
+	default:
+	}
+	ui.release <- struct{}{}
+	<-customDone
+}
+
+// Pi 1.2.0 interactive-mode.ts:2690-2857: an extension dialog never waits for another. A second dialog opens at once and
+// displaces the first, whose call stays pending, and an open dialog does not keep a focused overlay waiting.
+func TestInteractiveDialogsDoNotWaitForEachOther(t *testing.T) {
+	ui := &serialFocusedUI{
+		UIContext: extension.NoopUIContext,
+		entered:   make(chan string, 3),
+		release:   make(chan struct{}, 3),
+	}
+	bridge := NewUIBridge(func() {})
+	bridge.SetUIContext(ui)
+	open := func(method string, args json.RawMessage) <-chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			_, _ = bridge.handleCall(context.Background(), "ext", nil, &CallPayload{Method: method, Args: args})
+			close(done)
+		}()
+		return done
+	}
+	expect := func(want string) {
+		t.Helper()
+		select {
+		case got := <-ui.entered:
+			if got != want {
+				t.Fatalf("entered %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not open while another dialog was shown", want)
+		}
+	}
+	firstDone := open("ui.select", json.RawMessage(`{"title":"first","options":["a"]}`))
+	expect("first")
+	secondDone := open("ui.select", json.RawMessage(`{"title":"second","options":["b"]}`))
+	expect("second")
+	overlayArgs, _ := json.Marshal(RemoteOverlayOpenPayload{Key: "custom-1", Title: "overlay"})
+	overlayDone := open(CallUICustom, overlayArgs)
+	expect("overlay")
+	for range 3 {
+		ui.release <- struct{}{}
+	}
+	<-firstDone
+	<-secondDone
+	<-overlayDone
+}
+
+func TestFocusedLateFrameDoesNotRecreateCompletedOverlay(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	hostConn, peerConn := net.Pipe()
+	defer func() {
+		if err := hostConn.Close(); err != nil {
+			t.Errorf("close host connection: %v", err)
+		}
+	}()
+	defer func() {
+		if err := peerConn.Close(); err != nil {
+			t.Errorf("close peer connection: %v", err)
+		}
+	}()
+	owner := NewConn("ext", hostConn)
+	args, err := json.Marshal(RemoteOverlayOpenPayload{Key: "custom-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.reserveCustomOverlay("ext", owner, args)
+	bridge.unregisterCustomOverlay("ext", owner, "custom-1")
+
+	renderArgs, err := json.Marshal(RemoteOverlayRenderPayload{Key: "custom-1", Lines: []string{"late"}, Width: 80, Seq: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.HandleNotifyFrom("ext", owner, &NotifyPayload{Method: NotifyUICustomRender, Args: renderArgs})
+
+	bridge.mu.RLock()
+	remaining := len(bridge.customOverlays)
+	bridge.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("late frame recreated %d completed overlay entries", remaining)
+	}
+}
+
+func TestFocusedProxyRejectsSecondTarget(t *testing.T) {
+	proxy := newOverlayProxy()
+	first := &recordingRemoteOverlayHandle{closed: make(chan struct{})}
+	second := &recordingRemoteOverlayHandle{closed: make(chan struct{})}
+	proxy.SetTarget(first)
+	proxy.SetTarget(second)
+	select {
+	case <-second.closed:
+		if _, ok := second.result.(remoteOverlayError); !ok {
+			t.Fatalf("second target result = %#v", second.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second target was not rejected")
+	}
+	select {
+	case <-first.closed:
+		t.Fatal("rejecting second target closed the active target")
+	default:
+	}
+}
+
+func TestFocusedCloseBarrierIsIdempotent(t *testing.T) {
+	proxy := newOverlayProxy()
+	target := &recordingRemoteOverlayHandle{closed: make(chan struct{})}
+	proxy.SetTarget(target)
+	proxy.Close("first")
+	proxy.Close("second")
+	if target.result != "first" {
+		t.Fatalf("duplicate close replaced result with %#v", target.result)
+	}
+}
+
+func TestFocusedFrameRejectsStaleWidthAndSequence(t *testing.T) {
+	proxy := newOverlayProxy()
+	target := &capturingRemoteOverlayHandle{}
+	proxy.SetTarget(target)
+	proxy.UpdateFrame([]string{"current"}, 100, 2, 100)
+	proxy.UpdateFrame([]string{"old-sequence"}, 100, 1, 100)
+	proxy.UpdateFrame([]string{"old-width"}, 80, 3, 100)
+	if len(target.lines) != 1 || target.lines[0] != "current" {
+		t.Fatalf("accepted stale focused frame: %v", target.lines)
+	}
+}
+
+type capturingRemoteOverlayHandle struct {
+	lines []string
+}
+
+func (h *capturingRemoteOverlayHandle) UpdateLines(lines []string) {
+	h.lines = append([]string(nil), lines...)
+}
+func (*capturingRemoteOverlayHandle) Close(any) {}
+
+type recordingRemoteOverlayHandle struct {
+	result any
+	closed chan struct{}
+}
+
+func (*recordingRemoteOverlayHandle) UpdateLines([]string) {}
+func (h *recordingRemoteOverlayHandle) Close(result any) {
+	h.result = result
+	close(h.closed)
+}
+
+func TestUIBridgeClearExtensionRemovesWidgetsFromMountedSet(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	bridge.SetUIContext(&mockUIContext{})
+	counts := make(chan int, 2)
+	bridge.SetWidgetSyncFunc(func(widgets map[string]*PushProxy) { counts <- len(widgets) })
+	bridge.HandleWidgetPush("ext", nil, &WidgetPushPayload{Key: "status", Lines: []string{"ready"}})
+	bridge.ClearExtension("ext")
+	for _, want := range []int{1, 0} {
+		select {
+		case got := <-counts:
+			if got != want {
+				t.Fatalf("mounted widget count = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("mounted widget count %d was not published", want)
+		}
+	}
+}
+
+func TestUIBridge_HandleCall_SetFooter_Clear(t *testing.T) {
+	mock := &mockUIContext{}
+	b := newTestBridge(mock)
+
+	_, err := call(b, "ui.setFooter", `{"clear":true}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mock.footerCleared {
+		t.Error("expected footer to be cleared")
+	}
+}
+
+func TestUIBridgeReplaysBoundStatusAndFooterOnRebind(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	bridge.SetUIContext(&mockUIContext{})
+	if _, err := call(bridge, "ui.setStatus", `{"key":"startup","text":"ready"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := call(bridge, "ui.setFooter", `{"lines":["startup-footer"]}`); err != nil {
+		t.Fatal(err)
+	}
+	ui := &mockUIContext{}
+	bridge.SetUIContext(ui)
+	if len(ui.statusCalls) != 1 || ui.statusCalls[0].key != "startup" || ui.statusCalls[0].text != "ready" {
+		t.Fatalf("status replay = %+v", ui.statusCalls)
+	}
+	lines, ok := ui.footerValue.([]string)
+	if !ok || len(lines) != 1 || lines[0] != "startup-footer" {
+		t.Fatalf("footer replay = %#v", ui.footerValue)
+	}
+}
+
+func TestUIBridge_AllWidgets(t *testing.T) {
+	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
+	b.HandleWidgetPush("e1", nil, &WidgetPushPayload{Key: "a", Lines: []string{"1"}})
+	b.HandleWidgetPush("e2", nil, &WidgetPushPayload{Key: "b", Lines: []string{"2"}})
+
+	all := b.AllWidgets()
+	if len(all) != 2 {
+		t.Errorf("expected 2 widgets, got %d", len(all))
+	}
+}
+
+func TestUIBridge_SetUIContext_Nil(t *testing.T) {
+	b := NewUIBridge(func() {})
+	b.SetUIContext(nil)
+	// Should fall back to NoopUIContext, not panic
+	res, err := call(b, "ui.getEditorText", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %s", res.Error.Message)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Agent control bridge unit tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestUIBridge_IsIdle(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{IsIdle: func() bool { return true }})
+
+	res, err := call(b, "isIdle", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["idle"] != true {
+		t.Errorf("idle = %v, want true", out["idle"])
+	}
+}
+
+func TestUIBridge_Abort(t *testing.T) {
+	aborted := false
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{Abort: func() { aborted = true }})
+
+	res, err := call(b, "abort", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %s", res.Error.Message)
+	}
+	if !aborted {
+		t.Error("abort callback not called")
+	}
+}
+
+func TestUIBridge_HasPendingMessages(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{HasPendingMessages: func() bool { return true }})
+
+	res, err := call(b, "hasPendingMessages", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(res.Result, &out)
+	if out["pending"] != true {
+		t.Errorf("pending = %v, want true", out["pending"])
+	}
+}
+
+func TestUIBridge_Shutdown(t *testing.T) {
+	shutdown := false
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{Shutdown: func() { shutdown = true }})
+
+	_, err := call(b, "shutdown", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !shutdown {
+		t.Error("shutdown callback not called")
+	}
+}
+
+func TestUIBridge_Compact(t *testing.T) {
+	compacted := false
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{Compact: func(context.Context, *extension.CompactOptions) { compacted = true }})
+
+	_, err := call(b, "compact", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !compacted {
+		t.Error("compact callback not called")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Session control bridge unit tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestUIBridge_WaitForIdle(t *testing.T) {
+	waited := false
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{WaitForIdle: func(context.Context) error { waited = true; return nil }})
+
+	res, err := call(b, "waitForIdle", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %s", res.Error.Message)
+	}
+	if !waited {
+		t.Error("waitForIdle callback not called")
+	}
+}
+
+// runner.ts:383-387,557-562: a command context whose actions are not bound answers { cancelled: false } for newSession, fork, navigateTree and
+// switchSession, and a resolved no-op for reload, so the bridge never fails these calls with "not available".
+func TestUIBridge_UnboundSessionActionsAnswerLikePi(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	for _, tc := range []struct{ method, args, want string }{
+		{"newSession", `{}`, `{"cancelled":false}`},
+		{"fork", `{"entryId":"e1"}`, `{"cancelled":false}`},
+		{"navigateTree", `{"targetId":"e1"}`, `{"cancelled":false}`},
+		{"switchSession", `{"sessionPath":"/s.jsonl"}`, `{"cancelled":false}`},
+		{"reload", `{}`, ``},
+	} {
+		res, err := call(b, tc.method, tc.args)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.method, err)
+		}
+		if res.Error != nil || string(res.Result) != tc.want {
+			t.Errorf("%s = %+v, want result %q and no error", tc.method, res, tc.want)
+		}
+	}
+}
+
+func TestUIBridge_Fork(t *testing.T) {
+	forked := false
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{Fork: func(_ context.Context, entryID string, opts *extension.ForkOptions) (extension.CancelledResult, error) {
+		forked = true
+		return extension.CancelledResult{Cancelled: false}, nil
+	}})
+
+	res, err := call(b, "fork", `{"entryId":"e1"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %s", res.Error.Message)
+	}
+	if !forked {
+		t.Error("fork callback not called")
+	}
+}
+
+func TestUIBridge_NavigateTree(t *testing.T) {
+	navigated := false
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{NavigateTree: func(_ context.Context, targetID string, opts *extension.NavigateTreeOptions) (extension.CancelledResult, error) {
+		navigated = true
+		if targetID != "t1" {
+			t.Errorf("targetID = %q, want t1", targetID)
+		}
+		return extension.CancelledResult{Cancelled: false}, nil
+	}})
+
+	res, err := call(b, "navigateTree", `{"targetId":"t1","summarize":true}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %s", res.Error.Message)
+	}
+	if !navigated {
+		t.Error("navigateTree callback not called")
+	}
+}
+
+func TestUIBridge_SwitchSession(t *testing.T) {
+	switched := false
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{SwitchSession: func(_ context.Context, path string, opts *extension.SwitchSessionOptions) (extension.CancelledResult, error) {
+		switched = true
+		return extension.CancelledResult{Cancelled: false}, nil
+	}})
+
+	res, err := call(b, "switchSession", `{"sessionPath":"/tmp/s.jsonl"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %s", res.Error.Message)
+	}
+	if !switched {
+		t.Error("switchSession callback not called")
+	}
+}
+
+func TestUIBridge_Reload(t *testing.T) {
+	reloaded := false
+	b := newTestBridge(&mockUIContext{})
+	b.SetActions(&HostCallbacks{Reload: func(context.Context) error { reloaded = true; return nil }})
+
+	res, err := call(b, "reload", `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %s", res.Error.Message)
+	}
+	if !reloaded {
+		t.Error("reload callback not called")
+	}
+}
+
+// A theme reaches an extension as the structured object the host holds. The
+// ui.theme and ui.getTheme handlers used to render it with fmt.Sprintf("%v"),
+// which turns a theme struct into a Go debug string. Every SDK unmarshals the
+// result into an untyped value, so nothing failed: Go, Rust, and Python all
+// accepted "&{dark map[...]}" as a theme and could not read a single field
+// from it. The theme_change notify path always marshalled correctly, so the
+// same theme was structured when pushed and stringified when queried.
+func TestThemeQueriesReturnStructuredThemeNotDebugString(t *testing.T) {
+	type paletteTheme struct {
+		Name       string `json:"name"`
+		Background string `json:"background"`
+	}
+	current := paletteTheme{Name: "current", Background: "#101010"}
+	named := paletteTheme{Name: "solarized", Background: "#002b36"}
+	b := newTestBridge(&mockUIContext{theme: current, namedTheme: named})
+
+	for _, tc := range []struct {
+		method string
+		args   string
+		want   paletteTheme
+	}{
+		{method: "ui.theme", want: current},
+		{method: "ui.getTheme", args: `{"name":"solarized"}`, want: named},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			res, err := b.HandleCall("ext", &CallPayload{Method: tc.method, Args: json.RawMessage(tc.args)})
+			if err != nil {
+				t.Fatalf("%s: %v", tc.method, err)
+			}
+			if res.Error != nil {
+				t.Fatalf("%s: %+v", tc.method, res.Error)
+			}
+			var got struct {
+				Theme paletteTheme `json:"theme"`
+			}
+			if err := json.Unmarshal(res.Result, &got); err != nil {
+				t.Fatalf("%s returned a value no SDK can decode as a theme: %v (raw %s)", tc.method, err, res.Result)
+			}
+			if got.Theme != tc.want {
+				t.Errorf("%s theme = %+v, want %+v (raw %s)", tc.method, got.Theme, tc.want, res.Result)
+			}
+		})
+	}
+}
+
+func validLoginJSON(t *testing.T, name string) []byte {
+	t.Helper()
+	definition := extension.LoginDefinition{
+		Brand:       []string{strings.Repeat("A", 41), strings.Repeat("A", 41), strings.Repeat("A", 41), strings.Repeat("A", 41), strings.Repeat("A", 41)},
+		Hero:        slices.Repeat([]string{strings.Repeat("A", 32)}, 14),
+		Mascot:      []string{strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16), strings.Repeat("A", 16)},
+		Palette:     map[string]string{"A": "#112233"},
+		Name:        name,
+		Description: "description",
+		Tagline:     "tagline",
+	}
+	encoded, err := json.Marshal(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func TestUIBridgeSetLoginImmediate(t *testing.T) {
+	ui := &mockUIContext{}
+	bridge := newTestBridge(ui)
+	result, err := bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "immediate")})
+	if err != nil || result.Error != nil {
+		t.Fatalf("set login = (%+v, %v)", result, err)
+	}
+	if len(ui.loginCalls) != 1 || ui.loginCalls[0].Name != "immediate" {
+		t.Fatalf("login calls = %#v", ui.loginCalls)
+	}
+}
+
+func TestUIBridgeSetLoginPendingAppliesOnce(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	if result, err := bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "pending")}); err != nil || result.Error != nil {
+		t.Fatalf("set login = (%+v, %v)", result, err)
+	}
+	first := &mockUIContext{}
+	bridge.SetUIContext(first)
+	second := &mockUIContext{}
+	bridge.SetUIContext(second)
+	if len(first.loginCalls) != 1 || first.loginCalls[0].Name != "pending" {
+		t.Fatalf("first login calls = %#v", first.loginCalls)
+	}
+	if len(second.loginCalls) != 0 {
+		t.Fatalf("pending login applied more than once: %#v", second.loginCalls)
+	}
+}
+
+func TestUIBridgeLoginAndHeaderSharePendingSlot(t *testing.T) {
+	t.Run("login then header", func(t *testing.T) {
+		bridge := NewUIBridge(func() {})
+		_, _ = bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "login")})
+		_, _ = bridge.handleSetHeader("test-ext", nil, json.RawMessage(`{"lines":["header"]}`))
+		ui := &mockUIContext{}
+		bridge.SetUIContext(ui)
+		if len(ui.loginCalls) != 0 || len(ui.headerCalls) != 1 {
+			t.Fatalf("login calls = %d, header calls = %#v", len(ui.loginCalls), ui.headerCalls)
+		}
+	})
+	t.Run("header then login", func(t *testing.T) {
+		bridge := NewUIBridge(func() {})
+		_, _ = bridge.handleSetHeader("test-ext", nil, json.RawMessage(`{"lines":["header"]}`))
+		_, _ = bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "login")})
+		ui := &mockUIContext{}
+		bridge.SetUIContext(ui)
+		if len(ui.headerCalls) != 0 || len(ui.loginCalls) != 1 || ui.loginCalls[0].Name != "login" {
+			t.Fatalf("header calls = %#v, login calls = %#v", ui.headerCalls, ui.loginCalls)
+		}
+	})
+	t.Run("clear wins and restores default", func(t *testing.T) {
+		bridge := NewUIBridge(func() {})
+		_, _ = bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "login")})
+		_, _ = bridge.handleSetHeader("test-ext", nil, json.RawMessage(`{"clear":true}`))
+		ui := &mockUIContext{}
+		bridge.SetUIContext(ui)
+		if len(ui.loginCalls) != 0 || len(ui.headerCalls) != 1 || !ui.headerCleared {
+			t.Fatalf("header clear not applied: headers=%#v logins=%#v", ui.headerCalls, ui.loginCalls)
+		}
+	})
+}
+
+func TestUIBridgeSetLoginRejectsInvalidWithoutReplacingState(t *testing.T) {
+	cases := map[string][]byte{
+		"malformed":          []byte(`{"brand":`),
+		"duplicate palette":  []byte(strings.Replace(string(validLoginJSON(t, "valid")), `"palette":{"A":"#112233"}`, `"palette":{"A":"#112233","A":"#445566"}`, 1)),
+		"unknown field":      []byte(strings.Replace(string(validLoginJSON(t, "valid")), `"name":`, `"unknown":true,"name":`, 1)),
+		"invalid definition": []byte(strings.Replace(string(validLoginJSON(t, "valid")), strings.Repeat("A", 41), strings.Repeat("A", 40), 1)),
+	}
+	for name, invalid := range cases {
+		t.Run(name+" pending", func(t *testing.T) {
+			bridge := NewUIBridge(func() {})
+			_, _ = bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "preserved")})
+			result, err := bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: invalid})
+			if err != nil || result.Error == nil || result.Error.Code != "invalid_login" || result.Error.Message == "" {
+				t.Fatalf("invalid result = (%+v, %v)", result, err)
+			}
+			ui := &mockUIContext{}
+			bridge.SetUIContext(ui)
+			if len(ui.loginCalls) != 1 || ui.loginCalls[0].Name != "preserved" {
+				t.Fatalf("prior pending login not preserved: %#v", ui.loginCalls)
+			}
+		})
+	}
+
+	ui := &mockUIContext{}
+	bridge := newTestBridge(ui)
+	_, _ = bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "active")})
+	result, _ := bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: cases["invalid definition"]})
+	if result.Error == nil || len(ui.loginCalls) != 1 || ui.loginCalls[0].Name != "active" {
+		t.Fatalf("invalid login replaced active state: result=%+v calls=%#v", result, ui.loginCalls)
+	}
+}
+
+func TestUIBridgeSetLoginDefensivelyCopiesPendingData(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	raw := validLoginJSON(t, "original")
+	call := &CallPayload{Method: CallUISetLogin, Args: raw}
+	result, err := bridge.HandleCall("test-ext", call)
+	if err != nil || result.Error != nil {
+		t.Fatalf("set login = (%+v, %v)", result, err)
+	}
+	copy(raw, strings.Repeat(" ", len(raw)))
+	ui := &mockUIContext{}
+	bridge.SetUIContext(ui)
+	if len(ui.loginCalls) != 1 || ui.loginCalls[0].Name != "original" || ui.loginCalls[0].Palette["A"] != "#112233" {
+		t.Fatalf("pending login changed with call data: %#v", ui.loginCalls)
+	}
+}
+
+func TestUIBridgePendingLoginSurvivesUIApplyError(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	result, err := bridge.HandleCall("test-ext", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "pending")})
+	if err != nil || result.Error != nil {
+		t.Fatalf("set login = (%+v, %v)", result, err)
+	}
+
+	failing := &mockUIContext{loginErr: errors.New("render unavailable")}
+	bridge.SetUIContext(failing)
+	if len(failing.loginCalls) != 1 {
+		t.Fatalf("failing UI login calls = %#v", failing.loginCalls)
+	}
+
+	working := &mockUIContext{}
+	bridge.SetUIContext(working)
+	if len(working.loginCalls) != 1 || working.loginCalls[0].Name != "pending" {
+		t.Fatalf("pending login was lost after UI error: %#v", working.loginCalls)
+	}
+}
+
+// BindCommandActions exposes the session actions to subprocess extensions;
+// the flat wire arguments reach the bound action.
+// Pi: packages/coding-agent/src/core/extensions/types.ts:2208 (CommandActions.navigateTree).
+func TestUIBridge_BindCommandActionsNavigateTree(t *testing.T) {
+	b := NewUIBridge(func() {})
+	var gotTarget string
+	var gotOptions *extension.NavigateTreeOptions
+	b.BindCommandActions(extension.CommandActions{NavigateTree: func(target string, opts *extension.NavigateTreeOptions) (extension.CancelledResult, error) {
+		gotTarget, gotOptions = target, opts
+		return extension.CancelledResult{}, nil
+	}})
+	res, err := call(b, "navigateTree", `{"targetId":"entry-1","summarize":true,"customInstructions":"focus"}`)
+	if err != nil || res.Error != nil {
+		t.Fatalf("navigateTree = %+v, %v", res, err)
+	}
+	if gotTarget != "entry-1" || gotOptions == nil || !gotOptions.Summarize || gotOptions.CustomInstructions != "focus" {
+		t.Fatalf("bound action got %q %+v", gotTarget, gotOptions)
+	}
+}
+
+// waitNewerBlockedOrDone returns once the newer call has either completed or parked on a mutex inside fn (a function name in its stack). A correct bridge parks it behind the admitted older call, so the test never proceeds on a wall-clock guess that the newer call has reached the bridge. The deadline only bounds a hung test.
+func waitNewerBlockedOrDone(t *testing.T, done <-chan struct{}, fn string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	buf := make([]byte, 1<<20)
+	for time.Now().Before(deadline) {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		for g := range strings.SplitSeq(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+			header, _, _ := strings.Cut(g, "\n")
+			if strings.Contains(header, "Mutex.Lock") && strings.Contains(g, fn) {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("newer call neither completed nor blocked in %s", fn)
+}
+
+// blockingFooterUI holds the STALE footer inside SetFooter so a newer footer call can run while the older one is still applying.
+type blockingFooterUI struct {
+	*mockUIContext
+	mu      sync.Mutex
+	entered chan struct{}
+	release chan struct{}
+	applied []string
+}
+
+func (u *blockingFooterUI) SetFooter(build extension.FooterFactory) {
+	factory := frameOf(build, 3)
+	lines, _ := factory.([]string)
+	if len(lines) == 1 && lines[0] == "STALE" {
+		close(u.entered)
+		<-u.release
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.applied = append(u.applied, lines...)
+}
+
+// An admitted footer call must finish applying before a newer one applies, or the older call replaces the newer footer after it was admitted (53-extension-header-spacers race, footer slot).
+func TestUIBridgeFooterAdmissionAndApplyAreAtomic(t *testing.T) {
+	bridge := NewUIBridge(func() {})
+	ui := &blockingFooterUI{mockUIContext: &mockUIContext{}, entered: make(chan struct{}), release: make(chan struct{})}
+	bridge.SetUIContext(ui)
+	call := func(text string) {
+		args := json.RawMessage(`{"lines":["` + text + `"]}`)
+		if _, err := bridge.handleCall(context.Background(), "test-ext", nil, &CallPayload{Method: "ui.setFooter", Args: args}); err != nil {
+			t.Error(err)
+		}
+	}
+	var calls sync.WaitGroup
+	calls.Go(func() { call("STALE") })
+	<-ui.entered
+	newer := make(chan struct{})
+	calls.Go(func() { call("NEWER"); close(newer) })
+	// The newer call must wait for the admitted older call. If it completes first, the older call is about to overwrite it.
+	waitNewerBlockedOrDone(t, newer, "handleSetFooter")
+	close(ui.release)
+	calls.Wait()
+	ui.mu.Lock()
+	applied := slices.Clone(ui.applied)
+	ui.mu.Unlock()
+	if len(applied) == 0 || applied[len(applied)-1] != "NEWER" {
+		t.Fatalf("footer applications = %v, want NEWER last", applied)
+	}
+}
+
+// blockingReplayUI holds the replay of a pending STALE header or footer inside SetUIContext so a newer live call can run while the replay is still applying.
+type blockingReplayUI struct {
+	*mockUIContext
+	mu      sync.Mutex
+	entered chan struct{}
+	release chan struct{}
+	applied map[string][]string
+}
+
+func (u *blockingReplayUI) apply(slot string, factory any) {
+	lines, _ := factory.([]string)
+	if len(lines) == 1 && lines[0] == "STALE" {
+		close(u.entered)
+		<-u.release
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.applied[slot] = append(u.applied[slot], lines...)
+}
+
+func (u *blockingReplayUI) SetFooter(build extension.FooterFactory) {
+	factory := frameOf(build, 3)
+	u.apply("footer", factory)
+}
+func (u *blockingReplayUI) SetHeader(build extension.HeaderFactory) {
+	factory := frameOf(build, 2)
+	u.apply("header", factory)
+}
+
+// SetUIContext replays the header and footer onto a rebound UI. A live call that arrives during the replay must apply after it, or the replayed older value replaces the newer one (Pi applies setHeader/setFooter in program order, interactive-mode.ts:2427-2488).
+func TestUIBridgeSlotReplayAndLiveCallAreAtomic(t *testing.T) {
+	for _, tc := range []struct{ slot, method string }{
+		{"footer", "ui.setFooter"},
+		{"header", "ui.setHeader"},
+	} {
+		t.Run(tc.slot, func(t *testing.T) {
+			bridge := NewUIBridge(func() {})
+			call := func(text string) {
+				args := json.RawMessage(`{"lines":["` + text + `"]}`)
+				if _, err := bridge.handleCall(context.Background(), "test-ext", nil, &CallPayload{Method: tc.method, Args: args}); err != nil {
+					t.Error(err)
+				}
+			}
+			bridge.SetUIContext(&mockUIContext{})
+			call("STALE")
+			ui := &blockingReplayUI{mockUIContext: &mockUIContext{}, entered: make(chan struct{}), release: make(chan struct{}), applied: map[string][]string{}}
+			var calls sync.WaitGroup
+			calls.Go(func() { bridge.SetUIContext(ui) })
+			<-ui.entered
+			newer := make(chan struct{})
+			calls.Go(func() { call("NEWER"); close(newer) })
+			// The live call must wait for the replay. If it completes first, the replay is about to overwrite it.
+			waitNewerBlockedOrDone(t, newer, "handleSet"+strings.ToUpper(tc.slot[:1])+tc.slot[1:])
+			close(ui.release)
+			calls.Wait()
+			ui.mu.Lock()
+			applied := slices.Clone(ui.applied[tc.slot])
+			ui.mu.Unlock()
+			if len(applied) == 0 || applied[len(applied)-1] != "NEWER" {
+				t.Fatalf("%s applications = %v, want NEWER last", tc.slot, applied)
+			}
+		})
+	}
+}
+
+func TestUIBridgeSharedSurfacesRejectRetiredFrames(t *testing.T) {
+	for _, kind := range []string{"header", "footer"} {
+		t.Run(kind, func(t *testing.T) {
+			bridge := NewUIBridge(func() {})
+			ui := &mockUIContext{}
+			bridge.SetUIContext(ui)
+			call := func(extName, args string) {
+				t.Helper()
+				if _, err := bridge.HandleCall(extName, &CallPayload{Method: "ui.set" + strings.ToUpper(kind[:1]) + kind[1:], Args: json.RawMessage(args)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			current := func() any {
+				if kind == "header" {
+					return ui.headerCalls[len(ui.headerCalls)-1]
+				}
+				return ui.footerValue
+			}
+			call("old", `{"lines":["old"],"surfaceId":17}`)
+			call("new", `{"lines":["new"],"surfaceId":17}`)
+			call("old", `{"lines":["stale"],"surfaceId":17,"updateOnly":true}`)
+			if lines, _ := current().([]string); !slices.Equal(lines, []string{"new"}) {
+				t.Fatalf("retired extension replaced current surface: %v", current())
+			}
+			call("new", `{"lines":["resized"],"surfaceId":17,"updateOnly":true}`)
+			if lines, _ := current().([]string); !slices.Equal(lines, []string{"resized"}) {
+				t.Fatalf("current frame did not apply: %v", current())
+			}
+			call("old", `{"lines":["replacement"],"surfaceId":18}`)
+			call("old", `{"lines":["stale generation"],"surfaceId":17,"updateOnly":true}`)
+			if lines, _ := current().([]string); !slices.Equal(lines, []string{"replacement"}) {
+				t.Fatalf("retired generation replaced current surface: %v", current())
+			}
+			call("new", `{"clear":true}`)
+			call("old", `{"lines":["resurrected"],"surfaceId":18,"updateOnly":true}`)
+			rebound := &mockUIContext{}
+			bridge.SetUIContext(rebound)
+			if kind == "header" && !rebound.headerCleared || kind == "footer" && !rebound.footerCleared {
+				t.Fatalf("retired surface revived after clear and rebind: %#v", rebound)
+			}
+		})
+	}
+}
+
+func TestUIBridgeSurfaceReplacementRetiresPreviousComponent(t *testing.T) {
+	for _, method := range []string{"ui.setHeader", "ui.setFooter"} {
+		t.Run(method, func(t *testing.T) {
+			host, peer := net.Pipe()
+			conn := NewConn("ext", host)
+			t.Cleanup(func() { _ = host.Close(); _ = peer.Close() })
+			bridge := newTestBridge(&mockUIContext{})
+			args := json.RawMessage(`{"lines":["old"],"surfaceId":17}`)
+			if _, err := bridge.handleCall(context.Background(), "ext", conn, &CallPayload{Method: method, Args: args}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := bridge.handleCall(context.Background(), "ext", nil, &CallPayload{Method: method, Args: args}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case frame := <-conn.outCh:
+				var env Envelope
+				if err := json.Unmarshal(frame.payloadBytes(), &env); err != nil {
+					t.Fatal(err)
+				}
+				want := `{"kind":"` + strings.ToLower(strings.TrimPrefix(method, "ui.set")) + `","surfaceId":17}`
+				if env.Type != MsgNotify || env.Notify == nil || env.Notify.Method != "ui.surface_retired" || string(env.Notify.Args) != want {
+					t.Fatalf("retirement notification = %+v, want %s", env, want)
+				}
+			default:
+				t.Fatal("replacing a connection did not retire its component")
+			}
+		})
+	}
+}
+
+func TestUIBridgeSurfaceClearAndEmptyFrameSurviveRebind(t *testing.T) {
+	for _, method := range []string{"ui.setHeader", "ui.setFooter"} {
+		t.Run(method, func(t *testing.T) {
+			bridge := newTestBridge(&mockUIContext{})
+			for _, clear := range []bool{false, true} {
+				args := json.RawMessage(fmt.Sprintf(`{"lines":[],"width":73,"clear":%t}`, clear))
+				if _, err := bridge.HandleCall("ext", &CallPayload{Method: method, Args: args}); err != nil {
+					t.Fatal(err)
+				}
+				ui := &mockUIContext{}
+				bridge.SetUIContext(ui)
+				var got = ui.footerValue
+				if method == "ui.setHeader" {
+					if len(ui.headerCalls) == 0 {
+						t.Fatal("header was not replayed")
+					}
+					got = ui.headerCalls[len(ui.headerCalls)-1]
+				}
+				if (got == nil) != clear {
+					t.Fatalf("rebound surface = %#v, clear = %v", got, clear)
+				}
+			}
+		})
+	}
+}
+
+func TestUIBridgeLoginRetiresHeaderOnlyWhenAccepted(t *testing.T) {
+	for _, rejected := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rejected=%v", rejected), func(t *testing.T) {
+			ui := &mockUIContext{}
+			if rejected {
+				ui.loginErr = errors.New("login unavailable")
+			}
+			bridge := newTestBridge(ui)
+			_, _ = bridge.HandleCall("header", &CallPayload{Method: "ui.setHeader", Args: json.RawMessage(`{"lines":["header"],"surfaceId":17}`)})
+			_, _ = bridge.HandleCall("login", &CallPayload{Method: CallUISetLogin, Args: validLoginJSON(t, "login")})
+			_, _ = bridge.HandleCall("header", &CallPayload{Method: "ui.setHeader", Args: json.RawMessage(`{"lines":["updated"],"surfaceId":17,"updateOnly":true}`)})
+			want := 1
+			if rejected {
+				want = 2
+			}
+			if got := len(ui.headerCalls); got != want {
+				t.Fatalf("header calls = %#v, rejected = %v", ui.headerCalls, rejected)
+			}
+		})
+	}
+}
+
+// pig additive (D107): SetFrontend's state_update runs on the bridge's owned
+// worker. StopFrontendPushes, which Host.Shutdown calls, waits for a push in
+// flight, and a change after it updates the flag without pushing.
+func TestUIBridge_StopFrontendPushesJoinsTheWorker(t *testing.T) {
+	b := newTestBridge(&mockUIContext{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var pushes atomic.Int32
+	b.OnStateChanged = func() {
+		if pushes.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+	b.SetFrontend(true)
+	<-entered
+	stopped := make(chan struct{})
+	go func() {
+		b.StopFrontendPushes()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("StopFrontendPushes returned while a push was in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopFrontendPushes did not return after the push finished")
+	}
+	b.SetFrontend(false)
+	if b.Snapshot(nil, 0, false).Frontend {
+		t.Fatal("SetFrontend(false) after stop left the flag set")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := pushes.Load(); got != 1 {
+		t.Fatalf("pushes = %d, want only the one before stop", got)
+	}
+}
+
+// Pi's RPC mode forwards setWidget for undefined and string arrays only and never runs a component factory (packages/coding-agent/src/modes/rpc/rpc-mode.ts
+// setWidget). A frame a Node component rendered at a width reaches the host as lines with a width; the request observer must not forward it, while a string
+// list and a clear still go through.
+func TestUIBridge_HandleCall_SetWidget_RequestObserverDropsRenderedFrames(t *testing.T) {
+	b := NewUIBridge(func() {})
+	b.SetUIContext(&mockUIContext{})
+	var got []string
+	b.SetWidgetRequestFunc(func(_ string, key string, lines []string, _ *extension.ExtensionWidgetOptions) {
+		got = append(got, key+":"+strings.Join(lines, ",")+":"+fmt.Sprint(lines == nil))
+	})
+	for _, args := range []string{
+		`{"key":"frame","content":["RENDERED"],"width":80}`,
+		`{"key":"text","content":["plain"]}`,
+		`{"key":"frame","content":null}`,
+	} {
+		if _, err := call(b, "ui.setWidget", args); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"text:plain:false", "frame::true"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("forwarded %q, want %q", got, want)
+	}
+}

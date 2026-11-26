@@ -1,0 +1,486 @@
+//go:build parity
+
+// Package runner walks test/parity/scenarios/**/*.toml and runs each scenario
+// against both pig and upstream pi, asserting they behave equivalently.
+//
+// This is the canonical parity gate. See test/parity/README.md for the schema.
+package runner
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+)
+
+// Scenario is the TOML schema for a parity scenario.
+type Scenario struct {
+	// Identity
+	Name        string   `toml:"name"`
+	Description string   `toml:"description"`
+	Covers      []string `toml:"covers"`
+	Tags        []string `toml:"tags"`
+	Group       string   `toml:"group"`
+
+	// Driver selection
+	Driver string `toml:"driver"`
+	// OpenAIFixture selects the hermetic HTTP/SSE endpoint and isolated model configuration.
+	OpenAIFixture bool `toml:"openai_fixture"`
+	// ProviderFixture selects the same hermetic endpoint for another provider API (anthropic-messages, google-generative-ai, mistral-conversations, openai-completions, or openai-responses). It excludes openai_fixture.
+	ProviderFixture string `toml:"provider_fixture"`
+	// ProviderFixtureBasePath stands between the fixture server's address and the API's own base path in the model's baseUrl ("/api.anthropic.com"), for behavior a provider derives from its base URL. Empty keeps the plain address.
+	ProviderFixtureBasePath string `toml:"provider_fixture_base_path"`
+	// ProviderFixtureCompat is written as the compat object of the fixture's model ({ supportsStrictMode = true }). Empty writes no compat member.
+	ProviderFixtureCompat map[string]any `toml:"provider_fixture_compat"`
+	Model                 string         `toml:"model"`
+	// ChangelogFixture replaces only the bundled changelog input in isolated PiG/Pi builds.
+	ChangelogFixture string `toml:"changelog_fixture"`
+
+	// Driver-specific config (top-level tables to avoid key collision
+	// with the `driver` string key).
+	Print         PrintDriverConfig         `toml:"print"`
+	Tmux          TmuxDriverConfig          `toml:"tmux"`
+	CLI           CLIDriverConfig           `toml:"cli"`
+	RPC           RPCDriverConfig           `toml:"rpc"`
+	ExtensionHost ExtensionHostDriverConfig `toml:"extension_host"`
+
+	// Per-binary overrides
+	Env EnvOverrides `toml:"env"`
+
+	// Assertions
+	Assert AssertSpec `toml:"assert"`
+
+	// Documented intentional divergences
+	Diverge DivergeSpec `toml:"diverge"`
+
+	// SourcePath is the .toml file the scenario was loaded from.
+	// Not part of the TOML schema; populated by LoadScenario.
+	SourcePath string `toml:"-"`
+}
+
+// PrintDriverConfig configures the print-mode driver.
+type PrintDriverConfig struct {
+	Prompt         string `toml:"prompt"`
+	TimeoutSeconds int    `toml:"timeout_seconds"`
+	CWD            string `toml:"cwd"` // working directory (relative to scenario file)
+}
+
+// CLIDriverConfig configures the cli-mode driver.
+type CLIDriverConfig struct {
+	Args           []string `toml:"args"`
+	PigArgs        []string `toml:"pig_args"` // replaces Args for pig when non-nil
+	PiArgs         []string `toml:"pi_args"`  // replaces Args for pi when non-nil
+	InputLines     []string `toml:"input_lines"`
+	SettleSeconds  int      `toml:"settle_seconds"`
+	TimeoutSeconds int      `toml:"timeout_seconds"`
+	CWD            string   `toml:"cwd"` // working directory (relative to scenario file)
+	// SnapshotCWD copies the cwd fixture to a fresh per-binary temp dir and
+	// runs there, outside the checkout, as the other drivers always do. Set it
+	// for a fixture project whose .pi or .pig resources make the run depend on
+	// project trust, so the checkout's own trust decision cannot answer it.
+	SnapshotCWD bool `toml:"snapshot_cwd"`
+
+	// ArtifactPath names a file the command writes, read into Result.Artifact
+	// after the run so AssertSpec can compare it. Supports {{TEMP}}, so each
+	// binary reads back its own copy. Required for commands whose real output
+	// is a file rather than stdout.
+	ArtifactPath string `toml:"artifact_path"`
+}
+
+// RPCDriverConfig configures the rpc-mode driver.
+type RPCDriverConfig struct {
+	// CanonicalJSON sorts object keys without dropping fields, reordering records or changing string contents.
+	CanonicalJSON bool `toml:"canonical_json"`
+	// Terminate sends SIGTERM with stdin deliberately open after the final output barrier.
+	Terminate      bool           `toml:"terminate"`
+	InputLines     []string       `toml:"input_lines"` // JSON lines to write to stdin
+	Steps          []RPCInputStep `toml:"steps"`
+	TimeoutSeconds int            `toml:"timeout_seconds"`
+	// SettleSeconds is the time to wait after writing all input lines
+	// before closing stdin. Required for prompt commands where the binary
+	// needs time to process and emit events before stdin EOF triggers
+	// shutdown. 0 means close stdin immediately.
+	SettleSeconds int    `toml:"settle_seconds"`
+	CWD           string `toml:"cwd"` // working directory (relative to scenario file)
+	// ArtifactPath captures a command-owned file after output barriers and process shutdown. It uses the same per-binary {{TEMP}} expansion as input lines.
+	ArtifactPath string `toml:"artifact_path"`
+}
+
+// RPCInputStep sends one JSONL command and waits for observable output before
+// the next command. It is used for cancellation and response-driven flows.
+type RPCInputStep struct {
+	WaitEvent          string   `toml:"wait_event"`
+	Line               string   `toml:"line"`
+	WaitContains       []string `toml:"wait_contains"`
+	WaitTimeoutSeconds int      `toml:"wait_timeout_seconds"`
+	// PollUntil turns the step into a state barrier for work that has no event: the driver resends Line, a read-only query whose
+	// request id names the step, until a response record contains this JSON object (nested objects match as subsets), within
+	// WaitTimeoutSeconds. Every response to the polled id is left out of the compared output and the raw output (the JSON comparator reads the raw one), because how many polls ran depends
+	// on timing; the scenario's own later commands prove the settled state.
+	PollUntil string `toml:"poll_until"`
+}
+
+// ExtensionHostDriverConfig configures the pig-only extension host validation
+// driver. It shells through `pig install <sources...> --validate-only --json`
+// and lets AssertSpec.Extensions inspect the structured registration report.
+type ExtensionHostDriverConfig struct {
+	Sources        []string `toml:"sources"`
+	TimeoutSeconds int      `toml:"timeout_seconds"`
+	CWD            string   `toml:"cwd"`
+}
+
+// TmuxDriverConfig configures the interactive-tmux driver.
+type TmuxDriverConfig struct {
+	Width               int        `toml:"width"`
+	Height              int        `toml:"height"`
+	ReadyPatternPig     string     `toml:"ready_pattern_pig"`
+	ReadyPatternPi      string     `toml:"ready_pattern_pi"`
+	ReadyTimeoutSeconds int        `toml:"ready_timeout_seconds"`
+	Keys                []string   `toml:"keys"`
+	SettleSeconds       int        `toml:"settle_seconds"`
+	Steps               []TmuxStep `toml:"steps"`
+	CaptureStart        string     `toml:"capture_start"`
+	CaptureEnd          string     `toml:"capture_end"`
+	CaptureEndRegex     string     `toml:"capture_end_regex"`
+	CaptureStartLast    bool       `toml:"capture_start_last"`
+	// CaptureJoinWrapped captures soft-wrapped terminal rows as the single
+	// logical line the program wrote (tmux capture-pane -J). Use it when an
+	// assertion names text whose on-screen wrap point depends on the host,
+	// such as a path under the runner's temporary directory.
+	CaptureJoinWrapped bool     `toml:"capture_join_wrapped"`
+	PreClearPaths      []string `toml:"pre_clear_paths"`
+	// CWD changes the working directory of the launched binary. Resolved
+	// relative to the scenario source file (matching print/cli drivers).
+	// Required for interactive scenarios that mutate files (e.g. edit-tool
+	// rendering) since the runner's snapshot mechanism only copies
+	// env-referenced agent dirs, not arbitrary CWD fixtures.
+	CWD string `toml:"cwd"`
+	// GitBranch makes the per-binary cwd copy an empty git repository whose
+	// HEAD is this unborn branch, for scenarios that assert the footer's
+	// branch display. Without it the cwd is not inside any repository.
+	GitBranch string `toml:"git_branch"`
+	// WindowStyle sets this pane's default colors before the binary starts.
+	// tmux answers OSC 11 from these colors, independently of COLORFGBG.
+	WindowStyle string `toml:"window_style"`
+
+	// CaptureHistory includes all retained scrollback, not only the final viewport. The driver gives this session its own maximum-retention pane.
+	CaptureHistory bool `toml:"capture_history"`
+
+	// PreTuiLines makes the launch shell print that many numbered lines (PRE-TUI-LINE-1 ...) before it starts the binary, the same for both binaries: the text a program, a package installer or a shell leaves above a TUI. Combine it with capture_history to see whether a command erased it.
+	PreTuiLines int `toml:"pre_tui_lines"`
+}
+
+// TmuxStep is one staged interaction block for an interactive-tmux
+// scenario. Each step sends its keys in order, then optionally waits
+// before the next step. This allows scenarios to model
+// prompt → wait-for-response → /tree-style flows without falling back
+// to legacy shell scripts.
+type TmuxStep struct {
+	Keys                []string `toml:"keys"`
+	SettleSeconds       int      `toml:"settle_seconds"`
+	WaitContains        []string `toml:"wait_contains"`
+	WaitVisibleContains []string `toml:"wait_visible_contains"`
+	// WaitVisibleContainsPig and WaitVisibleContainsPi add binary-specific rows to WaitVisibleContains, for a surface that
+	// differs by a numbered divergence (as ready_pattern_pig and ready_pattern_pi do for the ready pattern).
+	WaitVisibleContainsPig []string `toml:"wait_visible_contains_pig"`
+	WaitVisibleContainsPi  []string `toml:"wait_visible_contains_pi"`
+	WaitNotContains        []string `toml:"wait_not_contains"`
+	// WaitStableMilliseconds waits, after the other step waits, until the
+	// visible pane has not changed for this long. It is the completion barrier
+	// for an animation that emits no completion output.
+	WaitStableMilliseconds int `toml:"wait_stable_milliseconds"`
+	WaitTimeoutSeconds     int `toml:"wait_timeout_seconds"`
+	// FrameWatch samples the visible pane from before the step's keys until the step's waits end and counts the samples it forbids.
+	FrameWatch *TmuxFrameWatch `toml:"frame_watch"`
+	// FinalFrame reads the raw terminal transcript after the step's waits, for no_frames_after_reply.
+	FinalFrame *TmuxFinalFrame `toml:"final_frame"`
+	// Signal ends the step by sending SIGTERM ("TERM") or SIGHUP ("HUP") to the program the pane's launch shell started, after the step's keys: a pane's keys can only be typed, and a program that ends on a signal is ended the way a supervisor or a closing terminal ends it. The signal goes to the program, not to the pane's process group or its terminal.
+	Signal string `toml:"signal"`
+}
+
+// TmuxFinalFrame names the text of a reply the step ends on. The visible pane keeps what the program last drew, so a settled-screen comparison cannot
+// see a frame that repaints the same rows; the raw transcript can.
+type TmuxFinalFrame struct {
+	// Text is a reply text that appears once, unbroken by escape sequences.
+	Text string `toml:"text"`
+	// QuietMilliseconds is how long to wait for a late frame before reading the transcript (default 300).
+	QuietMilliseconds int `toml:"quiet_milliseconds"`
+	// WriteLog names the file that holds the bytes each binary's renderers wrote: the scenario sets PI_TUI_WRITE_LOG to the same value for both
+	// binaries (tokens such as {{TEMP}} are expanded per binary). The frames are then read from that file and not from the terminal transcript.
+	// It is for a count the terminal does not get from PiG in both of its modes: PiG's screen writer (D624) sits under that log and does not
+	// send the terminal a frame that changes nothing. What is asserted is then what the renderers wrote, not what reached the terminal.
+	WriteLog string `toml:"write_log"`
+}
+
+// TmuxFrameWatch names a frame a step must never put on screen. The terminal keeps what the program last drew, so a frame the program
+// draws and replaces within a few milliseconds is not on screen long enough to sample; the watch is for a state that lasts, such as a
+// transcript left unchanged behind a closed prompt while a slow operation runs.
+type TmuxFrameWatch struct {
+	// StaleContains is every row a forbidden pane shows.
+	StaleContains []string `toml:"stale_contains"`
+	// StaleUnlessContains is a row that makes a pane legitimate, such as the prompt that is still open.
+	StaleUnlessContains []string `toml:"stale_unless_contains"`
+	// MinSamples is the fewest samples a passing watch takes: a step that finished before the watch could look proves nothing.
+	MinSamples int `toml:"min_samples"`
+}
+
+// visibleContains is the step's visible-state wait for the binary labeled label: the shared rows plus that binary's own.
+func (step TmuxStep) visibleContains(label string) []string {
+	if label == "pi" {
+		return slices.Concat(step.WaitVisibleContains, step.WaitVisibleContainsPi)
+	}
+	return slices.Concat(step.WaitVisibleContains, step.WaitVisibleContainsPig)
+}
+
+// visibleWaitIsOnlyEvidence reports whether the visible-state wait (visible and WaitNotContains) is all the step has to show that its keys took
+// effect: it sends keys and has no new-output wait, stable window, settle, frame watch or final frame.
+func (step TmuxStep) visibleWaitIsOnlyEvidence(visible []string) bool {
+	return len(step.Keys) > 0 && (len(visible) > 0 || len(step.WaitNotContains) > 0) &&
+		len(step.WaitContains) == 0 && step.WaitStableMilliseconds == 0 && step.SettleSeconds == 0 && step.FrameWatch == nil && step.FinalFrame == nil
+}
+
+// EnvOverrides lets a scenario inject per-binary environment variables
+// and extra extension paths. This enables faux-provider parity tests
+// without live LLM calls.
+type EnvOverrides struct {
+	Pig           []string `toml:"pig"`            // extra KEY=VALUE pairs for pig
+	Pi            []string `toml:"pi"`             // extra KEY=VALUE pairs for pi
+	PiExtensions  []string `toml:"pi_extensions"`  // extra -e <path> args for pi
+	PigExtensions []string `toml:"pig_extensions"` // extra -e <path> args for pig
+	PigArgs       []string `toml:"pig_args"`       // extra CLI args for pig
+	PiArgs        []string `toml:"pi_args"`        // extra CLI args for pi
+	PigBin        string   `toml:"pig_bin"`        // override pig binary path for this scenario
+	PiBin         string   `toml:"pi_bin"`         // override upstream binary path for this scenario
+	// OverrideBaseArgs, when true, suppresses the per-binary baseline
+	// args (BinaryRef.Args, e.g. pi's default `--no-extensions`). Use
+	// this only when the scenario must control the exact argv: e.g.
+	// subcommands like `pi config` / `pig config` that must appear as
+	// argv[0] for the dispatcher to recognise them.
+	OverrideBaseArgs bool `toml:"override_base_args"`
+	// PigGoTests lists the packages (./-relative to cli.cwd) whose test binaries a cli-mode pig script runs through
+	// test/parity/testdata/prebuilt-go-test.sh. The runner builds them before the timed runs (go_prebuild.go).
+	PigGoTests []string `toml:"pig_go_tests"`
+	// PiGoTests is PigGoTests for the Pi side: a Pi script that dumps Go-side probes runs the test binaries through the same helper.
+	PiGoTests []string `toml:"pi_go_tests"`
+	// PigGoPrograms and PiGoPrograms list the main packages (./-relative to cli.cwd) a script of that side runs through
+	// test/parity/testdata/prebuilt-go-run.sh instead of `go run`. The runner builds them before the timed runs.
+	PigGoPrograms []string `toml:"pig_go_programs"`
+	PiGoPrograms  []string `toml:"pi_go_programs"`
+}
+
+// AssertSpec lists the assertions to evaluate against driver results.
+type AssertSpec struct {
+	ExitCode        *int     `toml:"exit_code"`
+	PigExitCode     *int     `toml:"pig_exit_code"`
+	PiExitCode      *int     `toml:"pi_exit_code"`
+	BothContain     []string `toml:"both_contain"`
+	BothNotContain  []string `toml:"both_not_contain"`
+	PigContains     []string `toml:"pig_contains"`
+	PigNotContain   []string `toml:"pig_not_contain"`
+	PiContains      []string `toml:"pi_contains"`
+	PiNotContain    []string `toml:"pi_not_contain"`
+	BothMatchRegex  []string `toml:"both_match_regex"`
+	JSONOutputEqual bool     `toml:"json_output_equal"`
+	// JSONOutputOrderedEqual is json_output_equal with object member order significant at every depth.
+	JSONOutputOrderedEqual bool            `toml:"json_output_ordered_equal"`
+	StderrEqual            bool            `toml:"stderr_equal"`
+	JSONAliases            []JSONAliasRule `toml:"json_aliases"`
+	OutputEqual            bool            `toml:"output_equal"`
+	OutputNormalizedEqual  bool            `toml:"output_normalized_equal"`
+	OutputLayoutEqual      bool            `toml:"output_layout_equal"`
+	EscapedOutputEqual     bool            `toml:"escaped_output_equal"`
+	RuntimeRatioMax        float64         `toml:"runtime_ratio_max"`
+	BothReachReady         bool            `toml:"both_reach_ready"`
+	// PigNoStaleFrames requires every pig run's frame_watch steps to have sampled enough panes and found no forbidden one. It is pig-only for a
+	// scenario whose operation Pi awaits without holding the frame (an extension handler that awaits), so Pi's samples are not asserted.
+	PigNoStaleFrames bool `toml:"pig_no_stale_frames"`
+	// NoFramesAfterReply requires, for every run of both binaries, that no frame begins after the last occurrence of a final_frame text in the raw
+	// transcript: the frame that carries the end of a reply ends the stream (Pi's agent_end requests one frame; agent_settled requests none).
+	NoFramesAfterReply bool `toml:"no_frames_after_reply"`
+	// FinalFrameCursorOnlyPig and FinalFrameCursorOnlyPi pin, for every run of that binary, the exact number of cursor-only frames (CSI ? 2026 h,
+	// CSI <row>;1 H, CSI ? 25 l, CSI ? 2026 l: a render that repaints nothing) that begin after the last occurrence of a final_frame text. Both
+	// binaries write other frames there while the terminal answers their start-up queries, so a scenario about a repaint pins the one frame
+	// kind it is about and not the whole stream.
+	FinalFrameCursorOnlyPig *int `toml:"final_frame_cursor_only_pig"`
+	FinalFrameCursorOnlyPi  *int `toml:"final_frame_cursor_only_pi"`
+	// TranscriptSequencesEqual requires, for every run pair and each window it declares, that the ordered escape sequences and text runs the two binaries wrote between two points of the terminal transcript are the same list (see SequenceWindowSpec). The transcript holds every byte from the program's first write; the comparator reads output only, never the keys or terminal replies the program received.
+	TranscriptSequencesEqual []SequenceWindowSpec `toml:"transcript_sequences_equal"`
+	Runs                     int                  `toml:"runs"`
+
+	// ChangelogHeadersComplete compares all rendered release headers with each binary's own document, in reverse source order (D22).
+	ChangelogHeadersComplete bool `toml:"changelog_headers_complete"`
+
+	// ArtifactNormalizedEqual compares the file named by the driver's
+	// artifact_path between pig and pi, after the same normalize() the
+	// output comparators use. Asserts on what the command wrote.
+	ArtifactEqual           bool `toml:"artifact_equal"`
+	ArtifactNormalizedEqual bool `toml:"artifact_normalized_equal"`
+	// ArtifactBothContain requires each substring in both binaries' artifacts.
+	ArtifactBothContain []string `toml:"artifact_both_contain"`
+	// ArtifactBothNotContain rejects each substring in either artifact.
+	ArtifactBothNotContain []string `toml:"artifact_both_not_contain"`
+
+	// JSONPigOnlyRecords names the whole records an approved numbered divergence makes Pig emit and Pi never emit; each is dropped from Pig's output before the JSON comparison.
+	JSONPigOnlyRecords []JSONPigOnlyRecordRule `toml:"json_pig_only_records"`
+
+	// NormalizeReplace applies individually justified replacements to text comparators. JSON comparison never applies these rules.
+	NormalizeReplace []NormalizeReplaceRule `toml:"normalize_replace"`
+	// StderrNormalizeReplace applies individually justified replacements to the stderr_equal comparison only, so a scenario that compares JSON output exactly can still meet a distribution-specific path in a warning on stderr.
+	StderrNormalizeReplace []NormalizeReplaceRule `toml:"stderr_normalize_replace"`
+
+	// Extensions asserts structured output from the extension-host driver.
+	Extensions ExtensionAssertSpec `toml:"extensions"`
+}
+
+// jsonCompared reports whether a JSON comparison reads the run outputs: json_output_equal, or json_output_ordered_equal.
+func (a AssertSpec) jsonCompared() bool { return a.JSONOutputEqual || a.JSONOutputOrderedEqual }
+
+// ExtensionAssertSpec defines structured assertions over the JSON emitted by
+// `pig install --validate-only --json`. It is intentionally pig-only: extension
+// runtime cells and subprocess SDKs are documented downstream divergences from
+// upstream pi, but they still need first-class automated QC.
+type ExtensionAssertSpec struct {
+	RegisteredTools     []string          `toml:"registered_tools"`
+	RegisteredCommands  []string          `toml:"registered_commands"`
+	RegisteredProviders []string          `toml:"registered_providers"`
+	RegisteredShortcuts []string          `toml:"registered_shortcuts"`
+	NoDiagnostics       bool              `toml:"no_diagnostics"`
+	PlacementStrategy   map[string]string `toml:"placement_strategy"`
+}
+
+// NormalizeReplaceRule declares one justified regex replacement for a scenario's text comparisons.
+type NormalizeReplaceRule struct {
+	Pattern string `toml:"pattern"`
+	With    string `toml:"with"`
+	Reason  string `toml:"reason"`
+}
+
+// DivergeSpec captures documented intentional differences.
+type DivergeSpec struct {
+	PigContains []string `toml:"pig_contains"`
+	PiContains  []string `toml:"pi_contains"`
+	Reason      string   `toml:"reason"`
+}
+
+// LoadScenario parses a TOML scenario file and fills in defaults.
+func LoadScenario(path string) (*Scenario, error) {
+	var sc Scenario
+	if _, err := toml.DecodeFile(path, &sc); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+	sc.SourcePath = path
+	applyDefaults(&sc)
+	if err := validate(&sc); err != nil {
+		return nil, fmt.Errorf("validate %s: %w", path, err)
+	}
+	return &sc, nil
+}
+
+func applyDefaults(sc *Scenario) {
+	if sc.Assert.Runs <= 0 {
+		sc.Assert.Runs = 1
+	}
+	if sc.Tmux.Width <= 0 {
+		sc.Tmux.Width = 100
+	}
+	if sc.Tmux.Height <= 0 {
+		sc.Tmux.Height = 35
+	}
+	if sc.Tmux.ReadyTimeoutSeconds <= 0 {
+		// 30s default: node extension cold-start under PARITY_PARALLEL=12
+		// tmux contention can legitimately push first-byte past 15s on a
+		// busy machine. Failing-case-only deadline; passing scenarios pay
+		// only the real boot time.
+		sc.Tmux.ReadyTimeoutSeconds = 30
+	}
+}
+
+func validate(sc *Scenario) error {
+	if sc.Name == "" {
+		return fmt.Errorf("scenario must have a name")
+	}
+	if sc.Driver == "" {
+		return fmt.Errorf("scenario %q must declare a driver", sc.Name)
+	}
+	if len(sc.Covers) == 0 {
+		return fmt.Errorf("covers must list at least one upstream file")
+	}
+	if sc.Assert.ExitCode != nil && (sc.Assert.PigExitCode != nil || sc.Assert.PiExitCode != nil) {
+		return fmt.Errorf("exit_code cannot be combined with pig_exit_code or pi_exit_code")
+	}
+	if (sc.Assert.PigExitCode == nil) != (sc.Assert.PiExitCode == nil) {
+		return fmt.Errorf("pig_exit_code and pi_exit_code must be declared together")
+	}
+	if sc.Tmux.CaptureHistory && sc.Driver != "interactive-tmux" {
+		return fmt.Errorf("capture_history requires interactive-tmux")
+	}
+	if sc.Tmux.PreTuiLines < 0 || sc.Tmux.PreTuiLines > 0 && sc.Driver != "interactive-tmux" {
+		return fmt.Errorf("pre_tui_lines is a count of lines printed before an interactive-tmux binary starts")
+	}
+	if len(sc.Assert.TranscriptSequencesEqual) > 0 && sc.Driver != "interactive-tmux" {
+		return fmt.Errorf("transcript_sequences_equal requires interactive-tmux: only its panes have a terminal transcript")
+	}
+	for _, window := range sc.Assert.TranscriptSequencesEqual {
+		if err := window.validate(); err != nil {
+			return err
+		}
+	}
+	for i, step := range sc.Tmux.Steps {
+		if step.Signal != "" && step.Signal != "TERM" && step.Signal != "HUP" {
+			return fmt.Errorf("tmux step %d signal %q is unknown: the signals are %q and %q", i, step.Signal, "TERM", "HUP")
+		}
+	}
+	if sc.Assert.ChangelogHeadersComplete && (sc.Driver != "interactive-tmux" || !sc.Tmux.CaptureHistory) {
+		return fmt.Errorf("changelog_headers_complete requires complete tmux history")
+	}
+	if sc.Assert.JSONOutputEqual && sc.Assert.JSONOutputOrderedEqual {
+		return fmt.Errorf("json_output_equal and json_output_ordered_equal are one comparison: json_output_ordered_equal already compares everything json_output_equal does")
+	}
+	if sc.Assert.jsonCompared() && (sc.Assert.OutputNormalizedEqual || len(sc.Assert.NormalizeReplace) > 0) {
+		return fmt.Errorf("json_output_equal and json_output_ordered_equal cannot use text normalization")
+	}
+	if len(sc.Assert.JSONPigOnlyRecords) > 0 && !sc.Assert.jsonCompared() {
+		return fmt.Errorf("json_pig_only_records requires json_output_equal or json_output_ordered_equal")
+	}
+	for _, rule := range sc.Assert.JSONPigOnlyRecords {
+		if err := rule.validate(); err != nil {
+			return err
+		}
+	}
+	for _, rule := range sc.Assert.NormalizeReplace {
+		if rule.Reason == "" {
+			return fmt.Errorf("normalize_replace %q requires a reason", rule.Pattern)
+		}
+	}
+	if sc.CLI.SnapshotCWD && sc.CLI.CWD == "" {
+		return fmt.Errorf("cli.snapshot_cwd requires cli.cwd")
+	}
+	for field, pkgs := range map[string][]string{"pig_go_tests": sc.Env.PigGoTests, "pi_go_tests": sc.Env.PiGoTests, "pig_go_programs": sc.Env.PigGoPrograms, "pi_go_programs": sc.Env.PiGoPrograms} {
+		if len(pkgs) == 0 {
+			continue
+		}
+		if sc.Driver != "cli-mode" {
+			return fmt.Errorf("%s requires the cli-mode driver", field)
+		}
+		if sc.CLI.CWD == "" || strings.Contains(sc.CLI.CWD, "{{") {
+			return fmt.Errorf("%s requires a fixed cli.cwd: its packages are relative to it", field)
+		}
+		for _, pkg := range pkgs {
+			if !isLocalGoPackage(pkg) {
+				return fmt.Errorf("%s entry %q must be a ./-relative package directory inside cli.cwd", field, pkg)
+			}
+		}
+	}
+	return nil
+}
+
+// HasTag reports whether the scenario carries the given tag.
+func (sc *Scenario) HasTag(tag string) bool {
+	for _, t := range sc.Tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}

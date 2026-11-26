@@ -1,0 +1,73 @@
+# PiG Standard
+
+PiG Standard is an explicit Piglet composition built from ordinary Resources.
+It is separate from Stock PiG. Bare `pig` does not load this composition.
+
+Run it from this source tree:
+
+```bash
+pig --piglet piglets/standard/pig-standard.yaml
+```
+
+Build a directly executable Piglet Binary:
+
+```bash
+pig piglet build piglets/standard/pig-standard.yaml \
+  --format binary \
+  --out ./pig-standard
+```
+
+Each PiG release also publishes this Binary as its own archive,
+`pig-standard-<version>-<os>-<arch>.tar.gz` (`.zip` on Windows), for Linux, macOS
+and Windows on `amd64` and `arm64`. It is separate from the Stock `pig-<version>-<os>-<arch>`
+archive and has its own checksums, SBOMs, vulnerability scan and build-provenance
+attestation in the release. Run `pig-standard version`: it prints the release
+version, and `pig-standard status` names `pig-standard` as the active Piglet.
+Termux has no Standard archive. The build-provenance attestation covers the
+archive, so check it with `pig verify --provenance <archive>` on the downloaded
+archive, not on the extracted Binary. The Binary reports `build: dev`; the release
+ships a `-build-record.json` per archive with the source commit it was built from.
+
+The current composition selects `extensions/piglogin`, `extensions/pigrunner`,
+`extensions/angrypigs` and `extensions/bunruntime`. The login extension owns the PiG login, sprite
+catalogue, `/sprite` command, and selected-sprite state. The composition strips Stock PiG's built-in `pig-login` extension, which registers `/sprite` as well (`strip.extensions`, D92). The default sprite is
+`hpe-agentic`: the green pixel pig and "PiG." wordmark from the PiG website.
+`/sprite` selects another sprite, and each sprite colors the wordmark period. The Runner extension
+owns `/runner`, `/pig-runner`, and high-score state. PiG Runner is the original
+half-block pixel-art runner, with the selected sprite's pig, drawn over the
+whole terminal. The Angry Pigs extension in `extensions/angrypigs` owns `/angry-pigs` and
+its high-score state. Angry Pigs is a pixel-art slingshot game over the whole
+terminal: Up and Down pull the band back for power, Left and Right aim, and a
+mouse drag aims when the terminal reports mouse input. The selected sprite's
+pig flies at bird-topped towers of wood, stone, and ice that crack, shatter,
+and collapse, with a gauge, a trajectory preview, and particles. Physics runs
+at a fixed 120 Hz step; a camera pans over the fixed-size world, and a
+minimap shows the whole field when the terminal is narrower than the world.
+PiG Runner follows the Chrome Dino difficulty curve: its speed climbs to a
+cap, and obstacles come faster, in groups, and flying as it speeds up.
+Both games share `internal/arcade`: PiG Runner's night sky, hills, and turf,
+the two HUD lines with score and high score, and the pixel-font title and
+game-over cards.
+The Bun runtime extension in `extensions/bunruntime` owns `/bun-runtime`. `/bun-runtime install` downloads stock Bun 1.4.2 for this platform from the Bun GitHub release, verifies the OpenPGP signature of `SHASUMS256.txt.asc` with the pinned Robobun key, checks the archive and the extracted executable against the digests pinned in `lock.go`, and installs it into PiG's TypeScript runtime slot (`<agent dir>/runtimes/typescript/bun`). `/bun-runtime verify`, `/bun-runtime remove` and `/bun-runtime status` check, delete or report it. Install, remove, verify and status take an advisory lock (`.bun-install.lock` in the slot root), so two processes never replace or check `<slot>/bun` at the same time, and an install removes the `bun.old-*` directory a killed install left. Selecting it is a separate step: `"extensionsTypescriptRuntime": "bun"` or `PIG_TS_RUNTIME=bun`. See `docs/site/docs/typescript-runtimes.md`. Bun is MIT-licensed; its executable bundles JavaScriptCore (LGPL-2.1) and other components that Bun's own license file lists.
+Stock PiG only supplies generic extension UI contracts.
+
+The composition sets `viewClient: terminal`, so the TUI draws the views its extensions mount (`ui.view`, D614). Stock PiG attaches no view client.
+
+PiG Standard sets `build.extensionRealization: fused`. A Binary build fails if
+any selected extension is not a fuse-compatible Go factory. The build does not
+fall back to a subprocess component. Source execution uses the normal
+subprocess host for development and verification. PiG serializes focused
+extension overlays, keeps component work off the TUI loop, coalesces timer
+redraws to the 16 ms frame interval, and detaches invalidation before disposal.
+The games share `internal/pixel`, which draws RGBA canvases as half-block
+lines in 24-bit color, or the nearest 256 color when the terminal lacks 24-bit
+color, and reuses unchanged lines between frames. They open with
+`internal/termgame.Overlay`, a modal overlay over the whole terminal whose
+one-cell box frames the game.
+
+PiG Standard currently includes identity, Runner UI, and Angry Pigs. It does not include the
+removed onboarding, harness-discovery, hook-runner, marketplace, or host-auth
+products. Generic extension events, Package installation, Piglets, and provider
+OAuth remain Stock PiG infrastructure. Add a future product capability only as
+an explicitly selected, fuse-compatible Standard Resource with its own state
+and public host contract.

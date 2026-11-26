@@ -1,0 +1,244 @@
+//go:build parity
+
+package runner
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/internal/testenv"
+)
+
+// Hermetic per-run substitution tokens.
+//
+// Background. The original scenario isolation strategy used literal
+// `/tmp/pig-parity-<NN>-sessions` paths in CLI args and `pre_clear_paths`.
+// That had four failure modes observed in production runs:
+//
+//  1. Two concurrent runs of the same scenario (durability 3x, two
+//     developers, `make parity` while a prior run was still finalizing)
+//     race on the same `/tmp` path.
+//  2. `pre_clear_paths` does `os.RemoveAll` on a literal path. If a
+//     second run starts during the first run's tail, the second wipes
+//     the first's live session-dir.
+//  3. Scenarios that used a *relative* `--session-dir sessions` inside
+//     a snapshotted CWD shared that subdir between the pig and pi
+//     invocations within a single run, leaking state cross-side.
+//  4. Snapshot machinery (snapshotEnvDirs) only covered env vars, not
+//     CLI args. Hard-coded paths in `pig_args` / `pi_args` bypassed
+//     all isolation.
+//
+// Fix. Scenarios declare their writable paths using these substitution
+// tokens. The runner expands every token to a fresh per-binary, per-run
+// `t.TempDir()` path before launching the binary, in CLI args, env
+// values, and CWD. Tokens are NEVER shared between pig and pi. The
+// tempdirs auto-clean via t.Cleanup.
+//
+// Token reference:
+//
+//   {{TEMP}}       : a fresh per-binary tempdir (root)
+//   {{TEMP}}/<sub> : a subdir under the per-binary tempdir
+//   {{FAKE_BIN}}   : absolute path to test/parity/testdata/fake-bin, a
+//                     directory of no-op shims (open, xdg-open, start)
+//                     used in scenarios that would otherwise launch a
+//                     real browser via OAuth login. PATH-shadow these
+//                     to keep tests hermetic.
+//   {{PATH}}       : the parent process's PATH at test launch. Use
+//                     this when the scenario needs to prepend FAKE_BIN
+//                     without losing access to node / git / etc., e.g.
+//                     `PATH={{FAKE_BIN}}:{{PATH}}`.
+//
+// No scenario should reference any literal /tmp path. The scenario lint
+// (test/parity/cmd/lint) rejects literal /tmp in scenario fields.
+
+// tokenContext holds the per-binary, per-run tempdir for substitution.
+type tokenContext struct {
+	tempRoot string
+	// kept is why the root is left in place when the run ends, or "".
+	kept string
+}
+
+// keep leaves the root in place when the run ends. A run calls it when a process it started may still write into the root: removing a directory under a live writer fails with "directory not empty" or deletes what the writer is about to write, and says nothing of the writer. reason names that process.
+func (tc *tokenContext) keep(reason string) {
+	tc.kept = reason
+}
+
+// newTokenContext allocates a fresh tempdir for one binary's run and
+// registers it for automatic cleanup. Callers receive a distinct
+// context per (binary, run), guaranteeing no cross-side or cross-run
+// state visibility.
+//
+// The root is the canonical path, like the cwd copies (cleanSnapshotRoot).
+// macOS spells its temporary directory through a symlink (/var/folders is
+// /private/var/folders), and a binary that resolves a path under {{TEMP}}
+// (Python's Path.resolve, bash's pwd, Node's process.cwd) reports the
+// canonical spelling. The "temp" identity root and every {{TEMP}} expansion
+// must be that spelling, or a path alias cannot match the paths the binaries
+// print.
+func newTokenContext(t *testing.T, label string) *tokenContext {
+	t.Helper()
+	dir, err := os.MkdirTemp("", fmt.Sprintf("parity-%s-*", label))
+	if err != nil {
+		t.Fatalf("parity: alloc tempdir for %s: %v", label, err)
+	}
+	tc := &tokenContext{}
+	t.Cleanup(func() {
+		if tc.kept != "" {
+			t.Logf("parity: kept %s: %s", dir, tc.kept)
+			return
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	canonical, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("parity: resolve tempdir %s for %s: %v", dir, label, err)
+	}
+	tc.tempRoot = canonical
+	return tc
+}
+
+// expand performs token substitution on a single string. Returns the
+// expanded value. Safe to call on strings with no tokens (returns input
+// unchanged).
+func (tc *tokenContext) expand(s string) string {
+	if tc == nil {
+		return s
+	}
+	if strings.Contains(s, "{{TEMP}}") {
+		// Forward slashes: scenarios place {{TEMP}} inside JSON and TOML
+		// strings, where a Windows path's backslashes would be escape
+		// sequences. Windows file APIs accept either separator.
+		s = strings.ReplaceAll(s, "{{TEMP}}", filepath.ToSlash(tc.tempRoot))
+	}
+	if strings.Contains(s, "{{FAKE_BIN}}") {
+		s = strings.ReplaceAll(s, "{{FAKE_BIN}}", fakeBinDir())
+	}
+	if strings.Contains(s, "{{PATH}}") {
+		s = strings.ReplaceAll(s, "{{PATH}}", os.Getenv("PATH"))
+	}
+	return s
+}
+
+// expandSlice returns a new slice with every element expanded. The
+// input is not mutated.
+func (tc *tokenContext) expandSlice(in []string) []string {
+	if tc == nil {
+		return in
+	}
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = tc.expand(v)
+	}
+	return out
+}
+
+// containsLiteralTmpPath reports whether any element looks like a
+// literal /tmp path that bypasses the substitution mechanism. Used by
+// the scenario lint to flag isolation regressions.
+func containsLiteralTmpPath(parts []string) (string, bool) {
+	for _, p := range parts {
+		if strings.HasPrefix(p, "/tmp/") {
+			return p, true
+		}
+		// Catch embedded /tmp/ in args like `--session-dir=/tmp/...`.
+		if idx := strings.Index(p, "=/tmp/"); idx >= 0 {
+			return p[idx+1:], true
+		}
+	}
+	return "", false
+}
+
+// fakeBinDir resolves to the absolute path of test/parity/testdata/fake-bin
+// relative to the test/parity/runner package source directory. The directory
+// holds no-op shims (open, xdg-open, start) used by hermetic OAuth
+// scenarios to suppress real browser launches.
+//
+// go test runs the runner in its package directory, so the path holds under -trimpath and whatever directory invoked go test.
+func fakeBinDir() string {
+	dir, err := testenv.PackageDirPath()
+	if err != nil {
+		return "test/parity/testdata/fake-bin"
+	}
+	return filepath.Join(filepath.Dir(dir), "testdata", "fake-bin")
+}
+
+// shellQuote returns s safely quoted for inclusion in an inline shell
+// command line. Preserves KEY=value env assignments by quoting only the
+// value half; anything else is wrapped in single-quotes when it
+// contains shell metacharacters.
+//
+// This exists because the tmux driver joins all parts into a single
+// shell command line; user PATHs that include directories like
+// "/Applications/Visual Studio Code.app/Contents/Resources/app/bin"
+// would otherwise be word-split by the shell, breaking the launch.
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !needsShellQuote(s) {
+		return s
+	}
+	// KEY=value form: quote only the value, leave KEY= bare so the
+	// shell still treats it as an env assignment for the next command.
+	if i := indexEnvAssign(s); i > 0 {
+		return s[:i+1] + singleQuoteEscape(s[i+1:])
+	}
+	return singleQuoteEscape(s)
+}
+
+func needsShellQuote(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '_', r == '-', r == '.', r == '/', r == ':', r == ',', r == '=', r == '@', r == '+', r == '%':
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func indexEnvAssign(s string) int {
+	for i, r := range s {
+		if r == '=' {
+			if i == 0 {
+				return -1
+			}
+			// Anything before '=' must look like a shell identifier
+			// (letters, digits, underscore) for this to be an env
+			// assignment.
+			for _, c := range s[:i] {
+				ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+				if !ok {
+					return -1
+				}
+			}
+			return i
+		}
+	}
+	return -1
+}
+
+func singleQuoteEscape(s string) string {
+	// Wrap in single-quotes and replace any embedded ' with '"'"'.
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('\'')
+	for _, r := range s {
+		if r == '\'' {
+			b.WriteString(`'"'"'`)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('\'')
+	return b.String()
+}

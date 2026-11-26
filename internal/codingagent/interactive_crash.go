@@ -1,0 +1,249 @@
+package codingagent
+
+// interactive_crash.go wires the crash log (crash_log.go) into interactive
+// mode the way upstream InteractiveMode does: UI panics and fatal create,
+// resume, and import failures are recorded, and the next start announces them.
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"runtime/debug"
+	"slices"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/tui"
+)
+
+// ErrInteractiveCrashed reports that Run recovered a crash it already
+// printed and recorded; the caller exits 1 without printing it again.
+var ErrInteractiveCrashed = errors.New("interactive mode crashed")
+
+// showCrashNotice announces the newest unannounced crash. Mirrors the
+// takeUnnotifiedCrash notice in upstream InteractiveMode.init.
+func (m *InteractiveMode) showCrashNotice() {
+	if m.opts.AgentDir == "" {
+		return
+	}
+	if crash, ok := TakeUnnotifiedCrash(CrashLogPath(m.opts.AgentDir), time.Now()); ok {
+		m.showWarning(crashNotice(crash))
+	}
+}
+
+// crashMessage mirrors upstream `error.message || error.name` for errors and
+// String(value) otherwise.
+func crashMessage(value any) string {
+	if err, ok := value.(error); ok {
+		if message := err.Error(); message != "" {
+			return message
+		}
+		return fmt.Sprintf("%T", err)
+	}
+	return fmt.Sprint(value)
+}
+
+// crashSessionFile returns the current session file, if any.
+func (m *InteractiveMode) crashSessionFile() string {
+	if session := m.currentSession(); session != nil {
+		return session.Path()
+	}
+	return ""
+}
+
+// recordCrash persists a crash so the next start can point at /bug. It reports
+// false when nothing was written. Mirrors upstream InteractiveMode.recordCrash.
+func (m *InteractiveMode) recordCrash(kind string, value any, stack string) bool {
+	if m.opts.AgentDir == "" {
+		return false
+	}
+	cwd := m.opts.CWD
+	if session := m.currentSession(); session != nil && session.CWD() != "" {
+		cwd = session.CWD()
+	}
+	_, ok := RecordCrash(CrashInput{
+		Kind:        kind,
+		Message:     crashMessage(value),
+		Stack:       stack,
+		SessionFile: m.crashSessionFile(),
+		CWD:         cwd,
+		Version:     m.opts.AppVersion,
+	}, CrashLogPath(m.opts.AgentDir), time.Now())
+	return ok
+}
+
+// crashExtensionMetadata snapshots loaded extensions and their provenance for
+// stack attribution. SubprocessHost's concrete implementation supplies the
+// registered set; resource metadata retains authored package roots.
+func (m *InteractiveMode) crashExtensionMetadata() []ExtensionStackMetadata {
+	metadata := make([]ExtensionStackMetadata, 0)
+	seen := make(map[string]struct{})
+	appendExtension := func(path, resolvedPath string, sourceInfo ResourceSourceInfo) {
+		key := path + "\x00" + resolvedPath + "\x00" + sourceInfo.Source + "\x00" + sourceInfo.BaseDir
+		if _, duplicate := seen[key]; duplicate {
+			return
+		}
+		seen[key] = struct{}{}
+		metadata = append(metadata, ExtensionStackMetadata{Path: path, ResolvedPath: resolvedPath, SourceInfo: sourceInfo})
+	}
+	if provider, ok := m.opts.SubprocessHost.(interface{ Extensions() []extension.Extension }); ok {
+		for _, loaded := range provider.Extensions() {
+			appendExtension(loaded.Path, loaded.ResolvedPath, resourceSourceInfoValue(loaded.SourceInfo))
+		}
+	}
+	for _, loaded := range m.opts.BuiltinExtensions {
+		appendExtension(loaded.Path, loaded.ResolvedPath, resourceSourceInfoValue(loaded.SourceInfo))
+	}
+	paths := make([]string, 0, len(m.resourceSourceInfo))
+	for path, info := range m.resourceSourceInfo {
+		if info.ResourceType == "extensions" && info.Enabled {
+			paths = append(paths, path)
+		}
+	}
+	slices.Sort(paths)
+	for _, path := range paths {
+		info := m.resourceSourceInfo[path]
+		resolvedPath := info.Path
+		if resolvedPath == "" {
+			resolvedPath = path
+		}
+		appendExtension(path, resolvedPath, info)
+	}
+	return metadata
+}
+
+func resourceSourceInfoValue(value extension.SourceInfo) ResourceSourceInfo {
+	return ResourceSourceInfo{Path: value.Path, Source: value.Source, Scope: value.Scope, Origin: value.Origin, BaseDir: value.BaseDir, ChangelogPath: value.ChangelogPath}
+}
+
+func (m *InteractiveMode) crashExtensionHint(stack string) string {
+	return FormatCrashExtensionHint(FindExtensionStackMatches(stack, m.crashExtensionMetadata()))
+}
+
+// handleFatalRuntimeError reports a runtime replacement failure and asks the
+// input loop to exit with status 1 after terminal restoration.
+func (m *InteractiveMode) handleFatalRuntimeError(prefix string, value any) error {
+	// A replacement that ended because the session already shut down is not a failure; Pi's process has exited by then.
+	if err, ok := value.(error); ok && errors.Is(err, errInteractiveShutdown) {
+		return err
+	}
+	message := crashMessage(value)
+	stack := string(debug.Stack())
+	// Pi shows the hint for the thrown Error's own stack: an error an extension's runtime threw carries the frames of its source.
+	if failure, ok := value.(error); ok && extension.ErrorStack(failure) != "" {
+		stack = extension.ErrorStack(failure)
+	}
+	m.showError(prefix + ": " + message)
+	if hint := m.crashExtensionHint(stack); hint != "" {
+		// Pi adds both notes straight under the error, at the output padding and without a spacer (handleFatalRuntimeError).
+		m.chatContainer.Add(themedNotice("warning", hint, m.outputPad))
+	}
+	if m.recordCrash("fatal_error", value, stack) {
+		m.chatContainer.Add(themedNotice("muted", crashReportInstructions(m.crashSessionFile()), m.outputPad))
+	}
+	m.fatalRuntime.Store(true)
+	m.requestExit.Store(true)
+	return fmt.Errorf("%w: %s: %s", ErrInteractiveCrashed, prefix, message)
+}
+
+func (m *InteractiveMode) requestedExitError() error {
+	if m.fatalRuntime.Load() {
+		return ErrInteractiveCrashed
+	}
+	return nil
+}
+
+// uncaughtCrash reports a crash recovered on the UI goroutine after the
+// terminal has been restored. A dead-terminal error exits 129 without a report or crash record. Mirrors upstream
+// InteractiveMode.uncaughtCrash.
+func (m *InteractiveMode) uncaughtCrash(value any, stack []byte, stderr io.Writer) {
+	// A dead terminal is not a pig crash. Do not report or record it.
+	if failure, ok := value.(error); ok && isDeadTerminalError(failure) {
+		m.emergencyTerminalExit("terminal gone: " + failure.Error())
+	}
+	// Upstream kills the tracked detached children before it reports: the exit skips the cancellation that stops them.
+	tools.KillTrackedDetachedChildren()
+	if failure, ok := value.(error); ok && extension.ErrorStack(failure) != "" {
+		stack = []byte(extension.ErrorStack(failure))
+		_, _ = fmt.Fprintf(stderr, "%s exiting due to uncaughtException:\n%s\n", AppName, stack)
+	} else {
+		_, _ = fmt.Fprintf(stderr, "%s exiting due to uncaughtException:\n%s\n%s", AppName, uncaughtValueText(value), stack)
+	}
+	if hint := m.crashExtensionHint(string(stack)); hint != "" {
+		_, _ = fmt.Fprintf(stderr, "\n%s\n", hint)
+	}
+	if m.recordCrash("uncaught_exception", value, string(stack)) {
+		_, _ = fmt.Fprintf(stderr, "\n%s\n", crashReportInstructions(m.crashSessionFile()))
+	}
+	// A crash is the exit the flight recorder (PIG_PROFILE=flight) exists for; uncaughtOffLoop exits before any deferred profile stop runs.
+	dumpFlightRecord(m.opts.AgentDir)
+}
+
+// uncaughtOffLoop ends the process for a panic in a goroutine the owner loop does not run, as upstream's uncaughtException
+// handler does for an unawaited rejection: it stops the extension processes, restores the terminal, reports and records
+// the crash, and exits 1. It runs on the panicking goroutine because the owner loop may be the thing that is stuck.
+// pig additive (D102): Go would otherwise end the process with a stderr dump and no crash record.
+func (m *InteractiveMode) uncaughtOffLoop(value any, stack []byte) {
+	if failure, ok := value.(error); !ok || !isDeadTerminalError(failure) {
+		if m.opts.TerminateExtensionProcesses != nil {
+			m.opts.TerminateExtensionProcesses()
+		}
+		// Pi's uncaughtCrash calls ui.stop() before it reports; the exit handler restores the alternate screen and every mode first (9df819de, #11170).
+		tui.RestoreTerminalOnExit()
+		tui.RestoreTerminalFromSignal()
+	}
+	m.uncaughtCrash(value, stack, os.Stderr)
+	// This exit records a crash (crashes.json), not an exit.log line, so it does not claim the record. It still waits
+	// behind an emergency exit and for a line in flight (exit_ending.go).
+	BeforeExit()
+	EndSessionMarker()
+	os.Exit(1)
+}
+
+// uncaughtError carries an upstream Error that no caller awaits to Run's uncaughtException handler.
+type uncaughtError struct{ err error }
+
+func (e uncaughtError) Error() string { return e.err.Error() }
+func (e uncaughtError) Unwrap() error { return e.err }
+
+// uncaughtValueText formats a recovered value for the uncaughtException
+// report. The renderer overflow and an unawaited rejection are upstream's
+// thrown Errors, which Node's console.error prints as "Error: <message>"
+// before the stack.
+func uncaughtValueText(value any) string {
+	var overflow *tui.RenderOverflowError
+	if err, ok := value.(error); ok && errors.As(err, &overflow) {
+		return "Error: " + overflow.Error()
+	}
+	if rejection, ok := value.(uncaughtError); ok {
+		return "Error: " + rejection.Error()
+	}
+	return fmt.Sprint(value)
+}
+
+// forwardRenderCrash re-raises a renderer overflow recovered off the owner
+// loop on the owner loop, where Run's uncaughtException handler restores the
+// terminal, records the crash, and exits 1. Upstream renders on its single
+// event loop, so the throw always reaches that handler. Other panics
+// propagate unchanged.
+func (m *InteractiveMode) forwardRenderCrash(value any) {
+	var overflow *tui.RenderOverflowError
+	err, ok := value.(error)
+	if !ok || !errors.As(err, &overflow) {
+		panic(value)
+	}
+	raise := func() { panic(value) }
+	if !m.postUITask(raise) {
+		go func() { _ = m.postToMain(m.runCtx, raise) }()
+	}
+}
+
+// interactiveExitReason words the reason Run ended with an error, naming a closed input outright.
+func interactiveExitReason(err error) string {
+	if errors.Is(err, io.EOF) {
+		return "terminal input closed (" + err.Error() + ") while the session ran (exit 1)"
+	}
+	return "interactive mode ended with an error: " + err.Error() + " (exit 1)"
+}

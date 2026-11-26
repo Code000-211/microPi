@@ -1,0 +1,448 @@
+import type {
+  ExecuteToolOptions,
+  Extension,
+  ExtensionAPI,
+  ExtensionToolContext,
+  ExtensionVirtualModel,
+  InlineExtension,
+  McpServerConfig,
+  EntryRenderOptions,
+  KeybindingHints,
+  McpServersChangeEvent,
+  MessageRenderOptions,
+  ModelRegistry,
+  ProviderConfig,
+  ProviderStreamEvent,
+  RegisteredMcpServer,
+  ToolAnnotations,
+  ToolDefinition,
+  ToolExposure,
+  ToolLoadout,
+  ToolLoadoutChanges,
+  ToolNamespace,
+} from "@earendil-works/pi-coding-agent";
+import { clampThinkingLevel } from "@earendil-works/pi-ai/models";
+import type { Component, Container } from "@earendil-works/pi-tui";
+import type {
+  ExtensionToolContext as AdapterExtensionToolContext,
+  McpServerConfig as AdapterMcpServerConfig,
+  ModelRegistry as AdapterModelRegistry,
+  ProviderConfig as AdapterProviderConfig,
+  PiGLoginDefinition,
+  PiGSpriteDefinition,
+  PiGViewAbilities,
+  PiGViewClaim,
+  PiGViewGrid,
+  PiGViewImage,
+  PiGViewImageNode,
+  PiGViewNode,
+  PiGViewNotice,
+  PiGViewLines,
+  PiGViewStatus,
+  PiGViewTheme,
+} from "@michaelkinsy/pig-extension-types";
+
+// Pi's package root does not export ToolRenderContext (Pi 1.4.0+b556cfe5 and 1.5.0 export KeybindingHints, MessageRenderOptions and EntryRenderOptions beside it), so an extension names it through the context parameter Pi's ToolDefinition hands to renderCall.
+type ToolRenderContext = Parameters<NonNullable<ToolDefinition["renderCall"]>>[2];
+
+const login: PiGLoginDefinition = {
+  brand: ["."],
+  hero: ["."],
+  mascot: ["."],
+  palette: {},
+  name: "Example",
+  description: "Type declaration check",
+  tagline: "Pi-compatible extension",
+};
+
+const sprite: PiGSpriteDefinition = {
+  id: "example",
+  name: "Example",
+  tagline: "Type declaration check",
+  mascot: ["."],
+  palette: {},
+};
+
+export default function extension(pi: ExtensionAPI): void {
+  pi.on("session_start", async (_event, ctx) => {
+    await ctx.ui.setLogin(login);
+    await ctx.ui.registerSprite(sprite);
+    ctx.ui.notify("ready", "info");
+    const abilities: PiGViewAbilities | null = ctx.ui.viewAbilities();
+    const mounted: PiGViewStatus = await ctx.ui.mountView({ key: "k", slot: "panel", title: "K", intents: [{ name: "x.open", arg: { type: "object" }, whenHidden: true }, { name: "x.close", arg: { type: "object" }, dismiss: true }], view: { root: { kind: "text", text: String(abilities?.limits.mounts) } } });
+    await ctx.ui.updateView(mounted.mount, { title: "K2", view: { root: { kind: "box", id: "b", bg: "selectedBg", children: [{ kind: "text", id: "t", text: "next" }] } }, a11y: [{ node: "b", name: "Next" }], focus: [{ node: "t", request: "update" }] });
+    await ctx.ui.updateView(mounted.mount, {
+      view: { root: { kind: "text", id: "t", text: "next" } },
+      alternatives: [{ when: { any: [{ all: [{ claim: "display.colors", op: "atLeast", value: 256 }] }] }, view: { root: { kind: "text", text: "rich" } } }],
+      drawing: { profile: "scene", shapes: [{ kind: "rect", width: 1, height: 1 }], regions: [{ key: "r", shape: { kind: "rect", width: 1, height: 1 }, gestures: ["activate"], intent: "x.go", name: "Go" }] },
+      a11y: [{ node: "t", name: "Next", role: "status" }],
+      focus: [{ node: "t", request: "mount" }],
+      bindings: [{ key: "shift+left", intent: "x.go", arg: {}, name: "Back" }, { gesture: "swipe-left", intent: "x.go" }],
+    });
+    const grid: PiGViewGrid = {
+      kind: "grid",
+      id: "month",
+      columns: 7,
+      head: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
+      chipRows: 2,
+      selected: "d2",
+      cells: [{ label: "30", dim: true }, { value: "d2", label: "2", mark: "current", color: "accent", chips: [{ text: "standup", color: "#3366cc" }], more: 2 }],
+    };
+    await ctx.ui.updateView(mounted.mount, {
+      view: { root: { kind: "container", children: [{ kind: "text", text: "November" }, grid] } },
+      intents: [{ name: "x.day", nodeKey: grid.id, arg: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }],
+      fallback: { kind: "text", text: "November" },
+    });
+    await ctx.ui.updateView(mounted.mount, { view: { root: grid } });
+    const photo: PiGViewImageNode = { kind: "image", id: "photo", ref: "a".repeat(64), mimeType: "image/jpeg", maxWidthCells: 66, maxHeightCells: 20, filename: "r1.jpg", fallbackColor: "muted" };
+    const photoBytes: PiGViewImage = { ref: photo.ref, mimeType: photo.mimeType, data: "AAAA" };
+    await ctx.ui.updateView(mounted.mount, { view: { root: { kind: "container", children: [photo] }, images: [photoBytes] } });
+    // A later view names the image by its ref alone.
+    await ctx.ui.updateView(mounted.mount, { view: { root: photo } });
+    // @ts-expect-error an image record carries ref, mimeType and data: the bytes are required
+    const noBytes: PiGViewImage = { ref: photo.ref, mimeType: "image/png" };
+    // @ts-expect-error the member of an image record is `data`, not `bytes`
+    const wrongField: PiGViewImage = { ref: photo.ref, mimeType: "image/png", data: "AAAA", bytes: "AAAA" };
+    // @ts-expect-error a view's images is a list of records
+    await ctx.ui.updateView(mounted.mount, { view: { root: photo, images: photoBytes } });
+    // @ts-expect-error an image node needs its ref
+    const noRef: PiGViewImageNode = { kind: "image", mimeType: "image/png" };
+    // The root is the host's view contract: a node of every kind the host builds, with the members of its kind.
+    const kinds: PiGViewNode = { kind: "container", id: "all", children: [
+      { kind: "text", text: "t", bg: "selectedBg" },
+      { kind: "markdown", text: "m", defaultTextStyle: { color: "accent", bold: true }, renderLatex: false },
+      { kind: "hstack", gap: 1, align: "center", children: [{ kind: "spacer", lines: 1, stack: { grow: 1 } }, { kind: "dynamic-border", color: "border" }] },
+      { kind: "select-list", id: "pick", items: [{ value: "a", label: "A" }], selectedIndex: 0 },
+      { kind: "settings-list", id: "set", items: [{ id: "s", label: "S", values: ["on", "off"], submenu: { kind: "text", text: "sub" } }], enableSearch: true },
+      { kind: "image", ref: "a".repeat(64), mimeType: "image/png", imageId: 4242 },
+      { kind: "loader", message: "Working", indicator: { frames: ["a", "b"], intervalMs: 80 }, frame: 0 },
+      { kind: "lines", content: ["a"], list: { items: [{ label: "a" }], selectedIndex: -1 } },
+      { kind: "assistant-message", message: { content: [{ type: "text", text: "hi" }], stopReason: "stop" } },
+      { kind: "tool-execution", toolName: "read", args: { path: "x" }, result: { content: [{ type: "text", text: "ok" }] } },
+      { kind: "scroll-view", follow: "end", children: [{ kind: "input", value: "v", cursor: { line: 0, col: 1 } }] },
+      grid,
+    ] };
+    await ctx.ui.updateView(mounted.mount, { view: { root: kinds } });
+    // @ts-expect-error a node kind the host does not build
+    const unknownKind: PiGViewNode = { kind: "carousel" };
+    // @ts-expect-error a text node has no children
+    const textChildren: PiGViewNode = { kind: "text", text: "t", children: [] };
+    // @ts-expect-error a select-list needs its id
+    const noId: PiGViewNode = { kind: "select-list", items: [] };
+    // @ts-expect-error the Kitty image id is a number
+    const idString: PiGViewNode = { kind: "image", ref: "a", mimeType: "image/png", imageId: "4242" };
+    // @ts-expect-error imageId belongs to the image node
+    const idOnText: PiGViewNode = { kind: "text", text: "t", imageId: 1 };
+    // @ts-expect-error a stack's align is one of stretch, start, center and end
+    const badAlign: PiGViewNode = { kind: "hstack", align: "middle" };
+    // @ts-expect-error a tool-execution needs its toolName
+    const noTool: PiGViewNode = { kind: "tool-execution" };
+    // @ts-expect-error a scroll-view holds exactly one child
+    const twoChildren: PiGViewNode = { kind: "scroll-view", children: [{ kind: "text" }, { kind: "text" }] };
+    // @ts-expect-error a view's root is a node, not any object
+    await ctx.ui.updateView(mounted.mount, { view: { root: { text: "no kind" } } });
+    void [noBytes, wrongField, noRef, unknownKind, textChildren, noId, idString, idOnText, badAlign, noTool, twoChildren];
+    const notices: PiGViewNotice[] = await ctx.ui.viewDiagnostics("k");
+    const colors = abilities?.claims?.find((claim: PiGViewClaim) => claim.name === "display.colors")?.value;
+    const finished: PiGViewStatus = await ctx.ui.finishView(mounted.mount, { colors, notices: notices.length });
+    void finished.result;
+  });
+  pi.onViewIntent((invocation) => ({ outcome: "done", answer: { echo: invocation.intent, aborted: invocation.signal.aborted } }));
+  pi.onViewAbilities(async (abilities, ctx) => {
+    const arrived: PiGViewAbilities | null = abilities;
+    if (arrived?.slots.includes("panel")) await ctx.ui.mountView({ key: "arrived", slot: "panel", view: { root: { kind: "text", text: "hello" } } });
+  });
+  // PiG emits Pi's UI prompt lifecycle for every SDK; the kinds and the
+  // optional title come from the pinned Pi declarations.
+  pi.on("ui_prompt_start", (event) => {
+    const kind: "select" | "confirm" | "input" | "editor" | "custom" = event.kind;
+    const title: string | undefined = event.title;
+    void [kind, title, event.reason satisfies "ui_prompt"];
+  });
+  pi.on("context_with_system", (event) => ({ messages: event.messages }));
+  pi.on("agent_before_settle", (event) => {
+    const outcome: "completed" | "aborted" | "error" = event.outcome;
+    const canContinue: boolean = event.context.canContinue;
+    void [outcome, canContinue, event.context.contextEntries, event.context.llmMessages];
+    return { entries: event.entries, continue: event.continue };
+  });
+  pi.on("turn_end", (event) => {
+    const messageEntryId: string = event.messageEntryId;
+    const toolResultEntryIds: string[] = event.toolResultEntryIds;
+    void [messageEntryId, toolResultEntryIds];
+  });
+  pi.on("ui_prompt_end", (event) => {
+    void [event.kind, event.title];
+  });
+}
+
+// The 0.99.1 extension API additions, exactly as the pinned declarations
+// spell them (.upstream/v0.99.1/packages/coding-agent/src/core/extensions/types.ts).
+// Each row fails to compile against the 0.87.1 declarations.
+const exposures = ["direct", "model-only", "codemode", "deferred", "hidden"] as const satisfies readonly ToolExposure[];
+const annotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} satisfies ToolAnnotations;
+const namespace = { name: "mcp__docs", description: "Docs server" } satisfies ToolNamespace;
+const parameters = {} as ToolDefinition["parameters"];
+
+export function toolDefinitionFields(): ToolDefinition {
+  return {
+    name: "lookup",
+    label: "Lookup",
+    description: "Look a name up",
+    parameters,
+    outputSchema: {} as ToolDefinition["parameters"],
+    exposure: exposures[3],
+    namespace,
+    annotations,
+    defaultActive: false,
+    prepareLoadout: (loadout: ToolLoadout): ToolLoadoutChanges | undefined => {
+      const exposure: ToolExposure = loadout.getExposure("lookup");
+      const group: ToolNamespace | undefined = loadout.getNamespace("lookup");
+      void [exposure, group, loadout.declared.length, loadout.callable.length, loadout.registered.length];
+      return { descriptions: { lookup: "Look a name up" }, hiddenDeclarations: ["lookup"] };
+    },
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx: ExtensionToolContext) {
+      const options: ExecuteToolOptions = { signal: new AbortController().signal, onUpdate: () => {} };
+      const outcome = await ctx.executeTool("read", { path: "a" }, options);
+      void [outcome, ctx.tools.length];
+      return { content: [], details: undefined, structuredContent: { ok: true } };
+    },
+  };
+}
+
+export function keybindingHints(pi: ExtensionAPI): void {
+  const hints = (hint: KeybindingHints): string => `${hint.keyText("app.tools.expand")} ${hint.keyHint("app.tools.expand", "to expand")}`;
+  pi.registerMessageRenderer("hints", (_message, options: MessageRenderOptions) => {
+    void hints(options);
+    return undefined;
+  });
+  pi.registerEntryRenderer("hints", (_entry, options: EntryRenderOptions) => {
+    void hints(options);
+    return undefined;
+  });
+  const renderCall = (_args: unknown, _theme: unknown, context: ToolRenderContext): undefined => {
+    void hints(context);
+    return undefined;
+  };
+  void renderCall;
+}
+
+export function apiAdditions(pi: ExtensionAPI): void {
+  void pi.exec("git", ["log"], { maxBuffer: 1024 * 1024 }).then((result) => {
+    const truncated: boolean = result.truncated;
+    const killed: boolean = result.killed;
+    void [truncated, killed];
+  });
+  pi.ownThinkingRuns();
+  pi.ownThinkingRuns(false);
+  const config: McpServerConfig = { url: "https://mcp.example.com/jira" };
+  pi.registerMcpServer("jira", config);
+  const servers: RegisteredMcpServer[] = pi.getMcpServers();
+  void servers;
+  pi.unregisterMcpServer("jira");
+
+  const model: ExtensionVirtualModel<{ turn: number }> = {
+    provider: "router",
+    id: "auto",
+    name: "Auto",
+    thinkingLevels: ["off", "high"],
+    route: (request, ctx) => {
+      void [request.reason, request.state?.turn, request.thinkingLevel, ctx.cwd];
+      return { model: request.model, thinkingLevel: "off", state: { turn: 1 } };
+    },
+  };
+  pi.registerVirtualModel(model);
+  pi.unregisterVirtualModel("router", "auto");
+
+  const settings: object = pi.getSettings();
+  void settings;
+
+  pi.on("mcp_servers_change", (event: McpServersChangeEvent) => {
+    const changed: RegisteredMcpServer[] = event.servers;
+    void [changed, event.type satisfies "mcp_servers_change"];
+  });
+  pi.on("provider_stream_event", (event: ProviderStreamEvent) => {
+    void [event.provider, event.api, event.model, event.data, event.type satisfies "provider_stream_event"];
+  });
+  pi.on("tool_call", (event) => {
+    const parent: string | undefined = event.parentToolCallId;
+    void parent;
+  });
+  pi.on("tool_result", (event) => {
+    const parent: string | undefined = event.parentToolCallId;
+    const structured = event.structuredContent;
+    void [parent, structured, event.isError];
+    return { structuredContent: { redacted: true }, isError: false };
+  });
+  pi.on("tool_execution_start", (event) => {
+    const parent: string | undefined = event.parentToolCallId;
+    void parent;
+  });
+  pi.on("tool_execution_update", (event) => {
+    const parent: string | undefined = event.parentToolCallId;
+    void parent;
+  });
+  pi.on("tool_execution_end", (event) => {
+    const parent: string | undefined = event.parentToolCallId;
+    void [parent, event.isError];
+  });
+
+  const provider: ProviderConfig = {
+    models: [
+      { id: "chat", name: "Chat", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1, maxTokens: 1 },
+      { type: "image", id: "img", name: "Image", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, output: ["image"] },
+      { type: "classifier", id: "cls", name: "Classifier", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1 },
+    ],
+  };
+  pi.registerProvider("lab", provider);
+}
+
+// Typed model registry and provider image/classifier operations (model-registry.ts:135-177; types.ts:1385-1387).
+// The declarations are the pinned package's, so a row is a use that must compile, or a misuse that must not.
+type Classify = ModelRegistry["classify"];
+type ClassifierModelArg = Parameters<Classify>[0];
+type ClassifierContextArg = Parameters<Classify>[1];
+type ClassifierOptionsArg = Parameters<Classify>[2];
+
+export async function typedModelRegistry(registry: ModelRegistry, classifier: ClassifierModelArg, request: ClassifierContextArg, options: ClassifierOptionsArg) {
+  const classifiers = registry.getModelsOfType("classifier");
+  const images = registry.getModelsOfType("image", "lab");
+  const chat = registry.getModelsOfType("chat");
+  const found = registry.findOfType("classifier", "lab", "cls");
+  const same = registry.getModelOfType("image", "lab", "img");
+  const available = await registry.getAvailableOfType("classifier", "lab", { signal: new AbortController().signal });
+  const result = await registry.classify(classifier, request, options);
+  void [classifiers[0]?.contextWindow, images[0]?.output, chat[0]?.api, found?.type satisfies "classifier" | undefined, same?.type satisfies "image" | undefined, available, result.stopReason, result.answers, result.usage];
+  registry.registerVirtualModel({ provider: "router", id: "auto", name: "Auto", route: (input) => ({ model: input.model, thinkingLevel: "off" }) });
+  registry.unregisterVirtualModel("router", "auto");
+  // @ts-expect-error a model type outside chat, image and classifier is rejected
+  registry.getModelsOfType("video");
+  // @ts-expect-error classify takes a classifier model, not a chat model
+  await registry.classify(chat[0], request);
+  // @ts-expect-error the type argument selects the model type: an image model is not a classifier model
+  const notClassifier: "classifier" | undefined = registry.findOfType("image", "lab", "img")?.type;
+  void notClassifier;
+}
+
+// model-registry.ts:181-188 (1.0.0): generateImages takes an image model and an images context, and never rejects.
+export async function generateImagesFromRegistry(registry: ModelRegistry) {
+  const painter = registry.getModelOfType("image", "openrouter", "google/gemini-2.5-flash-image");
+  if (!painter) return;
+  const result = await registry.generateImages(painter, { input: [{ type: "text", text: "a red circle" }] }, { signal: new AbortController().signal });
+  void [result.stopReason, result.output, result.errorMessage, result.usage];
+  const classifier = registry.getModelOfType("classifier", "lab", "cls");
+  // @ts-expect-error generateImages takes an image model, not a classifier model
+  if (classifier) await registry.generateImages(classifier, { input: [] });
+}
+
+export function extensionRegistryFromContext(pi: ExtensionAPI): void {
+  pi.registerCommand("typed", {
+    handler: async (_args, ctx) => {
+      const registry: ModelRegistry = ctx.modelRegistry;
+      const [first] = await registry.getAvailableOfType("classifier");
+      if (first) {
+        const result = await registry.classify(first, { state: { text: "hi" }, questions: {} });
+        void result.errorMessage;
+      }
+    },
+  });
+}
+
+export const providerImagesAndClassifiers: ProviderConfig = {
+  baseUrl: "https://lab.test",
+  apiKey: "key",
+  models: [
+    { type: "image", id: "img", name: "Image", api: "lab-images", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, output: ["image"] },
+    { type: "classifier", id: "cls", name: "Classifier", api: "lab-classifier", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1 },
+  ],
+  images: {
+    "lab-images": {
+      generateImages: async (model, context, options) => {
+        void [model.output, context.input, options?.signal];
+        return { api: model.api, provider: model.provider, model: model.id, output: [], stopReason: "stop", timestamp: 0 };
+      },
+    },
+  },
+  classifiers: {
+    "lab-classifier": {
+      classify: async (model, context, options) => {
+        void [context.state, context.questions, options?.apiKey, options?.headers];
+        return { api: model.api, provider: model.provider, model: model.id, answers: {}, stopReason: "stop", timestamp: 0 };
+      },
+    },
+  },
+};
+
+export function inlineExtensionFlags(loaded: Extension): InlineExtension {
+  const replaceable: boolean | undefined = loaded.replaceable;
+  return { name: "mcp", factory: () => {}, hidden: true, replaceable: replaceable ?? true, builtin: true };
+}
+
+// The adapter re-exports the pinned declarations: its names are the same types.
+type Same<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+export const adapterReexportsPinnedTypes: [
+  Same<AdapterExtensionToolContext, ExtensionToolContext>,
+  Same<AdapterMcpServerConfig, McpServerConfig>,
+  Same<AdapterModelRegistry, ModelRegistry>,
+  Same<AdapterProviderConfig, ProviderConfig>,
+] = [true, true, true, true];
+
+// PiG's component kit (D107): a surface root's token overrides and the
+// frontend-only annotations of a component's rows, on any pi-tui component.
+export function kitAnnotations(root: Container, table: Component): void {
+  const surface: Component = root;
+  surface.viewTheme = { accent: "#d75f00", selectedBg: "#102030" };
+  table.viewLines = {
+    list: { items: [{ label: "Blue in Green", detail: "Miles Davis", columns: ["5:37"] }], selectedIndex: 0 },
+    progress: { value: 30, max: 200 },
+    image: { data: "", mimeType: "image/png" },
+  };
+  const theme: PiGViewTheme | undefined = surface.viewTheme;
+  const lines: PiGViewLines | undefined = table.viewLines;
+  void [theme, lines];
+  // @ts-expect-error only the closed token set can be overridden
+  surface.viewTheme = { accent2: "#ffffff" };
+  // @ts-expect-error an override is a #rrggbb color
+  surface.viewTheme = { accent: "orange" };
+  // @ts-expect-error a list names its selected item
+  table.viewLines = { list: { items: [] } };
+}
+
+// before_agent_start tells a user run from a custom-message run (Pi 1.2.0 types.ts BeforeAgentStartEvent, Pi PR #10739).
+export function beforeAgentStartTrigger(pi: ExtensionAPI): void {
+  pi.on("before_agent_start", async (event) => {
+    const kind: "user" | "custom" = event.messageType;
+    if (event.messageType === "custom") {
+      const customType: string | undefined = event.message?.customType;
+      void customType;
+      return undefined;
+    }
+    void kind;
+    // @ts-expect-error messageType is a closed union
+    const other: "plan" = event.messageType;
+    void other;
+    return undefined;
+  });
+}
+
+// Pi serves @earendil-works/pi-ai/models to extensions (core/extensions/virtual-modules.ts, #11156); its declarations resolve.
+export const clampedThinkingLevel: string = clampThinkingLevel(
+  { reasoning: false } as Parameters<typeof clampThinkingLevel>[0],
+  "high",
+);
+
+// Pi eebd5d90: a Markdown transformer lists the surfaces it runs on and sees their message types.
+export function markdownTransformerSurfaces(pi: ExtensionAPI): void {
+  pi.registerMarkdownTransformer(
+    (markdown, context) => (context.messageType === "changelog" ? markdown.trim() : markdown),
+    { messageTypes: ["custom", "summary", "changelog"] },
+  );
+  pi.registerMarkdownTransformer((markdown) => markdown, { messageTypes: [] });
+  // @ts-expect-error messageTypes names the closed set of surfaces
+  pi.registerMarkdownTransformer((markdown) => markdown, { messageTypes: ["footer"] });
+}

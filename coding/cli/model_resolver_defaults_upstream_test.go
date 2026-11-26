@@ -1,0 +1,85 @@
+package cli
+
+import (
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/codingagent"
+)
+
+func TestModelResolverDefaultsUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want map[string]string
+	}{
+		// .upstream/current/packages/coding-agent/test/model-resolver.test.ts:683 (e56d35ce5: GPT-6.2 Sol)
+		{"openai defaults track current models", map[string]string{"openai": "gpt-6.2-sol", "openai-codex": "gpt-6.2-sol"}},
+		// .upstream/v0.99.1/packages/coding-agent/test/model-resolver.test.ts:714
+		{"zai, minimax, cerebras, and ant-ling defaults track current models", map[string]string{"zai": "glm-5.3", "zai-coding-cn": "glm-5.3", "minimax": "MiniMax-M3", "minimax-cn": "MiniMax-M3", "cerebras": "gpt-oss-120b", "ant-ling": "Ring-2.6-1T"}},
+		// .upstream/v0.99.1/packages/coding-agent/test/model-resolver.test.ts:738
+		{"ai-gateway default tracks current model", map[string]string{"vercel-ai-gateway": "zai/glm-5.3"}},
+		// .upstream/current/packages/coding-agent/test/model-resolver.test.ts b425754a2
+		{"anthropic default tracks current model", map[string]string{"anthropic": "claude-opus-5-5"}},
+		// d84123b32: provider defaults move to newer models at the same or a lower price.
+		{"newer models at the same or a lower price", map[string]string{"amazon-bedrock": "us.anthropic.claude-opus-5-5", "azure": "gpt-6.2-sol", "google": "gemini-4-argon", "google-vertex": "gemini-4-argon", "baseten": "zai-org/GLM-5.3", "qwen-token-plan": "qwen3.8-max", "qwen-token-plan-cn": "qwen3.8-max", "opencode-go": "kimi-k3.1-pro", "moonshotai": "kimi-k2.7-code", "moonshotai-cn": "kimi-k2.7-code", "huggingface": "moonshotai/Kimi-K2.7-Code", "opencode": "kimi-k2.7-code", "openrouter": "moonshotai/kimi-k2.7-code", "cloudflare-workers-ai": "@cf/moonshotai/kimi-k2.7-code", "cloudflare-ai-gateway": "workers-ai/@cf/moonshotai/kimi-k2.7-code"}},
+		// .upstream/v0.99.1/packages/coding-agent/test/model-resolver.test.ts:742
+		{"xai default tracks current model", map[string]string{"xai": "grok-4.7"}},
+		// .upstream/v0.99.1/packages/coding-agent/test/model-resolver.test.ts:746
+		{"qwen token plan individual default tracks current model", map[string]string{"qwen-token-plan-individual": "qwen3.8-max", "qwen-token-plan-individual-cn": "qwen3.8-max"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for provider, want := range tc.want {
+				if got := codingagent.DefaultModelPerProvider()[provider]; got != want {
+					t.Errorf("%s default=%q, want %q", provider, got, want)
+				}
+			}
+		})
+	}
+	// .upstream/v0.99.1/packages/coding-agent/test/model-resolver.test.ts:723-736: every built-in provider (getBuiltinProviders,
+	// Object.keys(MODELS), which includes providers whose catalog has only image or classifier models) either has a default
+	// in its chat catalog or, with no chat models, no default at all.
+	t.Run("built-in chat providers have defaults in their generated catalogs", func(t *testing.T) {
+		chatless := 0
+		for _, provider := range ai.ListProviders() {
+			t.Run(provider, func(t *testing.T) {
+				id, hasDefault := codingagent.DefaultModelPerProvider()[provider]
+				if len(ai.ListModels(provider)) == 0 {
+					chatless++
+					// A provider whose every model is on a stripped API lists none, and keeps Pi's default in the table: the default names no model any lookup can reach.
+					if hasDefault && !ai.ProviderStripped(provider) {
+						t.Errorf("%s has no chat models and should have no chat default, got %q", provider, id)
+					}
+					return
+				}
+				if _, ok := ai.LookupModelExact(provider + "/" + id); !ok {
+					t.Errorf("%s default %s is absent from generated catalog", provider, id)
+				}
+			})
+		}
+		if chatless == 0 {
+			t.Error("the pinned catalog has a provider without chat models (typesafe); none was checked")
+		}
+	})
+	// .upstream/v0.99.1/packages/coding-agent/test/model-resolver.test.ts:767
+	t.Run("findInitialModel selects ai-gateway default when available", func(t *testing.T) {
+		rt := newStartupModelRuntime([]codingagent.RuntimeModel{{Provider: "vercel-ai-gateway", ID: "anthropic/claude-opus-4-6", Name: "Claude Opus 4.6", Reasoning: true}}, func(string) bool { return true })
+		got, err := findInitialModel(rt, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Provider != "vercel-ai-gateway" || got.ID != "anthropic/claude-opus-4-6" {
+			t.Fatalf("model=%+v", got)
+		}
+	})
+	// .upstream/v0.99.1/packages/coding-agent/test/model-resolver.test.ts:795
+	t.Run("findInitialModel ignores an unauthenticated saved default", func(t *testing.T) {
+		rt := newStartupModelRuntime([]codingagent.RuntimeModel{{Provider: "deepseek", ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", Reasoning: true}, {Provider: "spark-two", ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", Reasoning: true}}, func(provider string) bool { return provider == "spark-two" })
+		got, err := findInitialModel(rt, "deepseek", "deepseek-v4-flash")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Provider != "spark-two" || got.ID != "deepseek-v4-flash" {
+			t.Fatalf("model=%+v", got)
+		}
+	})
+}

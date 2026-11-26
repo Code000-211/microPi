@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: MIT
+
+# Hosted Linux jobs (the preflight job and the Linux shards) partition make check. test/ci-images checks this against the current prerequisite graph so adding a gate cannot silently omit it from CI.
+# ci-preflight ci-preflight-platforms vet-native vet-platforms is the compile gate the Windows, macOS and Node loader jobs wait for, so a change that does not build or vet fails before they spend their minutes.
+ci-preflight: build vet-native
+ci-preflight-platforms: vet-platforms
+autofix-check: ## Unit-test the derived-file autofix tool that the bookkeeping job and the autofix workflow share
+	@python3 -B -m unittest discover -s automation/ci -p test_autofix.py
+
+# ci-bookkeeping is the fail-fast job every other job waits for: the committed derived files, ledgers and policy gates that need only Go, Python and the Pi source mirror (no oracle build, no npm install, no test binaries). A stale ledger or a missing sign-off stops the run in minutes instead of after the 30-minute shards. CI runs it with make -k -j, so one failing gate does not hide the others; automation/ci/autofix-gates.txt names the gates whose remedy is make generate.
+ci-bookkeeping: autofix-check divergences-drift piglet-strip-ids-drift sdk-bundles-drift known-gaps-drift custom-factory-ledger-drift lint-scenarios port-map-drift coverage-drift divergence-consistency divergence-quality divergence-guard gui-import-guard module-pins test-provenance docs-drift bug-ledger-check perf-scoreboard-check
+ci-startup: startup-proxies
+ci-build: module-publication lint go-fix-clean race-coverage model-data-check fixture-guard source-hygiene node-runtime-drift vendor-pi-dist-drift
+# The light pull-request run (automation/ci/ci-tiers.txt) lints the whole changed files (CI sets LINT_BASE=origin/main); the full run keeps the repository-wide lint.
+ci-build-pr: module-publication lint-changed go-fix-clean race-coverage model-data-check fixture-guard source-hygiene node-runtime-drift vendor-pi-dist-drift
+# Short gates share one hosted job each, so their setup is paid once. CI runs them with make -k, so one failing gate does not hide the others.
+ci-checks: ci-startup ci-drift ci-closure
+ci-checks-pr: ci-startup ci-drift-pr ci-closure
+ci-toolchains: ci-race ci-integration ci-sdk ci-extensions ci-term-engines
+# CI runs test-fast and test-cli in halves on separate jobs; each pair together is the whole target.
+ci-test-fast: test-fast-parallel
+ci-test-fast-sharded: test-fast-sharded-1
+ci-test-fast-sharded-2: test-fast-sharded-2
+# The light pull-request run's test-fast shard (automation/ci/ci-tiers.txt): the fast-parallel packages the change affects (TEST_BASE names the pull request's base), no -race so it runs what the full run does, and the whole ci-test-fast when the change touches go.mod, go.sum, go.work or go.work.sum or a file no package test reads.
+ci-test-changed: export TEST_CHANGED_FOR := fast-parallel
+ci-test-changed: export TEST_CHANGED_RACE := none
+ci-test-changed: test-changed sdk-vectors-changed
+# The allocation ratchet's own shard (automation/ci/ci-tiers.txt): the nightly's alloc-baseline for the hot packages the change touches or imports (TEST_BASE names the base). It blocks like every shard of the linux matrix (a failure fails "Linux verification" and so "CI result"). It is its own shard because a change to ai or tui makes it measure most of the hot packages, about 22 minutes, which test-fast must not carry; a change that touches none measures nothing.
+ci-alloc-ratchet: alloc-baseline-changed
+# The SDK modules are not packages of the main module, so test-changed never runs their Pi vector suites. When the change touches the shared tui engine, an SDK or a vector file (automation/ci/sdk-vectors-changed.sh), run the vector check and each SDK's own suite.
+sdk-vectors-changed:
+	@if [ "$$(automation/ci/sdk-vectors-changed.sh)" = true ]; then \
+		node automation/gen/generate-sdk-vectors.mjs --check && $(MAKE) -s test-sdk-go lint-rust test-sdk-rs lint-sdk-py test-sdk-py test-sdk-lisp; \
+	else echo "sdk-vectors-changed: no path the SDK vector suites read changed"; fi
+ci-test-cli-1: test-cli-1
+ci-test-cli-2: test-cli-2
+ci-test-subprocess: test-subprocess
+ci-test-conformance-1: test-conformance-1
+ci-test-conformance-2: test-conformance-2
+ci-test-conformance-3: test-conformance-3
+ci-test-conformance-4: test-conformance-4
+ci-sdk: test-go-modules lint-rust test-sdk-rs lint-sdk-py test-sdk-py test-sdk-py-311 test-sdk-lisp test-sdk-ts
+ci-extensions: typescript-extension-corpus examples-check standard-check
+ci-race: test-race
+ci-term-engines: test-term-engines
+ci-integration: test-integration
+ci-parity: parity-fast
+# CI splits the hermetic parity scenarios in two by name hash; each half runs under the same 20-minute limit.
+ci-parity-1: parity-fast-1
+ci-parity-2: parity-fast-2
+parity-fast-1:
+	@$(MAKE) -s parity-fast PARITY_SHARD=1/2
+parity-fast-2:
+	@$(MAKE) -s parity-fast PARITY_SHARD=2/2
+# module-size's install proof is the one drift gate the light pull-request run leaves to the full run.
+ci-drift: ci-drift-pr module-size
+ci-drift-pr: port-lint any-trap perf-lint
+ci-contracts: correspondence-check porter-check interface-inventory interface-inventory-test interface-go-drift interface-recommendations-drift interface-mapping-quality interface-delta interface-gaps behavior-contracts test-inventory-drift test-inventory test-porting-release format-version-inventory sdk-surface-drift sdk-apidiff piglet-strip-build piglet-strip-guard
+ci-closure: closure-check
+# The Durable core conformance gate in CI: the host's npm tree linked to the pinned Pi build first (durable-contract only checks out the reference); the job picks one build with DURABLE_CONTRACT_ARGS="--impls <pi|wasm-tinygo|native> -j 4".
+ci-durable-contract: durable-core-host-deps durable-contract
+# The Durable conformance tooling's own Go and Node tests in CI: build the TinyGo and native core artifacts first, then require them so an absent artifact fails instead of skipping.
+ci-durable-contract-test:
+	$(MAKE) -C durable/core build-tinygo
+	sh durable/core/budget/build-native.sh
+	DURABLE_CONTRACT_REQUIRE_BUILDS=1 $(MAKE) durable-contract-test
+# portmap-check runs the evidence tests of every proven PORT_MAP row under coverage. It builds each evidence package's test binary once and
+# caches each green row in build/portmap-coverage, but a cold run is still about 170 minutes of 4-CPU runner time (run 41987378567: three shards took 44, 49 and more than 58
+# minutes, the third until the job's 60-minute limit cancelled it), so CI runs it as PORTMAP_SHARDS parallel jobs; every shard computes the same plan, judges its own rows and skips the rest, and the Linux verification
+# job requires all of them.
+PORTMAP_SHARDS := 12
+ci-portmap-1: portmap-check-1
+ci-portmap-2: portmap-check-2
+ci-portmap-3: portmap-check-3
+ci-portmap-4: portmap-check-4
+ci-portmap-5: portmap-check-5
+ci-portmap-6: portmap-check-6
+ci-portmap-7: portmap-check-7
+ci-portmap-8: portmap-check-8
+ci-portmap-9: portmap-check-9
+ci-portmap-10: portmap-check-10
+ci-portmap-11: portmap-check-11
+ci-portmap-12: portmap-check-12
+portmap-check-1:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=1/$(PORTMAP_SHARDS)
+portmap-check-2:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=2/$(PORTMAP_SHARDS)
+portmap-check-3:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=3/$(PORTMAP_SHARDS)
+portmap-check-4:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=4/$(PORTMAP_SHARDS)
+portmap-check-5:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=5/$(PORTMAP_SHARDS)
+portmap-check-6:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=6/$(PORTMAP_SHARDS)
+portmap-check-7:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=7/$(PORTMAP_SHARDS)
+portmap-check-8:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=8/$(PORTMAP_SHARDS)
+portmap-check-9:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=9/$(PORTMAP_SHARDS)
+portmap-check-10:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=10/$(PORTMAP_SHARDS)
+portmap-check-11:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=11/$(PORTMAP_SHARDS)
+portmap-check-12:
+	@$(MAKE) -s portmap-check PORTMAP_SHARD=12/$(PORTMAP_SHARDS)
+
+# Run after upstream-mirror under each selected Node runtime. Do not reinstall
+# npm dependencies here: the qualified npm requires a newer Node than Pi does.
+# The matrix selects extension hosting/runtime tests. Go URL-conversion oracle
+# tests stay in the full suite on the qualified Node pin; so does TestNodePiAiExtensionViewMatchesThePinnedView, which compares against
+# Pi's view under testenv.RequireQualifiedNode and so refuses the engine-floor and current Node (-skip).
+# ci-chord-tui runs the terminal surface's tests under the Node on the PATH, which must be 26.5.1 or later (the sandbox's floor): CI sets
+# CHORD_REQUIRE_TUI_NODE, so a Node that is too old fails them rather than skipping them (Pi skips; the Go suite must not hide them).
+ci-chord-tui:
+	CHORD_TUI_NODE="$$(command -v node)" CHORD_REQUIRE_TUI_NODE=1 go test -count=1 ./chord/nextnode/tui
+
+# ci-chord-web runs the web surface's tests in a real Chromium (the page, React hooks, language, stylesheets, and the reload suite's rows
+# with the delegate test: reload_*_test.go, app_delegate_test.go) and the React stores under the Node on the PATH. CI sets CHORD_REQUIRE_CHROMIUM, so a missing browser fails them rather than skipping them.
+# The page tests of the reference web client of plugin views (examples/ui-view-web, TestPage*) run in the same Chromium under the same rule.
+ci-chord-web:
+	CHROMIUM_BIN="$${CHROMIUM_BIN:-$$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser)}" CHORD_REQUIRE_CHROMIUM=1 \
+		go test -count=1 ./chord/nextnode/app -run '^Test(React|ThePagesLanguage|APage|AChangeOfBaseCode|AReload|ARollout|AJobRunning|AServerPluginsObject)'
+	go test -count=1 ./chord/nextnode/surfaces -run '^TestReact'
+	CHROMIUM_BIN="$${CHROMIUM_BIN:-$$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser)}" CHORD_REQUIRE_CHROMIUM=1 \
+		go test -count=1 ./examples/ui-view-web -run '^TestPage'
+
+ci-node-runtime:
+	go test -tags=parity -count=1 ./coding/extension/host/subprocess -skip '^TestNodePiAiExtensionViewMatchesThePinnedView$$' -run '^Test(Node|EmbeddedNode|ResolveNode|EnsureNode|Host.*Node|Builder.*Node|BuildExtCommand_Node|PiDiff|PiScrollView|PiTui|VendoredCrossSpawn|TerminalInputNode)'
+	go test -tags=parity -count=1 ./coding/cli -run '^TestRPCStartupMalformedPackageManifests$$'
+	@mkdir -p $(dir $(PARITY_PIG_BIN))
+	go build -o $(PARITY_PIG_BIN) ./cmd/pig
+	@results=$$($(MKTEMP)); trap 'rm -f "$$results"' EXIT; \
+		PIG_PARITY_PIG_BIN="$(PARITY_PIG_BIN)" go test -tags=parity -count=1 ./test/parity/runner \
+		-run 'TestParity/(23-extension-directory-entries|26-extension-load-order|31-extension-runtime-surface|32-extension-load-failure-message|34-extension-(module-loading|process-identity)|55-(package-manifest-startup|node-package-entry-exports))$$' \
+		-args -pig-parity.results="$$results" && \
+		$(MAKE) -s require-parity-ran RESULTS="$$results"
+
+.PHONY: ci-node-runtime ci-chord-tui ci-chord-web
+
+test-fast: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh fast
+
+test-cli: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh cli
+
+test-fast-parallel: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh fast-parallel
+
+test-fast-sharded: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh fast-sharded
+
+test-fast-sharded-1: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh fast-sharded 1 2
+
+test-fast-sharded-2: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh fast-sharded 2 2
+
+test-cli-1: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh cli 1 4
+
+test-cli-2: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh cli 5 8
+
+test-subprocess: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh subprocess
+
+test-conformance: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh conformance
+
+# CI runs the conformance shards in four jobs of five; the four ranges together are test-conformance. The shards run one after another, each as its own go test process under go test's 10-minute package limit (automation/ci/test-shard-weights.txt packs them, generated by automation/ci/shard-pack.py from measured timings); the processes share the extension cells (testenv.SharedCellCacheDir). On GitHub's 4-CPU runner two jobs of ten took 45 to 48 minutes warm and hit the 60-minute limit cold (runs 44870314130 and 44880357753); four jobs of five keep every job under 50% of the 60-minute limit warm and under 44 minutes cold.
+test-conformance-1: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh conformance 1 5
+
+test-conformance-2: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh conformance 6 10
+
+test-conformance-3: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh conformance 11 15
+
+test-conformance-4: test-prereqs interface-deps parity-deps durable-interop-deps
+	@./automation/ci/test-grouped.sh conformance 16 20
+
+# A golden or snapshot file declares where its expected values come from (test/testdata-provenance.toml).
+test-provenance: ## Fail on a golden or snapshot file without declared Pi provenance
+	@go run ./test/parity/cmd/testprune lint -provenance
+
+# An expectation edited in the same commit as the code it tests needs the Pi behavior change that justifies it.
+test-expectation-lint: ## Fail on test expectations edited with their code and no Pi-Behavior-Change trailer (TEST_EXPECT_BASE, default main)
+	@base=$$(git merge-base HEAD "$(TEST_EXPECT_BASE)") || { echo "test-expectation-lint: cannot find merge base with $(TEST_EXPECT_BASE)" >&2; exit 2; }; \
+	go run ./test/parity/cmd/testprune lint -base "$$base"
+
+TEST_EXPECT_BASE ?= main
+
+.PHONY: sdk-vectors-changed ci-durable-contract ci-durable-contract-test test-provenance test-expectation-lint ci-preflight ci-test-changed ci-bookkeeping autofix-check ci-startup ci-build ci-build-pr ci-checks ci-checks-pr ci-toolchains ci-test-fast ci-test-fast-sharded test-fast-sharded-1 test-fast-sharded-2 ci-test-fast-sharded-2 ci-test-cli-1 ci-test-cli-2 ci-test-subprocess ci-test-conformance-1 ci-test-conformance-2 ci-test-conformance-3 ci-test-conformance-4 ci-sdk ci-extensions ci-race ci-term-engines ci-integration ci-parity ci-parity-1 ci-parity-2 parity-fast-1 parity-fast-2 ci-drift ci-drift-pr ci-contracts ci-portmap-1 ci-portmap-2 ci-portmap-3 ci-portmap-4 ci-portmap-5 ci-portmap-6 ci-portmap-7 ci-portmap-8 ci-portmap-9 ci-portmap-10 ci-portmap-11 ci-portmap-12 portmap-check-1 portmap-check-2 portmap-check-3 portmap-check-4 portmap-check-5 portmap-check-6 portmap-check-7 portmap-check-8 portmap-check-9 portmap-check-10 portmap-check-11 portmap-check-12 ci-closure test-fast test-fast-parallel test-fast-sharded test-cli test-cli-1 test-cli-2 test-subprocess test-conformance test-conformance-1 test-conformance-2 test-conformance-3 test-conformance-4

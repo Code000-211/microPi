@@ -1,0 +1,152 @@
+//go:build !windows
+
+package daemon
+
+// pi: packages/env/daemon/src/sys/unix.rs
+
+import (
+	"bufio"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func TestServePingsAndStopsEverythingWhenTheClientGoesSilent(t *testing.T) {
+	silent := make(chan struct{})
+	// OnSilence runs on the daemon's ping goroutine, so it only signals; the test closes the input once it sees the signal.
+	p := startServe(t, Options{PingInterval: 50 * time.Millisecond, SilenceLimit: 2 * time.Second, OnSilence: func() { close(silent) }})
+	p.request(1, Object{"op": "exec", "cwd": t.TempDir(), "command": "echo $$; exec sleep 60"}, nil)
+	// The client answers pings, as a live client does, until the command has started; only then does it go silent. Otherwise a
+	// host slow to start the shell reaches the silence limit before the command exists. The limit leaves the live client's
+	// ping round trip (daemon, pipe, test goroutine, pipe, daemon) room for a loaded host: under -race beside other packages a
+	// 400 ms limit fired while the client was still answering.
+	var pid int
+	for pid == 0 {
+		var frame *Frame
+		select {
+		case next, ok := <-p.frames:
+			if !ok {
+				t.Fatal("the daemon closed its output before the command started")
+			}
+			frame = next
+		case <-time.After(20 * time.Second):
+			t.Fatal("no frame from the daemon")
+		}
+		switch {
+		case frame.Kind == FramePing:
+			p.send(FramePing, 0, Object{}, nil)
+		case frame.Kind == FrameEvent && frame.ID == 1:
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(frame.Payload)))
+		}
+	}
+	select {
+	case <-silent:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the silence limit never fired")
+	}
+	_ = p.input.Close()
+	pings := 0
+	for frame := range p.frames {
+		if frame.Kind == FramePing {
+			pings++
+		}
+	}
+	if pings < 3 {
+		t.Fatalf("%d pings in the silent period, want several", pings)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("the command (pid %d) outlived a silent client", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// main.rs hello and sys/unix.rs tmpdir: a daemon built for Android reports `android` and falls back to Termux's
+// $PREFIX/tmp, also when it is the linux/amd64 build that make build-env-daemons packages as pi-env-android-x64.
+func TestHelloAndTmpdirFollowTheTargetSystem(t *testing.T) {
+	saved := targetOS
+	t.Cleanup(func() { targetOS = saved })
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("PREFIX", "/data/data/com.termux/files/usr")
+	targetOS = "android"
+	if got := osName(); got != "android" {
+		t.Fatalf("osName() = %q, want android", got)
+	}
+	if got := tmpdir(); got != "/data/data/com.termux/files/usr/tmp" {
+		t.Fatalf("tmpdir() = %q, want Termux's $PREFIX/tmp", got)
+	}
+	targetOS = "linux"
+	if got := tmpdir(); got != "/tmp" {
+		t.Fatalf("tmpdir() = %q, want /tmp", got)
+	}
+	targetOS = "darwin"
+	if got := osName(); got != "macos" {
+		t.Fatalf("osName() = %q, want macos", got)
+	}
+}
+
+// The signal exit gives the daemon's input back under serveFrames' read, which then fails. Serve must not return that error
+// while the exit ends the process: pi-env's main would end it with status 1 where the exit means 128 + the signal (the
+// daemon ended by SIGTERM reported 1 on a macOS runner that scheduled the main goroutine first). The input is a real pipe, as
+// the daemon's stdin is, so the exit has a descriptor to close under the read.
+func TestServeDoesNotReturnWhileTheSignalExitEndsTheProcess(t *testing.T) {
+	inputReader, inputWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputReader, outputWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = inputWriter.Close()
+		_ = outputReader.Close()
+	})
+	returned := make(chan error, 1)
+	exits := make(chan int, 1)
+	// The exit hook returns where os.Exit would not, so this Serve stays blocked for the rest of the test binary and its ping
+	// goroutine keeps ticking. Without OnSilence the silence exit would end the test process with os.Exit(0) once the limit
+	// passed; the hook only records, because it can run after this test ended.
+	var silent atomic.Bool
+	go func() {
+		returned <- Serve(inputReader, outputWriter, "tok", Options{
+			OnSilence: func() { silent.Store(true) },
+			exit: func(code int) {
+				// The input is closed under the read by now: give Serve every chance to return before the exit ends the process.
+				select {
+				case err := <-returned:
+					t.Errorf("Serve returned %v while the signal exit was ending the process", err)
+				case <-time.After(250 * time.Millisecond):
+				}
+				exits <- code
+			},
+		})
+	}()
+	_ = outputReader.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if line, err := bufio.NewReader(outputReader).ReadString('\n'); err != nil || line != "PI-ENV tok\n" {
+		t.Fatalf("sync line %q: %v", line, err)
+	}
+	// Serve has taken the signals (it does before the sync line), so nothing but its exit sees this one.
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-exits:
+		if code != 128+int(syscall.SIGTERM) {
+			t.Fatalf("the signal exit ended the process with status %d, want %d", code, 128+int(syscall.SIGTERM))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the signal exit did not end the process")
+	}
+	if silent.Load() {
+		t.Error("the silence exit fired while the signal exit was ending the process")
+	}
+}

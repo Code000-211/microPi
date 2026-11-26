@@ -1,0 +1,322 @@
+package ai
+
+// Ports packages/ai/src/utils/event-stream.ts
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"iter"
+	"math"
+	"sync"
+	"time"
+)
+
+type eventDelivery struct {
+	event AssistantMessageEvent
+	done  bool
+}
+
+// eventWaiter is a pending iterator.next(). A push assigns it an event, or the end of the stream, under the stream lock.
+type eventWaiter struct {
+	onReady func(eventDelivery) func()
+}
+
+func (waiter *eventWaiter) deliver(delivery eventDelivery) func() {
+	return waiter.onReady(delivery)
+}
+
+// AssistantMessageEventStream is an ordered in-process event stream. Result
+// completes independently of event iteration; unread events remain available
+// until consumed. Subprocess transports impose their own bounded backpressure.
+type AssistantMessageEventStream struct {
+	mu           sync.Mutex
+	queue        []AssistantMessageEvent
+	waiters      []*eventWaiter
+	done         chan struct{}
+	executor     *continuationExecutor
+	publications assistantPublications
+	// validated is the longest string of tool-call arguments that the last emission-time snapshot (publishPartialLocked) found to be valid UTF-8, which the next snapshot of a longer string does not read again.
+	validated string
+	// producer is the executor turn that owns pushes, if any. Only a producer under the executor publishes live partial views.
+	producer *continuationTurn
+
+	// startedAt is the wall-clock time in milliseconds and startedMono the monotonic reading of the stream's creation, which time the final message.
+	startedAt   int64
+	startedMono time.Time
+
+	terminal      bool
+	resolved      bool
+	result        *AssistantMessage
+	resultWaiters []*continuationPromise[*AssistantMessage]
+}
+
+// NewAssistantMessageEventStream creates an open stream.
+func NewAssistantMessageEventStream() *AssistantMessageEventStream {
+	//portlint:allow clock Pi stamps the stream with Date.now() and times durationMs with performance.now(); neither reads an injected clock (event-stream.ts:98-99)
+	now := time.Now()
+	return &AssistantMessageEventStream{done: make(chan struct{}), startedAt: now.UnixMilli(), startedMono: now}
+}
+
+// timeLocked sets durationMs on the final message of a response the stream saw start: the monotonic milliseconds since the stream's creation, unless the stream is complete, the message already has one, or its timestamp predates the stream, as a deferred result fetched later does.
+// upstream: event-stream.ts:99-129 (AssistantMessageEventStream.#time)
+func (s *AssistantMessageEventStream) timeLocked(message *AssistantMessage) {
+	if message == nil || s.terminal || s.startedMono.IsZero() || message.DurationMs != nil || message.Timestamp < s.startedAt {
+		return
+	}
+	//portlint:allow numbers an elapsed-milliseconds value is finite and far below the int64 range
+	message.DurationMs = new(max(int64(0), int64(math.Round(float64(time.Since(s.startedMono))/float64(time.Millisecond)))))
+}
+
+// Push appends an event. Pushes after termination are ignored, matching Pi's
+// EventStream. Done and error may terminate without a start event. Missing data and invalid closed-union values return a payload error.
+func (s *AssistantMessageEventStream) Push(event AssistantMessageEvent) error {
+	return s.push(event, assistantMessageReplacements{})
+}
+
+// push is Push for a producer that assigned new nested objects to its partial since the last push. Earlier shallow copies keep the objects they retained.
+func (s *AssistantMessageEventStream) push(event AssistantMessageEvent, replacements assistantMessageReplacements) error {
+	if event == nil {
+		return errors.New("assistant message stream event is nil")
+	}
+	s.mu.Lock()
+	if executor := s.executor; executor != nil && executor.trace != nil && executor.trace.push != nil {
+		trace := executor.trace
+		s.mu.Unlock()
+		trace.push(s, event)
+		s.mu.Lock()
+	}
+	var continuations []func()
+	defer func() {
+		s.mu.Unlock()
+		for _, continuation := range continuations {
+			continuation()
+		}
+	}()
+	if s.terminal {
+		return nil
+	}
+	if err := s.validateLocked(event); err != nil {
+		return err
+	}
+	event = mapAssistantEventPartial(event, func(message *AssistantMessage) *AssistantMessage {
+		return s.publishPartialLocked(message, replacements)
+	})
+
+	terminal := false
+	switch event := event.(type) {
+	case DoneEvent:
+		s.timeLocked(event.Message)
+		s.publishTerminalLocked(event.Message, replacements)
+		s.terminal = true
+		s.result = event.Message
+		terminal = true
+	case ErrorEvent:
+		s.timeLocked(event.Error)
+		s.publishTerminalLocked(event.Error, replacements)
+		s.terminal = true
+		s.result = event.Error
+		terminal = true
+	}
+
+	if terminal {
+		s.validated = ""
+		continuations = append(continuations, s.resolveResultLocked()...)
+	}
+	if len(s.waiters) == 0 {
+		s.queue = append(s.queue, event)
+	} else {
+		waiter := s.waiters[0]
+		// The waiter list is shifted down in place, so a consumer that registers again appends into the array it left and the list never reallocates per event.
+		last := len(s.waiters) - 1
+		copy(s.waiters, s.waiters[1:])
+		s.waiters[last] = nil
+		s.waiters = s.waiters[:last]
+		if continuation := waiter.deliver(eventDelivery{event: event}); continuation != nil {
+			continuations = append(continuations, continuation)
+		}
+	}
+
+	if terminal {
+		for _, waiter := range s.waiters {
+			if continuation := waiter.deliver(eventDelivery{done: true}); continuation != nil {
+				continuations = append(continuations, continuation)
+			}
+		}
+		s.waiters = nil
+	}
+	return nil
+}
+
+func (s *AssistantMessageEventStream) validateLocked(event AssistantMessageEvent) error {
+	switch value := event.(type) {
+	case StartEvent:
+		if value.Partial == nil {
+			return errors.New("assistant message stream start is missing partial")
+		}
+	case DoneEvent:
+		if value.Message == nil {
+			return errors.New("assistant message stream done is missing message")
+		}
+		if value.Reason != StopReasonStop && value.Reason != StopReasonLength && value.Reason != StopReasonToolUse && value.Reason != StopReasonDeferred {
+			return fmt.Errorf("assistant message stream done has invalid reason %q", value.Reason)
+		}
+	case ErrorEvent:
+		if value.Error == nil {
+			return errors.New("assistant message stream error is missing assistant message")
+		}
+		if value.Reason != StopReasonError && value.Reason != StopReasonAborted {
+			return fmt.Errorf("assistant message stream error has invalid reason %q", value.Reason)
+		}
+	default:
+		if partial := eventPartial(event); partial == nil {
+			return fmt.Errorf("assistant message stream %s is missing partial", event.EventType())
+		}
+	}
+	return nil
+}
+
+// Events returns a single-pass sequence over the stream's shared FIFO. Multiple
+// iterators divide events in waiter-registration order, matching Pi's queue.
+// Canceling ctx removes an outstanding waiter without a delivery goroutine.
+func (s *AssistantMessageEventStream) Events(ctx context.Context) iter.Seq[AssistantMessageEvent] {
+	return s.events(ctx, true)
+}
+
+// events is Events with optional delivery-time materialization. A forwarder passes false so a hop between streams neither copies nor observes the partial.
+func (s *AssistantMessageEventStream) events(ctx context.Context, materialize bool) iter.Seq[AssistantMessageEvent] {
+	if ctx == nil {
+		panic("assistant message event stream: nil iterator context")
+	}
+	return func(yield func(AssistantMessageEvent) bool) {
+		if turn, ok := ctx.Value(continuationTurnKey{}).(*continuationTurn); ok && turn != nil {
+			iterator := newContinuationEventIterator(ctx, s, turn.executor)
+			defer iterator.close()
+			for {
+				delivery := awaitContinuation(turn, iterator.next())
+				if delivery.done || !yield(s.deliver(delivery.event, materialize)) {
+					return
+				}
+			}
+		}
+		for _, event := range s.observeEvents(ctx, materialize) {
+			if !yield(event) {
+				return
+			}
+		}
+	}
+}
+
+// deliver sets the event's partial fields to the stream state at the consumer's tick.
+func (s *AssistantMessageEventStream) deliver(event AssistantMessageEvent, materialize bool) AssistantMessageEvent {
+	if !materialize {
+		return event
+	}
+	return RefreshEvent(event)
+}
+
+// End closes iteration without synthesizing an event. An optional result resolves Result once; ending without a result leaves it pending, as Pi's EventStream.end does.
+func (s *AssistantMessageEventStream) End(result ...*AssistantMessage) {
+	s.mu.Lock()
+	var continuations []func()
+	defer func() {
+		s.mu.Unlock()
+		for _, continuation := range continuations {
+			continuation()
+		}
+	}()
+	if len(result) > 0 {
+		s.timeLocked(result[0])
+	}
+	s.terminal = true
+	s.validated = ""
+	if len(result) > 0 && !s.resolved {
+		s.publishTerminalLocked(result[0], assistantMessageReplacements{})
+		s.result = result[0]
+		continuations = append(continuations, s.resolveResultLocked()...)
+	}
+	for _, waiter := range s.waiters {
+		if continuation := waiter.deliver(eventDelivery{done: true}); continuation != nil {
+			continuations = append(continuations, continuation)
+		}
+	}
+	s.waiters = nil
+}
+
+// Result waits for a terminal event or End result and returns the first resolved message pointer.
+func (s *AssistantMessageEventStream) Result() *AssistantMessage {
+	result, _ := s.ResultContext(context.Background())
+	return result
+}
+
+// ResultContext waits for the final result or the caller's cancellation without changing stream ownership. The goroutine that runs a consumer callback awaits the result as Pi's `await stream.result()` inside that callback does: it releases the callback's turn and resumes in FIFO order. Any other goroutine only waits, so it never yields a callback that is running.
+func (s *AssistantMessageEventStream) ResultContext(ctx context.Context) (*AssistantMessage, error) {
+	s.mu.Lock()
+	executor := s.executor
+	s.mu.Unlock()
+	if executor != nil {
+		executor.mu.Lock()
+		observation := executor.observation
+		executor.mu.Unlock()
+		if observation != nil && observation.ownedByCaller() {
+			select {
+			case <-s.done:
+				if ctx.Err() == nil {
+					// An already settled result is an await of a resolved promise: its resume reaction is queued before execution is released, so it does not depend on when this goroutine is next scheduled.
+					observation.Yield()
+					s.mu.Lock()
+					defer s.mu.Unlock()
+					return s.result, nil
+				}
+			default:
+			}
+			resume := observation.suspend()
+			defer func() { resume(ctx.Err() == nil) }()
+		}
+	}
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.result, nil
+}
+
+func eventPartial(event AssistantMessageEvent) *AssistantMessage {
+	switch value := event.(type) {
+	case TextStartEvent:
+		return value.Partial
+	case TextDeltaEvent:
+		return value.Partial
+	case TextEndEvent:
+		return value.Partial
+	case ThinkingStartEvent:
+		return value.Partial
+	case ThinkingDeltaEvent:
+		return value.Partial
+	case ThinkingEndEvent:
+		return value.Partial
+	case ToolCallStartEvent:
+		return value.Partial
+	case ToolCallDeltaEvent:
+		return value.Partial
+	case ToolCallEndEvent:
+		return value.Partial
+	default:
+		return nil
+	}
+}
+
+// SettledResult returns the stream's final message without waiting, and whether the stream has one: Pi's `await response.result()` of a result that is already resolved.
+func (s *AssistantMessageEventStream) SettledResult() (*AssistantMessage, bool) {
+	select {
+	case <-s.done:
+	default:
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.result, true
+}

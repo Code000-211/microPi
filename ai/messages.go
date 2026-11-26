@@ -1,0 +1,594 @@
+package ai
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"maps"
+
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// Message is the closed provider-facing transcript union.
+type Message interface {
+	messageRole() string
+	MessageRole() string
+	cloneMessage() Message
+}
+
+// SystemContent is the closed content union for system messages.
+type SystemContent interface {
+	isSystemContent()
+	cloneSystemContent() SystemContent
+}
+
+// SystemText carries system instruction text.
+type SystemText string
+
+func (SystemText) isSystemContent()                       {}
+func (text SystemText) cloneSystemContent() SystemContent { return text }
+
+// SystemTextBlocks carries system instruction text blocks.
+type SystemTextBlocks []TextContent
+
+func (SystemTextBlocks) isSystemContent() {}
+func (blocks SystemTextBlocks) cloneSystemContent() SystemContent {
+	return append(SystemTextBlocks(nil), blocks...)
+}
+
+// UserContent is the closed content union for user messages.
+type UserContent interface {
+	isUserContent()
+	cloneUserContent() UserContent
+}
+
+// UserText carries a plain user message.
+type UserText string
+
+func (UserText) isUserContent()                     {}
+func (text UserText) cloneUserContent() UserContent { return text }
+
+// UserContentBlock is valid inside a user message.
+type UserContentBlock interface {
+	ContentBlock
+	isUserContentBlock()
+}
+
+func (TextContent) isUserContentBlock()  {}
+func (ImageContent) isUserContentBlock() {}
+
+// UserContentBlocks carries text and image user content.
+type UserContentBlocks []UserContentBlock
+
+func (UserContentBlocks) isUserContent() {}
+func (blocks UserContentBlocks) cloneUserContent() UserContent {
+	out := make(UserContentBlocks, len(blocks))
+	for i, block := range blocks {
+		out[i] = cloneUserContentBlock(block)
+	}
+	return out
+}
+
+// AssistantContentBlock is valid inside an assistant message.
+type AssistantContentBlock interface {
+	ContentBlock
+	isAssistantContentBlock()
+}
+
+func (TextContent) isAssistantContentBlock()     {}
+func (ThinkingContent) isAssistantContentBlock() {}
+func (ToolCall) isAssistantContentBlock()        {}
+
+// ToolResultMessageContent is valid inside a tool-result message.
+type ToolResultMessageContent interface {
+	ContentBlock
+	isToolResultMessageContent()
+}
+
+func (TextContent) isToolResultMessageContent()  {}
+func (ImageContent) isToolResultMessageContent() {}
+
+// SystemMessage changes instructions and tool state at one transcript position.
+type SystemMessage struct {
+	Content      SystemContent   `json:"content"`
+	Sections     OrderedSections `json:"sections,omitempty"`
+	Timestamp    int64           `json:"timestamp"`
+	ToolsAdded   []ToolSchema    `json:"toolsAdded,omitempty"`
+	ToolsRemoved []ToolReference `json:"toolsRemoved,omitempty"`
+}
+
+func (SystemMessage) messageRole() string { return "system" }
+
+// MessageRole is the role property of a message.
+func (SystemMessage) MessageRole() string { return "system" }
+func (message SystemMessage) cloneMessage() Message {
+	message.Content = cloneSystemContent(message.Content)
+	message.Sections = cloneSections(message.Sections)
+	message.ToolsAdded = cloneTools(message.ToolsAdded)
+	message.ToolsRemoved = append([]ToolReference(nil), message.ToolsRemoved...)
+	return message
+}
+
+// UserMessage is one user turn.
+type UserMessage struct {
+	Content   UserContent `json:"content"`
+	Timestamp int64       `json:"timestamp"`
+}
+
+func (UserMessage) messageRole() string { return "user" }
+
+// MessageRole is the role property of a message.
+func (UserMessage) MessageRole() string { return "user" }
+func (message UserMessage) cloneMessage() Message {
+	message.Content = cloneUserContent(message.Content)
+	return message
+}
+
+// AssistantMessage is a complete or partial model response. A stream event delivers a partial whose exported fields equal the stream state at delivery; they do not change behind readers. Observe and RefreshEvent read the current state of a partial retained past its delivery.
+type AssistantMessage struct {
+	observation           *assistantMessageObservation
+	Content               []AssistantContentBlock      `json:"content"`
+	API                   API                          `json:"api"`
+	Provider              string                       `json:"provider"`
+	Model                 string                       `json:"model"`
+	ResponseModel         string                       `json:"responseModel,omitempty"`
+	ResponseID            string                       `json:"responseId,omitempty"`
+	ProviderThinkingLevel string                       `json:"providerThinkingLevel,omitempty"`
+	Diagnostics           []AssistantMessageDiagnostic `json:"diagnostics,omitempty"`
+	Usage                 Usage                        `json:"usage"`
+	StopReason            StopReason                   `json:"stopReason"`
+	Deferred              *DeferredHandle              `json:"deferred,omitempty"`
+	RawStopReason         string                       `json:"rawStopReason,omitempty"`
+	EndTurn               *bool                        `json:"endTurn,omitempty"`
+	Timestamp             int64                        `json:"timestamp"`
+	// ErrorMessage follows the timestamp: a provider's catch block sets it on the output it built with its timestamp. A message
+	// built with the error first (ErrorBeforeTimestamp) encodes it before the timestamp.
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	// ErrorBeforeTimestamp records that the message was built with errorMessage before timestamp, as faux.ts builds its
+	// messages (fauxAssistantMessage and createErrorMessage spread errorMessage, then timestamp), and as a stored record
+	// that lists the keys in that order decodes. JavaScript keeps the order its source wrote, so the order is part of the
+	// message; both encoders write it.
+	ErrorBeforeTimestamp bool `json:"-"`
+	// FailureResponse holds non-serialized response metadata for a failed request (status, headers, stream phase) so a
+	// custom retry policy can inspect Retry-After and stream state without altering JSON wire encodings.
+	FailureResponse *FailureResponse `json:"-"`
+	// DurationMs is the milliseconds from the start of the request to the final message, measured with a monotonic clock by the AssistantMessageEventStream. Nil for legacy messages and for deferred results fetched later.
+	// upstream: ai/src/types.ts:582 AssistantMessage.durationMs
+	DurationMs *int64 `json:"durationMs,omitempty"`
+	// ModelThinkingLevel is the thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. Mirrors upstream AssistantMessage.thinkingLevel (packages/ai/src/types.ts:557).
+	ThinkingLevel ModelThinkingLevel `json:"thinkingLevel,omitempty"`
+}
+
+func (AssistantMessage) messageRole() string { return "assistant" }
+
+// MessageRole is the role property of a message.
+func (AssistantMessage) MessageRole() string { return "assistant" }
+func (message AssistantMessage) cloneMessage() Message {
+	return *message.Observe()
+}
+
+func cloneAssistantMessage(message AssistantMessage) AssistantMessage {
+	return cloneAssistantMessageWith(message, cloneArgumentsValue)
+}
+
+// clonePublishedAssistantMessage is cloneAssistantMessage for a snapshot a message cell published. Publication already copied its tool arguments through cloneArgumentsValue, so their strings are valid and a copy need not read them again: without that, every observation of a streaming tool call would read all of its arguments so far.
+func clonePublishedAssistantMessage(message AssistantMessage) AssistantMessage {
+	return cloneAssistantMessageWith(message, clonePublishedJSONValue)
+}
+
+func cloneAssistantMessageWith(message AssistantMessage, cloneArguments func(any) any) AssistantMessage {
+	message.observation = nil
+	message.Content = cloneAssistantContentWith(message.Content, cloneArguments)
+	message.Usage = cloneUsage(message.Usage)
+	message.Diagnostics = cloneDiagnostics(message.Diagnostics)
+	message.Deferred = cloneDeferredHandle(message.Deferred)
+	if message.EndTurn != nil {
+		message.EndTurn = new(*message.EndTurn)
+	}
+	if message.DurationMs != nil {
+		message.DurationMs = new(*message.DurationMs)
+	}
+	if message.FailureResponse != nil {
+		copied := *message.FailureResponse
+		copied.Headers = maps.Clone(message.FailureResponse.Headers)
+		message.FailureResponse = &copied
+	}
+	return message
+}
+
+// NestedToolCallStatus is the state of a [NestedToolCallRecord]. `unfinished` means the call was still running when the calling tool finished.
+//
+// upstream: .upstream/v0.99.1/packages/ai/src/types.ts:573-586 (NestedToolCallRecord.status)
+type NestedToolCallStatus string
+
+// The statuses of upstream's NestedToolCallRecord.status union.
+const (
+	NestedToolCallOK         NestedToolCallStatus = "ok"
+	NestedToolCallError      NestedToolCallStatus = "error"
+	NestedToolCallUnfinished NestedToolCallStatus = "unfinished"
+)
+
+// NestedToolCallRecord is a tool call that another tool made while it ran, for example from a codemode script. Arguments is nil when it was over the size limits; ArgumentsBytes then gives their size.
+//
+// upstream: .upstream/v0.99.1/packages/ai/src/types.ts:573-586 (NestedToolCallRecord)
+type NestedToolCallRecord struct {
+	ID     string               `json:"id"`
+	Name   string               `json:"name"`
+	Status NestedToolCallStatus `json:"status"`
+	// Arguments is omitted when over the size limits.
+	Arguments JsonObject `json:"arguments,omitempty"`
+	// ArgumentsBytes is the UTF-8 size of the arguments as JSON, set when Arguments is omitted.
+	ArgumentsBytes *int   `json:"argumentsBytes,omitempty"`
+	DurationMs     *int64 `json:"durationMs,omitempty"`
+	// Error is the error text, truncated.
+	Error string `json:"error,omitempty"`
+
+	// argumentOrder is the member order of Arguments, as ToolCall keeps it.
+	argumentOrder schemaObjectOrder
+}
+
+// SetArgumentsJSON decodes a complete JSON object into Arguments and keeps its member order.
+func (record *NestedToolCallRecord) SetArgumentsJSON(raw []byte) error {
+	call := ToolCall{}
+	if err := call.SetArgumentsJSON(raw); err != nil {
+		return err
+	}
+	record.Arguments, record.argumentOrder = call.Arguments, call.argumentOrder
+	return nil
+}
+
+// MarshalJSON keeps an empty `arguments` object, which differs from omitted arguments (over the size limits): only a nil Arguments is left out.
+func (record NestedToolCallRecord) MarshalJSON() ([]byte, error) {
+	wire := struct {
+		ID             string               `json:"id"`
+		Name           string               `json:"name"`
+		Status         NestedToolCallStatus `json:"status"`
+		Arguments      json.RawMessage      `json:"arguments,omitempty"`
+		ArgumentsBytes *int                 `json:"argumentsBytes,omitempty"`
+		DurationMs     *int64               `json:"durationMs,omitempty"`
+		Error          string               `json:"error,omitempty"`
+	}{ID: record.ID, Name: record.Name, Status: record.Status, ArgumentsBytes: record.ArgumentsBytes, DurationMs: record.DurationMs, Error: record.Error}
+	if record.Arguments != nil {
+		arguments, err := ToolCall{Arguments: record.Arguments, argumentOrder: record.argumentOrder}.ArgumentsJSON()
+		if err != nil {
+			return nil, err
+		}
+		wire.Arguments = arguments
+	}
+	return jsstring.MarshalKeepingSurrogates(wire)
+}
+
+// UnmarshalJSON decodes the record and keeps the member order of its arguments.
+func (record *NestedToolCallRecord) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil
+	}
+	type plain NestedToolCallRecord
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var members struct {
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	if len(members.Arguments) > 0 {
+		order, err := readSchemaObjectOrder(members.Arguments)
+		if err != nil {
+			return err
+		}
+		decoded.argumentOrder = order
+	}
+	*record = NestedToolCallRecord(decoded)
+	return nil
+}
+
+// NestedToolCalls is the bounded record of the nested calls a tool made. Results are not recorded. Complete is false when calls were dropped, arguments omitted, or calls had not finished.
+//
+// upstream: .upstream/v0.99.1/packages/ai/src/types.ts:588-592 (NestedToolCalls)
+type NestedToolCalls struct {
+	Calls    []NestedToolCallRecord `json:"calls"`
+	Complete bool                   `json:"complete"`
+}
+
+// ToolResultMessage carries one tool execution result.
+type ToolResultMessage struct {
+	ToolCallID string                     `json:"toolCallId"`
+	ToolName   string                     `json:"toolName"`
+	Content    []ToolResultMessageContent `json:"content"`
+	// Details is the tool's details value. Nil is no details unless DetailsNull is set.
+	Details any `json:"details,omitempty"`
+	// DetailsNull marks a nil Details as an explicit JSON null, which JSON writes as `"details":null`; without it a nil
+	// Details is absent and JSON omits the key, as JSON.stringify omits undefined. It has no effect when Details is set.
+	DetailsNull bool   `json:"-"`
+	Usage       *Usage `json:"usage,omitempty"`
+	// NestedCalls are the calls this tool made to other tools. Kept for the session record; not sent to the model.
+	// upstream: .upstream/v0.99.1/packages/ai/src/types.ts:604
+	NestedCalls *NestedToolCalls `json:"nestedCalls,omitempty"`
+	IsError     bool             `json:"isError"`
+	// DurationMs is the milliseconds execute() took, measured with a monotonic clock. Nil when the tool did not run, and for results stored before it was recorded.
+	// upstream: ai/src/types.ts ToolResultMessage.durationMs
+	DurationMs *int64 `json:"durationMs,omitempty"`
+	Timestamp  int64  `json:"timestamp"`
+}
+
+func (ToolResultMessage) messageRole() string { return "toolResult" }
+
+// MessageRole is the role property of a message.
+func (ToolResultMessage) MessageRole() string { return "toolResult" }
+func (message ToolResultMessage) cloneMessage() Message {
+	message.Content = cloneToolResultMessageContent(message.Content)
+	message.Details = cloneJSONValue(message.Details)
+	if message.Usage != nil {
+		message.Usage = new(cloneUsage(*message.Usage))
+	}
+	message.NestedCalls = cloneNestedToolCalls(message.NestedCalls)
+	if message.DurationMs != nil {
+		message.DurationMs = new(*message.DurationMs)
+	}
+	return message
+}
+
+func cloneNestedToolCalls(calls *NestedToolCalls) *NestedToolCalls {
+	if calls == nil {
+		return nil
+	}
+	cloned := &NestedToolCalls{Calls: make([]NestedToolCallRecord, len(calls.Calls)), Complete: calls.Complete}
+	for i, call := range calls.Calls {
+		if call.Arguments != nil {
+			call.Arguments = cloneArgumentsValue(map[string]any(call.Arguments)).(map[string]any)
+		}
+		if call.ArgumentsBytes != nil {
+			call.ArgumentsBytes = new(*call.ArgumentsBytes)
+		}
+		if call.DurationMs != nil {
+			call.DurationMs = new(*call.DurationMs)
+		}
+		cloned.Calls[i] = call
+	}
+	return cloned
+}
+
+func marshalMessage(role string, value any) ([]byte, error) {
+	// A lone surrogate in a string (Details, an id, a name) is written as its escape, as the content blocks write it. Marshal, not
+	// MarshalStringify: a value that is not JSON (NaN in Details) stays an error, as it was with encoding/json.
+	body, err := jsstring.MarshalKeepingSurrogates(value)
+	if err != nil {
+		return nil, err
+	}
+	// Role is inserted before the message fields without decoding nested objects into maps.
+	prefix := []byte(fmt.Sprintf(`{"role":%q`, role))
+	if len(body) > 2 {
+		prefix = append(prefix, ',')
+	}
+	return append(prefix, body[1:]...), nil
+}
+
+// MarshalJSON writes an empty but present sections object as {}, which Pi's durable store writes after a reset: an
+// absent member and an empty object are different records.
+func (message SystemMessage) MarshalJSON() ([]byte, error) {
+	// The members are listed in the order Pi writes them. An embedded struct plus an overriding field would put sections last.
+	type wire struct {
+		Content      SystemContent    `json:"content"`
+		Sections     *OrderedSections `json:"sections,omitempty"`
+		Timestamp    int64            `json:"timestamp"`
+		ToolsAdded   []ToolSchema     `json:"toolsAdded,omitempty"`
+		ToolsRemoved []ToolReference  `json:"toolsRemoved,omitempty"`
+	}
+	out := wire{Content: message.Content, Timestamp: message.Timestamp, ToolsAdded: message.ToolsAdded, ToolsRemoved: message.ToolsRemoved}
+	if message.Sections != nil {
+		out.Sections = &message.Sections
+	}
+	return marshalMessage(message.messageRole(), out)
+}
+
+func (message UserMessage) MarshalJSON() ([]byte, error) {
+	type plain UserMessage
+	return marshalMessage(message.messageRole(), plain(message))
+}
+
+func (message AssistantMessage) MarshalJSON() ([]byte, error) {
+	type plain AssistantMessage
+	if message.observation != nil {
+		message = *message.Observe()
+	}
+	if message.ErrorBeforeTimestamp && message.ErrorMessage != "" {
+		return marshalMessage(message.messageRole(), assistantErrorFirst(message))
+	}
+	return marshalMessage(message.messageRole(), plain(message))
+}
+
+// assistantErrorFirst is AssistantMessage's wire form with errorMessage before timestamp; responseId follows errorMessage as fauxAssistantMessage writes it (faux.ts:97-99).
+func assistantErrorFirst(message AssistantMessage) any {
+	type head struct {
+		Content               []AssistantContentBlock      `json:"content"`
+		API                   API                          `json:"api"`
+		Provider              string                       `json:"provider"`
+		Model                 string                       `json:"model"`
+		ResponseModel         string                       `json:"responseModel,omitempty"`
+		ProviderThinkingLevel string                       `json:"providerThinkingLevel,omitempty"`
+		Diagnostics           []AssistantMessageDiagnostic `json:"diagnostics,omitempty"` //portlint:allow emptydrop the errorMessage-first form emits the default form's members, whose diagnostics field the baseline lists
+		Usage                 Usage                        `json:"usage"`
+		StopReason            StopReason                   `json:"stopReason"`
+		Deferred              *DeferredHandle              `json:"deferred,omitempty"`
+		RawStopReason         string                       `json:"rawStopReason,omitempty"`
+		EndTurn               *bool                        `json:"endTurn,omitempty"`
+	}
+	return struct {
+		head
+		ErrorMessage  string             `json:"errorMessage"`
+		ResponseID    string             `json:"responseId,omitempty"`
+		Timestamp     int64              `json:"timestamp"`
+		DurationMs    *int64             `json:"durationMs,omitempty"`
+		ThinkingLevel ModelThinkingLevel `json:"thinkingLevel,omitempty"`
+	}{
+		head{message.Content, message.API, message.Provider, message.Model, message.ResponseModel, message.ProviderThinkingLevel,
+			message.Diagnostics, message.Usage, message.StopReason, message.Deferred, message.RawStopReason, message.EndTurn},
+		message.ErrorMessage, message.ResponseID, message.Timestamp, message.DurationMs, message.ThinkingLevel,
+	}
+}
+
+func (message ToolResultMessage) MarshalJSON() ([]byte, error) {
+	type plain ToolResultMessage
+	if message.Details == nil && message.DetailsNull {
+		message.Details = json.RawMessage("null")
+	}
+	return marshalMessage(message.messageRole(), plain(message))
+}
+
+// UnmarshalJSON decodes a toolResult message. A details member that is JSON null sets DetailsNull; a missing one leaves
+// Details nil and DetailsNull unset.
+func (message *ToolResultMessage) UnmarshalJSON(data []byte) error {
+	type plain ToolResultMessage
+	var wire struct {
+		plain
+		Content []json.RawMessage `json:"content"`
+		Details json.RawMessage   `json:"details"`
+	}
+	if err := jsstring.UnmarshalKeepingSurrogates(data, &wire); err != nil {
+		return err
+	}
+	decoded := ToolResultMessage(wire.plain)
+	if wire.Content != nil {
+		decoded.Content = make([]ToolResultMessageContent, 0, len(wire.Content))
+		for index, raw := range wire.Content {
+			block, err := UnmarshalContentBlock(raw)
+			if err != nil {
+				return fmt.Errorf("tool result content[%d]: %w", index, err)
+			}
+			typed, ok := block.(ToolResultMessageContent)
+			if !ok {
+				return fmt.Errorf("tool result content[%d] is %T, not tool result content", index, block)
+			}
+			decoded.Content = append(decoded.Content, typed)
+		}
+	}
+	if wire.Details != nil {
+		if err := jsstring.UnmarshalKeepingSurrogates(wire.Details, &decoded.Details); err != nil {
+			return fmt.Errorf("tool result details: %w", err)
+		}
+		decoded.DetailsNull = decoded.Details == nil
+	}
+	*message = decoded
+	return nil
+}
+
+func cloneSystemContent(content SystemContent) SystemContent {
+	if content == nil {
+		return SystemText("")
+	}
+	return content.cloneSystemContent()
+}
+
+func cloneUserContent(content UserContent) UserContent {
+	if content == nil {
+		return UserText("")
+	}
+	return content.cloneUserContent()
+}
+
+func cloneUserContentBlock(block UserContentBlock) UserContentBlock {
+	switch value := block.(type) {
+	case TextContent:
+		return value
+	case ImageContent:
+		return value
+	default:
+		panic(fmt.Sprintf("unsupported user content block %T", block))
+	}
+}
+
+func cloneAssistantContent(blocks []AssistantContentBlock) []AssistantContentBlock {
+	return cloneAssistantContentWith(blocks, cloneArgumentsValue)
+}
+
+func cloneAssistantContentWith(blocks []AssistantContentBlock, cloneArguments func(any) any) []AssistantContentBlock {
+	if blocks == nil {
+		return nil
+	}
+	return cloneAssistantContentInto(make([]AssistantContentBlock, len(blocks)), blocks, cloneArguments)
+}
+
+// cloneAssistantContentInto fills out, which has len(blocks) elements, with the copy cloneAssistantContentWith makes, and returns it.
+func cloneAssistantContentInto(out, blocks []AssistantContentBlock, cloneArguments func(any) any) []AssistantContentBlock {
+	for i, block := range blocks {
+		switch value := block.(type) {
+		case TextContent, ThinkingContent:
+			// A struct held in an interface is never changed in place (callers replace the whole block), so the clone shares the boxed value.
+			out[i] = block
+		case ToolCall:
+			if value.Arguments != nil {
+				value.Arguments = JsonObject(cloneArguments(value.Arguments).(map[string]any))
+			}
+			out[i] = value
+		default:
+			panic(fmt.Sprintf("unsupported assistant content block %T", block))
+		}
+	}
+	return out
+}
+
+func cloneToolResultMessageContent(blocks []ToolResultMessageContent) []ToolResultMessageContent {
+	if blocks == nil {
+		return nil
+	}
+	out := make([]ToolResultMessageContent, len(blocks))
+	for i, block := range blocks {
+		switch value := block.(type) {
+		case TextContent:
+			out[i] = value
+		case ImageContent:
+			out[i] = value
+		default:
+			panic(fmt.Sprintf("unsupported tool result content block %T", block))
+		}
+	}
+	return out
+}
+
+func cloneDiagnostics(diagnostics []AssistantMessageDiagnostic) []AssistantMessageDiagnostic {
+	if diagnostics == nil {
+		return nil
+	}
+	out := make([]AssistantMessageDiagnostic, len(diagnostics))
+	for i, diagnostic := range diagnostics {
+		out[i] = diagnostic
+		if diagnostic.Error != nil {
+			errorInfo := *diagnostic.Error
+			errorInfo.Code = cloneJSONValue(errorInfo.Code)
+			out[i].Error = &errorInfo
+		}
+		if diagnostic.Details != nil {
+			out[i].Details = cloneJSONValue(diagnostic.Details).(map[string]any)
+		}
+	}
+	return out
+}
+
+func cloneDeferredHandle(handle *DeferredHandle) *DeferredHandle {
+	if handle == nil {
+		return nil
+	}
+	out := *handle
+	if handle.ExpiresAt != nil {
+		out.ExpiresAt = new(*handle.ExpiresAt)
+	}
+	if handle.PollAfterMS != nil {
+		out.PollAfterMS = new(*handle.PollAfterMS)
+	}
+	out.Data = cloneJSONValue(handle.Data)
+	return &out
+}
+
+// cloneUsage copies usage so the optional counters are not shared.
+func cloneUsage(usage Usage) Usage {
+	if usage.CacheWrite1h != nil {
+		usage.CacheWrite1h = new(*usage.CacheWrite1h)
+	}
+	if usage.Reasoning != nil {
+		usage.Reasoning = new(*usage.Reasoning)
+	}
+	return usage
+}

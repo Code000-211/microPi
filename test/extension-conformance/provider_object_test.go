@@ -1,0 +1,534 @@
+package extensionconformance
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/ai"
+
+	"github.com/MichaelKinsy/PiG/coding"
+	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/subprocess"
+	"github.com/MichaelKinsy/PiG/internal/testenv"
+	"github.com/MichaelKinsy/PiG/test/extension-conformance/testfixture/providerobject"
+)
+
+// Pi model-registry.ts:101-103,165-167 returns the original Provider object, including callback-bearing auth and refresh methods.
+func TestNodeProviderObjectCarrier(t *testing.T) {
+	testNodeProviderObjectCarrier(t, false)
+}
+
+func TestNodeRemoteProviderObjectCarrier(t *testing.T) {
+	testNodeProviderObjectCarrier(t, true)
+}
+
+// Pi packages/coding-agent/src/core/extensions/types.ts:1830-1831 declares registerProvider(provider: Provider) beside registerProvider(name, config): the
+// Provider-object overload. Every SDK registers a callback-bearing Provider (Go RegisterNativeProvider, Python register_native_provider, Rust
+// register_native_provider) from an extension subprocess through the host wire; the production host registry then holds its model and streams a
+// host turn through the owner's callbacks, and a second extension reads the same Provider back (model-registry.ts:101-103,165-167).
+// mutation-checked: Extension.RegisterNativeProvider in extensions/sdk/provider.go not queueing the declaration fails the go subtests (model missing from the host runtime).
+// mutation-checked: dropping the onPayload replacement (Go provider_dispatch.go, Python provider.py dispatch_provider, Rust provider.rs ProviderObjects, host native_provider.go) or ignoring onProviderStreamEvent (each SDK's dispatch, the host's declaration) fails the owner subtests of that SDK.
+func TestProviderObjectsAcrossSDKs(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, language := range []string{"go", "python", "rust", "lisp"} {
+		placements := []string{"strict", "packed"}
+		if language == "go" {
+			placements = append(placements, "fused")
+		}
+		for _, placement := range placements {
+			for _, role := range []string{"owner", "reader"} {
+				t.Run(language+"-"+role+"-"+placement, func(t *testing.T) {
+					t.Setenv("CARRIER_ROLE", role)
+					testProviderObjectPair(t, root, role, language, placement, "pi.registerProvider(provider)")
+				})
+			}
+		}
+	}
+}
+
+// startProviderObjectPair loads the native fixture of language in placement with role, applies its queued registrations and returns the production services, the loaded extensions and the reader config.
+func startProviderObjectPair(t *testing.T, root, role, language, placement, call string) (*coding.AgentSessionServices, []extension.Extension, subprocess.ExtConfig, string) {
+	t.Helper()
+	dir := t.TempDir()
+	services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: dir, AgentDir: filepath.Join(dir, "agent")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(services.Close)
+	host := subprocess.NewHost(dir)
+	t.Cleanup(func() { host.Shutdown("done") })
+	host.SetProviderCallbacks(services.Registry().RegisterExtensionProvider, services.Registry().UnregisterProvider)
+	host.SetNativeProviderCallback(services.Registry().RegisterNativeProvider)
+	host.SetUIBridge(subprocess.NewUIBridge(nil))
+	owner := subprocess.ExtConfig{Name: "extension-provider-carrier-owner", Source: filepath.Join(root, "test/parity/scenarios/testdata/extension-provider-carrier-owner.mjs"), Enabled: true, Isolation: "strict"}
+	if os.Getenv("CARRIER_REFRESH_AUTH") != "" {
+		// TestProviderObjectReadBackRefreshModelsAuthAcrossSDKs: the Node owner registers its Provider with refreshModelsAuth too.
+		owner.Source = filepath.Join(root, "test/parity/scenarios/testdata/extension-provider-carrier-owner-configured.mjs")
+	}
+	reader := subprocess.ExtConfig{Name: "extension-provider-carrier-remote", Source: filepath.Join(root, "test/parity/scenarios/testdata/extension-provider-carrier-remote.mjs"), Enabled: true, Isolation: "strict"}
+	native := subprocess.ExtConfig{Name: "provider-object-" + language, Source: filepath.Join(root, "test/extension-conformance/testdata/provider-object-"+language), Enabled: true, Isolation: "strict", RuntimeKind: "subprocess", RuntimeLanguage: language, EntrypointKind: "factory"}
+	switch language {
+	case "go":
+		native.Factory = "Extension"
+		native.SDKName = "github.com/MichaelKinsy/PiG/extensions/sdk"
+		native.ModulePath = "example.com/provider-object-go"
+		native.Package = native.ModulePath
+	case "python":
+		native.Factory = "new_extension"
+		native.SDKName = "pig-sdk-py"
+		native.Package = "provider_object"
+	case "rust":
+		native.Factory = "new_extension"
+		native.SDKName = "pig-sdk"
+		native.Package = "provider-object-rust"
+	case "lisp":
+		native.Factory = "new-extension"
+		native.SDKName = "pig-sdk-lisp"
+		native.Package = "provider-object"
+	}
+	if placement == "packed" {
+		native.Isolation = "shared-ok"
+	}
+	if role == "owner" {
+		owner = native
+	} else {
+		reader = native
+	}
+	configs := []subprocess.ExtConfig{owner, reader}
+	if placement == "packed" {
+		peer := providerPeer(t, root, native)
+		if role == "owner" {
+			configs = []subprocess.ExtConfig{owner, peer, reader}
+		} else {
+			configs = append(configs, peer)
+		}
+		cells := subprocess.PlanCells(configs, nil)
+		packed := false
+		for _, cell := range cells {
+			if len(cell.Extensions) == 2 {
+				packed = true
+			}
+		}
+		if !packed {
+			t.Fatalf("native peer was not packed: %+v", cells)
+		}
+	}
+	var loaded []extension.Extension
+	if placement == "fused" {
+		for _, config := range configs {
+			var result *extension.Extension
+			var err error
+			if config.Name == native.Name {
+				result, err = host.LoadInProcess(t.Context(), config, providerobject.Extension().RunWithConn)
+			} else {
+				result, err = host.Load(t.Context(), config)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			loaded = append(loaded, *result)
+		}
+	} else {
+		var errs []error
+		loaded, errs = host.LoadAll(t.Context(), configs)
+		if len(errs) > 0 {
+			t.Fatal(errs)
+		}
+	}
+	if len(loaded) != len(configs) {
+		t.Fatalf("loaded %d of %d configured providers", len(loaded), len(configs))
+	}
+	applyQueuedRegistrations(host)
+	model := services.ModelRuntime().GetModel("carrier-provider", "carrier-model")
+	if model == nil {
+		t.Fatalf("%s: native provider model missing from host runtime", call)
+	}
+	return services, loaded, reader, dir
+}
+
+func testProviderObjectPair(t *testing.T, root, role, language, placement, call string) {
+	t.Helper()
+	services, loaded, reader, dir := startProviderObjectPair(t, root, role, language, placement, call)
+	model := services.ModelRuntime().GetModel("carrier-provider", "carrier-model")
+	// Pi hands the caller's onPayload, onResponse and onProviderStreamEvent to Provider.stream (model-runtime.ts:671-689, sdk.ts:425-427); the Provider invokes each by name, and onPayload's replacement reaches the Provider.
+	var seen []string
+	var callbacksMu sync.Mutex
+	record := func(entry string) {
+		callbacksMu.Lock()
+		defer callbacksMu.Unlock()
+		seen = append(seen, entry)
+	}
+	options := ai.StreamOptions{
+		OnPayload: func(payload any, requested *ai.Model) (any, error) {
+			record(fmt.Sprintf("payload %v %s", payload, requested.ID))
+			return map[string]any{"text": "simple via payload"}, nil
+		},
+		OnResponse: func(_ context.Context, response ai.ProviderResponse, requested *ai.Model) error {
+			record(fmt.Sprintf("response %d %s %s", response.Status, response.Headers["x-carrier"], requested.ID))
+			return nil
+		},
+		OnProviderStreamEvent: func(_ context.Context, data any, requested *ai.Model) error {
+			record(fmt.Sprintf("event %v %s", data, requested.ID))
+			return nil
+		},
+	}
+	stream := services.ModelRuntime().StreamSimple(t.Context(), model, ai.Context{Messages: []ai.Message{ai.UserMessage{Content: ai.UserText("host turn")}}}, options)
+	message := stream.Result()
+	if message.StopReason != ai.StopReasonStop {
+		t.Fatalf("host native stream: %+v", message)
+	}
+	if len(message.Content) != 1 || message.Content[0].(ai.TextContent).Text != "simple via payload" {
+		t.Fatalf("host native result: %+v", message)
+	}
+	if want := []string{"response 207 response carrier-model", "event map[carrier:event] carrier-model", "payload map[carrier:payload] carrier-model"}; !slices.Equal(seen, want) {
+		t.Fatalf("request callbacks = %q, want %q", seen, want)
+	}
+	// upstream: models.ts Provider.fetchDeferred / cancelDeferred through Models.fetchDeferred / cancelDeferred: the host's own runtime reaches the extension process's deferred operations, with the handle the caller passed.
+	handle := ai.DeferredHandle{Provider: "carrier-provider", ModelID: "carrier-model", API: model.ProviderMeta.API, ID: "deferred"}
+	fetched := services.ModelRuntime().FetchDeferred(t.Context(), model, handle)
+	if fetched.StopReason != ai.StopReasonStop || len(fetched.Content) != 1 || fetched.Content[0].(ai.TextContent).Text != "deferred" {
+		t.Fatalf("host deferred fetch: %+v", fetched)
+	}
+	if err := services.ModelRuntime().CancelDeferred(t.Context(), model, handle); err != nil {
+		t.Fatalf("host deferred cancel: %v", err)
+	}
+	wrong := handle
+	wrong.ID = "other"
+	if err := services.ModelRuntime().CancelDeferred(t.Context(), model, wrong); err == nil {
+		t.Fatal("host deferred cancel of another handle succeeded, want the extension's rejection")
+	}
+	// upstream: models.ts Provider.getAllModels / filterAllModels: the all-types catalog is the provider's getAllModels (it lists a model getModels does not), and the credential-specific availability across every model type is its filterAllModels, not filterModels (which, for this credential, shows none).
+	if services.ModelRuntime().GetModel("carrier-provider", "carrier-all-only") == nil {
+		t.Fatal("the model only getAllModels lists is missing from the host runtime")
+	}
+	if err := services.Auth().Set("carrier-provider", ai.Credential{Type: ai.CredentialAPIKey, Key: "all"}); err != nil {
+		t.Fatal(err)
+	}
+	services.ModelRuntime().Refresh(t.Context(), ai.ModelsRefreshOptions{AllowNetwork: new(false), Providers: []string{"carrier-provider"}})
+	available, err := services.ModelRuntime().GetAvailable(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var availableIDs []string
+	for _, candidate := range available {
+		if candidate.ProviderMeta.ProviderID == "carrier-provider" {
+			availableIDs = append(availableIDs, candidate.ID)
+		}
+	}
+	if !slices.Contains(availableIDs, "carrier-all-only") || !slices.Contains(availableIDs, "carrier-model") {
+		t.Fatalf("available carrier models = %v, want filterAllModels' result (every model for the all credential)", availableIDs)
+	}
+	path := filepath.Join(dir, "result.json")
+	for _, item := range loaded {
+		if item.Name == reader.Name {
+			if err := item.Commands["remote-carrier-probe"].Handler(t.Context(), path); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"source":"injected:CARRIER_SOURCE"`, `"apiKey":"injected:CARRIER_KEY"`, `"key":"Carrier key"`, `"access":"Carrier OAuth@caller-device"`, `"access":"rotated"`, `"persist","update"`, `"carrier-model","refreshed:https://regional.invalid/v1"`, `"text":"carrier answer"`, `"text":"simple"`, `"text":"deferred"`, `"cancelled":"aborted"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("missing %s in %s", want, data)
+		}
+	}
+}
+
+// pi-mono ai/src/models.ts:204 Provider.refreshModelsAuth, loader.ts:468-475 and model-runtime.ts:928: a Provider object registered with refreshModelsAuth "configured" keeps a stale OAuth login unrefreshed, and its catalog refresh runs without a credential. Every SDK registers the carrier with "configured" (CARRIER_REFRESH_AUTH); a declaration that drops the member falls back to credential mode, which runs the provider's OAuth refresh (rotating the stored login) and hands the refresh the credential.
+// mutation-checked: dropping the member from the host's NativeProviderDeclaration (protocol.go / native_provider.go), from Node's nativeDeclaration, or from any SDK's provider declaration fails that language's subtests.
+func TestProviderObjectRefreshModelsAuthAcrossSDKs(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, language := range []string{"go", "python", "rust", "lisp", "node"} {
+		placements := []string{"strict", "packed"}
+		if language == "go" {
+			placements = append(placements, "fused")
+		}
+		if language == "node" {
+			placements = []string{"strict"}
+		}
+		for _, placement := range placements {
+			t.Run(language+"-"+placement, func(t *testing.T) {
+				t.Setenv("CARRIER_ROLE", "owner")
+				t.Setenv("CARRIER_REFRESH_AUTH", "configured")
+				var services *coding.AgentSessionServices
+				if language == "node" {
+					services = startNodeProviderObject(t)
+				} else {
+					services, _, _, _ = startProviderObjectPair(t, root, "owner", language, placement, "pi.registerProvider(provider)")
+				}
+				stale := ai.Credential{Type: ai.CredentialOAuth, Access: "stale", Refresh: "revoked", Expires: 1}
+				if err := services.Auth().Set("carrier-provider", stale); err != nil {
+					t.Fatal(err)
+				}
+				services.Registry().YieldToRegistrationRefresh(t.Context())
+				result := services.ModelRuntime().Refresh(t.Context(), ai.ModelsRefreshOptions{Providers: []string{"carrier-provider"}, AllowNetwork: new(true), Force: new(true)})
+				if result.Aborted || len(result.Errors) != 0 {
+					t.Fatalf("refresh = %+v", result)
+				}
+				stored, _, err := services.Auth().GetRaw("carrier-provider")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if stored.Access != "stale" {
+					t.Fatalf("stored OAuth access = %q, want the stale login untouched: the OAuth refresh ran", stored.Access)
+				}
+				var refreshed []string
+				for _, candidate := range services.ModelRuntime().GetModels("carrier-provider") {
+					if candidate.ProviderMeta.ProviderID == "carrier-provider" && strings.HasPrefix(candidate.ID, "refreshed") {
+						refreshed = append(refreshed, candidate.ID)
+					}
+				}
+				if len(refreshed) != 1 || !strings.HasSuffix(refreshed[0], "|credential=false") {
+					t.Fatalf("network refresh published %q, want one model from a refresh that received no credential (refresh %+v, catalog %v)", refreshed, result, ids(services.ModelRuntime().GetModels("carrier-provider")))
+				}
+			})
+		}
+	}
+}
+
+func ids(models []*ai.Model) []string {
+	var out []string
+	for _, model := range models {
+		out = append(out, model.ID)
+	}
+	return out
+}
+
+// pi-mono coding-agent model-registry.ts getRegisteredNativeProvider returns the registered Provider object, so an extension reading another extension's
+// provider sees its refreshModelsAuth ("configured" here; undefined for the default). Every SDK registers the carrier with "configured" and reads the Node
+// owner's back, and the Node reader reads every SDK's: the read-back must say "configured", which no language's default reports.
+// mutation-checked: dropping the member from Node's remoteProvider (provider-object.mjs) or from a proxy (Go provider_proxy.go, Python provider.py, Rust proxy.rs, Lisp provider.lisp) fails that reader's subtests.
+func TestProviderObjectReadBackRefreshModelsAuthAcrossSDKs(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBack := func(t *testing.T, path string) {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), `"refreshModelsAuth":"configured"`) {
+			t.Fatalf("read-back of the configured Provider = %s, want refreshModelsAuth \"configured\"", data)
+		}
+	}
+	for _, language := range []string{"go", "python", "rust", "lisp"} {
+		placements := []string{"strict", "packed"}
+		if language == "go" {
+			placements = append(placements, "fused")
+		}
+		for _, placement := range placements {
+			for _, role := range []string{"owner", "reader"} {
+				t.Run(language+"-"+role+"-"+placement, func(t *testing.T) {
+					t.Setenv("CARRIER_ROLE", role)
+					t.Setenv("CARRIER_REFRESH_AUTH", "configured")
+					_, loaded, reader, dir := startProviderObjectPair(t, root, role, language, placement, "pi.registerProvider(provider)")
+					path := filepath.Join(dir, "read-back.json")
+					for _, item := range loaded {
+						if item.Name == reader.Name {
+							if err := item.Commands["remote-carrier-probe"].Handler(t.Context(), path); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					readBack(t, path)
+				})
+			}
+		}
+	}
+	t.Run("node-owner-node-reader", func(t *testing.T) {
+		dir := t.TempDir()
+		services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: dir, AgentDir: filepath.Join(dir, "agent")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(services.Close)
+		host := subprocess.NewHost(dir)
+		t.Cleanup(func() { host.Shutdown("done") })
+		host.SetProviderCallbacks(services.Registry().RegisterExtensionProvider, services.Registry().UnregisterProvider)
+		host.SetNativeProviderCallback(services.Registry().RegisterNativeProvider)
+		host.SetUIBridge(subprocess.NewUIBridge(nil))
+		var configs []subprocess.ExtConfig
+		for _, name := range []string{"extension-provider-carrier-owner-configured", "extension-provider-carrier-remote"} {
+			configs = append(configs, subprocess.ExtConfig{Name: name, Source: filepath.Join(root, "test/parity/scenarios/testdata", name+".mjs"), Enabled: true, Isolation: "strict"})
+		}
+		loaded, errs := host.LoadAll(t.Context(), configs)
+		if len(errs) != 0 || len(loaded) != 2 {
+			t.Fatalf("loaded %d of 2 extensions: %v", len(loaded), errs)
+		}
+		path := filepath.Join(dir, "read-back.json")
+		if err := loaded[1].Commands["remote-carrier-probe"].Handler(t.Context(), path); err != nil {
+			t.Fatal(err)
+		}
+		readBack(t, path)
+	})
+}
+
+// startNodeProviderObject loads the Node owner fixture (a TS extension calling pi.registerProvider(provider)) over production services.
+func startNodeProviderObject(t *testing.T) *coding.AgentSessionServices {
+	t.Helper()
+	dir := t.TempDir()
+	services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: dir, AgentDir: filepath.Join(dir, "agent")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(services.Close)
+	host := subprocess.NewHost(dir)
+	t.Cleanup(func() { host.Shutdown("done") })
+	host.SetProviderCallbacks(services.Registry().RegisterExtensionProvider, services.Registry().UnregisterProvider)
+	host.SetNativeProviderCallback(services.Registry().RegisterNativeProvider)
+	host.SetUIBridge(subprocess.NewUIBridge(nil))
+	source, err := filepath.Abs("../parity/scenarios/testdata/extension-provider-carrier-owner-configured.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, errs := host.LoadAll(t.Context(), []subprocess.ExtConfig{{Name: "extension-provider-carrier-owner-configured", Source: source, Enabled: true, Isolation: "strict"}}); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	applyQueuedRegistrations(host)
+	if services.ModelRuntime().GetModel("carrier-provider", "carrier-model") == nil {
+		t.Fatal("native provider model missing from host runtime")
+	}
+	return services
+}
+
+func providerPeer(t *testing.T, root string, native subprocess.ExtConfig) subprocess.ExtConfig {
+	t.Helper()
+	peer := native
+	peer.Name = "provider-peer"
+	// Owner and reader roles use the same peer source and artifact, but start fresh cells.
+	peer.Source = filepath.Join(sharedSources, "provider-peer-"+native.RuntimeLanguage)
+	write := func(path, content string) {
+		t.Helper()
+		if err := writeSharedSource(filepath.Join(peer.Source, path), content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	switch native.RuntimeLanguage {
+	case "go":
+		peer.ModulePath = "example.com/provider-peer"
+		peer.Package = peer.ModulePath
+		sdkVersion, err := testenv.RootSDKRequirement(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		write("go.mod", fmt.Sprintf("module %s\n\ngo 1.26.0\nrequire github.com/MichaelKinsy/PiG/extensions/sdk %s\nreplace github.com/MichaelKinsy/PiG/extensions/sdk => %s\n", peer.ModulePath, sdkVersion, filepath.ToSlash(filepath.Join(root, "extensions/sdk"))))
+		write("extension.go", "package peer\nimport sdk \"github.com/MichaelKinsy/PiG/extensions/sdk\"\nfunc Extension()*sdk.Extension{return sdk.New(\"provider-peer\")}\n")
+	case "python":
+		peer.Package = "provider_peer"
+		write("provider_peer.py", "import pig_sdk\ndef new_extension():\n    return pig_sdk.Extension('provider-peer')\n")
+	case "rust":
+		peer.Package = "provider-peer"
+		write("Cargo.toml", fmt.Sprintf("[package]\nname=\"provider-peer\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\npig-sdk={path=%q}\n", filepath.ToSlash(filepath.Join(root, "extensions/sdk-rs"))))
+		write("src/lib.rs", "pub fn new_extension()->pig_sdk::Extension{pig_sdk::Extension::new(\"provider-peer\")}\n")
+	case "lisp":
+		peer.Package = "provider-peer"
+		write("provider-peer.lisp", "(defpackage \"provider-peer\" (:use \"COMMON-LISP\"))\n(in-package \"provider-peer\")\n(defun new-extension () (pig:make-extension \"provider-peer\"))\n")
+	}
+	return peer
+}
+
+func testNodeProviderObjectCarrier(t *testing.T, remote bool) {
+	t.Helper()
+	dir := t.TempDir()
+	services, err := coding.CreateAgentSessionServices(coding.CreateAgentSessionServicesOptions{CWD: dir, AgentDir: filepath.Join(dir, "agent")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(services.Close)
+	host := subprocess.NewHost(dir)
+	t.Cleanup(func() { host.Shutdown("done") })
+	host.SetProviderCallbacks(services.Registry().RegisterExtensionProvider, services.Registry().UnregisterProvider)
+	host.SetNativeProviderCallback(services.Registry().RegisterNativeProvider)
+	host.SetUIBridge(subprocess.NewUIBridge(nil))
+	var configs []subprocess.ExtConfig
+	reader, isolation, command := "reader", "", "carrier-probe"
+	if remote {
+		reader, isolation, command = "remote", "strict", "remote-carrier-probe"
+	}
+	for _, suffix := range []string{"owner", reader} {
+		name := "extension-provider-carrier-" + suffix
+		source, err := filepath.Abs(filepath.Join("../parity/scenarios/testdata", name+".mjs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		configs = append(configs, subprocess.ExtConfig{Name: name, Source: source, Enabled: true, Isolation: isolation})
+	}
+	loaded, errs := host.LoadAll(t.Context(), configs)
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if len(loaded) != len(configs) {
+		t.Fatalf("loaded %d extensions for %d configured sources", len(loaded), len(configs))
+	}
+	path := filepath.Join(dir, "carrier.json")
+	if err := loaded[1].Commands[command].Handler(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("invalid result: %s", data)
+	}
+	// These values come from the caller's closures, not host auth or metadata snapshots.
+	if !remote && !strings.Contains(string(data), `"identity":true`) {
+		t.Fatalf("same-cell identity missing: %s", data)
+	}
+	// The remote reader passes baseUrl to refreshModels and the owner echoes it; the reader shared with Pi parity scenario 53 passes none, so the owner publishes the bare id.
+	refreshedModels := `"carrier-model","refreshed"`
+	if remote {
+		refreshedModels = `"carrier-model","refreshed:https://regional.invalid/v1"`
+	}
+	for _, value := range []string{`"source":"injected:CARRIER_SOURCE"`, `"apiKey":"injected:CARRIER_KEY"`, `"key":"Carrier key"`, `"access":"Carrier OAuth@caller-device"`, `"access":"rotated"`, `"persist","update"`, refreshedModels, `"text":"carrier answer"`, `"text":"simple"`, `"text":"deferred"`, `"cancelled":"aborted"`} {
+		if !strings.Contains(string(data), value) {
+			t.Errorf("missing %s in %s", value, data)
+		}
+	}
+	if remote {
+		if err := loaded[1].Commands["carrier-capture"].Handler(t.Context(), ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := loaded[0].Commands["carrier-remove"].Handler(t.Context(), ""); err != nil {
+			t.Fatal(err)
+		}
+		if services.ModelRuntime().GetModel("carrier-provider", "carrier-model") != nil {
+			t.Fatal("unregister kept the catalog model")
+		}
+		retained := filepath.Join(dir, "retained.json")
+		if err := loaded[1].Commands["carrier-retained"].Handler(t.Context(), retained); err != nil {
+			t.Fatal(err)
+		}
+		body, err := os.ReadFile(retained)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != `[{"type":"text","text":"simple"}]` {
+			t.Fatalf("retained Provider result: %s", body)
+		}
+		if err := loaded[0].Commands["carrier-crash"].Handler(t.Context(), ""); err == nil {
+			t.Fatal("owner crash reported success")
+		}
+		if err := loaded[1].Commands["carrier-retained"].Handler(t.Context(), retained); err == nil {
+			t.Fatal("captured Provider survived its connection")
+		}
+	}
+}

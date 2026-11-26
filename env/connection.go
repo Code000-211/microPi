@@ -1,0 +1,1043 @@
+// Package env is the remote execution environment of Pi Durable: an agent's tools run on another machine, usually over
+// SSH, while the Durable worker, its storage and credentials stay local.
+//
+// Ports packages/env/src/index.ts
+//
+// Go mapping: upstream's Promise-returning methods are blocking calls that take a context.Context first, where
+// upstream passes an AbortSignal. A request whose result is awaited later is a Call, started in call order (frames
+// leave in the order the calls were started, which the daemon's write ordering needs) and awaited with Wait.
+package env
+
+// Ports packages/env/src/connection.ts
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"os/exec"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf16"
+	"unicode/utf8"
+
+	"github.com/MichaelKinsy/PiG/internal/jsnumber"
+	"github.com/MichaelKinsy/PiG/internal/jsstring"
+)
+
+// Frame types (docs/protocol.md).
+const (
+	frameRequest byte = 1
+	frameResult  byte = 2
+	frameError   byte = 3
+	frameEvent   byte = 4
+	frameCancel  byte = 5
+	framePing    byte = 6
+)
+
+const (
+	maxFrame     = 16 * 1024 * 1024
+	pingInterval = 5 * time.Second
+	// silenceLimit: the daemon pings every five seconds; this much silence means the connection is gone.
+	silenceLimit = 30 * time.Second
+	// startTimeout is how long starting the daemon and its `hello` may take.
+	startTimeout = 60 * time.Second
+	// abortGrace is how long an aborted request waits for the daemon's answer to its cancel before it settles as aborted on its
+	// own. A live daemon answers within a round trip, with its own result (an `exec`'s spill file); a connection that died
+	// unnoticed (a rebooting host) would otherwise hold the request until the keepalive gives up.
+	abortGrace = time.Second
+	// maxNoise is how much output before the sync line is kept while looking for it.
+	maxNoise = 1024 * 1024
+	// stderrTailChars is how much stderr a startup error shows: short, because a tool error can reach the model.
+	stderrTailChars = 2000
+	stderrTailLines = 20
+)
+
+// Json is a JSON object.
+type Json = map[string]any
+
+// RemoteError is a failure reported by the daemon, with its Node-style code.
+type RemoteError struct {
+	Code string
+	// Path is the optional `path` property: nil when the daemon reported no string path, so an empty reported path stays distinct from none.
+	Path    *string
+	Message string
+	Fields  Json
+}
+
+// NewRemoteError returns the error of the daemon's error fields.
+func NewRemoteError(fields Json) *RemoteError {
+	message := "Remote operation failed"
+	if text, ok := fields["message"].(string); ok {
+		message = text
+	}
+	code := "unknown"
+	if text, ok := fields["code"].(string); ok {
+		code = text
+	}
+	e := &RemoteError{Code: code, Message: message, Fields: fields}
+	if text, ok := fields["path"].(string); ok {
+		e.Path = &text
+	}
+	return e
+}
+
+func (e *RemoteError) Error() string { return e.Message }
+
+// Name is the `name` property, "RemoteError".
+func (e *RemoteError) Name() string { return "RemoteError" }
+
+// RemoteInfo is what `hello` reports about the remote machine.
+type RemoteInfo struct {
+	Protocol int
+	Version  string
+	// OS is Rust's std::env::consts::OS spelling: linux, macos, android or windows.
+	OS   string
+	Arch string
+	Home string
+	// Tmpdir follows the remote Node's os.tmpdir() rules.
+	Tmpdir string
+	// Separator is the path separator: `/`, or `\` on Windows.
+	Separator string
+	// Cwd is the daemon's working directory, where Node's path.resolve would fall back to process.cwd().
+	Cwd string
+	// DriveCwds are Windows' per-drive working directories (`C:` to `C:\work`) of the `=C:` variables.
+	DriveCwds map[string]string
+	Pid       int
+	// Features are the operations added to protocol 1 that this daemon supports, such as `listFiles`; nil for older daemons, which omit the field.
+	Features []string
+}
+
+// NodeSystem is the daemon's system in Node's names, as process.platform and process.arch spell them.
+type NodeSystem struct{ Platform, Arch string }
+
+// NodePlatform is `nodePlatform` of connection.ts: Node's names for the daemon's system and architecture, which `hello`
+// reports in Rust's spelling: `windows` is `win32`, `macos` is `darwin`, `x86_64` is `x64`, `aarch64` is `arm64` and
+// `x86` is `ia32`, so they compare with process.platform and process.arch. Other names are kept.
+func NodePlatform(info RemoteInfo) NodeSystem {
+	platform, arch := info.OS, info.Arch
+	switch info.OS {
+	case "windows":
+		platform = "win32"
+	case "macos":
+		platform = "darwin"
+	}
+	switch info.Arch {
+	case "x86_64":
+		arch = "x64"
+	case "aarch64":
+		arch = "arm64"
+	case "x86":
+		arch = "ia32"
+	}
+	return NodeSystem{Platform: platform, Arch: arch}
+}
+
+func parseInfo(fields Json) RemoteInfo {
+	text := func(key string) string {
+		value, _ := fields[key].(string)
+		return value
+	}
+	number := func(key string) int {
+		value, _ := fields[key].(float64)
+		//portlint:allow numbers protocol and pid are integers the daemon writes (daemon/src/main.rs:144,153); connection.ts:298 keeps the JSON number as is
+		return int(value)
+	}
+	info := RemoteInfo{
+		Protocol: number("protocol"), Version: text("version"), OS: text("os"), Arch: text("arch"), Home: text("home"),
+		Tmpdir: text("tmpdir"), Separator: text("separator"), Cwd: text("cwd"), Pid: number("pid"),
+		DriveCwds: map[string]string{},
+	}
+	if features, ok := fields["features"].([]any); ok {
+		for _, feature := range features {
+			if value, ok := feature.(string); ok {
+				info.Features = append(info.Features, value)
+			}
+		}
+	}
+	if drives, ok := fields["driveCwds"].(Json); ok {
+		for drive, directory := range drives {
+			if value, ok := directory.(string); ok {
+				info.DriveCwds[drive] = value
+			}
+		}
+	}
+	return info
+}
+
+// ConnectionOptions configure a Connection.
+type ConnectionOptions struct {
+	// Command starts the daemon, before its `serve --token <hex>` arguments, e.g. `ssh -T -- host
+	// ~/.pi/mobile/tools/pi-env`.
+	Command []string
+	// CommandFunc computes the command at each start instead (detecting and deploying first, for example); its failure
+	// fails that start, and the next request tries again. It takes precedence over Command.
+	CommandFunc func(ctx context.Context) ([]string, error)
+	// OnLog receives the daemon's and the transport's diagnostic output.
+	OnLog func(text string)
+}
+
+// Reply is a successful reply.
+type Reply struct {
+	JSON    Json
+	Payload []byte
+	// Session is the daemon session that answered; handles from it are only valid while it lives.
+	Session int
+}
+
+// RequestOptions configure one request.
+type RequestOptions struct {
+	Payload []byte
+	// OnEvent receives progress events of the request, such as `exec` output, on the connection's reader.
+	OnEvent func(json Json, payload []byte)
+	// OnStart receives the request's id and session, for Kill, before the request is sent.
+	OnStart func(id uint32, session int)
+	// Session, when not 0, only runs the request in that daemon session, for requests on handles it opened. After the
+	// connection was lost and started again, such requests fail instead of reaching a daemon that never opened the
+	// handle.
+	Session int
+}
+
+func lost(message string) *RemoteError {
+	return NewRemoteError(Json{"code": "unknown", "message": message, "lost": true})
+}
+
+// IsConnectionLost reports whether err means the connection was lost, not that the daemon refused the request.
+func IsConnectionLost(err error) bool {
+	remote, ok := errors.AsType[*RemoteError](err)
+	return ok && remote.Fields["lost"] == true
+}
+
+// abortedError is the error of a request that stopped waiting: code `aborted`.
+func abortedError() *RemoteError {
+	return NewRemoteError(Json{"code": "aborted", "message": "aborted"})
+}
+
+func closedError() *RemoteError {
+	return NewRemoteError(Json{"code": "unknown", "message": "Connection closed"})
+}
+
+// errFrameTooLarge is the error of a frame that would pass maxFrame, the largest frame either side accepts.
+var errFrameTooLarge = fmt.Errorf("frame is over the %d byte frame limit", maxFrame)
+
+// encodeFrame builds one frame. A JSON body or payload past maxFrame is rejected before any size is added up, so the
+// frame length never overflows its u32 field or the allocation.
+func encodeFrame(kind byte, id uint32, value Json, payload []byte) ([]byte, error) {
+	if len(payload) > maxFrame {
+		return nil, errFrameTooLarge
+	}
+	var body bytes.Buffer
+	encoder := json.NewEncoder(&body)
+	encoder.SetEscapeHTML(false)
+	//portlint:allow mapkeyorder the daemon reads every frame into serde_json Maps, which sort their keys (daemon/Cargo.toml:11 enables no preserve_order), so frame key order is not observable
+	_ = encoder.Encode(value)
+	encoded := bytes.TrimSuffix(body.Bytes(), []byte("\n"))
+	if len(encoded) > maxFrame {
+		return nil, errFrameTooLarge
+	}
+	length := 9 + len(encoded) + len(payload)
+	if length > maxFrame {
+		return nil, errFrameTooLarge
+	}
+	data := make([]byte, 13, 4+length)
+	binary.BigEndian.PutUint32(data[0:4], uint32(length))
+	data[4] = kind
+	binary.BigEndian.PutUint32(data[5:9], id)
+	binary.BigEndian.PutUint32(data[9:13], uint32(len(encoded)))
+	data = append(data, encoded...)
+	return append(data, payload...), nil
+}
+
+type pendingCall struct {
+	call    *Call
+	onEvent func(json Json, payload []byte)
+}
+
+// Call is a request that was sent and has not been awaited.
+type Call struct {
+	done  chan struct{}
+	reply Reply
+	err   error
+
+	mu       sync.Mutex
+	stop     func() bool
+	finished bool
+}
+
+func newCall() *Call { return &Call{done: make(chan struct{})} }
+
+func failedCall(err error) *Call {
+	call := newCall()
+	call.finish(Reply{}, err)
+	return call
+}
+
+func (c *Call) finish(reply Reply, err error) {
+	c.mu.Lock()
+	if c.finished {
+		c.mu.Unlock()
+		return
+	}
+	c.finished = true
+	stop := c.stop
+	c.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	c.reply, c.err = reply, err
+	close(c.done)
+}
+
+func (c *Call) isFinished() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.finished
+}
+
+// onSettled runs stop once the call settles; if it already has, it runs now.
+func (c *Call) onSettled(stop func() bool) {
+	c.mu.Lock()
+	if !c.finished {
+		c.stop = stop
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+	stop()
+}
+
+// Wait blocks until the request settles. Cancelling the context of the request sends `cancel`; the request still
+// settles with the daemon's result or error.
+func (c *Call) Wait() (Reply, error) {
+	<-c.done
+	return c.reply, c.err
+}
+
+// session is one running daemon.
+type session struct {
+	id    int
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	token string
+
+	writeMu sync.Mutex
+
+	mu       sync.Mutex
+	pending  map[uint32]*pendingCall
+	live     bool
+	exited   chan struct{}
+	exitCode int
+	stopPing chan struct{}
+	lastSeen atomic.Int64
+
+	// stdoutDone and stderrDone close when the daemon's stdout and stderr have ended: Node's `close` event, which a
+	// start that fails before `hello` waits for so the stderr tail is complete.
+	stdoutDone chan struct{}
+	stderrDone chan struct{}
+	// stderrMu guards stderrTail and ready.
+	stderrMu sync.Mutex
+	// stderrTail is the end of the daemon's stderr until `hello` arrives.
+	stderrTail string
+	ready      bool
+}
+
+// keepStderr appends text to the tail while the session is not ready.
+func (s *session) keepStderr(text string) {
+	s.stderrMu.Lock()
+	defer s.stderrMu.Unlock()
+	if s.ready {
+		return
+	}
+	units := utf16.Encode([]rune(s.stderrTail + text))
+	if len(units) > stderrTailChars {
+		units = units[len(units)-stderrTailChars:]
+	}
+	s.stderrTail = string(utf16.Decode(units))
+}
+
+// markReady ends stderr capture: a ready session's errors carry no stderr.
+func (s *session) markReady() {
+	s.stderrMu.Lock()
+	defer s.stderrMu.Unlock()
+	s.ready = true
+	s.stderrTail = ""
+}
+
+func (s *session) isReady() bool {
+	s.stderrMu.Lock()
+	defer s.stderrMu.Unlock()
+	return s.ready
+}
+
+func (s *session) tail() string {
+	s.stderrMu.Lock()
+	defer s.stderrMu.Unlock()
+	return s.stderrTail
+}
+
+// ansiSequence is the pattern of Node's util.stripVTControlCharacters.
+var ansiSequence = regexp.MustCompile(
+	`[\x{1B}\x{9B}][[\]()#;?]*` +
+		`(?:(?:(?:(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*` +
+		`|[a-zA-Z\d]+(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?` +
+		`(?:\x{07}|\x{1B}\\|\x{9C}))` +
+		`|(?:(?:\d{1,4}(?:;\d{0,4})*)?` +
+		`[\dA-PR-TZcf-nq-uy=><~]))`)
+
+// withStderr is message plus the last lines of stderr. The remote machine wrote that text, so terminal escapes and
+// control characters are removed.
+func withStderr(message, stderr string) string {
+	stderr = strings.ReplaceAll(strings.ReplaceAll(stderr, "\r\n", "\n"), "\r", "\n")
+	stripped := stderr
+	if strings.ContainsAny(stderr, "\x1b\u009b") {
+		stripped = ansiSequence.ReplaceAllString(stderr, "")
+	}
+	var text strings.Builder
+	for _, char := range stripped {
+		if char == '\n' || char == '\t' || (char >= 0x20 && (char < 0x7f || char > 0x9f)) {
+			text.WriteRune(char)
+		}
+	}
+	var lines []string
+	for line := range strings.SplitSeq(text.String(), "\n") {
+		if line = jsstring.TrimEnd(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return message
+	}
+	if len(lines) > stderrTailLines {
+		lines = lines[len(lines)-stderrTailLines:]
+	}
+	return message + "\nremote stderr:\n" + strings.Join(lines, "\n")
+}
+
+// utf8Stream decodes a byte stream to text, holding back the bytes of a character split across reads, as Node's
+// setEncoding("utf8") does.
+type utf8Stream struct{ pending []byte }
+
+func (d *utf8Stream) write(chunk []byte) string {
+	data := slices.Concat(d.pending, chunk)
+	end := len(data)
+	// A trailing incomplete character is at most 3 bytes.
+	for back := 1; back <= utf8.UTFMax-1 && back <= len(data); back++ {
+		start := len(data) - back
+		if utf8.RuneStart(data[start]) {
+			if !utf8.FullRune(data[start:]) {
+				end = start
+			}
+			break
+		}
+	}
+	d.pending = append([]byte(nil), data[end:]...)
+	return string(data[:end])
+}
+
+// end flushes an incomplete character as one replacement character.
+func (d *utf8Stream) end() string {
+	if len(d.pending) == 0 {
+		return ""
+	}
+	d.pending = nil
+	return "\ufffd"
+}
+
+// readyStart is the shared outcome of starting the daemon, so concurrent first requests wait for one start.
+type readyStart struct {
+	done    chan struct{}
+	info    RemoteInfo
+	session *session
+	err     error
+}
+
+// Connection is one connection to a pi-env daemon: started lazily on the first request and started again after it is
+// lost. Requests in flight when it is lost fail with code `unknown`; for mutations their outcome is then unknown.
+type Connection struct {
+	options ConnectionOptions
+
+	mu       sync.Mutex
+	session  *session
+	ready    *readyStart
+	sessions int
+	nextID   uint32
+	closed   bool
+	// lifetime is cancelled by Close, which ends a start in progress.
+	lifetime context.Context
+	cancel   context.CancelFunc
+	starts   sync.WaitGroup
+	// afterDaemonStart, when set by a test, runs once a daemon process has started and before the connection keeps its
+	// session: it lets a test close the connection in between.
+	afterDaemonStart func(cmd *exec.Cmd)
+}
+
+// NewConnection returns a connection that starts the daemon at its first request.
+func NewConnection(options ConnectionOptions) *Connection {
+	lifetime, cancel := context.WithCancel(context.Background())
+	return &Connection{options: options, nextID: 1, lifetime: lifetime, cancel: cancel}
+}
+
+// Info connects if needed and returns what the daemon reported about its machine. Cancelling ctx stops waiting for the start (code `aborted`), not the start itself.
+func (c *Connection) Info(ctx context.Context) (RemoteInfo, error) {
+	ready, err := c.connect(ctx)
+	if err != nil {
+		return RemoteInfo{}, err
+	}
+	return ready.info, nil
+}
+
+// Session connects if needed and returns the live session's id. Upstream's session() takes no signal: the connecting is not cancelled.
+func (c *Connection) Session(_ context.Context) (int, error) {
+	//portlint:allow ctxmapping Pi's session() takes no signal (connection.ts session), so the connecting is not cancellable
+	ready, err := c.connect(context.Background())
+	if err != nil {
+		return 0, err
+	}
+	return ready.session.id, nil
+}
+
+// Request sends one request and waits for its reply.
+func (c *Connection) Request(ctx context.Context, op string, request Json, options RequestOptions) (Reply, error) {
+	return c.Start(ctx, op, request, options).Wait()
+}
+
+// Start sends one request and returns without waiting for its reply. Starting requests in a row sends them in that
+// order. Cancelling ctx while the connection starts ends the call at once with code `aborted` (the start goes on for other
+// requests); once the request is written, cancelling ctx sends `cancel`, and the call settles with the daemon's result or
+// error, or with code `aborted` if the daemon does not answer within a second.
+func (c *Connection) Start(ctx context.Context, op string, request Json, options RequestOptions) *Call {
+	if options.Session != 0 {
+		c.mu.Lock()
+		current := c.session
+		c.mu.Unlock()
+		if current == nil || current.id != options.Session || !current.isLive() {
+			return failedCall(lost("pi-env connection lost"))
+		}
+		return c.send(ctx, current, op, request, options)
+	}
+	ready, err := c.connect(ctx)
+	if err != nil {
+		return failedCall(err)
+	}
+	return c.send(ctx, ready.session, op, request, options)
+}
+
+// Close stops the daemon; it kills everything it started.
+func (c *Connection) Close() {
+	c.mu.Lock()
+	c.closed = true
+	current := c.session
+	c.mu.Unlock()
+	c.cancel()
+	if current != nil {
+		c.teardown(current, closedError())
+	}
+	c.starts.Wait()
+}
+
+// Kill kills one `exec` without aborting it.
+func (c *Connection) Kill(id uint32, sessionID int) {
+	c.mu.Lock()
+	current := c.session
+	c.mu.Unlock()
+	if current != nil && current.id == sessionID && current.isLive() {
+		c.writeControl(current, frameCancel, id, Json{"mode": "kill"})
+	}
+}
+
+func (s *session) isLive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.live
+}
+
+// connect waits for the daemon to be started, starting it if needed. It is untilAborted(#connect(), signal): ctx ending first rejects
+// with code `aborted` and leaves the start going.
+func (c *Connection) connect(ctx context.Context) (*readyStart, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, closedError()
+	}
+	if c.ready == nil {
+		ready := &readyStart{done: make(chan struct{})}
+		c.ready = ready
+		c.starts.Go(func() { c.runStart(ready) })
+	}
+	ready := c.ready
+	c.mu.Unlock()
+	// the start takes no cancellation of its own (it ends at its own timeout or at Close), but waiting for it does (Pi main c96e368e2).
+	if ctx.Err() != nil {
+		return nil, abortedError()
+	}
+	select {
+	case <-ready.done:
+	case <-ctx.Done():
+		return nil, abortedError()
+	}
+	if ready.err != nil {
+		return nil, ready.err
+	}
+	return ready, nil
+}
+
+func (c *Connection) runStart(ready *readyStart) {
+	info, started, err := c.start()
+	ready.info, ready.session, ready.err = info, started, err
+	if err != nil {
+		// A failed start is not remembered: the next request tries again.
+		c.mu.Lock()
+		if c.ready == ready {
+			c.ready = nil
+		}
+		c.mu.Unlock()
+	}
+	close(ready.done)
+}
+
+func (c *Connection) send(ctx context.Context, s *session, op string, request Json, options RequestOptions) *Call {
+	call := newCall()
+	if !s.isLive() {
+		return failedCall(lost("pi-env connection lost"))
+	}
+	c.mu.Lock()
+	id := c.nextID
+	c.nextID++
+	c.mu.Unlock()
+	s.mu.Lock()
+	if !s.live {
+		s.mu.Unlock()
+		return failedCall(lost("pi-env connection lost"))
+	}
+	pending := &pendingCall{call: call, onEvent: options.OnEvent}
+	s.pending[id] = pending
+	s.mu.Unlock()
+	if options.OnStart != nil {
+		options.OnStart(id, s.id)
+	}
+	frame, err := encodeRequest(id, op, request, options.Payload)
+	if err != nil {
+		s.mu.Lock()
+		delete(s.pending, id)
+		s.mu.Unlock()
+		call.finish(Reply{}, err)
+		return call
+	}
+	c.write(s, frame)
+	// Registered after the request is written, so a cancel never leaves before its request; a context that is already
+	// done sends its cancel right away.
+	var grace atomic.Pointer[time.Timer]
+	stopAbort := context.AfterFunc(ctx, func() {
+		c.writeControl(s, frameCancel, id, Json{})
+		// a cancel the daemon does not answer within abortGrace settles the call as aborted (Pi main c96e368e2). A late answer finds
+		// no pending request and is dropped.
+		timer := time.AfterFunc(abortGrace, func() {
+			s.mu.Lock()
+			if s.pending[id] != pending {
+				s.mu.Unlock()
+				return
+			}
+			delete(s.pending, id)
+			s.mu.Unlock()
+			call.finish(Reply{}, abortedError())
+		})
+		grace.Store(timer)
+		if call.isFinished() {
+			timer.Stop()
+		}
+	})
+	call.onSettled(func() bool {
+		if timer := grace.Load(); timer != nil {
+			timer.Stop()
+		}
+		return stopAbort()
+	})
+	return call
+}
+
+// encodeRequest builds the request frame of op. A request is rejected, as a *RemoteError the daemon would have sent,
+// when it cannot fit one frame: each field takes at least one byte of it, so a field count at maxFrame is over the
+// limit before the body is sized.
+func encodeRequest(id uint32, op string, request Json, payload []byte) ([]byte, error) {
+	if len(request) >= maxFrame {
+		return nil, frameTooLarge()
+	}
+	body := make(Json, len(request)+1)
+	maps.Copy(body, request)
+	body["op"] = op
+	frame, err := encodeFrame(frameRequest, id, body, payload)
+	if err != nil {
+		return nil, frameTooLarge()
+	}
+	return frame, nil
+}
+
+func frameTooLarge() *RemoteError {
+	return NewRemoteError(Json{"code": "EINVAL", "message": fmt.Sprintf("request is over the %d byte frame limit", maxFrame)})
+}
+
+// writeControl writes a cancel or ping, whose fixed small body always fits a frame.
+func (c *Connection) writeControl(s *session, kind byte, id uint32, value Json) {
+	if frame, err := encodeFrame(kind, id, value, nil); err == nil {
+		c.write(s, frame)
+	}
+}
+
+func (c *Connection) write(s *session, data []byte) {
+	if !s.isLive() {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, _ = s.stdin.Write(data)
+}
+
+// start starts the daemon and waits for its `hello`.
+func (c *Connection) start() (RemoteInfo, *session, error) {
+	var command []string
+	var commandErr error
+	switch {
+	case c.options.CommandFunc != nil:
+		command, commandErr = c.options.CommandFunc(c.lifetime)
+	default:
+		command = c.options.Command
+	}
+	if commandErr != nil {
+		return RemoteInfo{}, nil, NewRemoteError(Json{"code": "spawn_error", "message": commandErr.Error(), "lost": true})
+	}
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return RemoteInfo{}, nil, closedError()
+	}
+	if len(command) == 0 {
+		return RemoteInfo{}, nil, NewRemoteError(Json{"code": "spawn_error", "message": "No daemon command"})
+	}
+	var tokenBytes [16]byte
+	_, _ = rand.Read(tokenBytes[:])
+	token := hex.EncodeToString(tokenBytes[:])
+	//nolint:gosec // G204 (class c): program and leading args are the daemon command the user configured for the remote or container environment; PiG appends only serve --token plus a random token.
+	cmd := exec.Command(command[0], append(append([]string{}, command[1:]...), "serve", "--token", token)...)
+	stdin, stdinErr := cmd.StdinPipe()
+	stdout, stdoutErr := cmd.StdoutPipe()
+	stderr, stderrErr := cmd.StderrPipe()
+	if err := errors.Join(stdinErr, stdoutErr, stderrErr); err != nil {
+		return RemoteInfo{}, nil, NewRemoteError(Json{"code": "spawn_error", "message": err.Error(), "lost": true})
+	}
+	if err := cmd.Start(); err != nil {
+		return RemoteInfo{}, nil, NewRemoteError(Json{"code": "spawn_error", "message": err.Error(), "lost": true})
+	}
+	if c.afterDaemonStart != nil {
+		c.afterDaemonStart(cmd)
+	}
+	c.mu.Lock()
+	c.sessions++
+	s := &session{
+		id: c.sessions, cmd: cmd, stdin: stdin, token: token, pending: map[uint32]*pendingCall{}, live: true,
+		exited: make(chan struct{}), stopPing: make(chan struct{}),
+		stdoutDone: make(chan struct{}), stderrDone: make(chan struct{}),
+	}
+	s.lastSeen.Store(time.Now().UnixMilli())
+	if c.closed {
+		c.mu.Unlock()
+		c.teardown(s, closedError())
+		// Close found no session to tear down, so none of the goroutines below is started for this daemon. The teardown
+		// signalled it; this waits for its exit, which also closes its pipes. Upstream has no such window: #start spawns and
+		// keeps the session in one synchronous step (connection.ts:341-347), and Node reaps a child by itself.
+		//portlint:allow golifetime ends when the daemon exits, which the teardown above causes with SIGTERM; Pi close() (connection.ts:267-270) does not wait for the exit either
+		go func() { _ = cmd.Wait() }()
+		return RemoteInfo{}, nil, closedError()
+	}
+	c.session = s
+	c.mu.Unlock()
+
+	// The hello is pending before any goroutine below can deliver output, an exit or a teardown, as upstream sends it in
+	// the tick that spawns the daemon and Node delivers child events later. Whichever teardown comes first then decides
+	// the hello's failure: the daemon's own exit before the hello reports itself, as upstream's `exit` listener rejects
+	// the start first, and a corrupt frame or a timeout tears the session down before the killed daemon's exit can.
+	hello := c.send(c.lifetime, s, "hello", Json{"protocol": 1}, RequestOptions{})
+	//portlint:allow golifetime ends when the daemon exits, which teardown causes with SIGTERM; Pi close() (connection.ts:203-206) does not wait for the exit either
+	go func() { // reaps the daemon and fails the session when it exits
+		state, _ := cmd.Process.Wait()
+		s.exitCode = state.ExitCode()
+		close(s.exited)
+		// A ready session fails as soon as the daemon exits, even while a process it started keeps a pipe open; before
+		// `hello` the failure waits for the pipes to end, which is Node's `close`, so stderr is complete.
+		if !s.isReady() {
+			for _, done := range []chan struct{}{s.stdoutDone, s.stderrDone} {
+				select {
+				case <-done:
+				case <-s.stopPing:
+					return
+				}
+			}
+		}
+		failure := lost("pi-env connection lost")
+		if !s.isReady() {
+			code := "null"
+			if s.exitCode >= 0 {
+				code = fmt.Sprint(s.exitCode)
+			}
+			failure = lost("pi-env exited with code " + code + " before it was ready")
+		}
+		c.teardown(s, failure)
+	}()
+	//portlint:allow golifetime ends at the daemon's stderr EOF, as connection.ts forwards child.stderr data to onLog until the stream ends
+	go func() {
+		defer close(s.stderrDone)
+		defer func() { _ = stderr.Close() }()
+		var decoder utf8Stream
+		forward := func(text string) {
+			if text == "" {
+				return
+			}
+			s.keepStderr(text)
+			if c.options.OnLog != nil {
+				c.options.OnLog(text)
+			}
+		}
+		chunk := make([]byte, 16*1024)
+		for {
+			read, err := stderr.Read(chunk)
+			if read > 0 {
+				forward(decoder.write(chunk[:read]))
+			}
+			if err != nil {
+				forward(decoder.end())
+				return
+			}
+		}
+	}()
+	//portlint:allow golifetime ends at the daemon's stdout EOF or a corrupt frame (connection.ts data listener, removed with the child)
+	go func() {
+		defer close(s.stdoutDone)
+		c.readLoop(s, stdout)
+	}()
+	//portlint:allow golifetime ends when teardown closes s.stopPing, as connection.ts:310 clearInterval(session.timer)
+	go c.pingLoop(s)
+
+	timer := time.NewTimer(startTimeout)
+	defer timer.Stop()
+	type outcome struct {
+		reply Reply
+		err   error
+	}
+	answered := make(chan outcome, 1)
+	go func() {
+		reply, err := hello.Wait()
+		answered <- outcome{reply, err}
+	}()
+	var reply Reply
+	var err error
+	select {
+	case result := <-answered:
+		reply, err = result.reply, result.err
+	case <-timer.C:
+		err = lost(fmt.Sprintf("pi-env did not answer within %d s", int(startTimeout/time.Second)))
+	}
+	if err == nil && reply.JSON["protocol"] != float64(1) {
+		err = lost("Unsupported protocol " + templateString(reply.JSON, "protocol"))
+	}
+	if err != nil {
+		// The captured stderr joins whatever ended the start.
+		if remote, ok := errors.AsType[*RemoteError](err); ok {
+			failure := *remote
+			failure.Message = withStderr(remote.Message, s.tail())
+			err = &failure
+		}
+		c.teardown(s, err)
+		return RemoteInfo{}, nil, err
+	}
+	s.markReady()
+	return parseInfo(reply.JSON), s, nil
+}
+
+func (c *Connection) pingLoop(s *session) {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopPing:
+			return
+		case <-ticker.C:
+		}
+		if time.Since(time.UnixMilli(s.lastSeen.Load())) > silenceLimit {
+			c.teardown(s, lost("pi-env connection timed out"))
+			return
+		}
+		c.writeControl(s, framePing, 0, Json{})
+	}
+}
+
+func (c *Connection) teardown(s *session, err error) {
+	// Upstream #teardown (connection.ts:307-314) marks the session dead and forgets #ready in one step, so no request sees a dead session still offered as the ready one: c.mu is held across both (nothing takes c.mu while holding s.mu).
+	c.mu.Lock()
+	s.mu.Lock()
+	if !s.live {
+		s.mu.Unlock()
+		c.mu.Unlock()
+		return
+	}
+	s.live = false
+	pending := make([]*pendingCall, 0, len(s.pending))
+	for _, call := range s.pending {
+		pending = append(pending, call)
+	}
+	s.pending = map[uint32]*pendingCall{}
+	s.mu.Unlock()
+	if c.session == s {
+		c.session = nil
+		c.ready = nil
+	}
+	c.mu.Unlock()
+	close(s.stopPing)
+	_ = s.stdin.Close()
+	// child.kill() is Node's SIGTERM (connection.ts:316).
+	_ = terminateProcess(s.cmd.Process)
+	for _, call := range pending {
+		call.call.finish(Reply{}, err)
+	}
+}
+
+// seenReader records when bytes last arrived, so a large frame arriving slowly counts as a live daemon.
+type seenReader struct {
+	reader   io.Reader
+	lastSeen *atomic.Int64
+}
+
+func (r seenReader) Read(buffer []byte) (int, error) {
+	read, err := r.reader.Read(buffer)
+	if read > 0 {
+		r.lastSeen.Store(time.Now().UnixMilli())
+	}
+	return read, err
+}
+
+// readLoop reads the daemon's stdout: the sync line, then frames. The end of stdout ends nothing by itself: the
+// daemon's exit, or its silence, tears the session down, as upstream reacts to `exit` and not to the end of stdout.
+func (c *Connection) readLoop(s *session, stdout io.ReadCloser) {
+	defer func() { _ = stdout.Close() }()
+	synced, ok := c.syncStream(s, seenReader{stdout, &s.lastSeen})
+	if !ok {
+		return
+	}
+	reader := seenReader{synced, &s.lastSeen}
+	for {
+		var lengthBytes [4]byte
+		if _, err := io.ReadFull(reader, lengthBytes[:]); err != nil {
+			return
+		}
+		length := int(binary.BigEndian.Uint32(lengthBytes[:]))
+		if length < 9 || length > maxFrame {
+			c.teardown(s, lost("Corrupt frame from pi-env"))
+			return
+		}
+		body := make([]byte, length)
+		if _, err := io.ReadFull(reader, body); err != nil {
+			return
+		}
+		jsonLength := int(binary.BigEndian.Uint32(body[5:9]))
+		var value any
+		if 9+jsonLength > length || json.Unmarshal(body[9:9+jsonLength], &value) != nil {
+			c.teardown(s, lost("Corrupt frame from pi-env"))
+			return
+		}
+		object, isObject := value.(Json)
+		if !isObject {
+			c.teardown(s, lost("Corrupt frame from pi-env"))
+			return
+		}
+		c.dispatch(s, body[0], binary.BigEndian.Uint32(body[1:5]), object, body[9+jsonLength:])
+	}
+}
+
+// syncStream skips everything before the daemon's sync line, which shell startup files may print before it runs.
+func (c *Connection) syncStream(s *session, stdout io.Reader) (io.Reader, bool) {
+	marker := []byte("PI-ENV " + s.token + "\n")
+	var buffered []byte
+	chunk := make([]byte, 64*1024)
+	for {
+		read, err := stdout.Read(chunk)
+		if read > 0 {
+			buffered = append(buffered, chunk[:read]...)
+			if index := bytes.Index(buffered, marker); index >= 0 {
+				if noise := jsstring.Trim(string(buffered[:index])); noise != "" && c.options.OnLog != nil {
+					c.options.OnLog(noise)
+				}
+				return io.MultiReader(bytes.NewReader(buffered[index+len(marker):]), stdout), true
+			}
+			if len(buffered) > maxNoise {
+				buffered = append([]byte(nil), buffered[len(buffered)-len(marker):]...)
+			}
+		}
+		if err != nil {
+			return nil, false
+		}
+	}
+}
+
+func (c *Connection) dispatch(s *session, kind byte, id uint32, value Json, payload []byte) {
+	s.mu.Lock()
+	pending := s.pending[id]
+	if (kind == frameResult || kind == frameError) && pending != nil {
+		delete(s.pending, id)
+	}
+	s.mu.Unlock()
+	if pending == nil {
+		return
+	}
+	switch kind {
+	case frameEvent:
+		if pending.onEvent != nil {
+			pending.onEvent(value, payload)
+		}
+	case frameResult:
+		pending.call.finish(Reply{JSON: value, Payload: payload, Session: s.id}, nil)
+	case frameError:
+		pending.call.finish(Reply{}, NewRemoteError(value))
+	}
+}
+
+// templateString is `${object[key]}` of a JSON object: undefined when the key is missing, as JavaScript prints it.
+func templateString(object Json, key string) string {
+	value, present := object[key]
+	if !present {
+		return "undefined"
+	}
+	return jsString(value)
+}
+
+// jsString is String(value) of a decoded JSON value.
+func jsString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return typed
+	case bool:
+		return strconv.FormatBool(typed)
+	case float64:
+		return jsnumber.String(typed)
+	case []any:
+		parts := make([]string, len(typed))
+		for index, item := range typed {
+			if item != nil {
+				parts[index] = jsString(item)
+			}
+		}
+		return strings.Join(parts, ",")
+	}
+	return "[object Object]"
+}

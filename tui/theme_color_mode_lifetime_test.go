@@ -1,0 +1,117 @@
+package tui
+
+import (
+	"fmt"
+	"runtime"
+	"testing"
+	"weak"
+)
+
+// Pi's theme.ts createTheme creates a new theme for the requested mode without retaining the previous instance.
+func TestThemeWithColorModeReleasesSourceTheme(t *testing.T) {
+	// The source theme is a truecolor theme; a terminal without COLORTERM loads the built-in in 256 colors and the conversion would return the same instance.
+	preserveCapabilityState(t)
+	SetCapabilities(TerminalCapabilities{TrueColor: true})
+	source, converted := func() (weak.Pointer[Theme], *Theme) {
+		theme, err := LoadBuiltinTheme("dark")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return weak.Make(theme), theme.WithColorMode(TerminalColorMode256)
+	}()
+	if converted.GetColorMode() != TerminalColorMode256 || converted.Accent != "\x1b[38;5;140m" {
+		t.Fatalf("converted theme = %q (%s)", converted.Accent, converted.GetColorMode())
+	}
+	runtime.GC()
+	if source.Value() != nil {
+		t.Error("converted theme retains the obsolete source theme")
+	}
+	runtime.KeepAlive(converted)
+}
+
+// A registered theme activated by name stays that theme in either color mode, as Pi's setTheme returns the registered instance for the name.
+func TestSetThemeByNameKeepsRegisteredNameInEachColorMode(t *testing.T) {
+	preserveCapabilityState(t)
+	previousRegistry, previous := ActiveThemeRegistry(), ActiveTheme()
+	t.Cleanup(func() { SetThemeRegistry(previousRegistry); activeTheme.Store(previous) })
+	other, err := LoadBuiltinTheme("dark")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Name = "other"
+	registry := NewThemeRegistry()
+	registry.Add(other)
+	SetThemeRegistry(registry)
+	for _, trueColor := range []bool{true, false} {
+		SetCapabilities(TerminalCapabilities{TrueColor: trueColor})
+		SetThemeByName("other")
+		if got := ActiveTheme().Name; got != "other" {
+			t.Fatalf("trueColor=%v: active theme = %q, want other", trueColor, got)
+		}
+	}
+}
+
+// /reload applies capabilities and refreshes the active theme. Like Pi's createTheme/setGlobalTheme path, a refresh must not retain obsolete themes.
+func TestRefreshActiveThemeColorModeReleasesObsoleteThemes(t *testing.T) {
+	preserveCapabilityState(t)
+	previous := ActiveTheme()
+	t.Cleanup(func() { activeTheme.Store(previous) })
+	for _, rounds := range []int{1, 100} {
+		t.Run(fmt.Sprintf("round_trips_%d", rounds), func(t *testing.T) {
+			obsolete := refreshThemeRoundTrips(t, rounds)
+			runtime.GC()
+			retained := 0
+			for _, theme := range obsolete {
+				if theme.Value() != nil {
+					retained++
+				}
+			}
+			if retained != 0 {
+				t.Errorf("refresh retained %d of %d obsolete themes", retained, len(obsolete))
+			}
+		})
+	}
+}
+
+func refreshThemeRoundTrips(t *testing.T, rounds int) []weak.Pointer[Theme] {
+	t.Helper()
+	theme, err := LoadBuiltinTheme("dark")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeTheme.Store(theme)
+	var obsolete []weak.Pointer[Theme]
+	for range rounds {
+		for _, trueColor := range []bool{false, true} {
+			obsolete = append(obsolete, weak.Make(ActiveTheme()))
+			SetCapabilities(TerminalCapabilities{TrueColor: trueColor})
+			RefreshActiveThemeColorMode()
+			wantMode, wantAccent := TerminalColorMode256, "\x1b[38;5;140m"
+			if trueColor {
+				wantMode, wantAccent = TerminalColorModeTrueColor, "\x1b[38;2;167;152;215m"
+			}
+			if got := ActiveTheme(); got.GetColorMode() != wantMode || got.Accent != wantAccent || got.GetFgAnsi("accent") != wantAccent {
+				t.Fatalf("refreshed theme = %q (%s), want %q (%s)", got.Accent, got.GetColorMode(), wantAccent, wantMode)
+			}
+		}
+	}
+	return obsolete
+}
+
+func BenchmarkRefreshActiveThemeColorModeRoundTrip(b *testing.B) {
+	preserveCapabilityState(b)
+	previous := ActiveTheme()
+	b.Cleanup(func() { activeTheme.Store(previous) })
+	theme, err := LoadBuiltinTheme("dark")
+	if err != nil {
+		b.Fatal(err)
+	}
+	activeTheme.Store(theme)
+	b.ReportAllocs()
+	for b.Loop() {
+		SetCapabilities(TerminalCapabilities{TrueColor: false})
+		RefreshActiveThemeColorMode()
+		SetCapabilities(TerminalCapabilities{TrueColor: true})
+		RefreshActiveThemeColorMode()
+	}
+}

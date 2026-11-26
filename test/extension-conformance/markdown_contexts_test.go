@@ -1,0 +1,58 @@
+package extensionconformance
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/MichaelKinsy/PiG/coding/extension"
+)
+
+// packages/coding-agent/src/core/extensions/types.ts:1679 (ExtensionAPI.registerMarkdownTransformer).
+// Pi markdown-transform.ts:18-29 passes the current display context to each callback. Use the existing common fixture and compare all SDKs and placements to the real native reference without polling away a missing first answer.
+func TestMarkdownContextsAcrossSDKs(t *testing.T) {
+	t.Parallel()
+	cases := allHarnessCases()
+	for _, language := range []string{"go", "python", "rust", "lisp"} {
+		cases = append(cases, harnessCase{name: "packed-" + language, make: func(t *testing.T) *harness { return makePackedUIHarness(t, language) }})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.make(t)
+			t.Cleanup(func() {
+				if h.cleanup != nil {
+					h.cleanup()
+				}
+				if h.host != nil {
+					h.host.Shutdown("test done")
+				}
+			})
+			transforms := h.runner.GetMarkdownTransformers()
+			if len(transforms) == 0 {
+				t.Fatal("common fixture has no Markdown transformer")
+			}
+			for _, text := range []string{"", "ordinary *Markdown*", "猫😀\nsecond line", strings.Repeat("x", 64<<10)} {
+				for i, messageType := range []extension.MarkdownMessageType{extension.MarkdownMessageUser, extension.MarkdownMessageAssistant, extension.MarkdownMessageAssistantThinking} {
+					ctx := extension.MarkdownTransformContext{Context: t.Context(), MessageType: messageType, IsStreaming: i == 1, AvailableWidth: []int{1, 17, 4096}[i]}
+					want := fmt.Sprintf("md:%s:%s:streaming=%t:width=%d", text, messageType, ctx.IsStreaming, ctx.AvailableWidth)
+					for j, transform := range transforms {
+						if got := transform(text, ctx); got != want {
+							t.Fatalf("registerMarkdownTransformer transform%d input bytes=%d context=%+v: got %q; want %q", j, len(text), ctx, got, want)
+						}
+					}
+				}
+			}
+			// Pi eebd5d90: the fixture lists the custom, summary and changelog surfaces in options.messageTypes. An SDK that ignores the option leaves them
+			// to the default types, and the wrapper passes the Markdown of those surfaces through unchanged.
+			for _, messageType := range []extension.MarkdownMessageType{extension.MarkdownMessageCustom, extension.MarkdownMessageSummary, extension.MarkdownMessageChangelog} {
+				ctx := extension.MarkdownTransformContext{Context: t.Context(), MessageType: messageType, AvailableWidth: 40}
+				want := fmt.Sprintf("md:surface *text*:%s:streaming=false:width=40", messageType)
+				for j, transform := range transforms {
+					if got := transform("surface *text*", ctx); got != want {
+						t.Fatalf("registerMarkdownTransformer options.messageTypes transform%d on %s: got %q; want %q (the SDK ignored the option)", j, messageType, got, want)
+					}
+				}
+			}
+		})
+	}
+}

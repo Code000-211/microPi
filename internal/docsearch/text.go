@@ -54,19 +54,43 @@ func isStopword(w string) bool {
 // RawWords scans maximal runs of alphanumeric or joiner characters and trims leading/trailing joiners.
 func RawWords(text string) []string {
 	var words []string
+	eachRawWord(text, func(word string) { words = append(words, word) })
+	return words
+}
+
+// wordByte classifies ASCII bytes for eachRawWord: letters, digits and joiners continue a word.
+var wordByte = func() (table [utf8.RuneSelf]bool) {
+	for c := 0; c < utf8.RuneSelf; c++ {
+		r := rune(c)
+		table[c] = unicode.IsLetter(r) || unicode.IsDigit(r) || isJoiner(r)
+	}
+	return table
+}()
+
+// isWordRuneAt reports whether the rune at text[i:] continues a word, and its size; ASCII is looked up in wordByte.
+func isWordRuneAt(text string, i int) (bool, int) {
+	if c := text[i]; c < utf8.RuneSelf {
+		return wordByte[c], 1
+	}
+	r, size := utf8.DecodeRuneInString(text[i:])
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || isJoiner(r), size
+}
+
+// eachRawWord calls fn with each word RawWords returns, in order, without collecting them.
+func eachRawWord(text string, fn func(word string)) {
 	n := len(text)
 	i := 0
 	for i < n {
-		r, size := utf8.DecodeRuneInString(text[i:])
-		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !isJoiner(r) {
+		ok, size := isWordRuneAt(text, i)
+		if !ok {
 			i += size
 			continue
 		}
 		start := i
 		i += size
 		for i < n {
-			r2, s2 := utf8.DecodeRuneInString(text[i:])
-			if !unicode.IsLetter(r2) && !unicode.IsDigit(r2) && !isJoiner(r2) {
+			ok2, s2 := isWordRuneAt(text, i)
+			if !ok2 {
 				break
 			}
 			i += s2
@@ -80,10 +104,9 @@ func RawWords(text string) []string {
 			word = word[:len(word)-1]
 		}
 		if len(word) > 0 {
-			words = append(words, word)
+			fn(word)
 		}
 	}
-	return words
 }
 
 var stemSuffixes = []string{"ungen", "ung", "ing", "ies", "ed", "es", "en", "er", "s", "e"}
@@ -101,6 +124,23 @@ func Stem(w string) string {
 		}
 	}
 	return w
+}
+
+// hasCamelBoundary reports whether CamelParts(part) returns more than one part, without building them: a part ends at each
+// lowercase->uppercase, letter->digit or digit->letter boundary, and every part is non-empty.
+func hasCamelBoundary(part string) bool {
+	var prevR rune
+	for i, r := range part {
+		if i > 0 {
+			prevDigit := prevR >= '0' && prevR <= '9'
+			curDigit := r >= '0' && r <= '9'
+			if (unicode.IsLower(prevR) && unicode.IsUpper(r)) || (unicode.IsLetter(prevR) && curDigit) || (prevDigit && unicode.IsLetter(r)) {
+				return true
+			}
+		}
+		prevR = r
+	}
+	return false
 }
 
 // CamelParts splits a token at lowercase->uppercase, letter->digit, and digit->letter boundaries,
@@ -179,16 +219,11 @@ func splitJoiners(w string) []string {
 // Terms tokenizes text into normalized search terms (with light stemming on plain words
 // and full + split + camelCase decomposition on compound/camelCase identifiers).
 func Terms(text string) []string {
-	raw := RawWords(text)
-	if len(raw) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(raw))
-	for _, w := range raw {
+	var out []string
+	eachRawWord(text, func(w string) {
 		lower := strings.ToLower(w)
 		compound := strings.ContainsFunc(w, isJoiner)
-		cparts := CamelParts(w)
-		mixed := len(cparts) > 1
+		mixed := hasCamelBoundary(w)
 		if !compound && !mixed {
 			if keepTerm(lower) && !isStopword(lower) {
 				if allAlpha(lower) {
@@ -197,7 +232,7 @@ func Terms(text string) []string {
 					out = append(out, lower)
 				}
 			}
-			continue
+			return
 		}
 		out = append(out, lower)
 		jparts := splitJoiners(w)
@@ -209,16 +244,15 @@ func Terms(text string) []string {
 			if keepTerm(pl) && !isStopword(pl) && pl != lower {
 				out = append(out, pl)
 			}
-			sub := CamelParts(p)
-			if len(sub) > 1 {
-				for _, s := range sub {
+			if hasCamelBoundary(p) {
+				for _, s := range CamelParts(p) {
 					if utf8.RuneCountInString(s) >= 2 && !allDigits(s) && !isStopword(s) && s != pl {
 						out = append(out, s)
 					}
 				}
 			}
 		}
-	}
+	})
 	return out
 }
 
@@ -361,11 +395,11 @@ func Entities(text, filename string, isFirstChunk bool) []string {
 		if letters >= 20 && upper*10 > letters*6 {
 			continue
 		}
-		for _, w := range RawWords(line) {
+		eachRawWord(line, func(w string) {
 			if IsEntityWord(w) {
 				add(w)
 			}
-		}
+		})
 	}
 
 	// 4. File identity for chunk 0.

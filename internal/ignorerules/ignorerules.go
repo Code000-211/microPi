@@ -24,7 +24,20 @@ type Rule struct {
 	dirOnly      bool
 	basenameOnly bool
 	matcher      *regexp.Regexp
+	// literal and suffix answer the commonest patterns without the expression: a plain name or path (`node_modules`, `docs/out`) is a
+	// case-insensitive comparison, and `*.log` (a star, then a plain rest with no slash) a case-insensitive suffix with no slash before it.
+	// The expression stays the reference; fastMatchKind says which one applies.
+	fast     fastMatchKind
+	fastText string
 }
+
+type fastMatchKind uint8
+
+const (
+	fastNone fastMatchKind = iota
+	fastLiteral
+	fastStarSuffix
+)
 
 // Append adds the rules from dir's .gitignore, .ignore, and .fdignore files,
 // as upstream Pi's addIgnoreRules (core/package-manager.ts) does.
@@ -101,6 +114,20 @@ func Ignored(candidate string, directory bool, root string, rules []Rule) bool {
 	return ruleSetIgnores(rel, directory, rules)
 }
 
+// IgnoredInWalk is Ignored for a walk that does not enter ignored directories: every directory above candidate was already found not
+// ignored, so only candidate itself is matched. Rules from a deeper ignore file carry that directory as their prefix and cannot match a
+// directory above it, so the answer is Ignored's. It saves matching every rule against each ancestor of each file.
+func IgnoredInWalk(candidate string, directory bool, root string, rules []Rule) bool {
+	if len(rules) == 0 {
+		return false
+	}
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	return ruleSetIgnores(filepath.ToSlash(rel), directory, rules)
+}
+
 func ruleSetIgnores(rel string, directory bool, rules []Rule) bool {
 	ignored := false
 	for _, rule := range rules {
@@ -142,7 +169,58 @@ func newRule(pattern string) (Rule, bool) {
 	// `ignore` decides this on the pattern as written, before it trims trailing spaces: "name/ " is anchored.
 	rule.basenameOnly = !hasInnerSlash(raw)
 	rule.matcher = compileGlob(body, rule.dirOnly)
+	if rule.matcher != nil {
+		rule.fast, rule.fastText = fastMatcher(body)
+	}
 	return rule, true
+}
+
+// fastMatcher picks the comparison that answers body exactly as its compiled expression does, or fastNone. A body without glob characters
+// or escapes compiles to (?i)^<literal>$; `*` followed by such a body without a slash compiles to (?i)^[^/]*<literal>$. Go's (?i) and
+// strings.EqualFold both use simple case folding.
+func fastMatcher(body string) (fastMatchKind, string) {
+	const special = "*?[\\"
+	if !strings.ContainsAny(body, special) {
+		return fastLiteral, body
+	}
+	if rest, ok := strings.CutPrefix(body, "*"); ok && rest != "" && !strings.ContainsAny(rest, special+"/") {
+		return fastStarSuffix, rest
+	}
+	return fastNone, ""
+}
+
+// hasFoldSuffix reports whether s ends with suffix under simple case folding.
+func hasFoldSuffix(s, suffix string) bool {
+	if isASCII(s) && isASCII(suffix) {
+		// ASCII folds only to ASCII of the same length: the byte suffix is the answer.
+		return len(s) >= len(suffix) && strings.EqualFold(s[len(s)-len(suffix):], suffix)
+	}
+	if len(s) < len(suffix) {
+		// Folding can change a rune's length (e.g. K and the Kelvin sign), so a short s may still match: ask the comparison itself.
+		return utf8.RuneCountInString(s) >= utf8.RuneCountInString(suffix) && foldSuffixByRunes(s, suffix)
+	}
+	if strings.EqualFold(s[len(s)-len(suffix):], suffix) {
+		return true
+	}
+	return foldSuffixByRunes(s, suffix)
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// foldSuffixByRunes compares the last runes of s with suffix one by one, for text whose folded forms differ in byte length.
+func foldSuffixByRunes(s, suffix string) bool {
+	sr, xr := []rune(s), []rune(suffix)
+	if len(sr) < len(xr) {
+		return false
+	}
+	return strings.EqualFold(string(sr[len(sr)-len(xr):]), suffix)
 }
 
 // hasInnerSlash reports whether the pattern has a slash that is not its last character.
@@ -425,6 +503,12 @@ func (rule Rule) match(candidate string, directory bool) bool {
 		if slash := strings.LastIndexByte(candidate, '/'); slash >= 0 {
 			candidate = candidate[slash+1:]
 		}
+	}
+	switch rule.fast {
+	case fastLiteral:
+		return strings.EqualFold(candidate, rule.fastText)
+	case fastStarSuffix:
+		return !strings.Contains(candidate, "/") && hasFoldSuffix(candidate, rule.fastText)
 	}
 	return rule.matcher.MatchString(candidate)
 }

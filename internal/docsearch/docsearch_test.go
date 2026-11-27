@@ -375,6 +375,8 @@ func TestEngineAndDocsCommand(t *testing.T) {
 	t.Setenv("DOCSEARCH_CACHE_DIR", t.TempDir())
 	t.Setenv("PI_CODING_AGENT_DIR", t.TempDir())
 	t.Setenv("PI_DOCSEARCH", "")
+	// Registered after the temporary directories, so it runs before they are removed: /docs rebuild below runs on a shared engine.
+	t.Cleanup(closeSharedEngines)
 
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\nfunc AlphaBeta() {}\n"), 0o644); err != nil {
 		t.Fatal(err)

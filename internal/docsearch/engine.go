@@ -242,7 +242,12 @@ func (e *Engine) initBuildOrLoad() {
 	if len(e.roots) == 0 || e.closed.Load() {
 		return
 	}
-	go pruneCacheDir()
+	// Close waits for it too, so nothing writes to the cache directory after the engine is closed.
+	e.bgWG.Add(1)
+	go func() {
+		defer e.bgWG.Done()
+		pruneCacheDir()
+	}()
 
 	if idx, err := Load(e.idxPath, e.roots); err == nil {
 		e.setView(idx, nil)

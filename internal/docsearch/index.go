@@ -245,7 +245,8 @@ func parseFilesParallel(files []FileMeta, maxBytes int64) []parsedFile {
 	if len(files) == 0 {
 		return nil
 	}
-	workers := min(max(runtime.NumCPU(), 1), len(files))
+	// µPi: the index is built in the background while the agent's own tools run; half the CPUs leave them the rest.
+	workers := min(max(runtime.NumCPU()/2, 1), len(files))
 	results := make([]parsedFile, len(files))
 	valid := make([]bool, len(files))
 

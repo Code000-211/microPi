@@ -371,13 +371,15 @@ func loadIgnorePatternsFromFile(path, prefix string) []string {
 	return patterns
 }
 
+// isIgnoredByStack is asked only by walkTree, which does not enter ignored directories, so each layer matches the entry alone
+// (ignorerules.IgnoredInWalk).
 func isIgnoredByStack(absPath string, isDir bool, stack []taggedIgnoreRule) bool {
 	ignored := false
 	for _, layer := range stack {
 		if len(layer.rules) == 0 {
 			continue
 		}
-		if ignorerules.Ignored(absPath, isDir, layer.root, layer.rules) {
+		if ignorerules.IgnoredInWalk(absPath, isDir, layer.root, layer.rules) {
 			ignored = true
 		}
 	}

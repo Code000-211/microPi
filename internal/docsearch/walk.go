@@ -190,7 +190,7 @@ func ScanExtensions(roots, extensions []string, maxFileBytes int64, maxFiles int
 						return filepath.SkipDir
 					}
 					parent := filepath.Dir(p)
-					if ignorerules.Ignored(p, true, absRoot, rulesByDir[parent]) {
+					if ignorerules.IgnoredInWalk(p, true, absRoot, rulesByDir[parent]) {
 						return filepath.SkipDir
 					}
 				}
@@ -211,7 +211,7 @@ func ScanExtensions(roots, extensions []string, maxFileBytes int64, maxFiles int
 				}
 			}
 			parent := filepath.Dir(p)
-			if ignorerules.Ignored(p, false, absRoot, rulesByDir[parent]) {
+			if ignorerules.IgnoredInWalk(p, false, absRoot, rulesByDir[parent]) {
 				return nil
 			}
 			if _, dup := seenAbs[p]; dup {

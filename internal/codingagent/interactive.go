@@ -556,9 +556,11 @@ type InteractiveMode struct {
 	// goroutine. evCurrentBlock/evTurnIndex are that handler's
 	// cross-event state (one assistant block per message; mirrors upstream's
 	// per-stream locals), only ever touched on the main goroutine.
-	eventCh            <-chan agent.AgentEvent
-	evCurrentBlock     *tui.AssistantMessageComponent
-	bugReportHintShown bool
+	eventCh        <-chan agent.AgentEvent
+	evCurrentBlock *tui.AssistantMessageComponent
+	// evFirstPaintPending is set when an assistant message starts and cleared by its first text or thinking delta, which is drawn at once.
+	evFirstPaintPending bool
+	bugReportHintShown  bool
 	// installChanges holds what this process recorded at startup; nil records nothing.
 	installChanges            *installchange.Tracker
 	installChangeWarningShown bool

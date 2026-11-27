@@ -418,6 +418,7 @@ func (m *InteractiveMode) applyAgentEvent(ev agent.AgentEvent) {
 			updateAssistantMessageBlock(m.evCurrentBlock, e.Message.Assistant)
 			m.appendToChat(m.evCurrentBlock)
 			m.assistantBlocks = append(m.assistantBlocks, m.evCurrentBlock)
+			m.evFirstPaintPending = true
 			m.tuiInst.RequestRender()
 		}
 
@@ -430,7 +431,20 @@ func (m *InteractiveMode) applyAgentEvent(ev agent.AgentEvent) {
 		// pig additive (D625): while the adaptive policy paces the frames, a tool call delta that leaves its card's lines as the last frame drew them asks for no frame (unchanged, below): the frame would send the terminal nothing. Under Pi's interval every update asks for one here and one below, as Pi's handler does.
 		_, toolDelta := e.AssistantMessageEvent.(ai.ToolCallDeltaEvent)
 		skippable := toolDelta && m.framePacingInForce()
-		if !skippable {
+		// µPi: the first text or thinking of an answer is drawn on the next loop turn, as a key press is (RequestImmediateRender: no full redraw),
+		// not when the frame interval since the last frame (a loader step) has passed: the answer appears up to 16 ms sooner. Later deltas keep
+		// the paced frames.
+		firstPaint := false
+		if m.evFirstPaintPending {
+			switch e.AssistantMessageEvent.(type) {
+			case ai.TextDeltaEvent, ai.ThinkingDeltaEvent:
+				firstPaint = true
+				m.evFirstPaintPending = false
+			}
+		}
+		if firstPaint {
+			m.tuiInst.RequestImmediateRender()
+		} else if !skippable {
 			m.tuiInst.RequestRender()
 		}
 		unchanged := false

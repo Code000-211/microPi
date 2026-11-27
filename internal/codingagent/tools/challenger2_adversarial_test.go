@@ -239,19 +239,19 @@ func TestChallenger2_ContentCacheCapsAndBinaryAndPieceStreaming(t *testing.T) {
 
 	searchCacheMu.Lock()
 	cacheSz := contentCacheSize
-	// The LRU cap evicts the files searched first: bin_small.dat and exact_512k.txt come before f_000.txt in path
-	// order, so all three are gone after the 70 MB of f_*.txt.
+	// A walk larger than the cache keeps what it cached first (entries used within contentCacheKeepRecent are not evicted), so the
+	// next search finds those files cached instead of none: f_000.txt stays, f_139.txt did not fit.
 	_, hasFirst := contentCacheMap[normalizeCacheKey(filepath.Join(dir, "f_000.txt"))]
 	_, hasLast := contentCacheMap[normalizeCacheKey(filepath.Join(dir, "f_139.txt"))]
 	searchCacheMu.Unlock()
 	if cacheSz > maxContentCacheBytes {
 		t.Fatalf("contentCacheSize %d exceeds maxContentCacheBytes %d", cacheSz, maxContentCacheBytes)
 	}
-	if hasFirst {
-		t.Fatalf("f_000.txt should have been evicted under 64MB cap")
+	if !hasFirst {
+		t.Fatalf("f_000.txt, cached first in the walk, should still be cached")
 	}
-	if !hasLast {
-		t.Fatalf("f_139.txt, searched last, should be cached")
+	if hasLast {
+		t.Fatalf("f_139.txt should not have evicted a recently used entry")
 	}
 
 	// A search of the three small files, after the walk: the 512 KB cap per file and the binary entry.

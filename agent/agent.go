@@ -2185,8 +2185,11 @@ func (h *loopHost) consumeStreamWithEarly(ctx context.Context, stream *ai.Assist
 			}
 		}
 		if early != nil {
-			if tcEnd, ok := event.(ai.ToolCallEndEvent); ok {
-				early.maybeStartFromEvent(tcEnd.ContentIndex, tcEnd.Partial, tcEnd.ToolCall)
+			switch ev := event.(type) {
+			case ai.ToolCallDeltaEvent:
+				early.observeDelta(ev.ContentIndex, ev.Partial, ev.Delta)
+			case ai.ToolCallEndEvent:
+				early.maybeStartFromEvent(ev.ContentIndex, ev.Partial, ev.ToolCall)
 			}
 		}
 		if partial, update := assistantUpdatePartial(event); update && !h.messageUpdateObserved() {

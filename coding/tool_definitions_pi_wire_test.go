@@ -3,8 +3,10 @@ package coding
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -43,6 +45,14 @@ func TestBuiltInToolDefinitionsMatchPisOwn(t *testing.T) {
 	if len(golden) != len(definitions) {
 		t.Fatalf("golden has %d tools, test builds %d", len(golden), len(definitions))
 	}
+	// µPi: the members µPi deliberately changes are not compared with Pi's: the shell tools' texts and background parameter, sequential
+	// bash/powershell/edit/write (calls in one response run in order), and edit's sentence about that order.
+	microPiMembers := map[string][]string{
+		"Bash":       {"description", "promptGuidelines", "parameters", "executionMode"},
+		"PowerShell": {"description", "promptGuidelines", "parameters", "executionMode"},
+		"Edit":       {"description", "executionMode"},
+		"Write":      {"executionMode"},
+	}
 	for name, want := range golden {
 		t.Run(name, func(t *testing.T) {
 			definition, ok := definitions[name]
@@ -61,6 +71,12 @@ func TestBuiltInToolDefinitionsMatchPisOwn(t *testing.T) {
 			for key := range want {
 				projected[key] = got[key]
 			}
+			want = maps.Clone(want)
+			for _, key := range microPiMembers[name] {
+				delete(projected, key)
+				delete(want, key)
+				delete(got, key)
+			}
 			// A member Pi leaves undefined is absent from the Go definition too.
 			for _, key := range []string{"promptSnippet", "promptGuidelines", "constrainedSampling", "renderShell", "executionMode"} {
 				if _, expected := want[key]; !expected {
@@ -77,7 +93,7 @@ func TestBuiltInToolDefinitionsMatchPisOwn(t *testing.T) {
 			if err := json.Compact(&gotParameters, definition.Parameters); err != nil {
 				t.Fatal(err)
 			}
-			if gotParameters.String() != wantParameters.String() {
+			if gotParameters.String() != wantParameters.String() && !slices.Contains(microPiMembers[name], "parameters") {
 				t.Errorf("parameters member order differs from Pi's:\ngot  %s\nwant %s", gotParameters.String(), wantParameters.String())
 			}
 			if !reflect.DeepEqual(projected, want) {

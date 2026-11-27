@@ -18,7 +18,7 @@ func TestPromptDocsSectionNamesGetDocsPathWithATildeConfigRoot(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	for _, tc := range []struct{ name, pigHome, xdg, want string }{
 		{"PIG_HOME", "~/x", "", pigdocs.DocsDir(filepath.Join(home, "x"))},
-		{"XDG_CONFIG_HOME", "", "~/cfg", pigdocs.DocsDir(filepath.Join(home, "cfg", "pig"))},
+		{"XDG_CONFIG_HOME", "", "~/cfg", pigdocs.DocsDir(filepath.Join(home, "cfg", "micropi"))}, // µPi: config root micropi
 	} {
 		t.Setenv("PIG_HOME", tc.pigHome)
 		t.Setenv("XDG_CONFIG_HOME", tc.xdg)
@@ -26,7 +26,8 @@ func TestPromptDocsSectionNamesGetDocsPathWithATildeConfigRoot(t *testing.T) {
 			t.Fatalf("%s: GetDocsPath = %q, want %q", tc.name, got, tc.want)
 		}
 		prompt := prompts.BuildDefaultPrompt(prompts.Options{})
-		if !strings.Contains(prompt, "Additional docs: "+tc.want+"\n") {
+		// µPi: the docs section is microPi's one line ("read README and the docs in DIR"), which names the bundle directory.
+		if !strings.Contains(prompt, tc.want) {
 			t.Errorf("%s: the prompt's docs section does not name %q:\n%s", tc.name, tc.want, prompt)
 		}
 		if strings.Contains(prompt, "~/") {
@@ -42,7 +43,7 @@ func TestGetDocsPathIsAbsoluteForARelativeConfigRoot(t *testing.T) {
 	if !filepath.IsAbs(got) || filepath.Base(filepath.Dir(got)) != "docs" || !strings.Contains(got, "relative-home") {
 		t.Fatalf("GetDocsPath = %q, want an absolute path to a bundle in relative-home/docs", got)
 	}
-	if prompt := prompts.BuildDefaultPrompt(prompts.Options{}); !strings.Contains(prompt, "Additional docs: "+got+"\n") {
+	if prompt := prompts.BuildDefaultPrompt(prompts.Options{}); !strings.Contains(prompt, got) {
 		t.Fatalf("the prompt's docs section does not name %q", got)
 	}
 }

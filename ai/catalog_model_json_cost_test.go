@@ -12,9 +12,17 @@ import (
 // allocated by the encoding and the heap bytes still live after it with the encodings dropped.
 func builtinCatalogEncodeCost(t *testing.T) (allocated, retained uint64) {
 	t.Helper()
-	models := make([]*Model, len(GeneratedModels))
+	// µPi: the Melious models are added to the built-in list without a catalog record; their encoding falls back to member-by-member
+	// (CatalogModelJSON ok=false), so only the models that have a record are measured here.
+	var generated []GeneratedModel
 	for i := range GeneratedModels {
-		models[i] = GeneratedModels[i].ToModel()
+		if ResolveCatalogRecord(GeneratedModels[i].Record) != "" {
+			generated = append(generated, GeneratedModels[i])
+		}
+	}
+	models := make([]*Model, len(generated))
+	for i := range generated {
+		models[i] = generated[i].ToModel()
 	}
 	clearCatalogRecordBaselines()
 	runtime.GC()
@@ -25,13 +33,13 @@ func builtinCatalogEncodeCost(t *testing.T) (allocated, retained uint64) {
 	for i, model := range models {
 		data, ok, err := CatalogModelJSON(model)
 		if err != nil || !ok {
-			t.Fatalf("%s: ok %t, %v", ResolveCatalogRecord(GeneratedModels[i].Record)[:40], ok, err)
+			t.Fatalf("%s/%s: ok %t, %v", generated[i].Provider, generated[i].ID, ok, err)
 		}
 		encoded[i] = data
 	}
 	runtime.ReadMemStats(&after)
 	for i := range encoded {
-		if !bytes.Equal(encoded[i], []byte(ResolveCatalogRecord(GeneratedModels[i].Record))) {
+		if !bytes.Equal(encoded[i], []byte(ResolveCatalogRecord(generated[i].Record))) {
 			t.Fatalf("model %d: encoding is not its catalog record", i)
 		}
 	}

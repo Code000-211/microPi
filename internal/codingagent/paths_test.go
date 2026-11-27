@@ -213,7 +213,8 @@ func TestGetDocsPathIsTheAbsoluteDocsDirectoryOfTheConfigRoot(t *testing.T) {
 	t.Setenv("PIG_HOME", "")
 	xdg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
-	if got, want := GetDocsPath(), pigdocs.DocsDir(filepath.Join(xdg, "pig")); got != want {
+	// µPi: the config root under XDG_CONFIG_HOME is micropi (configroot.Resolve).
+	if got, want := GetDocsPath(), pigdocs.DocsDir(filepath.Join(xdg, "micropi")); got != want {
 		t.Fatalf("GetDocsPath() under XDG_CONFIG_HOME = %q, want %q", got, want)
 	}
 	t.Setenv("PIG_HOME", "relative-home")

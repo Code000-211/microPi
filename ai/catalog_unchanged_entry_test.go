@@ -11,8 +11,8 @@ import (
 // for the model is what it emits for the entry, which this test checks for all of them.
 func TestEveryListedCatalogEntryIsRecognizedAndEncodesAsItsRecord(t *testing.T) {
 	entries := listedCatalogEntries()
-	if len(entries) <= len(GeneratedModels) {
-		t.Fatalf("the listed catalog holds %d entries and the bundled one %d: no D199 variants", len(entries), len(GeneratedModels))
+	if len(entries) <= len(recordModels()) {
+		t.Fatalf("the listed catalog holds %d entries and the bundled one %d: no D199 variants", len(entries), len(recordModels()))
 	}
 	clearCatalogRecordBaselines()
 	for i := range entries {
@@ -40,8 +40,8 @@ func TestEveryListedCatalogEntryIsRecognizedAndEncodesAsItsRecord(t *testing.T) 
 func catalogFamilyEntries(has func(*GeneratedModel) bool) []*GeneratedModel {
 	seen := map[API]bool{}
 	var picked []*GeneratedModel
-	for i := range GeneratedModels {
-		entry := &GeneratedModels[i]
+	for i := range recordModels() {
+		entry := &recordModels()[i]
 		if seen[entry.API] || !has(entry) {
 			continue
 		}

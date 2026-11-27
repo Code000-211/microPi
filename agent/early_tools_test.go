@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -184,5 +186,109 @@ func TestEarlyToolExecutionLeadingReadOfASequentialBatchIsReused(t *testing.T) {
 	}
 	if got := write.readCountAtStart.Load(); got != 1 {
 		t.Fatalf("write started after %d reads, want 1", got)
+	}
+}
+
+// earlyArgsReadTool records the arguments of each run.
+type earlyArgsReadTool struct {
+	earlyMockReadTool
+	mu   sync.Mutex
+	runs []string
+}
+
+func (t *earlyArgsReadTool) Execute(ctx context.Context, id string, args json.RawMessage, update ToolUpdateCallback) (AgentToolResult, error) {
+	t.mu.Lock()
+	t.runs = append(t.runs, string(args))
+	t.mu.Unlock()
+	res, err := t.earlyMockReadTool.Execute(ctx, id, args, update)
+	res.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: "read " + string(args)}}
+	return res, err
+}
+
+// streamDeltaMessage streams one tool call whose arguments arrive as deltas; the provider ends the call only with the message (as
+// openai-completions does), with finalArgs. It waits for started (or a timeout) before ending the message.
+func streamDeltaMessage(t *testing.T, tool AgentTool, deltas []string, finalArgs map[string]any, started chan struct{}) *Agent {
+	t.Helper()
+	stream := ai.NewAssistantMessageEventStream()
+	var requests int
+	a := mustNewAgent(AgentOptions{
+		Model: &ai.Model{ID: "m"},
+		Tools: []AgentTool{tool},
+		StreamFn: func(_ context.Context, _ *ai.Model, _ ai.TranscriptContext, _ ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+			requests++
+			if requests == 1 {
+				return stream, nil
+			}
+			doneStream := ai.NewAssistantMessageEventStream()
+			msg := agentTestAssistant([]ai.AssistantContentBlock{ai.TextContent{Text: "done"}}, ai.StopReasonStop)
+			_ = doneStream.Push(ai.StartEvent{Partial: msg})
+			_ = doneStream.Push(ai.DoneEvent{Reason: ai.StopReasonStop, Message: msg})
+			doneStream.End(msg)
+			return doneStream, nil
+		},
+	})
+	go func() {
+		streaming := ai.ToolCall{ID: "tc1", Name: "read", Arguments: map[string]any{}}
+		partial := agentTestAssistant([]ai.AssistantContentBlock{streaming}, "")
+		_ = stream.Push(ai.StartEvent{Partial: partial})
+		_ = stream.Push(ai.ToolCallStartEvent{ContentIndex: 0, Partial: partial})
+		for _, d := range deltas {
+			_ = stream.Push(ai.ToolCallDeltaEvent{ContentIndex: 0, Delta: d, Partial: partial})
+		}
+		if started != nil {
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Error("the call did not start from its streamed arguments before the message ended")
+			}
+		}
+		final := ai.ToolCall{ID: "tc1", Name: "read", Arguments: finalArgs}
+		finalMsg := agentTestAssistant([]ai.AssistantContentBlock{final}, ai.StopReasonToolUse)
+		_ = stream.Push(ai.ToolCallEndEvent{ContentIndex: 0, ToolCall: final, Partial: finalMsg})
+		_ = stream.Push(ai.DoneEvent{Reason: ai.StopReasonToolUse, Message: finalMsg})
+		stream.End(finalMsg)
+	}()
+	return a
+}
+
+// µPi: a call starts once its streamed arguments form a complete object, before the provider ends it, and that run is used.
+func TestEarlyToolExecutionStartsFromCompleteStreamedArguments(t *testing.T) {
+	tool := &earlyArgsReadTool{earlyMockReadTool: earlyMockReadTool{started: make(chan struct{})}}
+	a := streamDeltaMessage(t, tool, []string{`{"path"`, `: "a.txt"`, `}`}, map[string]any{"path": "a.txt"}, tool.started)
+	if _, err := a.Send(context.Background(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	if len(tool.runs) != 1 {
+		t.Fatalf("runs = %v, want one run reused", tool.runs)
+	}
+}
+
+// When the final arguments differ from the streamed ones, the early run is dropped and the call runs with the final arguments.
+func TestEarlyToolExecutionRunsAgainWhenTheFinalArgumentsDiffer(t *testing.T) {
+	tool := &earlyArgsReadTool{earlyMockReadTool: earlyMockReadTool{started: make(chan struct{})}}
+	a := streamDeltaMessage(t, tool, []string{`{"path":"a.txt"}`}, map[string]any{"path": "b.txt"}, tool.started)
+	if _, err := a.Send(context.Background(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	tr := findToolResult(t, a.Messages(), "tc1")
+	var result string
+	for _, c := range tr.Content {
+		if text, ok := c.(ai.TextContent); ok {
+			result += text.Text
+		}
+	}
+	if !strings.Contains(result, "b.txt") {
+		t.Fatalf("tool result %q, want the run with the final arguments; runs %v", result, tool.runs)
+	}
+}
+
+func TestCanonicalArgsIgnoresKeyOrderAndSpacing(t *testing.T) {
+	a, okA := canonicalArgs([]byte(`{"b": 1, "a": "x"}`))
+	b, okB := canonicalArgs([]byte(`{"a":"x","b":1}`))
+	if !okA || !okB || a != b {
+		t.Fatalf("%q %v / %q %v", a, okA, b, okB)
+	}
+	if _, ok := canonicalArgs([]byte(`[1]`)); ok {
+		t.Fatal("an array is not an argument object")
 	}
 }

@@ -93,7 +93,7 @@ func (r *loopRun) executeToolCallsSequential(ctx context.Context, calls []pendin
 		r.h.emitToolExecutionStart(call)
 		var f finalizedToolCall
 		if outcome := r.h.prepareToolCall(ctx, call); outcome.prepared != nil {
-			executed, ok := early.takeResult(call.id)
+			executed, ok := early.takeResult(call.id, call.args)
 			if ok {
 				r.h.timings.RecordTool(call.name, executed.duration)
 			} else {
@@ -209,7 +209,7 @@ func (r *loopRun) executeToolCallsParallel(ctx context.Context, assistant *Assis
 					defer window.Close()
 				}
 				callCtx := enterRegistrationOrder(callCtx, outcome.prepared.call.id)
-				if executed, ok := early.takeResult(outcome.prepared.call.id); ok {
+				if executed, ok := early.takeResult(outcome.prepared.call.id, outcome.prepared.call.args); ok {
 					r.h.timings.RecordTool(outcome.prepared.call.name, executed.duration)
 					finalized[i] = r.h.finalizeExecutedToolCall(callCtx, *outcome.prepared, executed)
 					return

@@ -546,3 +546,33 @@ func TestSessionCheckersRegisterCppLast(t *testing.T) {
 		t.Fatalf("PI_CHECKS=cpp gives %d checkers", len(only))
 	}
 }
+
+// A slow baseline (cargo check of a large crate) holds an edit up for maxBaselineWait at most.
+func TestAwaitBaselineWaitsAtMostMaxBaselineWait(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits maxBaselineWait")
+	}
+	t.Setenv("PI_CHECKS_WAIT", "30")
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.go")
+	block := make(chan struct{})
+	checker := &stubChecker{
+		name:    "stub",
+		matches: func(p string) bool { return strings.HasSuffix(p, ".go") },
+		runFn: func(ctx context.Context, _ *CheckUnit) ([]Diagnostic, error) {
+			select {
+			case <-block:
+			case <-ctx.Done():
+			}
+			return nil, nil
+		},
+	}
+	bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: dir, Checkers: []Checker{checker}})
+	t.Cleanup(func() { close(block); bc.Dispose() })
+	bc.OnRead(file)
+	start := time.Now()
+	bc.AwaitBaseline(context.Background(), file)
+	if waited := time.Since(start); waited < maxBaselineWait-200*time.Millisecond || waited > maxBaselineWait+2*time.Second {
+		t.Fatalf("AwaitBaseline waited %v, want about %v", waited, maxBaselineWait)
+	}
+}

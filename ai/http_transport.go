@@ -394,9 +394,6 @@ func dialStreamingTLS(ctx context.Context, network, address string, dial func(co
 		}
 		options.ServerName = host
 	}
-	if len(options.NextProtos) == 0 {
-		options.NextProtos = []string{"h2", "http/1.1"}
-	}
 	secure := tls.Client(tracked, options)
 	if err := secure.HandshakeContext(connectCtx); err != nil {
 		_ = conn.Close()
@@ -474,7 +471,7 @@ func newStreamingTransport(insecure bool) http.RoundTripper {
 		}),
 		// A TLS upgrade after proxy CONNECT has its own connector budget, as in Undici. Direct TLS uses DialTLSContext's shared TCP/TLS budget.
 		TLSHandshakeTimeout:   defaultHTTPConnectTimeout,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   4,
 		IdleConnTimeout:       120 * time.Second,

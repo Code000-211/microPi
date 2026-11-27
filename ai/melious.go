@@ -56,6 +56,15 @@ func meliousThinkingMap() map[ModelThinkingLevel]*string {
 	}
 }
 
+// meliousInputLimits is the image resize profile every vision model of the catalog carries (Pi's conservative default), or nil for a
+// text-only model. Without it an image would go to a Melious vision model unresized.
+func meliousInputLimits(images bool) *ModelInputLimits {
+	if !images {
+		return nil
+	}
+	return &ModelInputLimits{Images: &ModelImageInputLimits{Resize: &ModelImageResizeOptions{MaxWidth: 2000, MaxHeight: 2000, MaxBytes: 4718592, JPEGQuality: 80}}}
+}
+
 func meliousGeneratedModels() []GeneratedModel {
 	type spec struct {
 		id        string
@@ -114,6 +123,7 @@ func meliousGeneratedModels() []GeneratedModel {
 			CacheReadCost:        s.cacheRead,
 			Reasoning:            s.reasoning,
 			Capabilities:         caps,
+			InputLimits:          meliousInputLimits(s.images),
 		})
 	}
 	return out
@@ -432,6 +442,7 @@ func fetchMeliousModels(refresh RefreshModelsContext) ([]AnyModel, error) {
 			CacheWriteCost:       cost.cacheWrite,
 			Reasoning:            isReasoning,
 			Capabilities:         capabilities,
+			InputLimits:          meliousInputLimits(hasImage),
 		}
 		out = append(out, generated.ToModel())
 	}

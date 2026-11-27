@@ -17,26 +17,26 @@ func TestChangedBuiltinModelEncodesAsItsDecodedRecord(t *testing.T) {
 		"base url":      func(m *Model) { m.ProviderMeta.BaseURL += "/changed" },
 		"cleared input": func(m *Model) { m.Input = nil },
 	}
-	for i := 0; i < len(GeneratedModels); i += 7 {
-		record := ResolveCatalogRecord(GeneratedModels[i].Record)
+	for i := 0; i < len(recordModels()); i += 7 {
+		record := ResolveCatalogRecord(recordModels()[i].Record)
 		for name, change := range changes {
-			built := GeneratedModels[i].ToModel()
+			built := recordModels()[i].ToModel()
 			change(built)
 			got, ok, err := CatalogModelJSON(built)
 			if err != nil || !ok {
-				t.Fatalf("%s %s: ok %t, %v", GeneratedModels[i].ID, name, ok, err)
+				t.Fatalf("%s %s: ok %t, %v", recordModels()[i].ID, name, ok, err)
 			}
 			decoded, known, err := DecodeStoredModel([]byte(record))
 			if err != nil || !known {
-				t.Fatalf("%s: decode: known %t, %v", GeneratedModels[i].ID, known, err)
+				t.Fatalf("%s: decode: known %t, %v", recordModels()[i].ID, known, err)
 			}
 			change(decoded.(*Model))
 			want, err := EncodeStoredModel(decoded)
 			if err != nil {
-				t.Fatalf("%s %s: encode: %v", GeneratedModels[i].ID, name, err)
+				t.Fatalf("%s %s: encode: %v", recordModels()[i].ID, name, err)
 			}
 			if !bytes.Equal(got, want) {
-				t.Fatalf("%s %s:\n got %s\nwant %s", GeneratedModels[i].ID, name, got, want)
+				t.Fatalf("%s %s:\n got %s\nwant %s", recordModels()[i].ID, name, got, want)
 			}
 		}
 	}

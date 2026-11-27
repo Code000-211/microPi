@@ -174,6 +174,7 @@ func TestEnvAPIKeysTableMatchesUpstream(t *testing.T) {
 		"xiaomi-token-plan-cn":  {"XIAOMI_TOKEN_PLAN_CN_API_KEY"},
 		"xiaomi-token-plan-ams": {"XIAOMI_TOKEN_PLAN_AMS_API_KEY"},
 		"xiaomi-token-plan-sgp": {"XIAOMI_TOKEN_PLAN_SGP_API_KEY"},
+		"melious":               {"MELIOUS_API_KEY"}, // µPi: the Melious provider
 	}
 	if len(envAPIKeyVars()) != len(want)-2 {
 		t.Fatalf("env table has %d entries, want %d", len(envAPIKeyVars()), len(want)-2)

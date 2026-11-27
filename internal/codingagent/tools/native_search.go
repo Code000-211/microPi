@@ -28,13 +28,17 @@ const (
 	maxVerifiedDirs       = 4096
 	maxContentCacheBytes  = 64 << 20  // 64 MB
 	maxCachedFileBytes    = 512 << 10 // 512 KB
-	contentCacheStatFree  = 1500 * time.Millisecond
-	wholeFileBytes        = 2 << 20 // 2 MB
-	pieceBytes            = 1 << 20 // 1 MB
-	maxIgnoreFileBytes    = 4 << 20 // 4 MiB
-	maxBraceExpansions    = 1024
-	fuzzyFallbackLimit    = 20
-	walkBatchConcurrency  = 32
+	// contentCacheKeepRecent: an entry used this recently is not evicted for a new one. A search over a tree larger than the cache then
+	// keeps what the cache holds instead of evicting each file before the next search needs it (no hit at all); between searches further
+	// apart the cache follows what is searched.
+	contentCacheKeepRecent = 10 * time.Second
+	contentCacheStatFree   = 1500 * time.Millisecond
+	wholeFileBytes         = 2 << 20 // 2 MB
+	pieceBytes             = 1 << 20 // 1 MB
+	maxIgnoreFileBytes     = 4 << 20 // 4 MiB
+	maxBraceExpansions     = 1024
+	fuzzyFallbackLimit     = 20
+	walkBatchConcurrency   = 32
 )
 
 type entryKind uint8
@@ -68,7 +72,9 @@ type cachedFileBuffer struct {
 	mtimeNanos int64
 	size       int64
 	verifiedAt time.Time
-	buffer     []byte // nil means binary file (contains NUL)
+	// usedAt is when a search last read the entry.
+	usedAt time.Time
+	buffer []byte // nil means binary file (contains NUL)
 }
 
 var (
@@ -142,7 +148,7 @@ func NotifySearchFileTouched(filePath string, content []byte, mtime time.Time) {
 	defer searchCacheMu.Unlock()
 
 	if content != nil {
-		storeContentLocked(key, mtime.UnixNano(), int64(len(content)), content, time.Now())
+		storeContentLocked(key, mtime.UnixNano(), int64(len(content)), content, false, time.Now())
 	} else {
 		removeContentLocked(key)
 	}
@@ -178,15 +184,21 @@ func removeContentLocked(key string) {
 	}
 }
 
-func storeContentLocked(key string, mtimeNanos, size int64, raw []byte, now time.Time) {
+// storeContentLocked caches raw for key. owned means raw belongs to the cache from now on (a buffer the search read itself); otherwise it is
+// copied. It reports whether raw was kept.
+func storeContentLocked(key string, mtimeNanos, size int64, raw []byte, owned bool, now time.Time) bool {
 	removeContentLocked(key)
-	if size > maxCachedFileBytes {
-		return
+	if size > maxCachedFileBytes || !contentCacheAdmitsLocked(int64(len(raw)), now) {
+		return false
 	}
 	var stored []byte
 	if bytes.IndexByte(raw, 0) == -1 {
-		stored = make([]byte, len(raw))
-		copy(stored, raw)
+		if owned {
+			stored = raw[:len(raw):len(raw)]
+		} else {
+			stored = make([]byte, len(raw))
+			copy(stored, raw)
+		}
 		contentCacheSize += int64(len(stored))
 	}
 	entry := &cachedFileBuffer{
@@ -194,6 +206,7 @@ func storeContentLocked(key string, mtimeNanos, size int64, raw []byte, now time
 		mtimeNanos: mtimeNanos,
 		size:       size,
 		verifiedAt: now,
+		usedAt:     now,
 		buffer:     stored,
 	}
 	elem := contentCacheList.PushBack(entry)
@@ -207,6 +220,47 @@ func storeContentLocked(key string, mtimeNanos, size int64, raw []byte, now time
 		}
 		contentCacheList.Remove(front)
 		delete(contentCacheMap, old.key)
+	}
+	return stored != nil
+}
+
+// contentCacheAdmitsLocked reports whether n more bytes may enter the cache: they fit, or the least recently used entry is older than
+// contentCacheKeepRecent and so may make room.
+func contentCacheAdmitsLocked(n int64, now time.Time) bool {
+	if contentCacheSize+n <= maxContentCacheBytes {
+		return true
+	}
+	front := contentCacheList.Front()
+	return front != nil && now.Sub(front.Value.(*cachedFileBuffer).usedAt) >= contentCacheKeepRecent
+}
+
+// readBufPool holds buffers for files a search reads without caching them.
+var readBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 64<<10); return &b }}
+
+// readWholeFile reads the size bytes of path into buf's storage when it is large enough, else into a new buffer.
+func readWholeFile(path string, size int64, buf []byte) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	if int64(cap(buf)) < size+1 {
+		buf = make([]byte, 0, size+512)
+	}
+	buf = buf[:0]
+	for {
+		n, err := f.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err == io.EOF {
+			return buf, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(buf) == cap(buf) {
+			// The file grew since its stat: read the rest into a larger buffer.
+			buf = append(buf, 0)[:len(buf)]
+		}
 	}
 }
 
@@ -426,11 +480,16 @@ func getCachedTree(ctx context.Context, root string, requireGit bool) (*cachedTr
 	searchCacheMu.Lock()
 	cached := treeCache[cacheKey]
 	extAt := externalChangeAt
+	// timestamp is rewritten under searchCacheMu by a concurrent revalidation, so it is read under it too.
+	var cachedAt time.Time
+	if cached != nil {
+		cachedAt = cached.timestamp
+	}
 	searchCacheMu.Unlock()
 
 	if cached != nil {
-		changedSince := !extAt.IsZero() && !cached.timestamp.After(extAt)
-		if !changedSince && now.Sub(cached.timestamp) < treeCacheVerifyWindow {
+		changedSince := !extAt.IsZero() && !cachedAt.After(extAt)
+		if !changedSince && now.Sub(cachedAt) < treeCacheVerifyWindow {
 			return cached, nil
 		}
 		valid := !(changedSince && cached.partial)
@@ -1504,6 +1563,7 @@ func grepOneFile(
 	if cached != nil && (extAt.IsZero() || cached.verifiedAt.After(extAt)) &&
 		now.Sub(cached.verifiedAt) < contentCacheStatFree && cached.size <= wholeFileBytes {
 		contentCacheList.MoveToBack(contentCacheMap[key])
+		cached.usedAt = now
 		buf := cached.buffer
 		searchCacheMu.Unlock()
 		if buf == nil {
@@ -1529,6 +1589,7 @@ func grepOneFile(
 		c := elem.Value.(*cachedFileBuffer)
 		if c.mtimeNanos == mtime && c.size == size {
 			c.verifiedAt = now
+			c.usedAt = now
 			contentCacheList.MoveToBack(elem)
 			buf := c.buffer
 			searchCacheMu.Unlock()
@@ -1540,13 +1601,35 @@ func grepOneFile(
 	}
 	searchCacheMu.Unlock()
 
-	raw, err := os.ReadFile(absPath)
+	// A file the cache will take is read into its own buffer, which the cache keeps; any other into a pooled buffer.
+	searchCacheMu.Lock()
+	admit := size <= maxCachedFileBytes && contentCacheAdmitsLocked(size, now)
+	searchCacheMu.Unlock()
+	var pooled *[]byte
+	var scratch []byte
+	if !admit {
+		pooled = readBufPool.Get().(*[]byte)
+		scratch = *pooled
+	}
+	raw, err := readWholeFile(absPath, size, scratch)
 	if err != nil {
+		if pooled != nil {
+			readBufPool.Put(pooled)
+		}
 		return false, err
 	}
-	searchCacheMu.Lock()
-	storeContentLocked(key, mtime, int64(len(raw)), raw, now)
-	searchCacheMu.Unlock()
+	if admit {
+		searchCacheMu.Lock()
+		storeContentLocked(key, mtime, int64(len(raw)), raw, true, now)
+		searchCacheMu.Unlock()
+	} else {
+		defer func() {
+			if cap(raw) <= 4<<20 {
+				*pooled = raw[:0]
+				readBufPool.Put(pooled)
+			}
+		}()
+	}
 
 	if bytes.IndexByte(raw, 0) != -1 {
 		return false, nil

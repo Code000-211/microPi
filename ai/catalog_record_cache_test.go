@@ -28,7 +28,7 @@ func cachedCatalogRecordBaselines() int {
 // model carried through CatalogRecordOf) changes with each refresh, so caching it would grow without bound.
 func TestCatalogRecordShapeCacheHoldsOnlyBuiltinRecords(t *testing.T) {
 	clearCatalogRecordBaselines()
-	builtin := GeneratedModels[0].ToModel()
+	builtin := recordModels()[0].ToModel()
 	// An unchanged model is recognized by its entry and decodes nothing; a changed one is decided by its record's baseline.
 	builtin.Capabilities.ContextWindow++
 	if _, ok, err := CatalogModelJSON(builtin); !ok || err != nil {
@@ -64,11 +64,11 @@ func TestCatalogRecordBaselinesPublishedToConcurrentReaders(t *testing.T) {
 	got := make([][][sha256.Size]byte, readers)
 	var wg sync.WaitGroup
 	for g := range readers {
-		got[g] = make([][sha256.Size]byte, len(GeneratedModels))
+		got[g] = make([][sha256.Size]byte, len(recordModels()))
 		wg.Go(func() {
-			for n := range GeneratedModels {
-				i := (g*53 + n) % len(GeneratedModels)
-				sum, err := catalogRecordBaseline(GeneratedModels[i].Record)
+			for n := range recordModels() {
+				i := (g*53 + n) % len(recordModels())
+				sum, err := catalogRecordBaseline(recordModels()[i].Record)
 				if err != nil {
 					t.Errorf("row %d: %v", i, err)
 					return
@@ -78,7 +78,7 @@ func TestCatalogRecordBaselinesPublishedToConcurrentReaders(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	for i := range GeneratedModels {
+	for i := range recordModels() {
 		for g := range readers {
 			if got[g][i] != got[0][i] {
 				t.Fatalf("row %d: goroutine %d read a different baseline digest than goroutine 0", i, g)

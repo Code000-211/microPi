@@ -642,6 +642,7 @@ func NotifyFileChanged(path string) {
 			if rel, err := filepath.Rel(root, abs); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				eng.mu.Lock()
 				eng.lastCheck = time.Time{}
+				eng.notified = true
 				eng.mu.Unlock()
 				break
 			}

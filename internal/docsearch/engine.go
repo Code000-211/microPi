@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,6 +144,12 @@ type Engine struct {
 	generation uint64
 	lastCheck  time.Time
 	lastChange time.Time
+	// notified is set by NotifyFileChanged: a change check is due whatever the throttle says, and a view stored by a check or rebuild that
+	// began before the notice leaves it due.
+	notified bool
+	// lastDiff is the change set (relative path, mtime, size of every changed or deleted file) the last check found. A check that finds the
+	// same set has nothing new: files that are listed but give no section (blank, binary) would otherwise look changed on every check.
+	lastDiff string
 	// lastScan is how long the last change check's walk took (refreshThrottle).
 	lastScan   atomic.Int64
 	building   atomic.Bool
@@ -275,7 +283,9 @@ func (e *Engine) setView(base *Index, ov *Overlay) {
 		Generation: e.generation,
 		baseRef:    ref,
 	}
-	e.lastCheck = time.Now()
+	if !e.notified {
+		e.lastCheck = time.Now()
+	}
 	e.mu.Unlock()
 
 	if old != nil && old.baseRef != nil {
@@ -283,16 +293,32 @@ func (e *Engine) setView(base *Index, ov *Overlay) {
 	}
 }
 
-// Rebuild triggers an asynchronous full rebuild.
-func (e *Engine) Rebuild() {
+// setViewOnBase is setView for a view computed on base: it is stored only while base is still the current view's base, so a check that
+// read an older base does not put it back over a rebuild that replaced it meanwhile.
+func (e *Engine) setViewOnBase(base *Index, ov *Overlay) {
+	e.mu.RLock()
+	current := e.view != nil && e.view.Base == base
+	e.mu.RUnlock()
+	if current && !e.closed.Load() {
+		e.setView(base, ov)
+	}
+}
+
+// goRebuild runs rebuildSync in the background; Close waits for it.
+func (e *Engine) goRebuild(forceSave bool) {
 	if e.closed.Load() {
 		return
 	}
 	e.bgWG.Add(1)
 	go func() {
 		defer e.bgWG.Done()
-		e.rebuildSync(true)
+		e.rebuildSync(forceSave)
 	}()
+}
+
+// Rebuild triggers an asynchronous full rebuild.
+func (e *Engine) Rebuild() {
+	e.goRebuild(true)
 }
 
 func (e *Engine) rebuildSync(forceSave bool) {
@@ -302,7 +328,7 @@ func (e *Engine) rebuildSync(forceSave bool) {
 	defer e.building.Store(false)
 
 	idx, err := Build(Config{Roots: e.roots, Extensions: e.extensions})
-	if err != nil {
+	if err != nil || e.closed.Load() {
 		return
 	}
 	if idx.BuildMs >= 100 || forceSave {
@@ -333,10 +359,13 @@ func (e *Engine) MaybeRefresh() {
 	if e.closed.Load() {
 		return
 	}
+	// The view is retained while the check reads its base: a rebuild that replaces it meanwhile must not unmap it underneath.
+	v := e.acquireView()
+	defer v.release()
 	e.mu.RLock()
-	v := e.view
 	lastCheck := e.lastCheck
 	lastChange := e.lastChange
+	notified := e.notified
 	e.mu.RUnlock()
 
 	if v == nil || v.Base == nil {
@@ -344,12 +373,13 @@ func (e *Engine) MaybeRefresh() {
 	}
 	throttle := e.refreshThrottle()
 	now := time.Now()
-	if now.Sub(lastCheck) < throttle {
+	if !notified && now.Sub(lastCheck) < throttle {
 		return
 	}
 
 	e.mu.Lock()
 	e.lastCheck = now
+	e.notified = false
 	e.mu.Unlock()
 
 	scanStart := time.Now()
@@ -360,34 +390,62 @@ func (e *Engine) MaybeRefresh() {
 	}
 	changed, deleted := v.Base.Diff(files)
 	if len(changed) == 0 && len(deleted) == 0 {
+		e.mu.Lock()
+		e.lastDiff = ""
+		e.mu.Unlock()
 		if v.Overlay != nil {
-			e.setView(v.Base, nil)
+			e.setViewOnBase(v.Base, nil)
 		}
 		return
 	}
 
+	diff := diffSignature(changed, deleted)
 	e.mu.Lock()
-	e.lastChange = now
-	lastChange = now
+	unchanged := diff == e.lastDiff
+	if !unchanged {
+		e.lastDiff = diff
+		e.lastChange = now
+		lastChange = now
+	}
 	e.mu.Unlock()
+
+	if unchanged {
+		// Nothing changed since the last check: the view is current. An overlay that has been quiet long enough is folded into a rebuild.
+		if ov := v.Overlay; ov != nil && now.Sub(lastChange) >= quietBeforeRebuild &&
+			(ov.FileCount >= foldMinFiles || now.Sub(ov.CreatedAt) >= foldAfter) {
+			e.goRebuild(true)
+		}
+		return
+	}
 
 	totalDelta := len(changed) + len(deleted)
 	_, statErr := os.Stat(e.idxPath)
 	idxMissing := statErr != nil
 
 	if v.Base.BuildMs < 100 || idxMissing || totalDelta > overlayMaxFiles {
-		go e.rebuildSync(false)
+		e.goRebuild(false)
 		return
 	}
 
 	ov := BuildOverlay(v.Base, changed, deleted, DefaultMaxFileBytes)
-	e.setView(v.Base, ov)
-
-	// Background fold if quiet for 30s and threshold met.
-	if now.Sub(lastChange) >= quietBeforeRebuild &&
-		(ov.FileCount >= foldMinFiles || now.Sub(ov.CreatedAt) >= foldAfter) {
-		go e.rebuildSync(true)
+	if v.Overlay != nil {
+		// The overlay's age is the age of the oldest change it holds (foldAfter).
+		ov.CreatedAt = v.Overlay.CreatedAt
 	}
+	e.setViewOnBase(v.Base, ov)
+}
+
+// diffSignature identifies a change set by every changed file's path, mtime and size and every deleted file's path.
+func diffSignature(changed []FileMeta, deleted []string) string {
+	parts := make([]string, 0, len(changed)+len(deleted))
+	for _, f := range changed {
+		parts = append(parts, f.Rel+"\x00"+strconv.FormatInt(f.MtimeNanos, 10)+"\x00"+strconv.FormatInt(f.Size, 10))
+	}
+	for _, rel := range deleted {
+		parts = append(parts, rel+"\x00deleted")
+	}
+	slices.Sort(parts)
+	return strings.Join(parts, "\x01")
 }
 
 // refreshThrottle is how long a change check waits after the last one: checkEvery, or five times the last check's walk when that is
@@ -404,12 +462,13 @@ func (e *Engine) MaybeRefreshAsync() {
 	e.mu.RLock()
 	v := e.view
 	lastCheck := e.lastCheck
+	notified := e.notified
 	e.mu.RUnlock()
 	if v == nil || v.Base == nil {
 		return
 	}
 	throttle := e.refreshThrottle()
-	if time.Since(lastCheck) < throttle {
+	if !notified && time.Since(lastCheck) < throttle {
 		return
 	}
 	if !e.refreshing.CompareAndSwap(false, true) {

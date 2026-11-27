@@ -296,8 +296,10 @@ func SanitizeCompileFlags(rawArgs []string, targetFilePath, workingDir, contentH
 	if !slices.Contains(result, "-I"+fileDir) {
 		result = append(result, "-I"+fileDir)
 	}
+	// No limit: clang's limit counts the errors of every file of the translation unit, so a fixed error would let a later, pre-existing one in
+	// the checked file appear as new. The report lists at most MaxReported.
 	if !slices.ContainsFunc(result, func(a string) bool { return strings.HasPrefix(a, "-ferror-limit=") }) {
-		result = append(result, "-ferror-limit=20")
+		result = append(result, "-ferror-limit=0")
 	}
 	return result
 }

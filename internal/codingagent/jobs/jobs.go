@@ -563,7 +563,14 @@ func (r *JobReporter) report() {
 	}
 	ended := r.mgr.TakeUnreported(ReportedMessage)
 	if len(ended) > 0 && r.send != nil {
+		// The send is counted under mu, after disposed is checked again: Dispose waits for it, and a reporter disposed meanwhile sends nothing.
+		r.mu.Lock()
+		if r.disposed {
+			r.mu.Unlock()
+			return
+		}
 		r.wg.Add(1)
+		r.mu.Unlock()
 		go func() {
 			defer r.wg.Done()
 			r.send(ended)

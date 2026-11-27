@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,9 +126,14 @@ func (b *BackgroundChecks) Runs(name string) bool {
 	return false
 }
 
-// Fingerprint returns a position-independent key for a diagnostic (file, severity, code, message).
+// messageLineRE matches a line number a checker writes into a message ("toml: line 2 (last key ...)", "yaml: line 2: ...", go vet's "defined on
+// line 12", bash's "from `if' command on line 7").
+var messageLineRE = regexp.MustCompile(`\b([Ll]ine) \d+`)
+
+// Fingerprint returns a position-independent key for a diagnostic (file, severity, code, message). A line number inside the message is part of
+// the position too: an edit above a pre-existing error changes it, and the error must still match its baseline.
 func Fingerprint(d Diagnostic) string {
-	return fmt.Sprintf("%s\x00%s\x00%s\x00%s", d.File, d.Severity, d.Code, d.Message)
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s", d.File, d.Severity, d.Code, messageLineRE.ReplaceAllString(d.Message, "$1 N"))
 }
 
 func countDiagnostics(diags []Diagnostic) map[string]int {
@@ -304,8 +310,11 @@ func (b *BackgroundChecks) runUnit(state *unitState, edited map[string]struct{})
 
 	b.mu.Lock()
 	if err != nil {
-		for f := range edited {
-			delete(state.edited, f)
+		// A file edited again during the run stays edited: the rerun (state.dirty) reports its errors.
+		if !state.dirty {
+			for f := range edited {
+				delete(state.edited, f)
+			}
 		}
 	} else if !state.dirty {
 		for f := range edited {

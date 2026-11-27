@@ -307,3 +307,15 @@ func TestJobHubKeybindingDefaults(t *testing.T) {
 func jobHubTestPad(text string, width int) string {
 	return text + strings.Repeat(" ", width-widthx.VisibleWidth(text))
 }
+
+// µPi: the selection follows its job when a newer job starts: stop kills the job the user selected, not the one that moved into its row.
+func TestJobHubSelectionFollowsTheJobWhenANewJobStarts(t *testing.T) {
+	f := newJobHubFixture(t)
+	f.plain(100) // bg2, the newest, is selected
+	var newerKilled atomic.Int32
+	f.mgr.Add(jobs.JobSpec{Command: "sleep 100", CWD: "/work", Output: func() string { return "" }, Kill: func() { newerKilled.Add(1) }}, time.Now())
+	f.hub.HandleInput("x")
+	if f.killed.Load() != 1 || newerKilled.Load() != 0 {
+		t.Fatalf("stop killed the selected job %d times and the newer one %d times, want 1 and 0", f.killed.Load(), newerKilled.Load())
+	}
+}

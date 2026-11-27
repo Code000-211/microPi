@@ -183,6 +183,9 @@ func runCommand(ctx context.Context, argv []string, cwd string, extraEnv map[str
 
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = cwd
+	ownProcessGroup(cmd)
+	// A child that outlives the kill and keeps the output pipes open does not hold the check longer than this.
+	cmd.WaitDelay = 2 * time.Second
 	if len(extraEnv) > 0 {
 		env := os.Environ()
 		for k, v := range extraEnv {
@@ -513,6 +516,8 @@ var (
 	ruffToolRE       = regexp.MustCompile(`(?m)^\[tool\.ruff`)
 	ruffLineRE       = regexp.MustCompile(`^(.+?):(\d+):(\d+): (\S+) (?:\[\*\] )?(.*)$`)
 	pythonAstErrorRE = regexp.MustCompile(`(?m)line (\d+)[\s\S]*?(\w+Error: .*)$`)
+	// pythonAstResultRE reads pythonAstScript's line: "<line>\t<column>\t<ErrorType>: <message>".
+	pythonAstResultRE = regexp.MustCompile(`(?m)^(\d+)\t(\d+)\t(\w+Error: .*)$`)
 )
 
 func runRuff(ctx context.Context, unit *CheckUnit) ([]Diagnostic, error) {
@@ -576,19 +581,33 @@ var pythonChecker Checker = &simpleChecker{
 		if py3 == "" {
 			return nil, nil
 		}
+		// The script prints the error's own line, column and message: a traceback's first "line N" is the -c script's, not the file's.
 		ran, err := runCommand(ctx, []string{
-			py3, "-c", "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), sys.argv[1])", unit.File,
+			py3, "-c", pythonAstScript, unit.File,
 		}, unit.CWD, nil, 0)
 		if err != nil {
 			return nil, err
 		}
-		if m := pythonAstErrorRE.FindStringSubmatch(ran.stderr); m != nil {
+		if m := pythonAstResultRE.FindStringSubmatch(ran.stdout); m != nil {
 			ln, _ := strconv.Atoi(m[1])
-			return []Diagnostic{diag(unit.File, ln, 1, m[2], "", SeverityError)}, nil
+			col, _ := strconv.Atoi(m[2])
+			return []Diagnostic{diag(unit.File, max(ln, 1), max(col, 1), m[3], "", SeverityError)}, nil
+		}
+		if m := pythonAstErrorRE.FindStringSubmatch(ran.stderr); m != nil {
+			// An error the script did not catch (a file it cannot read or decode) is reported at line 1.
+			return []Diagnostic{diag(unit.File, 1, 1, m[2], "", SeverityError)}, nil
 		}
 		return nil, nil
 	},
 }
+
+// pythonAstScript parses the file named by argv[1] and prints a syntax error's line, column and message on one line (pythonAstResultRE).
+const pythonAstScript = "import ast,sys\n" +
+	"try:\n" +
+	"    ast.parse(open(sys.argv[1], encoding='utf-8').read(), sys.argv[1])\n" +
+	"except SyntaxError as e:\n" +
+	"    print(f'{e.lineno or 1}\\t{e.offset or 1}\\t{type(e).__name__}: {e.msg}')\n" +
+	"    sys.exit(1)\n"
 
 // ─── TypeScript: tsc; JavaScript: node ───────────────────────────────────────
 

@@ -73,6 +73,8 @@ type Results struct {
 	Entities []string `json:"entities"`
 	Micros   int64    `json:"micros"`
 	QTerms   int      `json:"qTerms"`
+	// topLex is the best lexical score of the search (searchSingle): an overlay's hits are normalized against the base's.
+	topLex float64
 }
 
 // Index is an in-memory or mmap-backed search index.
@@ -734,7 +736,7 @@ func SearchCombined(base *Index, ov *Overlay, query string, opts SearchOpts) Res
 		entNames[i] = base.EntityNames.Get(eid)
 	}
 
-	baseRes := searchSingle(base, ov, false, query, qterms, qEntities, opts, k, maxPerFile, useGraph)
+	baseRes := searchSingle(base, ov, false, query, qterms, qEntities, opts, k, maxPerFile, useGraph, nil, 0)
 	if ov == nil || ov.Index == nil || ov.Index.NumSections() == 0 {
 		baseRes.Entities = entNames
 		baseRes.Micros = time.Since(t0).Microseconds()
@@ -743,7 +745,9 @@ func SearchCombined(base *Index, ov *Overlay, query string, opts SearchOpts) Res
 	}
 
 	ovEntities := queryEntities(ov.Index, query)
-	ovRes := searchSingle(ov.Index, nil, true, query, qterms, ovEntities, opts, k, maxPerFile, useGraph)
+	// µPi: the overlay (the files changed since the base was built) is scored on the base's scale, not as a corpus of its own: its best hit
+	// would otherwise always score like the base's best, and its coverage would count only the query terms it happens to hold.
+	ovRes := searchSingle(ov.Index, nil, true, query, qterms, ovEntities, opts, k, maxPerFile, useGraph, base, baseRes.topLex)
 
 	merged := make([]Hit, 0, len(baseRes.Hits)+len(ovRes.Hits))
 	merged = append(merged, baseRes.Hits...)
@@ -817,6 +821,10 @@ func searchSingle(
 	opts SearchOpts,
 	k, maxPerFile int,
 	useGraph bool,
+	// ref is the base an overlay is searched against (nil for the base itself): its section count and document frequencies weigh the
+	// query terms, and its best lexical score refTopLex normalizes the overlay's.
+	ref *Index,
+	refTopLex float64,
 ) Results {
 	ns := idx.NumSections()
 	ne := idx.NumEntities()
@@ -835,15 +843,30 @@ func searchSingle(
 	var qts []qtInfo
 	idfTotal := 0.0
 	idfN := float64(max(ns, 1))
+	if ref != nil {
+		idfN = float64(max(ns+ref.NumSections(), 1))
+	}
 	for _, qt := range qterms {
-		if tid, ok := idx.TermMap.Lookup(qt); ok {
-			df := float64(idx.TermDF[tid])
-			idf := math.Log((idfN-df+0.5)/(df+0.5) + 1.0)
-			if idf < 0 {
-				idf = 0
+		df, known := 0.0, false
+		tid, inIdx := idx.TermMap.Lookup(qt)
+		if inIdx {
+			df, known = float64(idx.TermDF[tid]), true
+		}
+		if ref != nil {
+			if rtid, ok := ref.TermMap.Lookup(qt); ok && int(rtid) < len(ref.TermDF) {
+				df, known = df+float64(ref.TermDF[rtid]), true
 			}
+		}
+		if !known {
+			continue
+		}
+		idf := math.Log((idfN-df+0.5)/(df+0.5) + 1.0)
+		if idf < 0 {
+			idf = 0
+		}
+		idfTotal += idf
+		if inIdx {
 			qts = append(qts, qtInfo{tid: tid, idf: idf})
-			idfTotal += idf
 		}
 	}
 	if idfTotal < 1e-9 {
@@ -890,6 +913,7 @@ func searchSingle(
 	if len(lexHits) > 0 && lexHits[0].score > topLex {
 		topLex = lexHits[0].score
 	}
+	topLex = max(topLex, refTopLex)
 
 	addFinal := func(s uint32, delta float64) {
 		if sc.final[s] == 0 {
@@ -1144,7 +1168,7 @@ func searchSingle(
 		}
 	}
 
-	return Results{Hits: hits}
+	return Results{Hits: hits, topLex: topLex}
 }
 
 func looksLikeName(w string) bool {

@@ -92,6 +92,9 @@ type JobHubOptions struct {
 type JobHubComponent struct {
 	focused  bool
 	selected int
+	// selectedID is the selected job: the list is rebuilt newest first on every key and frame, so a job started meanwhile moves the others
+	// down, and the selection follows its job rather than its index.
+	selectedID string
 	// showOutput shows the selected job's whole output, scrolled outputScroll lines up from its end.
 	showOutput   bool
 	outputScroll int
@@ -148,11 +151,23 @@ func (h *JobHubComponent) list() []jobs.Job {
 }
 
 func (h *JobHubComponent) current(list []jobs.Job) (jobs.Job, bool) {
+	if i := slices.IndexFunc(list, func(j jobs.Job) bool { return j.ID == h.selectedID }); i >= 0 {
+		h.selected = i
+	}
 	h.selected = min(h.selected, max(0, len(list)-1))
 	if len(list) == 0 {
 		return jobs.Job{}, false
 	}
+	h.selectedID = list[h.selected].ID
 	return list[h.selected], true
+}
+
+// selectIndex selects the job at index i of list.
+func (h *JobHubComponent) selectIndex(list []jobs.Job, i int) {
+	h.selected = max(0, min(len(list)-1, i))
+	if h.selected < len(list) {
+		h.selectedID = list[h.selected].ID
+	}
 }
 
 // HandleInput implements tui.InputHandler.
@@ -187,9 +202,9 @@ func (h *JobHubComponent) HandleInput(data string) {
 	}
 	switch {
 	case kb.Matches(data, tui.KBSelectUp) || kb.Matches(data, string(AppJobsUp)):
-		h.selected = max(0, h.selected-1)
+		h.selectIndex(list, h.selected-1)
 	case kb.Matches(data, tui.KBSelectDown) || kb.Matches(data, string(AppJobsDown)):
-		h.selected = max(0, min(len(list)-1, h.selected+1))
+		h.selectIndex(list, h.selected+1)
 	case kb.Matches(data, tui.KBSelectConfirm) && ok:
 		h.showOutput, h.outputScroll = true, 0
 	case kb.Matches(data, string(AppJobsStop)) && ok && job.Status == jobs.StatusRunning:

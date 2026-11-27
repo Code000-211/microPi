@@ -172,7 +172,12 @@ func ScanExtensions(roots, extensions []string, maxFileBytes int64, maxFiles int
 		}
 		rulesByDir := make(map[string][]ignorerules.Rule)
 
-		err = filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, walkErr error) error {
+		// A symlinked root is walked at its target: WalkDir does not follow a root that is a link. Paths stay relative to the root.
+		walkRoot := absRoot
+		if resolved, err := filepath.EvalSymlinks(absRoot); err == nil {
+			walkRoot = resolved
+		}
+		err = filepath.WalkDir(walkRoot, func(p string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				if d != nil && d.IsDir() {
 					return filepath.SkipDir
@@ -183,21 +188,21 @@ func ScanExtensions(roots, extensions []string, maxFileBytes int64, maxFiles int
 				return fs.SkipAll
 			}
 			name := d.Name()
-			hidden := extensions != nil && p != absRoot && strings.HasPrefix(name, ".")
+			hidden := extensions != nil && p != walkRoot && strings.HasPrefix(name, ".")
 			if d.IsDir() {
-				if p != absRoot {
+				if p != walkRoot {
 					if _, skip := skippedDirs[name]; skip || hidden {
 						return filepath.SkipDir
 					}
 					parent := filepath.Dir(p)
-					if ignorerules.IgnoredInWalk(p, true, absRoot, rulesByDir[parent]) {
+					if ignorerules.IgnoredInWalk(p, true, walkRoot, rulesByDir[parent]) {
 						return filepath.SkipDir
 					}
 				}
 				parentRules := rulesByDir[filepath.Dir(p)]
 				rules := make([]ignorerules.Rule, len(parentRules))
 				copy(rules, parentRules)
-				rules = ignorerules.Append(rules, p, absRoot)
+				rules = ignorerules.Append(rules, p, walkRoot)
 				rulesByDir[p] = rules
 				return nil
 			}
@@ -211,7 +216,7 @@ func ScanExtensions(roots, extensions []string, maxFileBytes int64, maxFiles int
 				}
 			}
 			parent := filepath.Dir(p)
-			if ignorerules.IgnoredInWalk(p, false, absRoot, rulesByDir[parent]) {
+			if ignorerules.IgnoredInWalk(p, false, walkRoot, rulesByDir[parent]) {
 				return nil
 			}
 			if _, dup := seenAbs[p]; dup {
@@ -221,7 +226,7 @@ func ScanExtensions(roots, extensions []string, maxFileBytes int64, maxFiles int
 			if err != nil || fi.Size() > maxFileBytes || (extensions != nil && fi.Size() == 0) {
 				return nil
 			}
-			rel, err := filepath.Rel(absRoot, p)
+			rel, err := filepath.Rel(walkRoot, p)
 			if err != nil {
 				return nil
 			}

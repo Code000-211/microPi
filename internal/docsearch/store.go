@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"math"
 	"os"
 	"path/filepath"
@@ -149,7 +150,8 @@ func (m *StrMap) Lookup(key string) (uint32, bool) {
 	}
 	mask := uint64(len(m.Slots) - 1)
 	pos := hash64([]byte(key)) & mask
-	for {
+	// At most one probe per slot: a table with no empty slot (a corrupt file) ends the search instead of looping forever.
+	for range len(m.Slots) {
 		slot := m.Slots[pos]
 		if slot == emptySlot {
 			return 0, false
@@ -165,6 +167,7 @@ func (m *StrMap) Lookup(key string) (uint32, bool) {
 		}
 		pos = (pos + 1) & mask
 	}
+	return 0, false
 }
 
 func buildStrMapDirect(strs *Strs) StrMap {
@@ -465,10 +468,31 @@ func validateLists(l Lists, expected int, maxVal uint32) error {
 	return nil
 }
 
+// validatePostings checks that offsets start at 0, never decrease and end at len(secs), and that every section id is below ns.
+func validatePostings(offsets, secs []uint32, ns uint32) error {
+	if len(offsets) == 0 || offsets[0] != 0 || int(offsets[len(offsets)-1]) != len(secs) {
+		return fmt.Errorf("%w: posting offsets do not span the postings", ErrBadFile)
+	}
+	for i := 1; i < len(offsets); i++ {
+		if offsets[i] < offsets[i-1] {
+			return fmt.Errorf("%w: posting offsets decrease", ErrBadFile)
+		}
+	}
+	for _, sec := range secs {
+		if sec >= ns {
+			return fmt.Errorf("%w: posting section out of range", ErrBadFile)
+		}
+	}
+	return nil
+}
+
 func validateStrMap(m StrMap, maxTarget uint32) error {
 	n := len(m.Slots)
 	if n == 0 || (n&(n-1)) != 0 {
 		return fmt.Errorf("%w: map slots not power of two: %d", ErrBadFile, n)
+	}
+	if !slices.Contains(m.Slots, emptySlot) {
+		return fmt.Errorf("%w: map has no empty slot", ErrBadFile)
 	}
 	if m.Keys.Len() > 0 {
 		if len(m.Vals) != n {
@@ -477,9 +501,9 @@ func validateStrMap(m StrMap, maxTarget uint32) error {
 		if err := validateStrs(m.Keys, m.Keys.Len()); err != nil {
 			return err
 		}
-		for _, s := range m.Slots {
-			if s != emptySlot && int(s) >= m.Keys.Len() {
-				return fmt.Errorf("%w: map key slot out of range", ErrBadFile)
+		for i, s := range m.Slots {
+			if s != emptySlot && (int(s) >= m.Keys.Len() || m.Vals[i] >= maxTarget) {
+				return fmt.Errorf("%w: map key slot or value out of range", ErrBadFile)
 			}
 		}
 	} else {
@@ -750,6 +774,9 @@ func decodeIndex(data []byte, roots []string, fullValidate bool) (*Index, error)
 		}
 		if len(idx.TermDF) != int(nt) || len(idx.PostOffsets) != int(nt)+1 || len(idx.PostSecs) != len(idx.PostWeights) {
 			return nil, ErrBadFile
+		}
+		if err := validatePostings(idx.PostOffsets, idx.PostSecs, ns); err != nil {
+			return nil, err
 		}
 		if err := validateLists(idx.Graph, int(ns+ne), max(ns+ne, 1)); err != nil {
 			return nil, err

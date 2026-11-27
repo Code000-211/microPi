@@ -103,6 +103,43 @@ func estimateLLMTokens(msg ai.Message) int {
 	return 0
 }
 
+// seenToolResults counts the tool results before the last assistant message: the ones the model has seen. µPi: pruning never clears a
+// result after it, the results of the calls the model is waiting for; a batch of parallel calls larger than KeepRecent would otherwise
+// lose some before the model read them.
+func seenToolResults(messages []ai.Message) int {
+	last := -1
+	for i, msg := range messages {
+		switch msg.(type) {
+		case ai.AssistantMessage, *ai.AssistantMessage:
+			last = i
+		}
+	}
+	seen := 0
+	for _, msg := range messages[:max(last, 0)] {
+		if _, ok := toolResultOf(msg); ok {
+			seen++
+		}
+	}
+	return seen
+}
+
+// seenAgentToolResults is seenToolResults on the session's messages.
+func seenAgentToolResults(messages []agent.AgentMessage) int {
+	last := -1
+	for i, message := range messages {
+		if message.Assistant != nil {
+			last = i
+		}
+	}
+	seen := 0
+	for _, message := range messages[:max(last, 0)] {
+		if message.ToolResult != nil {
+			seen++
+		}
+	}
+	return seen
+}
+
 // clearedToolResult is the one-line note an old, large tool result is sent as.
 func clearedToolResult(result ai.ToolResultMessage) ai.ToolResultMessage {
 	chars, images := toolResultSize(result.Content)
@@ -141,7 +178,7 @@ func pruneToolResults(messages []ai.Message, settings ToolResultPruningSettings)
 	if tokens < settings.TriggerTokens || toolResults < 2*keepRecent {
 		return messages, 0
 	}
-	clearBefore := (toolResults - keepRecent) / keepRecent * keepRecent
+	clearBefore := min((toolResults-keepRecent)/keepRecent*keepRecent, seenToolResults(messages))
 	var out []ai.Message
 	cleared, index := 0, 0
 	for i, msg := range messages {
@@ -200,7 +237,7 @@ func prunedAgentTokens(messages []agent.AgentMessage, settings ToolResultPruning
 	if !settings.Enabled || toolResults < 2*keepRecent {
 		return 0
 	}
-	clearBefore := (toolResults - keepRecent) / keepRecent * keepRecent
+	clearBefore := min((toolResults-keepRecent)/keepRecent*keepRecent, seenAgentToolResults(messages))
 	// The large results before the boundary, the ones pruning would clear: with none, nothing is cleared whatever the size of the
 	// context, and the history need not be estimated.
 	var large []*agent.ToolResultMessage

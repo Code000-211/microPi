@@ -47,8 +47,12 @@ var readOnlyRefusedOptions = map[string]func(arg string) bool{
 		return a == "-f" || a == "-F" || strings.HasPrefix(a, "--follow") || tailFollowShort.MatchString(a)
 	},
 	"sort": func(a string) bool {
-		return a == "-o" || strings.HasPrefix(a, "--output") || sortOutputShort.MatchString(a)
+		return a == "-o" || strings.HasPrefix(a, "--output") || sortOutputShort.MatchString(a) || strings.HasPrefix(a, "--compress-program")
 	},
+	// date -s and --set set the clock.
+	"date": func(a string) bool { return a == "-s" || strings.HasPrefix(a, "--set") || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "s")) },
+	// file -C compiles a magic file.
+	"file": func(a string) bool { return a == "-C" || a == "--compile" },
 	"tree": func(a string) bool { return a == "-o" },
 	"rg":   func(a string) bool { return strings.HasPrefix(a, "--pre") },
 	"find": func(a string) bool { return findWrites.MatchString(a) },
@@ -70,6 +74,22 @@ var gitReadSubcommands = map[string]struct{}{
 // unsupportedShellSyntax is what tokenizeReadOnly does not take (with && removed first): line breaks, backquotes, $(, redirections, and a lone &.
 var unsupportedShellSyntax = regexp.MustCompile("[\n\r`<>&]|\\$\\(")
 
+// closingQuote returns the index of the quote byte that ends a quoted string starting at from. With escapes set (double quotes) a
+// backslash escapes only ", \, $ and `, as in bash; without (ANSI-C $'...') it escapes any byte.
+func closingQuote(command string, from int, quote byte, escapes bool) (int, bool) {
+	for j := from; j < len(command); j++ {
+		switch command[j] {
+		case '\\':
+			if j+1 < len(command) && (!escapes || strings.IndexByte("\"\\$`", command[j+1]) >= 0) {
+				j++
+			}
+		case quote:
+			return j, true
+		}
+	}
+	return 0, false
+}
+
 // tokenizeReadOnly splits a command into words and the operators between them; ok is false for what this check does not take.
 func tokenizeReadOnly(command string) ([]string, bool) {
 	if unsupportedShellSyntax.MatchString(strings.ReplaceAll(command, "&&", "")) {
@@ -87,7 +107,8 @@ func tokenizeReadOnly(command string) ([]string, bool) {
 	}
 	for i := 0; i < len(command); i++ {
 		switch c := command[i]; c {
-		case '\'', '"':
+		case '\'':
+			// Single quotes take no escapes: the quote ends at the next '.
 			end := strings.IndexByte(command[i+1:], c)
 			if end < 0 {
 				return nil, false
@@ -95,6 +116,36 @@ func tokenizeReadOnly(command string) ([]string, bool) {
 			word.WriteString(command[i+1 : i+1+end])
 			inWord = true
 			i += end + 1
+		case '"':
+			// In double quotes a backslash escapes ", \, $ and ` (bash): the quote ends where bash ends it, so an escaped " cannot hide a
+			// ; or | that bash runs.
+			end, ok := closingQuote(command, i+1, '"', true)
+			if !ok {
+				return nil, false
+			}
+			word.WriteString(command[i+1 : end])
+			inWord = true
+			i = end
+		case '$':
+			if i+1 < len(command) && command[i+1] == '\'' {
+				// $'...' (ANSI-C quoting) takes backslash escapes, \' among them.
+				end, ok := closingQuote(command, i+2, '\'', false)
+				if !ok {
+					return nil, false
+				}
+				word.WriteString(command[i+2 : end])
+				inWord = true
+				i = end
+				continue
+			}
+			word.WriteByte(c)
+			inWord = true
+		case '#':
+			if !inWord {
+				// A comment: what follows is not run, but this check does not read it as the shell does.
+				return nil, false
+			}
+			word.WriteByte(c)
 		case ' ', '\t':
 			endWord()
 		case '|', ';', '&':

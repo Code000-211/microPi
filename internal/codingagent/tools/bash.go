@@ -112,13 +112,18 @@ func (t *BashTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 	if operations == nil {
 		operations = &LocalShellOperations{ShellName: "bash", ResolveShell: func() (ShellConfig, error) { return resolveShellConfig(t.Settings) }}
 	}
+	autoBackground := t.autoBackgroundSeconds()
+	if agent.StartedEarly(ctx) {
+		// An early run may be dropped and must stay cancellable: it never moves to the background.
+		autoBackground = 0
+	}
 	return executeShellTool(ctx, t.CWD, shellToolConfig{
 		name:                     "bash",
 		shellName:                "bash",
 		tempFilePrefix:           "pi-bash",
 		operations:               operations,
 		local:                    local,
-		autoBackgroundSeconds:    t.autoBackgroundSeconds(),
+		autoBackgroundSeconds:    autoBackground,
 		editToolActive:           t.EditToolActive,
 		commandPrefix:            t.CommandPrefix,
 		exposeSessionEnvironment: !t.HideSessionEnvironment,

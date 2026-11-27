@@ -161,3 +161,30 @@ func TestTokensAfterPruning(t *testing.T) {
 		t.Fatalf("disabled: %d", got)
 	}
 }
+
+// µPi: the results of a batch of parallel calls the model is waiting for are not cleared, however many there are: 7 earlier results and one
+// assistant message with 10 calls, keepRecent 8, put the boundary at 8, inside the batch.
+func TestPruneToolResultsKeepsTheResultsTheModelHasNotSeen(t *testing.T) {
+	settings := ToolResultPruningSettings{Enabled: true, TriggerTokens: 1000, KeepRecent: 8, MinChars: 100}
+	messages := []ai.Message{ai.UserMessage{Content: ai.UserText("go")}}
+	for i := range 7 {
+		messages = append(messages, pruningCall(i), pruningResult(i, 1000))
+	}
+	var calls []ai.AssistantContentBlock
+	for i := range 10 {
+		calls = append(calls, ai.ToolCall{ID: "batch-" + string(rune('a'+i)), Name: "read", Arguments: map[string]any{"path": "f"}})
+	}
+	messages = append(messages, ai.AssistantMessage{Content: calls, StopReason: ai.StopReasonToolUse})
+	for i := range 10 {
+		messages = append(messages, ai.ToolResultMessage{ToolCallID: "batch-" + string(rune('a'+i)), ToolName: "read", Content: []ai.ToolResultMessageContent{ai.TextContent{Text: strings.Repeat("y", 1000)}}})
+	}
+	pruned := PruneToolResults(messages, settings)
+	for i, message := range pruned[len(pruned)-10:] {
+		if strings.HasPrefix(prunedText(message), "[Old") {
+			t.Fatalf("batch result %d was cleared before the model saw it", i)
+		}
+	}
+	if got := countCleared(pruned); got != 7 {
+		t.Fatalf("cleared %d results, want the 7 the model has seen", got)
+	}
+}

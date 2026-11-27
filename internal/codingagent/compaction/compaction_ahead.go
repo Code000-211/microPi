@@ -61,6 +61,8 @@ func (p *pendingSummary) isDone() bool {
 type CompactionAhead struct {
 	mu      sync.Mutex
 	pending *pendingSummary
+	// closed is set by Close: no summary starts after it.
+	closed bool
 }
 
 // AheadUpdate is what [CompactionAhead.Update] is told after a response.
@@ -93,14 +95,20 @@ func (c *CompactionAhead) Update(update AheadUpdate) bool {
 	goesOn := float64(update.ContextTokens) <= float64(threshold)+math.Min(float64(limit-threshold)/2, float64(threshold)*compactionAheadOverrun)
 	branch := update.Branch()
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.closed {
+		c.mu.Unlock()
+		return false
+	}
 	if current := c.pending; current != nil {
+		// A summary that failed stays until the threshold too: starting another after every response would repeat a failing request.
 		if current.fits(update.Session, branch, settings) {
+			c.mu.Unlock()
 			return goesOn && !current.isDone()
 		}
 		current.cancel()
 		c.pending = nil
 	}
+	c.mu.Unlock()
 	if len(branch) == 0 {
 		return false
 	}
@@ -109,7 +117,13 @@ func (c *CompactionAhead) Update(update AheadUpdate) bool {
 	if leafID == "" || prep == nil || (len(prep.MessagesToSummarize) == 0 && len(prep.TurnPrefixMessages) == 0) {
 		return false
 	}
+	// Summarize builds the request (it runs the extensions' context hook) outside mu: Cancel and Close never wait for a hook.
 	job := update.Summarize(*prep)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.pending != nil {
+		return false
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	pending := &pendingSummary{
 		session:          update.Session,
@@ -151,6 +165,14 @@ func (c *CompactionAhead) Take(ctx context.Context, session *codingagent.Session
 		<-pending.done
 	}
 	return pending.result
+}
+
+// Close stops the summary being made and starts no other: for a session that closes while a run may still reach Update.
+func (c *CompactionAhead) Close() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.Cancel()
 }
 
 // Cancel stops the summary being made.

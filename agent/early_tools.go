@@ -192,8 +192,18 @@ func (e *earlyToolExecutor) earlierCallsStartedLocked(index int, partial *ai.Ass
 	return true
 }
 
+// earlyStartKey marks the context of a tool call started before the model's message ended (StartedEarly).
+type earlyStartKey struct{}
+
+// StartedEarly reports whether ctx is the context of a call started early. Such a run may still be dropped (its final arguments differ, the
+// turn ends otherwise), so a tool keeps it cancellable: bash does not move it to the background.
+func StartedEarly(ctx context.Context) bool {
+	started, _ := ctx.Value(earlyStartKey{}).(bool)
+	return started
+}
+
 func (e *earlyToolExecutor) startLocked(index int, canonical string, call pendingToolCall) {
-	ctx, cancel := context.WithCancel(e.ctx)
+	ctx, cancel := context.WithCancel(context.WithValue(e.ctx, earlyStartKey{}, true))
 	res := &earlyToolResult{done: make(chan struct{}), index: index, args: canonical, cancel: cancel}
 	e.inflight[call.id] = res
 	e.wg.Add(1)

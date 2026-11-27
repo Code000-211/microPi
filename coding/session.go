@@ -1684,7 +1684,7 @@ func (s *Session) Dispose() {
 	}
 	s.AbortRetry()
 	s.AbortCompaction()
-	s.compactionAhead.Cancel()
+	s.compactionAhead.Close()
 	s.AbortBranchSummary()
 	s.AbortBash()
 	s.RequestAbort()
@@ -1727,8 +1727,8 @@ func (s *Session) Close() error {
 	s.AbortRetry()
 	s.AbortBash()
 	s.AbortCompaction()
-	// The summary made ahead is work the Session owns: it is cancelled and drained.
-	s.compactionAhead.Cancel()
+	// The summary made ahead is work the Session owns: it is cancelled and drained, and a run still in flight starts no other (Close).
+	s.compactionAhead.Close()
 	s.compactionAhead.Wait(context.Background())
 	s.AbortBranchSummary()
 	s.closeCacheWarming()
@@ -3026,6 +3026,8 @@ type CompactionResult = icodingagent.CompactionResult
 
 // Compact runs manual compaction and returns the generated result. Like upstream compact(), a session with nothing to compact is an error ("Nothing to compact (session too small)" or "Already compacted"); the compaction_end event reports it first.
 func (s *Session) Compact(ctx context.Context, customInstructions string) (*CompactionResult, error) {
+	// µPi: a manual compaction leaves no use for the summary made ahead.
+	s.compactionAhead.Cancel()
 	return s.compact(ctx, customInstructions)
 }
 
@@ -3780,6 +3782,9 @@ func (s *Session) runAutoCompaction(ctx context.Context, reason string, willRetr
 		var ahead *compaction.CompactionResult
 		if reason == "threshold" {
 			ahead = s.compactionAhead.Take(compactCtx, s.inner.Load(), entries, settings)
+		} else {
+			// An overflow compaction leaves no use for the summary made ahead: it is stopped instead of running on for nothing.
+			s.compactionAhead.Cancel()
 		}
 		switch {
 		case compactCtx.Err() != nil:

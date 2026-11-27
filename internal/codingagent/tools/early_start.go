@@ -29,7 +29,8 @@ func (t *BashTool) StartsEarly(args json.RawMessage) bool {
 		return false
 	}
 	var p shellParams
-	if err := json.Unmarshal(args, &p); err != nil {
+	// The aliases (run_in_background, is_background) are read too: the run applies them before it starts (PrepareArguments).
+	if err := json.Unmarshal(NormalizeToolArguments(args, BashAliases), &p); err != nil {
 		return false
 	}
 	if p.Background != nil && *p.Background {

@@ -4,11 +4,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"slices"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"unicode/utf8"
 	"unsafe"
 )

@@ -27,6 +27,12 @@ func materializeNodeRuntime(ctx context.Context, cacheDir, destination string) (
 	}
 	digest := sha256.Sum256(append([]byte(nodeRuntimeVersion), nodeRuntimeDigest()...))
 	hash := hex.EncodeToString(digest[:])
+	// µPi: the runtime is extracted once beside the executable when that directory is as trusted as the executable (sharedNodeRuntimeRoot),
+	// else in the per-home cache.
+	if shared := sharedNodeRuntimeRoot(); shared != "" {
+		cacheDir = shared
+		defer pruneSharedNodeRuntimes(shared, "node-runtime-"+hash)
+	}
 	root := filepath.Join(cacheDir, "node-runtime-"+hash)
 	// pig additive (D20): content-addressed runtime materialization shares the governed cell cache.
 	entry, err := runtimecell.PublishArtifact(ctx, root, "content.sha256", hash, "node", func(scratch string) (string, error) {

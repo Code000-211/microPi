@@ -22,6 +22,8 @@ var fixtureRoot string
 
 func TestMain(m *testing.M) {
 	maybeRunHarnessTestHelper()
+	// µPi: tests use the per-home runtime cache unless one opts into the runtime beside the executable (node_runtime_shared_test.go).
+	_ = os.Setenv("UPI_NODE_RUNTIME_SHARED", "off")
 	if fifoPath := os.Getenv(nodePreflightHelperFIFOEnv); fifoPath != "" {
 		fifo, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
 		if err != nil {

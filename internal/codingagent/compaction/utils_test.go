@@ -224,3 +224,17 @@ func TestTruncateForSummaryDropsASplitSurrogatePair(t *testing.T) {
 		t.Fatalf("truncateForSummary = %q", got)
 	}
 }
+
+// µPi (21038e76, tool-argument-aliases.test.ts): a recorded call keeps the argument names the model sent, so
+// the file lists also read `file_path`, the file tools' alias of `path`.
+func TestExtractFileOpsReadsFilePathAlias(t *testing.T) {
+	ops := NewFileOps()
+	ExtractFileOpsFromMessage(agent.AgentMessage{Assistant: &agent.AssistantMessage{Content: []ai.AssistantContentBlock{
+		ai.ToolCall{ID: "call-1", Name: "read", Arguments: map[string]any{"file_path": "a.ts"}},
+		ai.ToolCall{ID: "call-2", Name: "edit", Arguments: map[string]any{"file_path": "b.ts", "old_string": "a"}},
+	}}}, &ops)
+	readFiles, modifiedFiles := ComputeFileLists(ops)
+	if len(readFiles) != 1 || readFiles[0] != "a.ts" || len(modifiedFiles) != 1 || modifiedFiles[0] != "b.ts" {
+		t.Fatalf("file lists = %v, %v; want [a.ts], [b.ts]", readFiles, modifiedFiles)
+	}
+}

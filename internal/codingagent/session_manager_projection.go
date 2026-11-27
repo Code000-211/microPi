@@ -188,7 +188,13 @@ type messageDecoder func(SessionEntry) (MessageEntry, bool)
 
 // buildSessionProjection projects a path. Its messages are copies the caller owns when clone is set, and the entries' own messages, to be read and never modified, when it is not.
 func buildSessionProjection(path []SessionEntry, decode messageDecoder, clone bool) SessionProjection {
-	p := newSessionProjector(path, decode, clone, 0)
+	return buildSessionProjectionCarrying(path, decode, clone, nil)
+}
+
+// buildSessionProjectionCarrying is buildSessionProjection with carry supplying the user's messages the latest compaction carries
+// (nil: computed from path, which must then hold the messages before the compaction).
+func buildSessionProjectionCarrying(path []SessionEntry, decode messageDecoder, clone bool, carry carriedUserMessages) SessionProjection {
+	p := newSessionProjector(path, decode, clone, 0, carry)
 	return p.projection
 }
 
@@ -206,7 +212,7 @@ type sessionProjector struct {
 }
 
 // newSessionProjector projects path, with room for spare more message entries in its slab.
-func newSessionProjector(path []SessionEntry, decode messageDecoder, clone bool, spare int) *sessionProjector {
+func newSessionProjector(path []SessionEntry, decode messageDecoder, clone bool, spare int, carry carriedUserMessages) *sessionProjector {
 	contextEntries := buildContextEntries(path, decode)
 	p := &sessionProjector{decode: decode, clone: clone, edits: make(map[string]ContextEditEntry)}
 	hasContextEdits := false
@@ -227,7 +233,44 @@ func newSessionProjector(path []SessionEntry, decode messageDecoder, clone bool,
 	for i, entry := range contextEntries {
 		p.add(entry, i == 0)
 	}
+	p.carryUserMessages(path, carry)
 	return p
+}
+
+// carryUserMessages sets the user's messages the latest compaction carries on its summary message (session-manager.ts
+// projectSessionPath). µPi: an extension's own compaction (fromHook) decides itself what it keeps.
+func (p *sessionProjector) carryUserMessages(path []SessionEntry, carry carriedUserMessages) {
+	if len(p.projection.Entries) == 0 || !CompactionUserMessagesEnabled() {
+		return
+	}
+	first := &p.projection.Entries[0]
+	if first.SourceEntry.Base().Type != "compaction" || len(first.Messages) == 0 {
+		return
+	}
+	compaction, ok := first.SourceEntry.(CompactionEntry)
+	if !ok && json.Unmarshal(first.SourceEntry.Raw(), &compaction) != nil {
+		return
+	}
+	if compaction.FromHook {
+		return
+	}
+	var requests []string
+	if carry != nil {
+		requests = carry(compaction)
+	} else {
+		at := len(path)
+		for i, entry := range path {
+			if entry.Base().Type == "compaction" {
+				at = i
+			}
+		}
+		requests = compactedUserMessagesOfPath(path, at, compaction.FirstKeptEntryID, p.decode)
+	}
+	if len(requests) == 0 {
+		return
+	}
+	withUserRequests(first.Messages, requests)
+	copy(p.projection.Messages, first.Messages)
 }
 
 // add projects entry after the projected ones; first reports that it is the first context entry.

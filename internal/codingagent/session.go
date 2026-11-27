@@ -139,6 +139,8 @@ func (s *Session) UndecodableCount() int {
 // become orphaned subtrees in the same file).
 type Session struct {
 	mu sync.RWMutex
+	// carried holds the user's messages each compaction carries beside its summary (µPi, compacted_user_messages.go).
+	carried carriedCache
 	// messageEntries records the entries message_end persisted, with the sequence their message was numbered by (NoteMessageEntry).
 	messageEntries messageEntryLog
 	// appendMu makes writing an entry's record and adding the entry one step, so the file and memory hold the same entries in the same order.
@@ -1441,7 +1443,7 @@ func (s *Session) BuildContext(leafID *string) []agent.AgentMessage {
 	if target == nil {
 		return nil
 	}
-	return buildSessionProjection(s.contextPathToLocked(*target), s.messageFor, true).Messages
+	return buildSessionProjectionCarrying(s.contextPathToLocked(*target), s.messageFor, true, s.carriedUserMessagesLocked).Messages
 }
 
 // BuildSessionProjection returns the provenance-preserving projection of the
@@ -1461,7 +1463,7 @@ func (s *Session) BuildSessionProjection() SessionProjection {
 	if s.branchLeaf >= 0 && s.idAt(s.branchLeaf) == *s.leafID && s.slotOrZero(*s.leafID) == s.branchLeaf {
 		s.retainReadLocked(indexes, entries)
 	}
-	return buildSessionProjection(entries, s.messageFor, true)
+	return buildSessionProjectionCarrying(entries, s.messageFor, true, s.carriedUserMessagesLocked)
 }
 
 // BuildSessionProjectionView is BuildSessionProjection with the entries' own messages in place of copies. The caller reads them and never modifies them or hands them to code that might: an estimate over a long conversation then costs a walk of the branch and not a deep copy of every message in it.
@@ -1476,7 +1478,7 @@ func (s *Session) BuildSessionProjectionView() SessionProjection {
 		return SessionProjection{ThinkingLevel: "off"}
 	}
 	if s.branchLeaf < 0 || s.idAt(s.branchLeaf) != *s.leafID || s.slotOrZero(*s.leafID) != s.branchLeaf {
-		return buildSessionProjection(s.contextPathToLocked(*s.leafID), s.messageFor, false)
+		return buildSessionProjectionCarrying(s.contextPathToLocked(*s.leafID), s.messageFor, false, s.carriedUserMessagesLocked)
 	}
 	s.projMu.Lock()
 	defer s.projMu.Unlock()
@@ -1486,7 +1488,7 @@ func (s *Session) BuildSessionProjectionView() SessionProjection {
 		s.projCovered = len(path)
 		return s.projView.view()
 	}
-	s.projView = newSessionProjector(s.entriesAtLocked(path), s.messageFor, false, 0)
+	s.projView = newSessionProjector(s.entriesAtLocked(path), s.messageFor, false, 0, s.carriedUserMessagesLocked)
 	s.projGen, s.projCovered = s.ctxGen, len(path)
 	return s.projView.view()
 }

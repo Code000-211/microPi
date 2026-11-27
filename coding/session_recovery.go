@@ -488,10 +488,16 @@ func (s *Session) compactionSettings() (compaction.CompactionSettings, error) {
 	if err != nil {
 		return compaction.CompactionSettings{}, err
 	}
+	// µPi (710e4993): maxContextTokens caps the threshold (settings-manager.ts getCompactionSettings).
+	maxContext, err := s.SettingsManager().GetCompactionMaxContextTokens(s.Model())
+	if err != nil {
+		return compaction.CompactionSettings{}, err
+	}
 	return compaction.CompactionSettings{
 		Enabled:          cfg.Enabled,
 		ReserveTokens:    cfg.ReserveTokens,
 		KeepRecentTokens: cfg.KeepRecentTokens,
+		MaxContextTokens: maxContext,
 	}, nil
 }
 

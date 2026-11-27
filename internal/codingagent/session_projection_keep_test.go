@@ -19,7 +19,8 @@ func freshProjectionView(s *Session) SessionProjection {
 	if s.leafID == nil {
 		return SessionProjection{ThinkingLevel: "off"}
 	}
-	return buildSessionProjection(s.contextPathToLocked(*s.leafID), s.messageFor, false)
+	// µPi: the user's messages a compaction carries are read from the whole branch, as the Session's own projections read them.
+	return buildSessionProjectionCarrying(s.contextPathToLocked(*s.leafID), s.messageFor, false, s.carriedUserMessagesLocked)
 }
 
 func sameProjection(t *testing.T, what string, got, want SessionProjection) {

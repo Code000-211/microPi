@@ -45,6 +45,7 @@ var DefaultCompactionSettings = CompactionSettings{
 	Enabled:          true,
 	ReserveTokens:    16384,
 	KeepRecentTokens: 20000,
+	MaxContextTokens: 128000,
 }
 
 // CutPointResult from FindCutPoint.
@@ -213,13 +214,24 @@ func GetLastAssistantUsage(entries []codingagent.SessionEntry) *ai.Usage {
 	return nil
 }
 
+// GetCompactionThreshold is the context size above which compaction triggers: contextWindow - reserveTokens, or maxContextTokens
+// when that is lower (compaction.ts getCompactionThreshold). µPi (710e4993): maxContextTokens caps the threshold, not the window, so
+// an overflow is still the window's.
+func GetCompactionThreshold(contextWindow int, s CompactionSettings) int {
+	threshold := contextWindow - s.ReserveTokens
+	if s.MaxContextTokens > 0 {
+		threshold = min(threshold, s.MaxContextTokens)
+	}
+	return threshold
+}
+
 // ShouldCompact reports whether compaction should trigger.
 // Mirrors upstream shouldCompact (compaction.ts).
 func ShouldCompact(contextTokens, contextWindow int, s CompactionSettings) bool {
 	if !s.Enabled {
 		return false
 	}
-	return contextTokens > contextWindow-s.ReserveTokens
+	return contextTokens > GetCompactionThreshold(contextWindow, s)
 }
 
 // ─── Cut Point Detection ──────────────────────────────────────────────────────
@@ -488,8 +500,52 @@ func PrepareCompaction(
 		Settings:            s,
 	}
 	compactiontypes.SetTokenRatio(prep, providerTokenRatio(projection, contextEstimate))
+	if codingagent.CompactionUserMessagesEnabled() {
+		// µPi: the user's messages before the kept part go verbatim beside the summary (compaction.ts prepareCompaction).
+		keptIndex := slices.IndexFunc(pathEntries, func(entry codingagent.SessionEntry) bool { return entry.Base().ID == firstKeptEntryID })
+		if keptIndex < 0 {
+			keptIndex = len(pathEntries)
+		}
+		kept, complete := codingagent.UserMessagesBefore(pathEntries, keptIndex)
+		compactiontypes.SetKeptUserMessages(prep, kept, complete)
+	}
 	return prep
 }
+
+// KeptUserMessagesInstruction is what Pi's own summary request is told when the user's messages stay verbatim beside the summary
+// (CompactionPreparation keptUserMessages): not to restate them, so its room goes to the progress; "" when none stay. µPi
+// (compaction.ts keptUserMessagesInstruction).
+func KeptUserMessagesInstruction(prep CompactionPreparation) string {
+	kept, complete := compactiontypes.KeptUserMessagesOf(prep)
+	if len(kept) == 0 {
+		return ""
+	}
+	instruction := "The user's own messages from this history stay word for word next to your summary (up to " + compactedUserMessagesMaxCharsText + " characters; a longer one is cut there and its rest is yours to summarize). Do not quote, copy or restate them anywhere in the summary. Under Goal, write one line that names the task (such as an issue's number and title) and says it is in the user's messages; under Constraints & Preferences, list only what the conversation added to them (clarifications, decisions, constraints found during the work), or \"(none beyond the user's messages)\"."
+	if complete {
+		return instruction
+	}
+	// Not all fit: the summarizer has to know which stay, to summarize the others.
+	starts := make([]string, len(kept))
+	for i, text := range kept {
+		line, _, _ := strings.Cut(text, "\n")
+		quoted, _ := jsstring.MarshalJSON(jsstring.Slice(line, 0, 100))
+		starts[i] = "- " + string(quoted)
+	}
+	return instruction + "\n\nNot all of them fit: only those that start as listed below stay (one cut short ends with \"" + strings.TrimSpace(codingagent.CompactedUserMessageCut) + "\"). Summarize the user's other messages, and the rest of a cut one, as usual:\n" + strings.Join(starts, "\n")
+}
+
+// compactedUserMessagesMaxCharsText is CompactedUserMessagesMaxChars.toLocaleString("en-US").
+var compactedUserMessagesMaxCharsText = func() string {
+	digits := fmt.Sprint(codingagent.CompactedUserMessagesMaxChars)
+	var out []byte
+	for i := range len(digits) {
+		if i > 0 && (len(digits)-i)%3 == 0 {
+			out = append(out, ',')
+		}
+		out = append(out, digits[i])
+	}
+	return string(out)
+}()
 
 // ─── LLM Summarization ────────────────────────────────────────────────────────
 
@@ -562,7 +618,7 @@ func customMessageToLlm(custom map[string]any) (ai.Message, bool) {
 		return text(agent.BranchSummaryContextText(summary)), true
 	case agent.RoleCompactionSummary:
 		summary, _ := custom["summary"].(string)
-		return text(agent.CompactionSummaryContextText(summary)), true
+		return text(agent.CompactionSummaryText(summary, agent.CompactionSummaryUserRequests(custom))), true
 	case agent.RoleBashExecution:
 		if excluded, _ := custom["excludeFromContext"].(bool); excluded {
 			return nil, false
@@ -1228,9 +1284,6 @@ func Compact(
 
 	readFiles, modifiedFiles := ComputeFileLists(prep.FileOps)
 	summary += FormatFileOperations(readFiles, modifiedFiles)
-	if task := firstUserTaskText(prep.MessagesToSummarize); task != "" && !strings.Contains(summary, task) {
-		summary = "## Original User Task\n\n" + task + "\n\n" + summary
-	}
 
 	if prep.FirstKeptEntryID == "" {
 		return CompactionResult{}, errors.New("First kept entry has no UUID - session may need migration")
@@ -1246,34 +1299,4 @@ func Compact(
 			ModifiedFiles: modifiedFiles,
 		},
 	}, nil
-}
-
-const maxPreservedUserTaskBytes = 16 * 1024
-
-func firstUserTaskText(messages []agent.AgentMessage) string {
-	for _, msg := range messages {
-		if msg.Role() != agent.RoleUser || msg.User == nil {
-			continue
-		}
-		var b strings.Builder
-		switch c := msg.User.Content.(type) {
-		case ai.UserText:
-			b.WriteString(string(c))
-		case ai.UserContentBlocks:
-			for _, block := range c {
-				if tc, ok := block.(ai.TextContent); ok {
-					b.WriteString(tc.Text)
-				}
-			}
-		}
-		s := strings.TrimSpace(b.String())
-		if s == "" {
-			continue
-		}
-		if len(s) > maxPreservedUserTaskBytes {
-			s = s[:maxPreservedUserTaskBytes]
-		}
-		return s
-	}
-	return ""
 }

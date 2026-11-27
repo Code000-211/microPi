@@ -11,6 +11,7 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/compaction"
+	"github.com/MichaelKinsy/PiG/internal/compactiontypes"
 )
 
 // Ports packages/coding-agent/src/core/agent-session.ts (_getSummarizationRequestAuth).
@@ -31,6 +32,15 @@ func (s *Session) runDefaultCompaction(ctx context.Context, prep compaction.Comp
 	if err != nil {
 		return compaction.CompactionResult{}, err
 	}
+	// µPi: Pi's own summary sits beside the user's messages (session-manager.ts userMessagesBefore): it need not restate them
+	// (agent-session.ts _runDefaultCompaction, keptUserMessagesInstruction).
+	if kept := compaction.KeptUserMessagesInstruction(prep); kept != "" {
+		if customInstructions != "" {
+			customInstructions += "\n\n" + kept
+		} else {
+			customInstructions = kept
+		}
+	}
 	retry, retryCallbacks := s.summarizationRetryOptions("compaction", reason)
 	// upstream compact(preparation, model, apiKey, headers, customInstructions, signal, thinkingLevel, this.agent.streamFunction, env, retry, callbacks, sessionId): request.completer holds the Agent's stream function.
 	streamFn := request.streamFn
@@ -38,6 +48,17 @@ func (s *Session) runDefaultCompaction(ctx context.Context, prep compaction.Comp
 		streamFn = compaction.CompleterStreamFn(request.completer)
 	}
 	return compaction.Compact(ctx, prep, request.model, request.apiKey, request.headers, customInstructions, request.thinkingLevel, streamFn, request.env, retry, retryCallbacks, "")
+}
+
+// keepUserMessages records on prep the user's messages that go verbatim beside the summary, read from the whole branch: the context
+// branch PrepareCompaction was given holds none of the messages before the latest compaction's kept range, where Pi passes getBranch()
+// (µPi compaction.ts prepareCompaction, userMessagesBefore).
+func (s *Session) keepUserMessages(prep *compaction.CompactionPreparation) {
+	if !icodingagent.CompactionUserMessagesEnabled() {
+		return
+	}
+	kept, complete := s.inner.Load().UserMessagesBeforeEntry(prep.FirstKeptEntryID)
+	compactiontypes.SetKeptUserMessages(prep, kept, complete)
 }
 
 // withoutDeletedHeaders drops the headers an auth result deletes; summary requests take only header values.

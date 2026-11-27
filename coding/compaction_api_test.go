@@ -12,7 +12,8 @@ import (
 // index.ts exports DEFAULT_COMPACTION_SETTINGS, findCutPoint, findTurnStartIndex and getLastAssistantUsage. The public Go names read the same settings defaults the SettingsManager resolves (compaction.ts:126, settings-manager.ts getCompactionSettings) and operate on a real Session's entries.
 // Pi: packages/coding-agent/src/core/settings-manager.ts:964 (SettingsManager.getCompactionSettings).
 func TestCompactionHelpersArePublicAndAgreeWithSettingsDefaults(t *testing.T) {
-	if DefaultCompactionSettings != (CompactionSettings{Enabled: true, ReserveTokens: 16384, KeepRecentTokens: 20000}) {
+	// µPi (710e4993): DEFAULT_COMPACTION_SETTINGS also caps the threshold at maxContextTokens 128000.
+	if DefaultCompactionSettings != (CompactionSettings{Enabled: true, ReserveTokens: 16384, KeepRecentTokens: 20000, MaxContextTokens: 128000}) {
 		t.Fatalf("DefaultCompactionSettings = %+v", DefaultCompactionSettings)
 	}
 	resolved, err := codingagent.NewInMemorySettingsManager(codingagent.Settings{}).GetCompactionSettings()

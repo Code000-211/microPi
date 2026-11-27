@@ -51,12 +51,12 @@ func (s *CompactionSettingsJSON) UnmarshalJSON(data []byte) error {
 	}
 	return nil
 }
-func compactionNumberFields(extra map[string]json.RawMessage, reserve, recent *float64) (map[string]json.RawMessage, error) {
+func compactionNumberFields(extra map[string]json.RawMessage, reserve, recent, maxContext *float64) (map[string]json.RawMessage, error) {
 	fields := maps.Clone(extra)
 	if fields == nil {
 		fields = make(map[string]json.RawMessage)
 	}
-	for key, value := range map[string]*float64{"reserveTokens": reserve, "keepRecentTokens": recent} {
+	for key, value := range map[string]*float64{"reserveTokens": reserve, "keepRecentTokens": recent, "maxContextTokens": maxContext} {
 		if value != nil {
 			raw, err := json.Marshal(*value)
 			if err != nil {
@@ -68,7 +68,7 @@ func compactionNumberFields(extra map[string]json.RawMessage, reserve, recent *f
 	return fields, nil
 }
 func (s CompactionSettingsJSON) MarshalJSON() ([]byte, error) {
-	fields, err := compactionNumberFields(s.extra, s.ReserveTokens, s.KeepRecentTokens)
+	fields, err := compactionNumberFields(s.extra, s.ReserveTokens, s.KeepRecentTokens, s.MaxContextTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +106,7 @@ func (s CompactionModelOverride) MarshalJSON() ([]byte, error) {
 	if s.invalidEntry != nil {
 		return s.invalidEntry, nil
 	}
-	fields, err := compactionNumberFields(s.extra, s.ReserveTokens, s.KeepRecentTokens)
+	fields, err := compactionNumberFields(s.extra, s.ReserveTokens, s.KeepRecentTokens, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -177,6 +177,65 @@ func getCompactionTokenSetting(settings *CompactionSettingsJSON, field, provider
 		result = int(*override)
 	}
 	return result, nil
+}
+
+// defaultMaxContextTokens is the maxContextTokens that applies while neither reserveTokens nor maxContextTokens is set (µPi
+// settings-defaults.ts SETTINGS_DEFAULTS.compaction.maxContextTokens).
+const defaultMaxContextTokens = 128000
+
+// getCompactionMaxContextTokens resolves compaction.maxContextTokens for the model through its override, the ordinary setting, then the
+// default, which gives way to an explicit reserveTokens: that asks for a threshold of its own. 0 is no cap. µPi (710e4993,
+// settings-manager.ts getCompactionSettings, getExplicitCompactionSetting with the range 1 to Number.MAX_SAFE_INTEGER).
+func getCompactionMaxContextTokens(settings *CompactionSettingsJSON, provider, id string) (int, error) {
+	if settings == nil {
+		return defaultMaxContextTokens, nil
+	}
+	const field = "maxContextTokens"
+	valid := func(value float64) bool {
+		return !math.IsNaN(value) && !math.IsInf(value, 0) && math.Trunc(value) == value && value >= 1 && value <= (1<<53-1)
+	}
+	check := func(path string, value *float64, invalid json.RawMessage) error {
+		const expected = "Expected an integer from 1 to 9007199254740991."
+		if invalid != nil {
+			return fmt.Errorf("Invalid %s setting: %s. %s", path, compactionJSONText(invalid), expected)
+		}
+		if value != nil && !valid(*value) {
+			return fmt.Errorf("Invalid %s setting: %s. %s", path, compactionNumberText(*value), expected)
+		}
+		return nil
+	}
+	explicit := settings.MaxContextTokens
+	if err := check("compaction."+field, explicit, settings.extra[field]); err != nil {
+		return 0, err
+	}
+	explicitReserve := settings.ReserveTokens != nil || settings.extra["reserveTokens"] != nil
+	if provider != "" || id != "" {
+		if entry, ok := settings.ModelOverrides[provider+"/"+id]; ok {
+			path := fmt.Sprintf("compaction.modelOverrides[%q]", provider+"/"+id)
+			if entry.invalidEntry != nil {
+				return 0, fmt.Errorf("Invalid %s setting: %s. Expected an object.", path, compactionJSONText(entry.invalidEntry))
+			}
+			// An override keeps maxContextTokens in its members as written (CompactionModelOverride.extra).
+			if raw, present := entry.extra[field]; present && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				var value float64
+				if json.Unmarshal(raw, &value) != nil {
+					return 0, check(path+"."+field, nil, raw)
+				}
+				if err := check(path+"."+field, &value, nil); err != nil {
+					return 0, err
+				}
+				explicit = &value
+			}
+			explicitReserve = explicitReserve || entry.ReserveTokens != nil || entry.extra["reserveTokens"] != nil
+		}
+	}
+	switch {
+	case explicit != nil:
+		return int(*explicit), nil
+	case explicitReserve:
+		return 0, nil
+	}
+	return defaultMaxContextTokens, nil
 }
 
 func mergeCompactionNumber(current **float64, extra map[string]json.RawMessage, key string, incoming *float64, incomingExtra map[string]json.RawMessage) {

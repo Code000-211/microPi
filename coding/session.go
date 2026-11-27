@@ -603,7 +603,8 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 			}
 			// upstream: agent-session.ts:1683-1706 (_installHiddenDeclarationsProjection) runs before convertToLlm.
 			messages = sess.hideDeclarations(messages)
-			messages = compaction.PruneToolResults(messages, compaction.DefaultToolResultPruningSettings())
+			// µPi: the toolResultPruning settings of settings.json (sdk.ts convertToLlmWithBlockImages, getToolResultPruningSettings).
+			messages = compaction.PruneToolResults(messages, svcs.SettingsManager().GetToolResultPruningSettings())
 			if !blocksImages || !svcs.SettingsManager().GetBlockImages() {
 				return messages
 			}
@@ -3104,6 +3105,7 @@ func (s *Session) compact(ctx context.Context, customInstructions string) (*Comp
 		}
 		return fail(errors.New(reasonMsg), false)
 	}
+	s.keepUserMessages(prep)
 
 	if yield, ok := ctx.Value(compactionYieldKey{}).(func(context.Context)); ok {
 		yield(compactCtx)
@@ -3526,13 +3528,6 @@ func (s *Session) checkCompactionDecision(ctx context.Context, assistantMsg *age
 	if messageModel != nil {
 		contextWindow = messageModel.Capabilities.ContextWindow
 	}
-	if s.services != nil {
-		if c := s.services.Settings().Compaction; c != nil && c.MaxContextTokens != nil && *c.MaxContextTokens > 0 {
-			if capTok := int(*c.MaxContextTokens); capTok < contextWindow {
-				contextWindow = capTok
-			}
-		}
-	}
 
 	branch := s.currentBranch()
 	// The decision reads the projection (entry ids, estimates) and keeps none of its messages.
@@ -3578,9 +3573,12 @@ func (s *Session) checkCompactionDecision(ctx context.Context, assistantMsg *age
 	if assistantMsg.Usage != nil {
 		directContextTokens = agent.CalculateContextTokens(*assistantMsg.Usage)
 	}
+	// µPi (8f722e90): what the next request sends: tool-result pruning may clear more of it than of the last one.
+	pruning := s.SettingsManager().GetToolResultPruningSettings()
 	switch {
 	case projection.HasContextEdits:
-		contextTokens = compaction.EstimateProjectedContextTokens(projection, branch).Tokens
+		estimate := compaction.EstimateProjectedContextTokens(projection, branch)
+		contextTokens = compaction.TokensAfterPruning(estimate.Tokens, projection.Messages, estimate.LastUsageIndex, pruning)
 	case assistantMsg.StopReason == ai.StopReasonError || directContextTokens == 0:
 		// Estimate from the last valid response so persistent API errors and
 		// zero-usage responses still compact. Only a usage-backed estimate
@@ -3592,9 +3590,16 @@ func (s *Session) checkCompactionDecision(ctx context.Context, assistantMsg *age
 				return false, nil
 			}
 		}
-		contextTokens = estimate.Tokens
+		contextTokens = compaction.TokensAfterPruning(estimate.Tokens, messages, estimate.LastUsageIndex, pruning)
 	default:
 		contextTokens = directContextTokens
+		messages := s.agent.Messages()
+		for index, message := range slices.Backward(messages) {
+			if message.Assistant == assistantMsg {
+				contextTokens = compaction.TokensAfterPruning(directContextTokens, messages, index, pruning)
+				break
+			}
+		}
 	}
 	// pig divergence (D660): a context window of 0 or below is unknown, so the threshold check is skipped; Pi's shouldCompact(tokens, 0, settings) is true after every reply that carries usage.
 	if contextWindow <= 0 {
@@ -3702,6 +3707,7 @@ func (s *Session) runAutoCompaction(ctx context.Context, reason string, willRetr
 	if prep == nil {
 		return false, nil
 	}
+	s.keepUserMessages(prep)
 
 	compactCtx, cancel := context.WithCancel(s.withCompactionProgress(ctx))
 	s.compactMu.Lock()

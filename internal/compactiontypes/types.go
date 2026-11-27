@@ -18,6 +18,8 @@ type CompactionSettings struct {
 	Enabled          bool `json:"enabled"`
 	ReserveTokens    int  `json:"reserveTokens"`    // tokens reserved for response; default 16384
 	KeepRecentTokens int  `json:"keepRecentTokens"` // tokens to keep from recent history; default 20000
+	// MaxContextTokens also caps the threshold, whatever the window; 0 is no cap (µPi compaction.ts maxContextTokens, default 128000).
+	MaxContextTokens int `json:"maxContextTokens,omitempty"`
 }
 
 // FileOperations tracks files read/written/edited during a session segment.
@@ -65,6 +67,21 @@ type CompactionPreparation struct {
 	// when the session has none. It sizes the summary requests (D167). It is unexported, so Pi's field set is all the extension API
 	// type shows; SetTokenRatio and TokenRatioOf are the compaction pipeline's only way to it.
 	tokenRatio float64
+	// keptUserMessages are the user's messages before the kept part that Pi's own compaction carries verbatim beside its summary, and
+	// keptUserMessagesIncomplete reports that some did not fit (left out, or cut) (µPi compaction.ts CompactionPreparation.keptUserMessages,
+	// keptUserMessagesComplete). Unexported like tokenRatio; SetKeptUserMessages and KeptUserMessagesOf reach them.
+	keptUserMessages           []string
+	keptUserMessagesIncomplete bool
+}
+
+// SetKeptUserMessages records the user's messages a compaction carries beside its summary (see CompactionPreparation.keptUserMessages).
+func SetKeptUserMessages(prep *CompactionPreparation, kept []string, complete bool) {
+	prep.keptUserMessages, prep.keptUserMessagesIncomplete = kept, !complete
+}
+
+// KeptUserMessagesOf returns what SetKeptUserMessages recorded on prep; complete is true when nothing was recorded.
+func KeptUserMessagesOf(prep CompactionPreparation) (kept []string, complete bool) {
+	return prep.keptUserMessages, !prep.keptUserMessagesIncomplete
 }
 
 // SetTokenRatio records the measured token ratio on a preparation (see CompactionPreparation.tokenRatio).

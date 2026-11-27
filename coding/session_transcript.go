@@ -299,14 +299,10 @@ func (s *Session) exceedsCompactionThreshold(model *ai.Model, projection codinga
 		return false, nil
 	}
 	window := model.Capabilities.ContextWindow
-	if s.services != nil {
-		if c := s.services.Settings().Compaction; c != nil && c.MaxContextTokens != nil && *c.MaxContextTokens > 0 {
-			if capTok := int(*c.MaxContextTokens); capTok < window {
-				window = capTok
-			}
-		}
-	}
-	tokens := compaction.EstimateProjectedContextTokens(projection, s.currentBranch()).Tokens
+	// µPi (8f722e90): the threshold is checked against what the next request sends, after tool-result pruning
+	// (agent-session.ts _contextTokenEstimate nextRequestTokens).
+	estimate := compaction.EstimateProjectedContextTokens(projection, s.currentBranch())
+	tokens := compaction.TokensAfterPruning(estimate.Tokens, projection.Messages, estimate.LastUsageIndex, s.SettingsManager().GetToolResultPruningSettings())
 	settings, err := s.compactionSettings()
 	if err != nil {
 		return false, err

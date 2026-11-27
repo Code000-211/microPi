@@ -299,7 +299,7 @@ var customMessageMemberOrder = map[string][]string{
 	RoleCustom:            {"role", "customType", "content", "display", "details", "timestamp"},
 	"bashExecution":       {"role", "command", "output", "exitCode", "cancelled", "truncated", "fullOutputPath", "timestamp", "excludeFromContext"},
 	RoleBranchSummary:     {"role", "summary", "fromId", "timestamp"},
-	RoleCompactionSummary: {"role", "summary", "tokensBefore", "timestamp"},
+	RoleCompactionSummary: {"role", "summary", "tokensBefore", "timestamp", "userRequests"},
 }
 
 // contentBlockMemberOrder is the order Pi's tools and extensions write a TextContent or ImageContent in (packages/ai/src/types.ts).

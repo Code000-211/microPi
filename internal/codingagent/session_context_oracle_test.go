@@ -60,6 +60,8 @@ func contextTrees() [][]string {
 
 // TestBuildSessionContextMatchesPi runs buildSessionContext of Pi 1.0.4 and BuildSessionContext over the same entry trees and leaves (the last entry, null, each id, an unknown id).
 func TestBuildSessionContextMatchesPi(t *testing.T) {
+	// µPi: Pi's context has no userRequests beside a compaction summary (compaction-user-messages.test.ts covers µPi's).
+	t.Cleanup(SetCompactionUserMessages(false))
 	trees := append(contextTrees(), randomContextTrees()...)
 	type request struct {
 		Tree    int      `json:"tree"`

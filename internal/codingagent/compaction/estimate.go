@@ -167,9 +167,17 @@ func EstimateTokens(message agent.AgentMessage) int {
 			command, _ := message.Custom["command"].(string)
 			output, _ := message.Custom["output"].(string)
 			return ceilQuarter(jsLength(command) + jsLength(output))
-		case agent.RoleBranchSummary, agent.RoleCompactionSummary:
+		case agent.RoleBranchSummary:
 			summary, _ := message.Custom["summary"].(string)
 			return ceilQuarter(jsLength(summary))
+		case agent.RoleCompactionSummary:
+			summary, _ := message.Custom["summary"].(string)
+			if !codingagent.CompactionUserMessagesEnabled() {
+				// Pi's estimate, for the tests of Pi's own compaction that turn µPi's user messages off.
+				return ceilQuarter(jsLength(summary))
+			}
+			// µPi: the text the model is given, with the user's messages it carries (compaction.ts estimateTokens, compactionSummaryText).
+			return ceilQuarter(jsLength(agent.CompactionSummaryText(summary, agent.CompactionSummaryUserRequests(message.Custom))))
 		}
 	}
 	return 0

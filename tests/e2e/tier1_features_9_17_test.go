@@ -327,13 +327,13 @@ func TestT1_F12_ToolResultPruningShortensOldLargeResults(t *testing.T) {
 	largeContent := strings.Repeat("A_LARGE_LINE_OF_CODE_0123456789\n", 500)
 	env.WriteFile("large.txt", largeContent)
 
-	// 12 read calls -> oldest ones fall outside keepRecent=8
-	for i := 0; i < 12; i++ {
+	// µPi (ade455a6): pruning starts at 2*keepRecent results and clears in steps of keepRecent: 16 reads clear the oldest 8.
+	for i := 0; i < 16; i++ {
 		env.MockLLM.EnqueueToolCall(fmt.Sprintf("tc_%d", i), "read", map[string]any{"path": "large.txt"})
 	}
 	env.MockLLM.EnqueueText("done")
 
-	res := env.RunUPI("-p", "--provider", "mock", "--model", "mock-coder", "read large.txt 12 times")
+	res := env.RunUPI("-p", "--provider", "mock", "--model", "mock-coder", "read large.txt 16 times")
 	assertExitZero(t, res)
 
 	req, ok := env.MockLLM.LastRequest()
@@ -341,8 +341,8 @@ func TestT1_F12_ToolResultPruningShortensOldLargeResults(t *testing.T) {
 		t.Fatalf("expected final request")
 	}
 	results := toolResultMessages(req)
-	if len(results) < 12 {
-		t.Fatalf("expected 12 tool results, got %d", len(results))
+	if len(results) < 16 {
+		t.Fatalf("expected 16 tool results, got %d", len(results))
 	}
 	oldest := results[0]
 	if len(oldest) == 0 {

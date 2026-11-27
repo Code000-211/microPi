@@ -33,11 +33,11 @@ func DiffSystemPromptSections(previous, current ai.OrderedSections) ai.OrderedSe
 // DefaultToolSnippets are the built-in tool summaries used in the system prompt.
 func DefaultToolSnippets() map[string]string {
 	return map[string]string{
-		"read":       "Read file contents",
-		"bash":       "Execute bash commands (ls, grep, find, etc.)",
-		"powershell": "Execute PowerShell commands",
-		"edit":       "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
-		"write":      "Create or overwrite files",
+		"read":           "Read file contents",
+		"bash":           "Execute bash commands (ls, grep, find, etc.)",
+		"powershell":     "Execute PowerShell commands",
+		"edit":           "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+		"write":          "Create or overwrite files",
 		"grep":           "Search file contents for patterns (respects .gitignore)",
 		"find":           "Find files by glob pattern (respects .gitignore)",
 		"ls":             "List directory contents",

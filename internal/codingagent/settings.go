@@ -2261,6 +2261,16 @@ func (sm *SettingsManager) GetCompactionSettings(model ...*ai.Model) (Compaction
 	return CompactionConfig{Enabled: compactionEnabled(settings), ReserveTokens: reserve, KeepRecentTokens: recent}, nil
 }
 
+// GetCompactionMaxContextTokens resolves compaction.maxContextTokens for the optional model: the cap of the compaction threshold, 0
+// for none. µPi (710e4993): it is part of settings-manager.ts getCompactionSettings there; a getter of its own here keeps
+// GetCompactionSettings Pi's shape.
+func (sm *SettingsManager) GetCompactionMaxContextTokens(model ...*ai.Model) (int, error) {
+	provider, id := compactionModelKey(model)
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return getCompactionMaxContextTokens(sm.merged.Compaction, provider, id)
+}
+
 // GetCompactionEnabled returns the global compaction toggle independently of model token validation.
 func (sm *SettingsManager) GetCompactionEnabled() bool {
 	sm.mu.RLock()

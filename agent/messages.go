@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
@@ -238,6 +239,43 @@ func CompactionSummaryContextText(summary string) string {
 	return "The conversation history before this point was compacted into the following summary:\n\n<summary>\n" + summary + "\n</summary>"
 }
 
+// CompactionSummaryText is the text a compaction summary message gives the model: the summary, then the user's compacted messages
+// verbatim (µPi messages.ts compactionSummaryText).
+func CompactionSummaryText(summary string, userRequests []string) string {
+	text := CompactionSummaryContextText(summary)
+	if len(userRequests) == 0 {
+		return text
+	}
+	var b strings.Builder
+	b.WriteString(text)
+	b.WriteString("\n\nThe user's messages from the compacted history, verbatim and oldest first:\n")
+	for i, request := range userRequests {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("<user-message>\n" + request + "\n</user-message>")
+	}
+	return b.String()
+}
+
+// CompactionSummaryUserRequests returns the userRequests of a compaction summary message (µPi messages.ts
+// CompactionSummaryMessage.userRequests): set by the session projection as []string, or decoded from JSON as []any.
+func CompactionSummaryUserRequests(m map[string]any) []string {
+	switch requests := m["userRequests"].(type) {
+	case []string:
+		return requests
+	case []any:
+		out := make([]string, 0, len(requests))
+		for _, request := range requests {
+			if text, ok := request.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 // customMessageText renders a custom message as a plain text string for LLM context.
 // Mirrors upstream convertToLlm (messages.ts:143-188).
 func customMessageText(m map[string]any) string {
@@ -250,7 +288,7 @@ func customMessageText(m map[string]any) string {
 		return BranchSummaryContextText(summary)
 	case RoleCompactionSummary:
 		summary, _ := m["summary"].(string)
-		return CompactionSummaryContextText(summary)
+		return CompactionSummaryText(summary, CompactionSummaryUserRequests(m))
 	}
 	// Fallback: marshal to JSON
 	b, _ := json.Marshal(m)

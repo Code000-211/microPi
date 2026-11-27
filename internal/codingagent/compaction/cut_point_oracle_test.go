@@ -14,6 +14,8 @@ import (
 
 // Pi's findCutPoint, findTurnStartIndex, getLastAssistantUsage and estimateContextTokens (core/compaction/compaction.js) run against the vendored Pi module over seeded random session branches that mix user, assistant (usage, aborted, error, tool calls), tool-result, bash, custom, branch-summary, compaction and metadata entries.
 func TestCutPointAndContextEstimateMatchPiOracle(t *testing.T) {
+	// µPi: the user's compacted messages beside the summary (and the summary's framing) count in µPi's estimate; Pi's has neither.
+	t.Cleanup(codingagent.SetCompactionUserMessages(false))
 	rng := rand.New(rand.NewSource(5))
 	texts := []string{"", "a", "short text", strings.Repeat("long ", 120), strings.Repeat("😀", 40), strings.Repeat("x", 4000)}
 	usage := func() map[string]any {

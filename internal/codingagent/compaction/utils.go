@@ -52,7 +52,12 @@ func ExtractFileOpsFromMessage(msg agent.AgentMessage, ops *FileOperations) {
 }
 
 func addFileOp(toolName string, arguments map[string]any, ops *FileOperations) {
-	path, _ := arguments["path"].(string)
+	// µPi: a recorded call keeps the names the model sent: `file_path` is the file tools' alias of `path` (utils.ts addFileOp, `args?.path ?? args?.file_path`).
+	raw := arguments["path"]
+	if raw == nil {
+		raw = arguments["file_path"]
+	}
+	path, _ := raw.(string)
 	if path == "" {
 		return
 	}

@@ -683,8 +683,8 @@ var javascriptChecker Checker = &simpleChecker{
 // ─── Shell: bash -n, shuck ────────────────────────────────────────────────────
 
 var (
-	bashLineRE     = regexp.MustCompile(`: line (\d+): (.*)$`)
-	bashQuotedRE   = regexp.MustCompile("^`.*'$")
+	bashLineRE   = regexp.MustCompile(`: line (\d+): (.*)$`)
+	bashQuotedRE = regexp.MustCompile("^`.*'$")
 )
 
 var shellChecker Checker = &simpleChecker{
@@ -1271,7 +1271,7 @@ func nodeTool(dir, tool string) string {
 }
 
 var (
-	biomeConfigs = []string{"biome.json", "biome.jsonc"}
+	biomeConfigs  = []string{"biome.json", "biome.jsonc"}
 	oxlintConfigs = []string{".oxlintrc.json", "oxlintrc.json"}
 	eslintConfigs = []string{
 		"eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts",

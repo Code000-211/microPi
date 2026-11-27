@@ -687,6 +687,7 @@ func (b *cliRuntimeBuilder) loadPromptResources(build *cliBuild, agentToolNames 
 		PigDocsPath:    codingagent.GetDocsPath(), PigReadmePath: codingagent.GetReadmePath(), PigExamplesPath: codingagent.GetExamplesPath(),
 		AppendMode:   "append",
 		ContextFiles: promptCtxFiles,
+		Project:      cliProjectSnapshot(cwd, build.Flags),
 	}
 	if resolvedPrompts.custom != "" {
 		promptOptions.CustomPrompt = resolvedPrompts.custom
@@ -712,6 +713,7 @@ func (b *cliRuntimeBuilder) loadPromptResources(build *cliBuild, agentToolNames 
 		Cwd:                cwd,
 		ContextFiles:       extContextFiles,
 		Skills:             extensionPromptSkills(skillDefs),
+		Sections:           prompts.ProjectSections(promptOptions.Project),
 	}
 	build.ContextFiles = projectCtxFiles
 	build.ResolvedPrompts = resolvedPrompts

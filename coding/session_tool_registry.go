@@ -22,6 +22,7 @@ import (
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
+	"github.com/MichaelKinsy/PiG/internal/docsearch"
 )
 
 type sessionBoundTool struct {
@@ -366,7 +367,9 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 			filtered = append(filtered, name)
 		}
 		activeNames = filtered
-	} else if opts.AllowedTools == nil && services.CWD() != "" && slices.Contains(activeNames, "project_search") && countProjectFilesUpTo(services.CWD(), 151) <= 150 {
+	} else if slices.Contains(activeNames, "project_search") && (docsearch.IsDisabled() || (opts.AllowedTools == nil && services.CWD() != "" && docsearch.IsSmallProject(services.CWD()))) {
+		// µPi: PI_DOCSEARCH=off leaves the tool out, and so does a small project, its files counted from the git root
+		// (docsearch extension index.ts start).
 		filtered := activeNames[:0]
 		for _, name := range activeNames {
 			if name == "project_search" {
@@ -377,29 +380,6 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 		activeNames = filtered
 	}
 	return registry, registry.selectTools(activeNames), nil
-}
-
-func countProjectFilesUpTo(root string, limit int) int {
-	count := 0
-	stop := errors.New("limit reached")
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" || name == "node_modules" || name == ".micropi" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		count++
-		if count >= limit {
-			return stop
-		}
-		return nil
-	})
-	return count
 }
 
 // compileFilter compiles `--tools` and `--exclude-tools` with the Piglet tool scope.

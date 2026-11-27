@@ -84,6 +84,7 @@ func (s *Session) prepareRun(ctx context.Context, trigger extension.BeforeAgentS
 		s.applyPromptToolLoadout(s.admittedToolNames(run.SelectedTools))
 		return nil, err
 	}
+	run.Messages = icodingagent.DocsearchRecallMessages(ctx, s.CWD(), trigger, run.Messages)
 	p.run, p.systemPrompt, p.messages = run, run.SystemPrompt, run.Messages
 	return p, nil
 }

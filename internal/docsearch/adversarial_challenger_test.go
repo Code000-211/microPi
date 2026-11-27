@@ -34,7 +34,7 @@ func TestAdversarialConcurrencyStress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	idxPath := indexCachePath([]string{dir})
+	idxPath := indexCachePath([]string{dir}, nil)
 	if err := idx.Save(idxPath); err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestAdversarialCorruptIdxAndOkStamp(t *testing.T) {
 
 	// 4. Engine recovery when cached .idx is corrupt
 	t.Run("EngineRecoversFromCorruptCache", func(t *testing.T) {
-		engIdxPath := indexCachePath([]string{dir})
+		engIdxPath := indexCachePath([]string{dir}, nil)
 		if err := os.MkdirAll(filepath.Dir(engIdxPath), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -224,8 +224,9 @@ func TestAdversarialCountFilesAndNewToolBoundary(t *testing.T) {
 	for i := range 5 {
 		_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("skip_%d.ignored", i)), []byte("x"), 0o644)
 	}
-	// Note: .gitignore itself is a regular file (1 file). So add 149 more regular files -> total 150.
-	for i := range 149 {
+	// µPi: as index.ts countFiles, a .git that git cannot list falls back to a walk past hidden names, node_modules
+	// and target, which does not read .gitignore: the 5 ignored files count and .gitignore does not. 145 more -> 150.
+	for i := range 145 {
 		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f_%03d.txt", i)), []byte("hi"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -419,28 +420,29 @@ func TestAdversarialTranslationsAndDocsCmd(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "doc.md"), []byte("# Alpha\n\nUniqueSearchTokenHere\n"), 0o644)
 
-	eng := SharedEngine(dir)
+	eng := OpenProject(dir).Engine
 	defer eng.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	eng.WaitReady(ctx)
 
-	if out := HandleDocsCommand("status", dir); !strings.Contains(out, "docsearch:") || !strings.Contains(out, "auto-recall:") {
+	// µPi: `/docs status` is a query; the status is `/docs` alone (index.ts).
+	if out := HandleDocsCommand("status", dir); !strings.Contains(out, " sections in ") {
 		t.Errorf("/docs status unexpected: %q", out)
 	}
 	if out := HandleDocsCommand("", dir); !strings.Contains(out, "docsearch:") {
 		t.Errorf("/docs (empty) unexpected: %q", out)
 	}
-	if out := HandleDocsCommand("auto off", dir); out != "docsearch: auto-recall off" {
+	if out := HandleDocsCommand("auto off", dir); out != "docsearch auto-recall off" {
 		t.Errorf("/docs auto off = %q", out)
 	}
-	if LoadSettings().autoRecallEnabled() {
+	if LoadSettings().AutoRecall {
 		t.Error("autoRecallEnabled should be false after /docs auto off")
 	}
-	if out := HandleDocsCommand("auto on", dir); out != "docsearch: auto-recall on" {
+	if out := HandleDocsCommand("auto on", dir); out != "docsearch auto-recall on" {
 		t.Errorf("/docs auto on = %q", out)
 	}
-	if !LoadSettings().autoRecallEnabled() {
+	if !LoadSettings().AutoRecall {
 		t.Error("autoRecallEnabled should be true after /docs auto on")
 	}
 	if out := HandleDocsCommand("rebuild", dir); out != "docsearch: rebuilding" {

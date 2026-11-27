@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
@@ -62,6 +64,7 @@ func systemPromptRebuilder(cwd, agentDir string, projectTrusted bool, flags Args
 			Skills: promptSkills, PigDocsPath: codingagent.GetDocsPath(), PigReadmePath: codingagent.GetReadmePath(), PigExamplesPath: codingagent.GetExamplesPath(),
 			AppendMode: "append", ContextFiles: promptCtxFiles,
 			CustomPrompt: resolvedPrompts.custom, AppendSystemPrompt: resolvedPrompts.append,
+			Project: cliProjectSnapshot(cwd, flags),
 		}
 		if resolvedPrompts.custom != "" {
 			options.AppendMode = "replace"
@@ -77,7 +80,13 @@ func systemPromptRebuilder(cwd, agentDir string, projectTrusted bool, flags Args
 			CustomPrompt: resolvedPrompts.custom, CustomPromptSet: resolvedPrompts.customSet, SelectedTools: append([]string{}, toolNames...),
 			ToolSnippets: toolHints, ToolGuidelines: toolGuidelines,
 			AppendSystemPrompt: resolvedPrompts.append, Cwd: cwd,
-			ContextFiles: extContextFiles, Skills: extSkills,
+			ContextFiles: extContextFiles, Skills: extSkills, Sections: prompts.ProjectSections(options.Project),
 		}
 	}
+}
+
+// cliProjectSnapshot is the project snapshot a CLI session's prompt carries: none in remote mode (µPi
+// agent-session.ts _rebuildSystemPrompt).
+func cliProjectSnapshot(cwd string, flags Args) string {
+	return prompts.SessionProjectSnapshot(cwd, flags.Remote != "" || os.Getenv("PI_REMOTE") != "")
 }

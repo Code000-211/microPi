@@ -11,6 +11,7 @@ import (
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/internal/docsearch"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 	"github.com/MichaelKinsy/PiG/tui"
 )
@@ -610,6 +611,9 @@ func (m *InteractiveMode) appendCustomMessage(message CustomMessageEntry, meta m
 				return registered(customMessage, extension.MessageRenderOptions{Expanded: options.Expanded, OutputPad: options.OutputPad, Identity: identity}, nil)
 			}
 		}
+	}
+	if renderer == nil && message.CustomType == docsearch.RecallCustomType {
+		renderer = docsearchRecallRenderer(message.Details)
 	}
 	component := tui.NewCustomMessageComponentWithSurface(&tui.CustomMessage{CustomType: message.CustomType, Content: message.Content}, renderer, m.markdownThemeWithSettings(), m.outputPad, m.surfaceMarkdownTransform(extension.MarkdownMessageCustom, meta))
 	m.markdownBlocks = append(m.markdownBlocks, component)

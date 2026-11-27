@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MichaelKinsy/PiG/internal/procpolicy"
 )
@@ -30,15 +31,19 @@ type Config struct {
 	Roots        []string
 	MaxFileBytes int64
 	MaxFiles     int
+	// Extensions are the extensions to index, lowercase without the dot; nil indexes every text file.
+	Extensions []string
 }
 
 // SearchOpts configures a search query.
 type SearchOpts struct {
 	K          int
 	PathPrefix string
-	MaxPerFile int
-	MaxChars   int
-	Graph      *bool // nil defaults to true
+	// AbsPathPrefix keeps the files under this absolute path (index.ts resolves the tool's `path` against the project).
+	AbsPathPrefix string
+	MaxPerFile    int
+	MaxChars      int
+	Graph         *bool // nil defaults to true
 }
 
 func (o SearchOpts) useGraph() bool {
@@ -72,9 +77,9 @@ type Results struct {
 
 // Index is an in-memory or mmap-backed search index.
 type Index struct {
-	Roots   []string
-	BuildMs uint64
-	AvgLen  float64
+	Roots    []string
+	BuildMs  uint64
+	AvgLen   float64
 	TotalLen uint32
 
 	Files      Strs
@@ -227,7 +232,7 @@ func Build(cfg Config) (*Index, error) {
 	if maxFiles <= 0 {
 		maxFiles = DefaultMaxFiles
 	}
-	files, err := Scan(cfg.Roots, maxBytes, maxFiles)
+	files, err := ScanExtensions(cfg.Roots, normalizeExtensions(cfg.Extensions), maxBytes, maxFiles)
 	if err != nil {
 		return nil, err
 	}
@@ -625,15 +630,15 @@ type searchScratch struct {
 	matched []uint32
 	touched []uint32
 
-	pprR    []float64
-	pprP    []float64
-	pprInQ  []bool
-	pprQ    []uint32
+	pprR     []float64
+	pprP     []float64
+	pprInQ   []bool
+	pprQ     []uint32
 	pprTouch []uint32
 
-	cooc      []uint32
-	coocTouch []uint32
-	final     []float64
+	cooc       []uint32
+	coocTouch  []uint32
+	final      []float64
 	finalTouch []uint32
 }
 
@@ -1069,6 +1074,9 @@ func searchSingle(
 				continue
 			}
 		}
+		if opts.AbsPathPrefix != "" && !pathStartsWith(resolveAbsFromRoots(idx.Roots, idx.Files.Get(idx.SecFile[s])), opts.AbsPathPrefix) {
+			continue
+		}
 		candidates = append(candidates, scoredSec{sec: s, score: sc.final[s]})
 	}
 
@@ -1116,11 +1124,7 @@ func searchSingle(
 		text := readSectionLines(abs, lStart, lEnd)
 		cov := computeCoverage(text, heading, qTermSet, idx, idfTotal)
 
-		truncated := false
-		if opts.MaxChars > 0 && len(text) > opts.MaxChars {
-			text = text[:opts.MaxChars]
-			truncated = true
-		}
+		text, truncated := cutSectionText(text, opts.MaxChars)
 
 		hits = append(hits, Hit{
 			Path:      rel,
@@ -1150,6 +1154,38 @@ func looksLikeName(w string) bool {
 		return true
 	}
 	return len(CamelParts(w)) > 1
+}
+
+// cutSectionText is the docsearch addon's cut (node/src/lib.rs): at most maxChars bytes (default 1500, at least 200),
+// on a character boundary, and at a line break when one is in the second half.
+func cutSectionText(text string, maxChars int) (string, bool) {
+	if maxChars <= 0 {
+		maxChars = 1500
+	}
+	maxChars = max(maxChars, 200)
+	if len(text) <= maxChars {
+		return text, false
+	}
+	end := maxChars
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	if nl := strings.LastIndexByte(text[:end], '\n'); nl > maxChars/2 {
+		end = nl
+	}
+	return text[:end], true
+}
+
+// pathStartsWith is Rust's Path::starts_with: prefix is path or one of its parent folders.
+func pathStartsWith(path, prefix string) bool {
+	path, prefix = filepath.Clean(path), filepath.Clean(prefix)
+	if path == prefix {
+		return true
+	}
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	return strings.HasPrefix(path, prefix)
 }
 
 func resolveAbsFromRoots(roots []string, rel string) string {

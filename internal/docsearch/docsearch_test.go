@@ -403,7 +403,8 @@ func TestEngineAndDocsCommand(t *testing.T) {
 	if out := HandleDocsCommand("auto on", dir); !strings.Contains(out, "auto-recall on") {
 		t.Fatalf("unexpected /docs auto on output: %q", out)
 	}
-	if out := HandleDocsCommand("status", dir); !strings.Contains(out, "docsearch:") {
+	// µPi: the status is `/docs` alone; `/docs status` is a query (index.ts).
+	if out := HandleDocsCommand("", dir); !strings.Contains(out, "docsearch:") {
 		t.Fatalf("unexpected /docs status output: %q", out)
 	}
 	if out := HandleDocsCommand("AlphaBeta", dir); !strings.Contains(out, "main.go") {

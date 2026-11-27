@@ -70,6 +70,9 @@ type Options struct {
 	// rules, and docs sections are omitted, as upstream does for a custom
 	// system prompt).
 	AppendMode string
+	// Project is the project snapshot (TakeProjectSnapshot) the session took once when it started; empty leaves the
+	// project section out, as in remote mode or with PI_PROJECT_SNAPSHOT=off.
+	Project string
 }
 
 // preamble is microPi's (system-prompt.ts, the µPi build's), with µPi built on PiG in Go rather than compiled ahead of time.
@@ -152,8 +155,10 @@ func BuildSystemPromptSections(o Options) ai.OrderedSections {
 		cwd = "."
 	}
 	sections = append(sections, section{"cwd", strings.ReplaceAll(cwd, `\`, "/")})
-	if snap := BuildProjectSnapshot(cwd); snap != "" {
-		sections = append(sections, section{"project", snap})
+	// µPi: the project snapshot is one of the sections the session passes (agent-session.ts _rebuildSystemPrompt
+	// `sections: { project }`), after cwd.
+	if o.Project != "" {
+		sections = append(sections, section{"project", o.Project})
 	}
 	out := ai.OrderedSections{{Name: "preamble", Value: new(head)}}
 	for _, s := range sections {

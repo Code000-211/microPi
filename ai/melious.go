@@ -3,8 +3,12 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"os"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -115,24 +119,154 @@ func meliousGeneratedModels() []GeneratedModel {
 	return out
 }
 
-type meliousModelsResponse struct {
-	Data []struct {
-		ID                  string `json:"id"`
-		Name                string `json:"name"`
-		ContextLength       int    `json:"context_length"`
-		MaxCompletionTokens int    `json:"max_completion_tokens"`
-		Meta                *struct {
-			ContextLength       int   `json:"context_length"`
-			MaxCompletionTokens int   `json:"max_completion_tokens"`
-			Reasoning           *bool `json:"reasoning"`
-		} `json:"_meta"`
-	} `json:"data"`
+// meliousModelEntry is one entry of `GET /models?include_meta=true`. Fields that hold numbers, strings or anything
+// else stay raw: the catalog takes what it can read, as melious.ts does.
+type meliousModelEntry struct {
+	ID                  string          `json:"id"`
+	Name                json.RawMessage `json:"name"`
+	ContextLength       json.RawMessage `json:"context_length"`
+	MaxCompletionTokens json.RawMessage `json:"max_completion_tokens"`
+	Pricing             json.RawMessage `json:"pricing"`
+	Meta                *struct {
+		ContextLength       json.RawMessage `json:"context_length"`
+		MaxCompletionTokens json.RawMessage `json:"max_completion_tokens"`
+		Pricing             json.RawMessage `json:"pricing"`
+		Reasoning           json.RawMessage `json:"reasoning"`
+		Modalities          *struct {
+			Input json.RawMessage `json:"input"`
+		} `json:"modalities"`
+	} `json:"_meta"`
 }
 
+// meliousCost holds per-million-token rates.
+type meliousCost struct{ input, output, cacheRead, cacheWrite float64 }
+
+// rawPresent is JavaScript's `value ?? ...` test: a member that is there and not null.
+func rawPresent(raw json.RawMessage) bool {
+	return len(raw) > 0 && string(raw) != "null"
+}
+
+// rawTruthyNumber is a number member for JavaScript's `a || b`: 0, null and non-numbers fall through.
+func rawTruthyNumber(raw json.RawMessage) (float64, bool) {
+	var number float64
+	if !rawPresent(raw) || json.Unmarshal(raw, &number) != nil || number == 0 {
+		return 0, false
+	}
+	return number, true
+}
+
+var meliousLeadingFloat = regexp.MustCompile(`^[\t\n\v\f\r \x{a0}\x{feff}]*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)`)
+
+// parsePerMillionRate is melious.ts parsePerMillionRate: a string is read with parseFloat, and rates below 0.01 are
+// per-token rates, converted to $/1M tokens.
+func parsePerMillionRate(raw json.RawMessage, fallback float64) float64 {
+	var rate float64
+	var text string
+	switch {
+	case !rawPresent(raw):
+		return fallback
+	case json.Unmarshal(raw, &text) == nil:
+		match := meliousLeadingFloat.FindStringSubmatch(text)
+		if match == nil {
+			return fallback
+		}
+		parsed, err := strconv.ParseFloat(match[1], 64)
+		if err != nil {
+			return fallback
+		}
+		rate = parsed
+	case json.Unmarshal(raw, &rate) != nil:
+		return fallback
+	}
+	if math.IsInf(rate, 0) || math.IsNaN(rate) || rate < 0 {
+		return fallback
+	}
+	if rate > 0 && rate < 0.01 {
+		rounded, _ := strconv.ParseFloat(strconv.FormatFloat(rate*1_000_000, 'f', 6, 64), 64)
+		return rounded
+	}
+	return rate
+}
+
+// meliousCostOf is melious.ts meliousCost: the pricing's rates, each falling back to base.
+func meliousCostOf(pricing json.RawMessage, base meliousCost) meliousCost {
+	var fields struct {
+		Prompt          json.RawMessage `json:"prompt"`
+		Completion      json.RawMessage `json:"completion"`
+		Input           json.RawMessage `json:"input"`
+		Output          json.RawMessage `json:"output"`
+		InputCacheRead  json.RawMessage `json:"input_cache_read"`
+		InputCacheWrite json.RawMessage `json:"input_cache_write"`
+	}
+	if !rawPresent(pricing) {
+		return base
+	}
+	if json.Unmarshal(pricing, &fields) != nil {
+		// A pricing that is no object has none of the members: every rate falls back.
+		return base
+	}
+	input, output := fields.Prompt, fields.Completion
+	if !rawPresent(input) {
+		input = fields.Input
+	}
+	if !rawPresent(output) {
+		output = fields.Output
+	}
+	return meliousCost{
+		input:      parsePerMillionRate(input, base.input),
+		output:     parsePerMillionRate(output, base.output),
+		cacheRead:  parsePerMillionRate(fields.InputCacheRead, base.cacheRead),
+		cacheWrite: parsePerMillionRate(fields.InputCacheWrite, base.cacheWrite),
+	}
+}
+
+// pricing is `meta?.pricing ?? entry.pricing`.
+func (e *meliousModelEntry) pricing() json.RawMessage {
+	if e.Meta != nil && rawPresent(e.Meta.Pricing) {
+		return e.Meta.Pricing
+	}
+	return e.Pricing
+}
+
+// limit is `meta?.<field> || entry.<field>`.
+func (e *meliousModelEntry) limit(meta, entry json.RawMessage) (int, bool) {
+	if e.Meta != nil {
+		if n, ok := rawTruthyNumber(meta); ok {
+			return int(n), true
+		}
+	}
+	if n, ok := rawTruthyNumber(entry); ok {
+		return int(n), true
+	}
+	return 0, false
+}
+
+func (e *meliousModelEntry) contextLength() (int, bool) {
+	var meta json.RawMessage
+	if e.Meta != nil {
+		meta = e.Meta.ContextLength
+	}
+	return e.limit(meta, e.ContextLength)
+}
+
+func (e *meliousModelEntry) maxCompletionTokens() (int, bool) {
+	var meta json.RawMessage
+	if e.Meta != nil {
+		meta = e.Meta.MaxCompletionTokens
+	}
+	return e.limit(meta, e.MaxCompletionTokens)
+}
+
+// fetchMeliousModels is melious.ts personalizeMeliousCatalog: `GET /models?include_meta=true` with the key updates the
+// static catalog's context window, output limit and rates and appends the models the catalog lacks. Any failure, a
+// list that is not JSON included, keeps the static catalog (nil).
 func fetchMeliousModels(refresh RefreshModelsContext) ([]AnyModel, error) {
-	key := refresh.Credential.Key
-	if key == "" && refresh.Credential.Type == CredentialOAuth {
-		key = refresh.Credential.Access
+	var key string
+	if refresh.Credential != nil {
+		key = refresh.Credential.Key
+		if refresh.Credential.Type == CredentialOAuth {
+			key = refresh.Credential.Access
+		}
 	}
 	if key == "" {
 		key = strings.TrimSpace(os.Getenv("MELIOUS_API_KEY"))
@@ -141,16 +275,14 @@ func fetchMeliousModels(refresh RefreshModelsContext) ([]AnyModel, error) {
 		return nil, nil
 	}
 
-	baseURL := strings.TrimRight(refresh.BaseURL, "/")
-	if baseURL == "" {
-		baseURL = strings.TrimRight(os.Getenv("MELIOUS_BASE_URL"), "/")
-	}
+	baseURL := refresh.BaseURL
 	if baseURL == "" {
 		baseURL = meliousBaseURL
 	}
-	modelsURL := baseURL + "/models?include_meta=true"
-	if !strings.HasSuffix(baseURL, "/v1") {
-		modelsURL = baseURL + "/v1/models?include_meta=true"
+	baseURL = strings.TrimRight(baseURL, "/")
+	modelsURL := baseURL + "/v1/models?include_meta=true"
+	if strings.HasSuffix(baseURL, "/v1") {
+		modelsURL = baseURL + "/models?include_meta=true"
 	}
 
 	ctx := refresh.Signal
@@ -172,59 +304,101 @@ func fetchMeliousModels(refresh RefreshModelsContext) ([]AnyModel, error) {
 		return nil, nil
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, nil
 	}
 
-	var parsed meliousModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil || len(parsed.Data) == 0 {
+	var body struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || body.Data == nil {
+		return nil, nil
+	}
+	// A Map keyed by id: the first entry of an id keeps its place, the last one its content.
+	discovered := map[string]*meliousModelEntry{}
+	var order []string
+	for _, raw := range body.Data {
+		var entry meliousModelEntry
+		var probe struct {
+			ID any `json:"id"`
+		}
+		if json.Unmarshal(raw, &probe) != nil {
+			continue
+		}
+		if _, isString := probe.ID.(string); !isString {
+			continue
+		}
+		if json.Unmarshal(raw, &entry) != nil {
+			// A member of a type the entry does not take (a number for _meta, say) is read as missing.
+			entry = meliousModelEntry{ID: probe.ID.(string)}
+		}
+		if _, seen := discovered[entry.ID]; !seen {
+			order = append(order, entry.ID)
+		}
+		discovered[entry.ID] = &entry
+	}
+	if len(discovered) == 0 {
 		return nil, nil
 	}
 
 	builtin := GetBuiltinModels("melious")
-	byID := make(map[string]*Model, len(builtin))
-	out := make([]AnyModel, 0, len(builtin)+len(parsed.Data))
-	for _, m := range builtin {
-		byID[m.ID] = m
-		out = append(out, m)
+	seen := make(map[string]bool, len(builtin))
+	out := make([]AnyModel, 0, len(builtin)+len(order))
+	for _, model := range builtin {
+		seen[model.ID] = true
+		entry := discovered[model.ID]
+		if entry == nil {
+			out = append(out, model)
+			continue
+		}
+		// A copy: the catalog's own model stays as it is.
+		updated := *model
+		if n, ok := entry.contextLength(); ok {
+			updated.Capabilities.ContextWindow = n
+		}
+		if n, ok := entry.maxCompletionTokens(); ok {
+			updated.Capabilities.MaxOutputTokens = n
+		}
+		if pricing := entry.pricing(); rawPresent(pricing) {
+			caps := &updated.Capabilities
+			cost := meliousCostOf(pricing, meliousCost{caps.InputCostPer1M, caps.OutputCostPer1M, caps.CacheReadCostPer1M, caps.CacheWriteCostPer1M})
+			caps.InputCostPer1M, caps.OutputCostPer1M, caps.CacheReadCostPer1M, caps.CacheWriteCostPer1M = cost.input, cost.output, cost.cacheRead, cost.cacheWrite
+		}
+		out = append(out, &updated)
 	}
 
-	for _, entry := range parsed.Data {
-		if entry.ID == "" {
+	for _, id := range order {
+		if seen[id] {
 			continue
 		}
-		ctxWin := entry.ContextLength
-		maxTok := entry.MaxCompletionTokens
+		entry := discovered[id]
+		ctxWin, ok := entry.contextLength()
+		if !ok {
+			ctxWin = 131_072
+		}
+		maxTok, ok := entry.maxCompletionTokens()
+		if !ok {
+			maxTok = min(ctxWin, 65_536)
+		}
+		hasImage := false
 		var reasoning *bool
 		if entry.Meta != nil {
-			if entry.Meta.ContextLength > 0 {
-				ctxWin = entry.Meta.ContextLength
+			if entry.Meta.Modalities != nil {
+				var inputs []any
+				if json.Unmarshal(entry.Meta.Modalities.Input, &inputs) == nil {
+					hasImage = slices.Contains(inputs, any("image"))
+				}
 			}
-			if entry.Meta.MaxCompletionTokens > 0 {
-				maxTok = entry.Meta.MaxCompletionTokens
+			var flag bool
+			if rawPresent(entry.Meta.Reasoning) && json.Unmarshal(entry.Meta.Reasoning, &flag) == nil {
+				reasoning = &flag
 			}
-			reasoning = entry.Meta.Reasoning
-		}
-		if existing, ok := byID[entry.ID]; ok {
-			if ctxWin > 0 {
-				existing.Capabilities.ContextWindow = ctxWin
-			}
-			if maxTok > 0 {
-				existing.Capabilities.MaxOutputTokens = maxTok
-			}
-			continue
-		}
-		if ctxWin <= 0 {
-			ctxWin = 131072
-		}
-		if maxTok <= 0 {
-			maxTok = min(ctxWin, 65536)
 		}
 		isReasoning := false
 		if reasoning != nil {
 			isReasoning = *reasoning
 		} else {
-			lower := strings.ToLower(entry.ID)
+			lower := strings.ToLower(id)
 			isReasoning = strings.Contains(lower, "deepseek") ||
 				strings.Contains(lower, "glm-5") ||
 				strings.Contains(lower, "qwen3") ||
@@ -233,23 +407,33 @@ func fetchMeliousModels(refresh RefreshModelsContext) ([]AnyModel, error) {
 				strings.Contains(lower, "minimax") ||
 				strings.Contains(lower, "r1")
 		}
-		name := entry.Name
-		if name == "" {
-			name = entry.ID
+		name := id
+		var entryName string
+		if json.Unmarshal(entry.Name, &entryName) == nil && entryName != "" {
+			name = entryName
 		}
-		gm := GeneratedModel{
-			ID:              entry.ID,
-			Provider:        "melious",
-			DisplayName:     name,
-			API:             APIOpenAICompletions,
-			BaseURL:         baseURL,
-			Compat:          meliousCompat(isReasoning),
-			ContextWindow:   ctxWin,
-			MaxOutputTokens: maxTok,
-			Reasoning:       isReasoning,
-			Capabilities:    []string{"text"},
+		capabilities := []string{"text"}
+		if hasImage {
+			capabilities = []string{"text", "image"}
 		}
-		out = append(out, gm.ToModel())
+		cost := meliousCostOf(entry.pricing(), meliousCost{})
+		generated := GeneratedModel{
+			ID:                   id,
+			Provider:             "melious",
+			DisplayName:          name,
+			API:                  APIOpenAICompletions,
+			BaseURL:              meliousBaseURL,
+			Compat:               meliousCompat(isReasoning),
+			ContextWindow:        ctxWin,
+			MaxOutputTokens:      maxTok,
+			InputCostPerMTokens:  cost.input,
+			OutputCostPerMTokens: cost.output,
+			CacheReadCost:        cost.cacheRead,
+			CacheWriteCost:       cost.cacheWrite,
+			Reasoning:            isReasoning,
+			Capabilities:         capabilities,
+		}
+		out = append(out, generated.ToModel())
 	}
 	return out, nil
 }

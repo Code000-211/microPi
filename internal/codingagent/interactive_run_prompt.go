@@ -29,6 +29,9 @@ func (m *InteractiveMode) prepareRunPrompt(ctx context.Context, runner *inproc.R
 		}
 	}
 	run, resolveErr := ResolveBeforeAgentStartRun(base, combined)
+	if resolveErr == nil {
+		run.Messages = DocsearchRecallMessages(ctx, m.opts.CWD, trigger, run.Messages)
+	}
 	// _preparePromptAndToolLoadout replays the transcript's system messages before it builds the run's sections (agent-session.ts:1745-1748), so its TypeError comes first.
 	if replayErr := m.agent.CurrentSystemMessageError(); replayErr != nil {
 		resolveErr = replayErr

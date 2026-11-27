@@ -1,154 +1,178 @@
 package prompts
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/MichaelKinsy/PiG/ai"
+	"github.com/MichaelKinsy/PiG/internal/jsstring/localecompare"
 )
 
+// µPi: a listing of the working folder for the system prompt, taken once when the session starts. Nearly every coding
+// run otherwise spends its first turn listing the folder (`find`, `ls`). Bounded, so that a large repository costs a
+// short summary.
+//
+// Ports microPi packages/coding-agent/src/core/project-snapshot.ts.
+
+// maxListedFiles is how many files are listed one per line; above it, folders with their file counts.
 const (
-	maxSnapshotFiles = 150
-	maxSnapshotBytes = 6000
+	maxListedFiles   = 150
+	maxWalkedFiles   = 5_000
+	maxGitListBytes  = 16 * 1024 * 1024
+	gitListTimeout   = 2 * time.Second
+	snapshotMaxDepth = 6
 )
 
-var (
-	snapshotMu    sync.Mutex
-	snapshotCache = make(map[string]string)
-)
+var snapshotSkippedDirs = map[string]bool{
+	"node_modules": true,
+	"target":       true,
+	"build":        true,
+	"dist":         true,
+	"__pycache__":  true,
+	".venv":        true,
+	"venv":         true,
+	".git":         true,
+	"out":          true,
+}
 
-// BuildProjectSnapshot returns a compact <project> listing for cwd (cached per cwd),
-// or "" if PI_PROJECT_SNAPSHOT=off/0 or cwd is empty.
-func BuildProjectSnapshot(cwd string) string {
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("PI_PROJECT_SNAPSHOT"))); v == "off" || v == "0" || v == "false" {
-		return ""
+// listSnapshotFiles is git's list of tracked and unignored files where cwd holds a .git, else a walk past hidden and
+// build folders. ok is false when the walk reaches maxWalkedFiles.
+func listSnapshotFiles(cwd string) (files []string, ok bool) {
+	if _, err := os.Stat(filepath.Join(cwd, ".git")); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), gitListTimeout)
+		cmd := exec.CommandContext(ctx, "git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+		cmd.Dir = cwd
+		out, err := cmd.Output()
+		cancel()
+		if err == nil && len(out) <= maxGitListBytes {
+			for _, name := range strings.Split(string(out), "\x00") {
+				if name != "" {
+					files = append(files, name)
+				}
+			}
+			sort.Strings(files)
+			return files, true
+		}
 	}
-	if cwd == "" {
-		return ""
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if len(files) >= maxWalkedFiles || depth > snapshotMaxDepth {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		slices.SortFunc(entries, func(a, b os.DirEntry) int { return localecompare.Compare(a.Name(), b.Name()) })
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasPrefix(name, ".") || snapshotSkippedDirs[name] {
+				continue
+			}
+			path := filepath.Join(dir, name)
+			if entry.IsDir() {
+				walk(path, depth+1)
+			} else if entry.Type().IsRegular() {
+				if rel, err := filepath.Rel(cwd, path); err == nil {
+					files = append(files, filepath.ToSlash(rel))
+				}
+			}
+			if len(files) >= maxWalkedFiles {
+				return
+			}
+		}
 	}
-	abs, err := filepath.Abs(cwd)
+	walk(cwd, 0)
+	return files, len(files) < maxWalkedFiles
+}
+
+// summarizeSnapshot lists the top-level files and the folders with how many files each holds, two levels deep, for a
+// project too large to list.
+func summarizeSnapshot(files []string) string {
+	counts := map[string]int{}
+	var top []string
+	for _, file := range files {
+		parts := strings.Split(file, "/")
+		if len(parts) == 1 {
+			top = append(top, file)
+		}
+		for depth := 1; depth <= min(2, len(parts)-1); depth++ {
+			counts[strings.Join(parts[:depth], "/")+"/"]++
+		}
+	}
+	dirs := make([]string, 0, len(counts))
+	for dir := range counts {
+		dirs = append(dirs, dir)
+	}
+	slices.SortFunc(dirs, localecompare.Compare)
+	lines := slices.Clone(top[:min(40, len(top))])
+	for _, dir := range dirs[:min(80, len(dirs))] {
+		lines = append(lines, fmt.Sprintf("%s (%d files)", dir, counts[dir]))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TakeProjectSnapshot is the listing of cwd for the system prompt's project section, or "" for a folder that is no
+// project (the home folder, /) or cannot be listed. Callers take it once per session.
+func TakeProjectSnapshot(cwd string) string {
+	root, err := filepath.Abs(cwd)
 	if err != nil {
-		abs = cwd
-	}
-	snapshotMu.Lock()
-	if cached, ok := snapshotCache[abs]; ok {
-		snapshotMu.Unlock()
-		return cached
-	}
-	snapshotMu.Unlock()
-
-	snap := computeProjectSnapshot(abs)
-
-	snapshotMu.Lock()
-	if len(snapshotCache) > 64 {
-		clear(snapshotCache)
-	}
-	snapshotCache[abs] = snap
-	snapshotMu.Unlock()
-	return snap
-}
-
-func computeProjectSnapshot(cwd string) string {
-	if files, ok := walkSmallRepoFiles(cwd); ok && len(files) > 0 {
-		return joinCapped(files)
-	}
-	return summarizeDirs(cwd, 2)
-}
-
-func walkSmallRepoFiles(cwd string) ([]string, bool) {
-	var files []string
-	tooMany := false
-	var walk func(dir, rel string)
-	walk = func(dir, rel string) {
-		if tooMany {
-			return
-		}
-		des, err := os.ReadDir(dir)
-		if err != nil {
-			return
-		}
-		for _, de := range des {
-			if tooMany {
-				return
-			}
-			name := de.Name()
-			if name == ".git" || name == "node_modules" || name == ".work" || name == "target" || name == ".cache" {
-				continue
-			}
-			p := name
-			if rel != "" {
-				p = rel + "/" + name
-			}
-			if de.IsDir() {
-				walk(filepath.Join(dir, name), p)
-			} else {
-				files = append(files, p)
-				if len(files) > maxSnapshotFiles {
-					tooMany = true
-					return
-				}
-			}
-		}
-	}
-	walk(cwd, "")
-	if tooMany {
-		return nil, false
-	}
-	sort.Strings(files)
-	return files, true
-}
-
-func summarizeDirs(cwd string, maxDepth int) string {
-	var entries []string
-	var walk func(dir string, rel string, depth int)
-	walk = func(dir, rel string, depth int) {
-		if len(entries) >= maxSnapshotFiles {
-			return
-		}
-		des, err := os.ReadDir(dir)
-		if err != nil {
-			return
-		}
-		for _, de := range des {
-			if len(entries) >= maxSnapshotFiles {
-				return
-			}
-			name := de.Name()
-			if name == ".git" || name == "node_modules" || name == ".work" || name == "target" {
-				continue
-			}
-			p := name
-			if rel != "" {
-				p = rel + "/" + name
-			}
-			if de.IsDir() {
-				entries = append(entries, p+"/")
-				if depth < maxDepth {
-					walk(filepath.Join(dir, name), p, depth+1)
-				}
-			} else {
-				entries = append(entries, p)
-			}
-		}
-	}
-	walk(cwd, "", 1)
-	if len(entries) == 0 {
 		return ""
 	}
-	return joinCapped(entries)
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if absHome, err := filepath.Abs(home); err == nil && root == absHome {
+			return ""
+		}
+	}
+	if slash, err := filepath.Abs("/"); err == nil && root == slash {
+		return ""
+	}
+	files, ok := listSnapshotFiles(root)
+	if !ok || len(files) == 0 {
+		return ""
+	}
+	listing := strings.Join(files, "\n")
+	if len(files) > maxListedFiles {
+		listing = fmt.Sprintf("%d files; the folders, with how many files each holds:\n%s", len(files), summarizeSnapshot(files))
+	}
+	return "The files of the working folder when the session started:\n" + listing
 }
 
-func joinCapped(entries []string) string {
-	var b strings.Builder
-	for i, e := range entries {
-		if b.Len()+len(e)+1 > maxSnapshotBytes {
-			break
-		}
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString(e)
+var sessionSnapshots sync.Map // absolute cwd -> string
+
+// SessionProjectSnapshot is the session's project snapshot of cwd (agent-session.ts _getProjectSnapshot): taken once
+// and kept, "" in remote mode or with PI_PROJECT_SNAPSHOT=off.
+//
+// pig divergence: it is kept per process and working folder rather than per AgentSession object, so the CLI's
+// prompt build and its Session share one listing.
+func SessionProjectSnapshot(cwd string, remote bool) string {
+	if remote || os.Getenv("PI_PROJECT_SNAPSHOT") == "off" || cwd == "" {
+		return ""
 	}
-	return b.String()
+	key, err := filepath.Abs(cwd)
+	if err != nil {
+		key = cwd
+	}
+	if cached, ok := sessionSnapshots.Load(key); ok {
+		return cached.(string)
+	}
+	snapshot, _ := sessionSnapshots.LoadOrStore(key, TakeProjectSnapshot(key))
+	return snapshot.(string)
+}
+
+// ProjectSections is the `sections` option holding the project snapshot, as agent-session.ts passes
+// `sections: { project }`, or nil for an empty snapshot.
+func ProjectSections(project string) *ai.OrderedSections {
+	if project == "" {
+		return nil
+	}
+	return &ai.OrderedSections{{Name: "project", Value: new(project)}}
 }

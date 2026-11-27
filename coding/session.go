@@ -521,11 +521,9 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 	}
 	if opts.RemoteTarget == "" && os.Getenv("PI_REMOTE") == "" && svcs.CWD() != "" && !docsearch.IsDisabled() {
 		warmCWD := svcs.CWD()
-		go func() {
-			if docsearch.ShouldAutoEnable(warmCWD) {
-				_ = docsearch.SharedEngine(warmCWD)
-			}
-		}()
+		// µPi: the index builds at session start whenever there is something to index, also in a small project, where
+		// only auto-recall uses it (docsearch extension index.ts start).
+		go func() { _ = docsearch.OpenProject(warmCWD) }()
 	}
 	registry, allTools, err := createSessionToolRegistry(svcs, opts)
 	if err != nil {

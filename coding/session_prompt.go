@@ -13,6 +13,7 @@ import (
 	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/prompts"
 )
 
 // QueuedInputDisposition is how Steer and FollowUp dealt with their input: an input handler consumed it (`handled`) or it was queued (`queued`).
@@ -147,7 +148,7 @@ func (s *Session) loaderSystemPromptResources() *SystemPromptResources {
 // buildSystemPromptOptions mirrors _rebuildSystemPrompt (agent-session.ts:1371-1394): registry snippets and guidelines plus the resource-loader state. Without resources, a caller-supplied prompt is the custom prompt, as Pi's system prompt override is.
 func (s *Session) buildSystemPromptOptions(toolNames []string) *extension.BuildSystemPromptOptions {
 	snippets, guidelines := s.toolPromptMetadata()
-	options := &extension.BuildSystemPromptOptions{Cwd: s.CWD(), SelectedTools: append([]string{}, toolNames...), HiddenTools: s.HiddenDeclarationNames(), ToolSnippets: snippets, ToolGuidelines: guidelines}
+	options := &extension.BuildSystemPromptOptions{Cwd: s.CWD(), SelectedTools: append([]string{}, toolNames...), HiddenTools: s.HiddenDeclarationNames(), ToolSnippets: snippets, ToolGuidelines: guidelines, Sections: prompts.ProjectSections(s.projectSnapshot())}
 	if resources := s.effectiveSystemPromptResources(); resources != nil {
 		options.CustomPrompt = resources.CustomPrompt
 		options.CustomPromptSet = resources.CustomPromptSet

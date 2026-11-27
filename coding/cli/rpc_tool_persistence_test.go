@@ -13,7 +13,9 @@ func TestRPCToolDetailsPersistAndReplay(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cwd, "parity-read-target.txt"), []byte("READ-PROBE\nsecond line\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	env := []string{"HOME=" + home, "PIG_HOME=" + home, "PIG_CODING_AGENT_DIR=" + filepath.Join(home, "agent"), "PIG_TEST_FAUX=1"}
+	// µPi: docsearch auto-recall would add parity-read-target.txt, which the prompt names, as a doc section after the
+	// prompt; the faux provider answers the prompt only when it is the last message, so recall is off here.
+	env := []string{"HOME=" + home, "PIG_HOME=" + home, "PIG_CODING_AGENT_DIR=" + filepath.Join(home, "agent"), "PIG_TEST_FAUX=1", "PI_DOCSEARCH=off"}
 	args := []string{"--offline", "--no-extensions", "--no-context-files", "--no-skills", "--system-prompt", "Test", "--model", "test-faux/faux-1"}
 	f := &upstreamRPC{p: startRPCProcessAt(t, cwd, env, args...), agentDir: filepath.Join(home, "agent")}
 	f.prompt("Run: read parity-read-target.txt")

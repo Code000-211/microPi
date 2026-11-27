@@ -152,7 +152,7 @@ func normalizePromptGuidelines(guidelines []string) []string {
 // buildToolSystemPromptSections uses executable definitions' prompt metadata, including extension overrides.
 func (s *Session) buildToolSystemPromptSections(names []string) ai.OrderedSections {
 	hints, guidelines := s.toolPromptMetadata()
-	options := prompts.Options{Cwd: s.services.CWD(), Tools: names, HiddenTools: s.HiddenDeclarationNames(), ToolHints: hints, ToolGuidelines: guidelines}
+	options := prompts.Options{Cwd: s.services.CWD(), Tools: names, HiddenTools: s.HiddenDeclarationNames(), ToolHints: hints, ToolGuidelines: guidelines, Project: s.projectSnapshot()}
 	var resources *SystemPromptResources
 	if s.systemPromptResources.Load() == nil {
 		resources = s.loaderSystemPromptResources()

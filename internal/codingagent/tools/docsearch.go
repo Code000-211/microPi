@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
+	"slices"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
@@ -15,32 +15,11 @@ import (
 type ProjectSearchToolOptions struct{}
 
 // ProjectSearchTool implements the `project_search` built-in tool backed by internal/docsearch.
+//
+// µPi: ports microPi packages/docsearch/extension/index.ts (registerTool "project_search").
 type ProjectSearchTool struct {
 	CWD string
 }
-
-type projectSearchParams struct {
-	Query string `json:"query"`
-	K     int    `json:"k,omitempty"`
-	Path  string `json:"path,omitempty"`
-}
-
-const projectSearchParamsRaw = `{"type":"object","required":["query"],"properties":{
-	"query":{"type":"string","description":"Search query (identifiers, function/type names, or keywords)"},
-	"k":{"type":"integer","minimum":1,"maximum":20,"description":"Maximum number of sections to return (default: 6)"},
-	"path":{"type":"string","description":"Optional path prefix filter relative to project root"}
-}}`
-
-var projectSearchOutputSchema = json.RawMessage(`{"type":"object","properties":{
-	"hits":{"type":"array","items":{"type":"object","properties":{
-		"path":{"type":"string"},
-		"lineStart":{"type":"integer"},
-		"lineEnd":{"type":"integer"},
-		"heading":{"type":"string"},
-		"text":{"type":"string"},
-		"truncated":{"type":"boolean"}
-	}}}
-}}`)
 
 func (t *ProjectSearchTool) Name() string  { return "project_search" }
 func (t *ProjectSearchTool) Label() string { return "Project search" }
@@ -55,23 +34,18 @@ func (t *ProjectSearchTool) BorrowedSchema() ai.ToolSchema { return t.schema(tru
 
 func (t *ProjectSearchTool) schema(borrow bool) ai.ToolSchema {
 	return toolSchemaWithParameters(ai.ToolSchema{
-		Name:        "project_search",
-		Description: "Search this project's code and documentation and the configured doc folders. Returns the best-matching sections with path and line range: a doc section under its headings, or a whole function, class or struct under its name. A query naming a function or type returns its definition first. Ranks by terms and by the names the query mentions (identifiers, file names, flags, products). ~1 ms.",
-		PromptGuidelines: []string{
-			"Use project_search before grep/find/read when looking up function/type definitions or documentation sections.",
-			"Include exact identifiers, file names, flags, or type names in the query.",
-			"Use grep for exact-text or call-site searches.",
-			"Batch independent project_search calls in parallel.",
-		},
-	}, projectSearchParamsRaw, borrow)
+		Name:             "project_search",
+		Description:      docsearch.ToolDescription,
+		PromptGuidelines: slices.Clone(docsearch.ToolPromptGuidelines),
+	}, docsearch.ToolParameters, borrow)
 }
 
 func (t *ProjectSearchTool) OutputSchema() json.RawMessage {
-	return projectSearchOutputSchema
+	return json.RawMessage(docsearch.ToolOutputSchema)
 }
 
 func (t *ProjectSearchTool) Execute(ctx context.Context, _ string, rawParams json.RawMessage, _ agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
-	var p projectSearchParams
+	var p docsearch.ToolParams
 	if err := json.Unmarshal(rawParams, &p); err != nil {
 		return agent.AgentToolResult{}, fmt.Errorf("project_search: invalid params: %w", err)
 	}
@@ -87,35 +61,5 @@ func (t *ProjectSearchTool) Execute(ctx context.Context, _ string, rawParams jso
 	if err != nil {
 		return agent.AgentToolResult{}, err
 	}
-	k := p.K
-	if k <= 0 {
-		k = docsearch.LoadSettings().Results
-		if k <= 0 || k > 20 {
-			k = 6
-		}
-	}
-	if k > 20 {
-		k = 20
-	}
-	eng := docsearch.SharedEngine(cwd)
-	res, ready := eng.Search(ctx, p.Query, docsearch.SearchOpts{
-		K:          k,
-		PathPrefix: p.Path,
-	}, 5*time.Second)
-	if !ready {
-		return agent.AgentToolResult{
-			Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "project_search: index is still building; try again shortly."}},
-		}, nil
-	}
-	text := docsearch.FormatToolResult(p.Query, res)
-	structured, _ := json.Marshal(map[string]any{"hits": res.Hits})
-	return agent.AgentToolResult{
-		Content:           []ai.ToolResultMessageContent{ai.TextContent{Text: text}},
-		StructuredContent: structured,
-		Details: map[string]any{
-			"count":    len(res.Hits),
-			"micros":   res.Micros,
-			"entities": res.Entities,
-		},
-	}, nil
+	return docsearch.ExecuteTool(ctx, cwd, p)
 }

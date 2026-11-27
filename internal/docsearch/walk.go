@@ -2,12 +2,16 @@ package docsearch
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/MichaelKinsy/PiG/internal/ignorerules"
 )
@@ -69,66 +73,80 @@ func ResolveRoot(cwd string) string {
 	return root
 }
 
-// CountFiles counts regular non-ignored files under root up to limit+1 using pure Go.
+// CountFiles is index.ts countFiles: the project's files, counted up to limit+1 — git's list where root holds a .git
+// (`git ls-files --cached --others --exclude-standard`, all of it), else a walk past hidden folders and files,
+// node_modules and target, six folders deep.
 func CountFiles(root string, limit int) int {
 	if root == "" || limit < 0 {
 		return 0
 	}
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return 0
+	if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		cmd := exec.CommandContext(ctx, "git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+		cmd.Dir = root
+		out, err := cmd.Output()
+		cancel()
+		if err == nil && len(out) <= 64*1024*1024 {
+			count := 0
+			for _, name := range bytes.Split(out, []byte{0}) {
+				if len(name) > 0 {
+					count++
+				}
+			}
+			return count
+		}
 	}
 	count := 0
-	stopErr := fs.ErrPermission // sentinel to stop WalkDir early
-	rulesByDir := make(map[string][]ignorerules.Rule)
-
-	_ = filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			if d != nil && d.IsDir() {
-				return filepath.SkipDir
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if count > limit || depth > 6 {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if count > limit {
+				return
 			}
-			return nil
-		}
-		name := d.Name()
-		if d.IsDir() {
-			if p != absRoot {
-				if _, skip := skippedDirs[name]; skip {
-					return filepath.SkipDir
-				}
-				if strings.HasPrefix(name, ".") {
-					return filepath.SkipDir
-				}
-				parent := filepath.Dir(p)
-				if ignorerules.Ignored(p, true, absRoot, rulesByDir[parent]) {
-					return filepath.SkipDir
-				}
+			name := entry.Name()
+			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "target" {
+				continue
 			}
-			parentRules := rulesByDir[filepath.Dir(p)]
-			rules := make([]ignorerules.Rule, len(parentRules))
-			copy(rules, parentRules)
-			rules = ignorerules.Append(rules, p, absRoot)
-			rulesByDir[p] = rules
-			return nil
+			if entry.IsDir() {
+				walk(filepath.Join(dir, name), depth+1)
+			} else if entry.Type().IsRegular() {
+				count++
+			}
 		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		parent := filepath.Dir(p)
-		if ignorerules.Ignored(p, false, absRoot, rulesByDir[parent]) {
-			return nil
-		}
-		count++
-		if count > limit {
-			return stopErr
-		}
-		return nil
-	})
+	}
+	walk(root, 0)
 	return count
 }
 
 // Scan walks roots in pure Go, respecting .gitignore/.ignore rules and skipping
 // .git, node_modules, target, oversized files, and binary files.
 func Scan(roots []string, maxFileBytes int64, maxFiles int) ([]FileMeta, error) {
+	return ScanExtensions(roots, nil, maxFileBytes, maxFiles)
+}
+
+// normalizeExtensions lowercases the extensions and drops a leading dot (node/src/lib.rs DocIndex::new); nil stays nil.
+func normalizeExtensions(extensions []string) []string {
+	if extensions == nil {
+		return nil
+	}
+	out := make([]string, len(extensions))
+	for i, ext := range extensions {
+		out[i] = strings.ToLower(strings.TrimLeft(ext, "."))
+	}
+	return out
+}
+
+// ScanExtensions is Scan for the files with one of these extensions. With extensions given it lists the files as the
+// docsearch addon's scan does (index.rs scan, the ignore crate's walk): hidden files and folders and empty files are
+// left out too. Nil extensions take every text file.
+func ScanExtensions(roots, extensions []string, maxFileBytes int64, maxFiles int) ([]FileMeta, error) {
 	if maxFileBytes <= 0 {
 		maxFileBytes = DefaultMaxFileBytes
 	}
@@ -165,9 +183,10 @@ func Scan(roots []string, maxFileBytes int64, maxFiles int) ([]FileMeta, error) 
 				return fs.SkipAll
 			}
 			name := d.Name()
+			hidden := extensions != nil && p != absRoot && strings.HasPrefix(name, ".")
 			if d.IsDir() {
 				if p != absRoot {
-					if _, skip := skippedDirs[name]; skip {
+					if _, skip := skippedDirs[name]; skip || hidden {
 						return filepath.SkipDir
 					}
 					parent := filepath.Dir(p)
@@ -182,8 +201,14 @@ func Scan(roots []string, maxFileBytes int64, maxFiles int) ([]FileMeta, error) 
 				rulesByDir[p] = rules
 				return nil
 			}
-			if !d.Type().IsRegular() {
+			if !d.Type().IsRegular() || hidden {
 				return nil
+			}
+			if extensions != nil {
+				ext := filepath.Ext(name)
+				if ext == "" || !slices.Contains(extensions, strings.ToLower(ext[1:])) {
+					return nil
+				}
 			}
 			parent := filepath.Dir(p)
 			if ignorerules.Ignored(p, false, absRoot, rulesByDir[parent]) {
@@ -193,7 +218,7 @@ func Scan(roots []string, maxFileBytes int64, maxFiles int) ([]FileMeta, error) 
 				return nil
 			}
 			fi, err := d.Info()
-			if err != nil || fi.Size() > maxFileBytes {
+			if err != nil || fi.Size() > maxFileBytes || (extensions != nil && fi.Size() == 0) {
 				return nil
 			}
 			rel, err := filepath.Rel(absRoot, p)

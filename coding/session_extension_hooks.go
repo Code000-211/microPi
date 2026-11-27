@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
@@ -100,7 +101,28 @@ func (s *Session) toolCallHook(ctx context.Context, toolCallID, parentToolCallID
 
 // extensionToolResultHook emits tool_result and applies the chained override.
 func (s *Session) extensionToolResultHook(ctx context.Context, toolCallID, toolName string, args json.RawMessage, result agent.AgentToolResult) agent.AfterToolCallResult {
-	return s.toolResultHook(ctx, toolCallID, "", toolName, args, result)
+	override := s.toolResultHook(ctx, toolCallID, "", toolName, args, result)
+	if toolName != "bash" {
+		return override
+	}
+	// µPi: the docsearch definition hint (packages/docsearch/extension/index.ts tool_result), after the extensions' handlers.
+	content := result.Content
+	if override.Content != nil {
+		content = override.Content
+	}
+	texts := make([]string, len(content))
+	for i, block := range content {
+		if text, ok := block.(ai.TextContent); ok {
+			texts[i] = text.Text
+		}
+	}
+	if hint, ok := icodingagent.DocsearchDefinitionHint(ctx, s.CWD(), toolName, args, texts); ok {
+		override.Content = append(slices.Clone(content), ai.TextContent{Text: hint})
+		if override.StructuredContent == nil {
+			override.StructuredContent = result.StructuredContent
+		}
+	}
+	return override
 }
 
 // toolResultHook is [Session.extensionToolResultHook] for a call another tool made; see [Session.toolCallHook].

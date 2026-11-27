@@ -49,8 +49,10 @@ var readOnlyRefusedOptions = map[string]func(arg string) bool{
 	"sort": func(a string) bool {
 		return a == "-o" || strings.HasPrefix(a, "--output") || sortOutputShort.MatchString(a) || strings.HasPrefix(a, "--compress-program")
 	},
-	// date -s and --set set the clock.
-	"date": func(a string) bool { return a == "-s" || strings.HasPrefix(a, "--set") || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "s")) },
+	// date -s (also in a group of short options, -us) and --set set the clock.
+	"date": func(a string) bool {
+		return strings.HasPrefix(a, "--set") || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "s"))
+	},
 	// file -C compiles a magic file.
 	"file": func(a string) bool { return a == "-C" || a == "--compile" },
 	"tree": func(a string) bool { return a == "-o" },

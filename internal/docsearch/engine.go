@@ -362,20 +362,13 @@ func (e *Engine) MaybeRefresh() {
 	// The view is retained while the check reads its base: a rebuild that replaces it meanwhile must not unmap it underneath.
 	v := e.acquireView()
 	defer v.release()
-	e.mu.RLock()
-	lastCheck := e.lastCheck
-	lastChange := e.lastChange
-	notified := e.notified
-	e.mu.RUnlock()
-
-	if v == nil || v.Base == nil {
+	if v == nil || v.Base == nil || !e.checkDue() {
 		return
 	}
-	throttle := e.refreshThrottle()
 	now := time.Now()
-	if !notified && now.Sub(lastCheck) < throttle {
-		return
-	}
+	e.mu.RLock()
+	lastChange := e.lastChange
+	e.mu.RUnlock()
 
 	e.mu.Lock()
 	e.lastCheck = now
@@ -448,6 +441,15 @@ func diffSignature(changed []FileMeta, deleted []string) string {
 	return strings.Join(parts, "\x01")
 }
 
+// checkDue reports whether a change check is due: a file was reported changed (NotifyFileChanged), or the throttle has passed since the
+// last check.
+func (e *Engine) checkDue() bool {
+	e.mu.RLock()
+	lastCheck, notified := e.lastCheck, e.notified
+	e.mu.RUnlock()
+	return notified || time.Since(lastCheck) >= e.refreshThrottle()
+}
+
 // refreshThrottle is how long a change check waits after the last one: checkEvery, or five times the last check's walk when that is
 // longer, so checking a large tree takes at most about a fifth of a CPU while the agent searches.
 func (e *Engine) refreshThrottle() time.Duration {
@@ -459,16 +461,7 @@ func (e *Engine) MaybeRefreshAsync() {
 	if e.closed.Load() {
 		return
 	}
-	e.mu.RLock()
-	v := e.view
-	lastCheck := e.lastCheck
-	notified := e.notified
-	e.mu.RUnlock()
-	if v == nil || v.Base == nil {
-		return
-	}
-	throttle := e.refreshThrottle()
-	if !notified && time.Since(lastCheck) < throttle {
+	if v := e.CurrentView(); v == nil || v.Base == nil || !e.checkDue() {
 		return
 	}
 	if !e.refreshing.CompareAndSwap(false, true) {

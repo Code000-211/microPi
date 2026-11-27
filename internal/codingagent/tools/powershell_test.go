@@ -64,9 +64,8 @@ func TestPowerShellToolSchema(t *testing.T) {
 	if tool.Name() != "powershell" || s.Name != "powershell" {
 		t.Fatalf("name = %q/%q, want powershell", tool.Name(), s.Name)
 	}
-	const wantDescription = "Execute a PowerShell command in the current working directory. Returns stdout and stderr. " +
-		"Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. " +
-		"Optionally provide a timeout in seconds."
+	// µPi: microPi's shell tool description (createShellToolDefinition), shared by bash and PowerShell.
+	const wantDescription = "Execute a PowerShell command in the current working directory. Returns stdout and stderr; long output keeps its first 40 lines and its end, the full output is saved to a file. Optional timeout in seconds."
 	if s.Description != wantDescription {
 		t.Errorf("description = %q\nwant %q", s.Description, wantDescription)
 	}

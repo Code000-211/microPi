@@ -102,6 +102,10 @@ func TestRegisteredToolPromptContributions(t *testing.T) {
 					}
 				}
 				wantTools = "<tools>\n" + wantTools + "\n\nAdditional tools may be available.\n</tools>"
+				// µPi: microPi's ordered-calls rule, there when tools are.
+				if len(session.ActiveToolNames()) > 0 {
+					wantRules += "- Put calls that need no answer in between into one response: they run in order, so all edits for a fix and the command that tests them go together\n"
+				}
 				wantRules = "<rules>\n" + wantRules + "- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>"
 				if sections["tools"] != wantTools || sections["rules"] != wantRules {
 					t.Fatalf("tools:\n%s\nrules:\n%s\nwant:\n%s\n%s", sections["tools"], sections["rules"], wantTools, wantRules)

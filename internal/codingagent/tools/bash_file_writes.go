@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 	"unicode"
 
 	"github.com/MichaelKinsy/PiG/internal/codingagent/filetracking"
@@ -393,57 +392,54 @@ func FilesShownByCat(command string) (string, []string) {
 	return dir, files
 }
 
-// FileWriteRefusal formats a refusal message when bash file writes are disallowed (e.g. on /remote).
+// FileWriteRefusal is microPi's fileWriteRefusal (bash.ts): why a command that changes files as the edit and write
+// tools would was not run (on a remote machine, where what changed is not known here), and what to do instead.
 func FileWriteRefusal(writes []FileWrite) string {
-	if len(writes) == 0 {
-		return ""
+	what := make([]string, len(writes))
+	for i, w := range writes {
+		what[i] = fmt.Sprintf("%s (%s)", w.Target, w.How)
 	}
-	w := writes[0]
-	target := UnderDir(w.Dir, w.Target)
-	return fmt.Sprintf("Use the edit or write tool instead of %s to modify %s.", w.How, target)
+	return "Not run: the command changes " + strings.Join(what, ", ") + ". Change files with edit (exact replacements: it checks that the file was read and did not change since, and reports the compiler's new errors) or write (whole files). " +
+		"Appending (`>>`), files under /tmp, and a program's output redirected into a file run."
 }
 
-// FileSnapshot captures the pre-command state of a local file targeted by a bash command.
+// FileSnapshot is an existing file a bash command changes as edit and write would, with its content before the
+// command ran (microPi's WatchedFile).
 type FileSnapshot struct {
 	AbsolutePath string
-	Target       string
-	Existed      bool
-	Content      string
+	// Target is the file as the command names it.
+	Target string
+	// Content is "" when the file could not be read.
+	Content string
 }
 
-// WatchedFileChange describes a file modified by a bash command.
+// WatchedFileChange is a watched file the command changed, with the first and last line (1-based) that changed.
 type WatchedFileChange struct {
 	AbsolutePath string
 	Target       string
-	Created      bool
 	StartLine    int
 	EndLine      int
 }
 
-// WatchFiles snapshots the local targets of FileWritesInCommand before a bash command runs.
+// WatchFiles is microPi's watchFiles: the existing files of writes, with their content before the command ran. Only
+// files that exist: a new file has no compiler errors to compare.
 func WatchFiles(cwd string, writes []FileWrite) []FileSnapshot {
-	if len(writes) == 0 {
-		return nil
-	}
 	seen := make(map[string]struct{}, len(writes))
 	var snapshots []FileSnapshot
 	for _, w := range writes {
-		rel := UnderDir(w.Dir, w.Target)
-		abs, err := resolveToCwd(rel, cwd)
+		abs, err := resolveToCwd(UnderDir(w.Dir, w.Target), cwd)
 		if err != nil {
 			continue
 		}
 		if _, ok := seen[abs]; ok {
 			continue
 		}
-		seen[abs] = struct{}{}
-
-		snap := FileSnapshot{
-			AbsolutePath: abs,
-			Target:       w.Target,
+		if _, err := os.Stat(abs); err != nil {
+			continue
 		}
+		seen[abs] = struct{}{}
+		snap := FileSnapshot{AbsolutePath: abs, Target: w.Target}
 		if data, err := os.ReadFile(abs); err == nil {
-			snap.Existed = true
 			snap.Content = string(data)
 		}
 		snapshots = append(snapshots, snap)
@@ -451,8 +447,8 @@ func WatchFiles(cwd string, writes []FileWrite) []FileSnapshot {
 	return snapshots
 }
 
-// CheckChangedFiles compares post-command disk contents against snapshots, notifies tracker
-// (if non-nil), and returns the list of changed or created files with 1-indexed changed line ranges.
+// CheckChangedFiles is microPi's checkChangedFiles: for each watched file the command changed, the lines that changed.
+// The file tracker takes the new content as read (an edit after it needs no read). Empty when nothing changed.
 func CheckChangedFiles(snapshots []FileSnapshot, tracker *filetracking.Tracker) []WatchedFileChange {
 	var changes []WatchedFileChange
 	for _, snap := range snapshots {
@@ -461,51 +457,56 @@ func CheckChangedFiles(snapshots []FileSnapshot, tracker *filetracking.Tracker) 
 			continue
 		}
 		newContent := string(data)
-		if snap.Existed && newContent == snap.Content {
+		if newContent == snap.Content {
 			continue
 		}
-		startLine, endLine := diffLineRange(snap.Content, newContent)
-		changes = append(changes, WatchedFileChange{
-			AbsolutePath: snap.AbsolutePath,
-			Target:       snap.Target,
-			Created:      !snap.Existed,
-			StartLine:    startLine,
-			EndLine:      endLine,
-		})
-		if tracker != nil {
-			mtimeMs := float64(time.Now().UnixMilli())
-			if info, statErr := os.Stat(snap.AbsolutePath); statErr == nil {
-				mtimeMs = float64(info.ModTime().UnixNano()) / 1e6
-			}
-			tracker.OnFileModified(filetracking.FileModifiedParams{
-				AbsolutePath:     snap.AbsolutePath,
-				NewContent:       newContent,
-				NewMtimeMs:       mtimeMs,
-				FirstChangedLine: startLine,
-			})
+		startLine, endLine := changedLineRange(snap.Content, newContent)
+		changes = append(changes, WatchedFileChange{AbsolutePath: snap.AbsolutePath, Target: snap.Target, StartLine: startLine, EndLine: endLine})
+		if tracker == nil {
+			continue
 		}
+		info, statErr := os.Stat(snap.AbsolutePath)
+		if statErr != nil {
+			continue
+		}
+		tracker.OnFileModified(filetracking.FileModifiedParams{
+			AbsolutePath:     snap.AbsolutePath,
+			NewContent:       newContent,
+			NewMtimeMs:       float64(info.ModTime().UnixNano()) / 1e6,
+			FirstChangedLine: startLine,
+		})
 	}
 	return changes
 }
 
-func diffLineRange(oldText, newText string) (int, int) {
-	oldLines := strings.Split(normalizeToLF(oldText), "\n")
-	newLines := strings.Split(normalizeToLF(newText), "\n")
-	prefix := 0
-	for prefix < len(oldLines) && prefix < len(newLines) && oldLines[prefix] == newLines[prefix] {
-		prefix++
+// FormatChangedFiles is the report microPi's checkChangedFiles returns, appended to the command's result:
+// "\n\nX changed at line N." or "\n\nX changed in lines A-B." per file.
+func FormatChangedFiles(changes []WatchedFileChange) string {
+	var b strings.Builder
+	for _, ch := range changes {
+		if ch.StartLine == ch.EndLine {
+			fmt.Fprintf(&b, "\n\n%s changed at line %d.", ch.Target, ch.StartLine)
+		} else {
+			fmt.Fprintf(&b, "\n\n%s changed in lines %d-%d.", ch.Target, ch.StartLine, ch.EndLine)
+		}
 	}
-	if prefix == len(oldLines) && prefix == len(newLines) {
-		return 1, 1
+	return b.String()
+}
+
+// changedLineRange is microPi's changedLineRange: the first and last line (1-based) where after differs from before.
+func changedLineRange(before, after string) (int, int) {
+	a := strings.Split(before, "\n")
+	b := strings.Split(after, "\n")
+	start := 0
+	for start < len(a) && start < len(b) && a[start] == b[start] {
+		start++
 	}
-	suffix := 0
-	for suffix < len(oldLines)-prefix && suffix < len(newLines)-prefix &&
-		oldLines[len(oldLines)-1-suffix] == newLines[len(newLines)-1-suffix] {
-		suffix++
+	endA, endB := len(a)-1, len(b)-1
+	for endA > start && endB > start && a[endA] == b[endB] {
+		endA--
+		endB--
 	}
-	startLine := prefix + 1
-	endLine := max(startLine, len(newLines)-suffix)
-	return startLine, endLine
+	return start + 1, max(start+1, endB+1)
 }
 
 // Ensure filepath is referenced if needed by callers.

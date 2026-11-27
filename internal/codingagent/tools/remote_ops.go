@@ -141,6 +141,10 @@ type RemoteBashOperations struct {
 // Exec executes command remotely if Remote.Active(), else locally via Local.
 func (o *RemoteBashOperations) Exec(ctx context.Context, command, cwd string, opts BashOperationsExecOptions) (BashOperationsResult, error) {
 	if o.Remote != nil && o.Remote.Active() {
+		// µPi: the ssh process's id is not known here: a command that goes on in the background gets no stop hint.
+		if opts.OnSpawn != nil {
+			opts.OnSpawn(0)
+		}
 		code, err := o.Remote.Exec(ctx, command, nil, opts.OnData)
 		if err != nil {
 			if ctx.Err() != nil {

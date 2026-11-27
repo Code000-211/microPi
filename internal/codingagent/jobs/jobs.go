@@ -4,6 +4,8 @@ package jobs
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -445,14 +447,15 @@ func (m *Manager) Subscribe(fn func(Event)) func() {
 	}
 }
 
+// formatSeconds mirrors microPi's seconds() (background-jobs.ts): tenths of a second as JavaScript prints them
+// ("12 s", "1.5 s"); from a minute on, whole minutes and the seconds rounded ("2 min 5 s").
 func formatSeconds(d time.Duration) string {
-	s := float64(d.Round(100*time.Millisecond)) / float64(time.Second)
+	s := math.Round(float64(d)/float64(100*time.Millisecond)) / 10
 	if s < 60 {
-		return fmt.Sprintf("%.1f s", s)
+		return strconv.FormatFloat(s, 'f', -1, 64) + " s"
 	}
-	m := int(s) / 60
-	rem := int(s) - m*60
-	return fmt.Sprintf("%d min %d s", m, rem)
+	m := math.Floor(s / 60)
+	return fmt.Sprintf("%d min %d s", int(m), int(math.Round(s-m*60)))
 }
 
 func describeEnd(job Job) string {

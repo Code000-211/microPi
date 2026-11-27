@@ -38,64 +38,51 @@ func docsSections(root, readme, examples string) []section {
 
 // docsTopic is one subject the docs section names, with the strip entry that owns it, if any.
 type docsTopic struct {
-	text       string
-	list, id   string
-	headerWord bool
+	text     string
+	list, id string
 }
 
-// docsTopics are the docs section's "When asked about" topics in upstream order. The header names the ones marked
-// headerWord beside the harness itself, its SDK and TUI.
+// docsTopics are the docs section's topics in microPi's order (system-prompt.ts).
 var docsTopics = []docsTopic{
-	{text: "extensions (docs/extensions.md, examples/extensions/)", headerWord: true},
-	{text: "themes (docs/themes.md)", list: pigstrip.ListFeatures, id: pigstrip.Themes, headerWord: true},
-	{text: "skills (docs/skills.md)", list: pigstrip.ListFeatures, id: pigstrip.Skills, headerWord: true},
-	{text: "prompt templates (docs/prompt-templates.md)", list: pigstrip.ListFeatures, id: pigstrip.PromptTemplates},
-	{text: "TUI components (docs/tui.md)"},
-	{text: "keybindings (docs/keybindings.md)"},
-	{text: "SDK integrations (docs/sdk.md)"},
-	{text: "custom providers (docs/custom-provider.md)"},
-	{text: "adding models (docs/models.md)"},
-	{text: "packages (docs/packages.md)"},
-	{text: "environment variables (docs/environment-variables.md)"},
-	{text: "MCP servers (docs/mcp.md)", list: pigstrip.ListExtensions, id: "mcp"},
-	{text: "codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)", list: pigstrip.ListExtensions, id: "codemode"},
+	{text: "extensions"},
+	{text: "SDK"},
+	{text: "themes", list: pigstrip.ListFeatures, id: pigstrip.Themes},
+	{text: "skills", list: pigstrip.ListFeatures, id: pigstrip.Skills},
+	{text: "TUI"},
+	{text: "models"},
+	{text: "packages"},
+	{text: "MCP", list: pigstrip.ListExtensions, id: "mcp"},
 }
 
 // pigletTopic is the topic a Piglet adds. Like every topic it goes with the docs section: the `docs` feature owns it, so
 // stripping the `/piglet` command, which is only the inspection UI, does not remove the Piglet docs.
 // pig additive (D23, D92): Pi has no Piglets.
-var pigletTopic = docsTopic{text: "Piglets and their tool scope (docs/piglets.md, docs/piglet-strip.md)"}
+var pigletTopic = docsTopic{text: "Piglets"}
 
-// docsSectionAt points the model at PiG's documentation in upstream's format, with the README and examples locations given; an
-// empty readme is README.md inside root and empty examples is [PigExamplesLocation].
+// docsSectionAt is microPi's docs section: short, since every request carries it and it matters only for questions
+// about pi itself. An empty readme is README.md inside root. µPi: the examples are named only when they are a local
+// folder: PiG publishes its examples in its repository, and the section points only at the bundled documentation.
 // pig additive (D92): a topic the process strips is not named.
 func docsSectionAt(root, readme, examples string) string {
 	if readme == "" {
 		readme = filepath.Join(root, "README.md")
 	}
-	if examples == "" {
-		examples = PigExamplesLocation
-	}
-	var topics, header []string
 	all := docsTopics
 	if pigletDocsTopic.Load() {
 		all = append(slices.Clone(docsTopics), pigletTopic)
 	}
+	var topics []string
 	for _, topic := range all {
 		if topic.list != "" && pigstrip.Has(topic.list, topic.id) {
 			continue
 		}
 		topics = append(topics, topic.text)
-		if topic.headerWord {
-			header = append(header, strings.Fields(topic.text)[0])
-		}
 	}
-	// pig additive (D22): the docs section points at the materialized PiG documentation bundle.
-	return "PiG documentation (read only when the user asks about the harness itself, its SDK, " + strings.Join(header, ", ") + ", or TUI):\n" +
-		"- Main documentation: " + readme + "\n" +
-		"- Additional docs: " + root + "\n" +
-		"- Examples: " + examples + " (extensions, custom tools, SDK)\n" +
-		"- When reading pig docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n" +
-		"- When asked about: " + strings.Join(topics, ", ") + "\n" +
-		"- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references."
+	read := "read " + readme + " and the docs in " + root
+	paths := "docs/... paths are under that folder"
+	if examples != "" && !strings.Contains(examples, "://") {
+		read = "read " + readme + ", the docs in " + root + " and the examples in " + examples
+		paths = "docs/... and examples/... paths are under those folders"
+	}
+	return "Only for questions about pi itself (" + strings.Join(topics, ", ") + "): " + read + ", following their links; " + paths + ", not the working folder."
 }

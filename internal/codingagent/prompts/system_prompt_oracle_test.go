@@ -217,6 +217,10 @@ func comparableEntries(entries [][2]string, customPreamble bool) [][2]string {
 		if entry[0] == "docs" || (entry[0] == "preamble" && !customPreamble) {
 			continue
 		}
+		// µPi: microPi's ordered-calls rule, which Pi's rules do not have.
+		if entry[0] == "rules" {
+			entry[1] = strings.Replace(entry[1], "\n- "+orderedCallsRule, "", 1)
+		}
 		out = append(out, entry)
 	}
 	return out

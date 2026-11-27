@@ -172,7 +172,8 @@ func TestDefaultToolGuidelines(t *testing.T) {
 		}
 	}
 	// bash carries upstream's single PI_* session guideline.
-	if g := m["bash"]; len(g) != 1 || g[0] != sessionGuideline {
+	// µPi: bash carries the PI_* session guideline and microPi's background guideline.
+	if g := m["bash"]; len(g) != 2 || g[0] != sessionGuideline || g[1] != bashBackgroundGuideline {
 		t.Errorf("bash guidelines = %q, want upstream's session guideline", g)
 	}
 	// grep, find, ls define none upstream.

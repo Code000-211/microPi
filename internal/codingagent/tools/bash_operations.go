@@ -194,6 +194,9 @@ func (o *LocalShellOperations) Exec(ctx context.Context, command, cwd string, op
 	}
 	defer releaseProcessGroup(cmd.Process)
 	defer UntrackDetachedChild(cmd.Process)
+	if opts.OnSpawn != nil {
+		opts.OnSpawn(cmd.Process.Pid)
+	}
 	// os/exec copies a reader to the child's stdin the same way, and Wait
 	// waits for that copy.
 	var input sync.WaitGroup

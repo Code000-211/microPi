@@ -442,7 +442,8 @@ func TestT1_F06_SedInPlaceSingleFileTracked(t *testing.T) {
 
 	req, _ := env.MockLLM.LastRequest()
 	results := strings.Join(toolResultMessages(req), "\n")
-	assertContains(t, results, "mode=prod", "bash file-write guard reports changed lines")
+	// µPi: microPi's checkChangedFiles report names the changed lines.
+	assertContains(t, results, "cfg.txt changed at line 1.", "bash file-write guard reports changed lines")
 }
 
 func TestT1_F06_PerlInPlaceSingleFileTracked(t *testing.T) {

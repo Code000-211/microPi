@@ -25,7 +25,8 @@ func TestBashToolDefinitionCarriesItsSystemPromptContribution(t *testing.T) {
 	if definition.Name != "bash" || definition.PromptSnippet != "Execute bash commands (ls, grep, find, etc.)" {
 		t.Fatalf("name %q, prompt snippet %q", definition.Name, definition.PromptSnippet)
 	}
-	if want := []string{"You can inspect PI_* environment variables for current model and session details."}; !slices.Equal(definition.PromptGuidelines, want) {
+	// µPi: microPi's second bash guideline (bashToolSystemPromptContribution).
+	if want := []string{"You can inspect PI_* environment variables for current model and session details.", bashBackgroundGuideline}; !slices.Equal(definition.PromptGuidelines, want) {
 		t.Fatalf("prompt guidelines %v, want %v", definition.PromptGuidelines, want)
 	}
 	if len(definition.OutputSchema) == 0 {

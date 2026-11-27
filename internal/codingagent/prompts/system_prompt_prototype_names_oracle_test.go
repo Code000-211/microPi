@@ -55,7 +55,8 @@ emit(input.map((options) => {
 				continue
 			}
 			for line := range strings.SplitSeq(*section.Value, "\n") {
-				if strings.HasPrefix(line, "- ") && len(lines) < 3 {
+				// µPi: microPi's ordered-calls rule, which Pi's rules do not have, is left out.
+				if strings.HasPrefix(line, "- ") && line != "- "+orderedCallsRule && len(lines) < 3 {
 					lines = append(lines, line)
 				}
 			}

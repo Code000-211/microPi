@@ -231,12 +231,44 @@ func TestChallenger2_ContentCacheCapsAndBinaryAndPieceStreaming(t *testing.T) {
 	if strings.Contains(txt, "bin_small.dat") {
 		t.Fatalf("binary file with NUL byte should not match: %q", txt)
 	}
+	// Every match line is ~500 KB, so the 50 KB output limit cuts this listing short: the 64 MB walk only fills the
+	// cache. What matched where is asked below, with a search whose output fits.
+	if !strings.Contains(txt, "exact_512k.txt") {
+		t.Fatalf("expected exact_512k.txt (the first text file in path order) to match, got: %q", txt)
+	}
+
+	searchCacheMu.Lock()
+	cacheSz := contentCacheSize
+	// The LRU cap evicts the files searched first: bin_small.dat and exact_512k.txt come before f_000.txt in path
+	// order, so all three are gone after the 70 MB of f_*.txt.
+	_, hasFirst := contentCacheMap[normalizeCacheKey(filepath.Join(dir, "f_000.txt"))]
+	_, hasLast := contentCacheMap[normalizeCacheKey(filepath.Join(dir, "f_139.txt"))]
+	searchCacheMu.Unlock()
+	if cacheSz > maxContentCacheBytes {
+		t.Fatalf("contentCacheSize %d exceeds maxContentCacheBytes %d", cacheSz, maxContentCacheBytes)
+	}
+	if hasFirst {
+		t.Fatalf("f_000.txt should have been evicted under 64MB cap")
+	}
+	if !hasLast {
+		t.Fatalf("f_139.txt, searched last, should be cached")
+	}
+
+	// A search of the three small files, after the walk: the 512 KB cap per file and the binary entry.
+	limited, _ := json.Marshal(grepParams{Pattern: "NEEDLE_(512|BIN)", Glob: "{exact_512k.txt,over_512k.txt,bin_small.dat}"})
+	res, err = gt.Execute(ctx, "2", limited, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txt = extractText(res.Content)
+	if strings.Contains(txt, "bin_small.dat") {
+		t.Fatalf("binary file with NUL byte should not match: %q", txt)
+	}
 	if !strings.Contains(txt, "exact_512k.txt") || !strings.Contains(txt, "over_512k.txt") {
 		t.Fatalf("expected both exact_512k.txt and over_512k.txt to match, got: %q", txt)
 	}
 
 	searchCacheMu.Lock()
-	cacheSz := contentCacheSize
 	_, hasExact := contentCacheMap[normalizeCacheKey(exact512Path)]
 	_, hasOver := contentCacheMap[normalizeCacheKey(over512Path)]
 	binElem, hasBin := contentCacheMap[normalizeCacheKey(binPath)]
@@ -244,13 +276,8 @@ func TestChallenger2_ContentCacheCapsAndBinaryAndPieceStreaming(t *testing.T) {
 	if hasBin {
 		binBufNil = binElem.Value.(*cachedFileBuffer).buffer == nil
 	}
-	// f_000.txt should have been evicted by 64MB LRU cap
-	_, hasFirst := contentCacheMap[normalizeCacheKey(filepath.Join(dir, "f_000.txt"))]
 	searchCacheMu.Unlock()
 
-	if cacheSz > maxContentCacheBytes {
-		t.Fatalf("contentCacheSize %d exceeds maxContentCacheBytes %d", cacheSz, maxContentCacheBytes)
-	}
 	if !hasExact {
 		t.Fatalf("exact 512KB file should be cached")
 	}
@@ -259,9 +286,6 @@ func TestChallenger2_ContentCacheCapsAndBinaryAndPieceStreaming(t *testing.T) {
 	}
 	if !hasBin || !binBufNil {
 		t.Fatalf("small binary file should have nil buffer cache entry (hasBin=%v, binBufNil=%v)", hasBin, binBufNil)
-	}
-	if hasFirst {
-		t.Fatalf("f_000.txt should have been evicted under 64MB cap")
 	}
 }
 

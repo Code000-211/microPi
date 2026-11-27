@@ -60,7 +60,8 @@ func sessionEnvironment(ctx context.Context, expose bool, binDir string) []strin
 	hasNoColor := false
 	hasForceColor := false
 	for _, kv := range base {
-		if name, val, _ := strings.Cut(kv, "="); !slices.Contains(sessionVariables, name) {
+		// µPi: PI_REMOTE is the session's remote machine (--remote): a Pi a command starts works here unless told otherwise.
+		if name, val, _ := strings.Cut(kv, "="); !slices.Contains(sessionVariables, name) && name != "PI_REMOTE" {
 			if name == "NO_COLOR" {
 				hasNoColor = true
 			} else if name == "FORCE_COLOR" && val != "" && val != "0" {

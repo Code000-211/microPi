@@ -3,7 +3,6 @@ package tools
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/internal/codingagent/filetracking"
@@ -115,8 +114,10 @@ func TestFilesShownByCat(t *testing.T) {
 func TestFileWriteRefusalAndWatchFiles(t *testing.T) {
 	writes := FileWritesInCommand("sed -i 's/a/b/' dir/file.go")
 	refusal := FileWriteRefusal(writes)
-	if !strings.Contains(refusal, "sed -i") || !strings.Contains(refusal, "dir/file.go") {
-		t.Fatalf("unexpected refusal: %q", refusal)
+	// µPi: microPi's fileWriteRefusal wording.
+	want := "Not run: the command changes dir/file.go (sed -i). Change files with edit (exact replacements: it checks that the file was read and did not change since, and reports the compiler's new errors) or write (whole files). Appending (`>>`), files under /tmp, and a program's output redirected into a file run."
+	if refusal != want {
+		t.Fatalf("refusal = %q, want %q", refusal, want)
 	}
 
 	dir := t.TempDir()
@@ -124,7 +125,8 @@ func TestFileWriteRefusalAndWatchFiles(t *testing.T) {
 	if err := os.WriteFile(p, []byte("line1\nline2\nline3\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	snaps := WatchFiles(dir, FileWritesInCommand("sed -i 's/line2/LINE2/' x.txt"))
+	// Only files that exist are watched: a new file has no compiler errors to compare.
+	snaps := WatchFiles(dir, FileWritesInCommand("sed -i 's/line2/LINE2/' x.txt; echo new > new.txt"))
 	if len(snaps) != 1 {
 		t.Fatalf("expected 1 snapshot, got %d", len(snaps))
 	}
@@ -133,8 +135,14 @@ func TestFileWriteRefusalAndWatchFiles(t *testing.T) {
 	}
 	tr := filetracking.NewTracker()
 	changes := CheckChangedFiles(snaps, tr)
-	if len(changes) != 1 || changes[0].StartLine != 2 || changes[0].EndLine != 2 || changes[0].Created {
+	if len(changes) != 1 || changes[0].StartLine != 2 || changes[0].EndLine != 2 {
 		t.Fatalf("unexpected changes: %+v", changes)
+	}
+	if got := FormatChangedFiles(changes); got != "\n\nx.txt changed at line 2." {
+		t.Fatalf("report = %q", got)
+	}
+	if got := FormatChangedFiles([]WatchedFileChange{{Target: "a.go", StartLine: 3, EndLine: 5}}); got != "\n\na.go changed in lines 3-5." {
+		t.Fatalf("report = %q", got)
 	}
 	if !tr.StateTracker().HasBeenRead(p) {
 		t.Fatal("expected tracker to record modified file")

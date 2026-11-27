@@ -61,7 +61,8 @@ type Options struct {
 	// PigReadmePath is the README of that bundle; empty is README.md inside PigDocsPath.
 	// upstream: system-prompt.ts:163 getReadmePath()
 	PigReadmePath string
-	// PigExamplesPath is where the examples live; empty is [PigExamplesLocation].
+	// PigExamplesPath is where the examples live. µPi: the docs section names it only when it is a local folder, not a
+	// URL such as [PigExamplesLocation].
 	// upstream: system-prompt.ts:165 getExamplesPath()
 	PigExamplesPath string
 	// AppendMode is "append" (default: CustomPrompt becomes the addendum
@@ -71,7 +72,8 @@ type Options struct {
 	AppendMode string
 }
 
-const preamble = "You are a coding assistant running inside pig, a coding agent harness. Help users inspect files, run commands, and modify code."
+// preamble is microPi's (system-prompt.ts, the µPi build's), with µPi built on PiG in Go rather than compiled ahead of time.
+const preamble = "You are an expert coding assistant operating inside µPi, a build of pi (a coding agent harness) in Go. You help users by reading files, executing commands, editing code, and writing new files."
 
 type section struct{ name, content string }
 
@@ -163,6 +165,10 @@ func BuildSystemPromptSections(o Options) ai.OrderedSections {
 // PigExamplesLocation is PiG's examples directory. pig additive (D22): PiG's examples are published in its repository, not materialized beside the documentation bundle.
 const PigExamplesLocation = "https://github.com/MichaelKinsy/PiG/tree/main/examples"
 
+// orderedCallsRule is microPi's rule (buildRules), there when tools are: a response's calls run in order when one of
+// them changes files or runs a command, so an edit and the command that tests it can come in one response.
+const orderedCallsRule = "Put calls that need no answer in between into one response: they run in order, so all edits for a fix and the command that tests them go together"
+
 // renderRules mirrors upstream buildRules.
 func renderRules(tools []string, toolGuidelines map[string][]string, promptGuidelines []string) string {
 	var lines []string
@@ -203,8 +209,9 @@ func guidelinesFor(tools []string, toolGuidelines map[string][]string, promptGui
 	for _, rule := range promptGuidelines {
 		add(rule)
 	}
-	add("Batch independent tool calls in one response; dependent calls execute in order")
-	add("Long bash commands move to the background automatically; use wait only when nothing else is left to do")
+	if len(tools) > 0 {
+		add(orderedCallsRule)
+	}
 	add("Be concise in your responses")
 	add("Show file paths clearly when working with files")
 	return out

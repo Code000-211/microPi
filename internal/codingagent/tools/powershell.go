@@ -137,13 +137,17 @@ func (t *PowerShellTool) Label() string { return "" }
 // completed command.
 func (t *PowerShellTool) OutputSchema() json.RawMessage { return json.RawMessage(shellOutputSchema) }
 
-func (t *PowerShellTool) Schema() ai.ToolSchema {
-	return shellToolSchema("powershell", "PowerShell", !t.HideSessionEnvironment, false)
-}
+func (t *PowerShellTool) Schema() ai.ToolSchema { return t.schema(false) }
 
 // BorrowedSchema is Schema with the parameters shared, not copied: the caller reads them and never modifies them.
-func (t *PowerShellTool) BorrowedSchema() ai.ToolSchema {
-	return shellToolSchema("powershell", "PowerShell", !t.HideSessionEnvironment, true)
+func (t *PowerShellTool) BorrowedSchema() ai.ToolSchema { return t.schema(true) }
+
+func (t *PowerShellTool) schema(borrow bool) ai.ToolSchema {
+	var guidelines []string
+	if !t.HideSessionEnvironment {
+		guidelines = []string{sessionGuideline}
+	}
+	return shellToolSchema("powershell", "PowerShell", guidelines, 0, borrow)
 }
 
 // µPi: sequential, as microPi's: a response's calls run in order when one of them changes files or runs a command, so an edit and the
@@ -167,6 +171,7 @@ func (t *PowerShellTool) shellConfig() shellToolConfig {
 		shellName:                "PowerShell",
 		tempFilePrefix:           "pi-powershell",
 		operations:               t.operations(),
+		local:                    t.Operations == nil,
 		exposeSessionEnvironment: !t.HideSessionEnvironment,
 		binDir:                   t.BinDir,
 		spawnHook:                t.SpawnHook,

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bufio"
 	"bytes"
 	"container/list"
 	"context"
@@ -1639,6 +1640,18 @@ func searchBufferLines(
 	return false
 }
 
+// pieceMatch is a line searchInPieces found, held until the file was read to its end.
+type pieceMatch struct {
+	lineNumber int
+	lineText   []byte
+}
+
+// searchInPieces searches a file too large to read whole a piece at a time, with the outcome of a search of the file
+// read whole (microPi's searchInPieces): each piece is searched up to its last line break and the rest goes with the
+// next, so a match is within a line; and a file with a NUL byte anywhere (binary) has no matches, so the matches are
+// held until the file was read to its end (or to its first NUL byte). It holds at most the matches the limit leaves
+// room for, and one more, which tells that the limit stopped the search. With context, the lines around the matches
+// are read in a second pass, as microPi's grep reads them from the file (formatGrepMatches, getFileLines).
 func searchInPieces(
 	ctx context.Context,
 	absPath string,
@@ -1654,10 +1667,11 @@ func searchInPieces(
 	}
 	defer f.Close()
 
+	budget := opts.Limit - *matchCount
+	var found []pieceMatch
 	buf := make([]byte, pieceBytes)
 	var carry []byte
 	lineNo := 1
-	firstChunk := true
 
 	for {
 		if ctx.Err() != nil {
@@ -1667,17 +1681,20 @@ func searchInPieces(
 		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
 			return false, readErr
 		}
+		atEnd := readErr != nil
 		if n == 0 && len(carry) == 0 {
 			break
 		}
 		chunk := buf[:n]
-		if firstChunk {
-			firstChunk = false
-			if bytes.IndexByte(chunk, 0) != -1 {
-				return false, nil
+		if bytes.IndexByte(chunk, 0) != -1 {
+			return false, nil // (Binary.)
+		}
+		if len(found) > budget {
+			// The limit is reached: the rest is only read for a NUL byte.
+			if atEnd {
+				break
 			}
-		} else if bytes.IndexByte(chunk, 0) != -1 {
-			return false, nil
+			continue
 		}
 
 		combined := chunk
@@ -1688,21 +1705,17 @@ func searchInPieces(
 		}
 
 		var process []byte
-		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+		if atEnd {
 			process = combined
 			carry = nil
 		} else {
 			lastNL := bytes.LastIndexByte(combined, '\n')
-			if lastNL >= 0 {
-				process = combined[:lastNL+1]
-				carry = append(carry[:0], combined[lastNL+1:]...)
-			} else {
+			if lastNL < 0 {
 				carry = append(carry[:0], combined...)
-				if n == 0 {
-					break
-				}
 				continue
 			}
+			process = combined[:lastNL+1]
+			carry = append(carry[:0], combined[lastNL+1:]...)
 		}
 
 		if len(process) > 0 {
@@ -1712,15 +1725,10 @@ func searchInPieces(
 					lines = lines[:len(lines)-1]
 				}
 				for _, l := range lines {
-					clean := bytes.TrimSuffix(l, []byte("\r"))
-					if matcher.matchLine(clean) {
-						if *matchCount >= opts.Limit {
-							*matchLimitReached = true
-							return true, nil
-						}
-						*matchCount++
-						if emit(nativeGrepEvent{absPath: absPath, lineNumber: lineNo, lineText: l, isMatch: true}) {
-							return true, nil
+					if matcher.matchLine(bytes.TrimSuffix(l, []byte("\r"))) {
+						found = append(found, pieceMatch{lineNumber: lineNo, lineText: bytes.Clone(l)})
+						if len(found) > budget {
+							break
 						}
 					}
 					lineNo++
@@ -1730,11 +1738,135 @@ func searchInPieces(
 			}
 		}
 
-		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+		if atEnd {
 			break
 		}
 	}
+	if len(found) == 0 {
+		return false, nil
+	}
+	if opts.Context > 0 {
+		return emitPieceContext(ctx, f, absPath, found, opts, matchCount, matchLimitReached, emit)
+	}
+	for _, m := range found {
+		if *matchCount >= opts.Limit {
+			*matchLimitReached = true
+			return true, nil
+		}
+		*matchCount++
+		if emit(nativeGrepEvent{absPath: absPath, lineNumber: m.lineNumber, lineText: m.lineText, isMatch: true}) {
+			return true, nil
+		}
+	}
 	return false, nil
+}
+
+// plannedLine is a line emitPieceContext emits, or the point where the match limit stops it.
+type plannedLine struct {
+	lineNumber int
+	isMatch    bool
+	stop       bool
+}
+
+// emitPieceContext emits found with opts.Context lines around each, read from f again, in the order and with the
+// limit searchBufferLines applies to a file read whole: lines shared by two windows once.
+func emitPieceContext(
+	ctx context.Context,
+	f *os.File,
+	absPath string,
+	found []pieceMatch,
+	opts nativeGrepOpts,
+	matchCount *int,
+	matchLimitReached *bool,
+	emit func(nativeGrepEvent) (stop bool),
+) (bool, error) {
+	isMatch := make(map[int]bool, len(found))
+	for _, m := range found {
+		isMatch[m.lineNumber] = true
+	}
+	// The lines to emit, as searchBufferLines walks the windows; lines past the end of the file are never read.
+	var plan []plannedLine
+	count := *matchCount
+	lastEmitted := 0
+planning:
+	for _, m := range found {
+		if count >= opts.Limit {
+			plan = append(plan, plannedLine{stop: true})
+			break
+		}
+		for cur := max(1, m.lineNumber-opts.Context, lastEmitted+1); cur <= m.lineNumber+opts.Context; cur++ {
+			if isMatch[cur] {
+				if count >= opts.Limit {
+					plan = append(plan, plannedLine{stop: true})
+					break planning
+				}
+				count++
+			}
+			plan = append(plan, plannedLine{lineNumber: cur, isMatch: isMatch[cur]})
+			lastEmitted = cur
+		}
+	}
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	reader := bufio.NewReaderSize(f, 64*1024)
+	lineNo := 0
+	var line []byte
+	for _, step := range plan {
+		if step.stop {
+			*matchLimitReached = true
+			return true, nil
+		}
+		for lineNo < step.lineNumber {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			read, ok, err := readPieceLine(reader, lineNo+1 == step.lineNumber)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return false, nil // (Past the end of the file.)
+			}
+			line = read
+			lineNo++
+		}
+		if step.isMatch {
+			*matchCount++
+		}
+		if emit(nativeGrepEvent{absPath: absPath, lineNumber: step.lineNumber, lineText: line, isMatch: step.isMatch}) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// readPieceLine reads one line without its line break; keep false skips it without holding it. ok is false past the
+// last line (as a file read whole, the nothing after a last line break is no line).
+func readPieceLine(reader *bufio.Reader, keep bool) (line []byte, ok bool, err error) {
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(part) > 0 {
+			ok = true
+			if keep {
+				line = append(line, part...)
+			}
+		}
+		switch {
+		case err == nil:
+			if keep {
+				line = line[:len(line)-1]
+			}
+			return line, true, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF):
+			return line, ok, nil
+		default:
+			return nil, false, err
+		}
+	}
 }
 
 // unused guard for utf8/strconv if needed by future helpers

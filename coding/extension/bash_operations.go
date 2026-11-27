@@ -13,6 +13,10 @@ type BashOperationsExecOptions struct {
 	Timeout *float64
 	// Env replaces the inherited environment when non-nil.
 	Env []string
+	// OnSpawn, when set, receives the process started for the command (0 when its id is not known), for a caller
+	// that lets it run on in the background. µPi: microPi's onSpawn; the bash tool moves a command to the
+	// background only once it was called.
+	OnSpawn func(pid int)
 }
 
 // BashOperationsResult mirrors upstream { exitCode: number | null }: a signal

@@ -29,7 +29,8 @@ func TestRulesDeduplicateTrimAndKeepToolOrder(t *testing.T) {
 		"mcp":    {"Use mcp tool X for Y"},
 		"absent": {"Never listed"},
 	}, []string{"Global rule", "Edit rule"})
-	want := []string{"Edit rule", "Shared", "Use mcp tool X for Y", "Read rule", "Global rule", "Be concise in your responses", "Show file paths clearly when working with files"}
+	// µPi: microPi's ordered-calls rule follows the guidelines when tools are.
+	want := []string{"Edit rule", "Shared", "Use mcp tool X for Y", "Read rule", "Global rule", orderedCallsRule, "Be concise in your responses", "Show file paths clearly when working with files"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("rules\n got: %q\nwant: %q", got, want)
 	}
@@ -46,7 +47,7 @@ func TestFileOperationRuleFollowsShellTools(t *testing.T) {
 			t.Errorf("%v: first rule %q, want %q", tools, got[0], rule)
 		}
 	}
-	if got := guidelinesFor([]string{"bash", "grep"}, nil, nil); got[0] != "Be concise in your responses" {
+	if got := guidelinesFor([]string{"bash", "grep"}, nil, nil); got[0] != orderedCallsRule {
 		t.Errorf("with grep, the shell rule must be absent: %q", got)
 	}
 }

@@ -631,7 +631,8 @@ func TestT1_F15_RemoteCLIFlagRoutesBashToRemoteDir(t *testing.T) {
 	env := NewTestEnv(t)
 
 	env.MockLLM.EnqueueToolCall("tc1", "bash", map[string]any{
-		"command": "echo REMOTE_BASH_OK > remote_bash.txt",
+		// µPi: an append; text redirected over a file is refused on a remote machine (bash-file-writes.ts).
+		"command": "echo REMOTE_BASH_OK >> remote_bash.txt",
 	})
 	env.MockLLM.EnqueueText("done")
 
@@ -639,6 +640,22 @@ func TestT1_F15_RemoteCLIFlagRoutesBashToRemoteDir(t *testing.T) {
 	assertExitZero(t, res)
 
 	assertContains(t, env.ReadRemoteFile("remote_bash.txt"), "REMOTE_BASH_OK", "remote bash")
+}
+
+// µPi: on a remote machine a command that changes a file as edit or write would is refused (bash-file-writes.ts).
+func TestT1_F15_RemoteBashRefusesTextRedirectedIntoAFile(t *testing.T) {
+	env := NewTestEnv(t)
+
+	env.MockLLM.EnqueueToolCall("tc1", "bash", map[string]any{
+		"command": "echo REMOTE_BASH_OK > remote_bash.txt",
+	})
+	env.MockLLM.EnqueueText("done")
+
+	res := env.RunUPI("-p", "--remote", "devbox:"+env.RemoteDir, "--provider", "mock", "--model", "mock-coder", "run remote bash")
+	assertExitZero(t, res)
+
+	req, _ := env.MockLLM.LastRequest()
+	assertContains(t, strings.Join(toolResultMessages(req), "\n"), "Not run: the command changes remote_bash.txt (a redirection).", "remote file-write refusal")
 }
 
 func TestT1_F15_RemoteSlashCommandSwitchesAndReportsStatus(t *testing.T) {

@@ -20,15 +20,12 @@ func TestUpstreamSystemPromptSecondHalfExactSections(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("PIG_HOME", home)
 	docsRoot := pigdocs.DocsDir(home)
-	docs := "<docs>\nPiG documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):\n" +
-		"- Main documentation: " + filepath.Join(docsRoot, "README.md") + "\n" +
-		"- Additional docs: " + docsRoot + "\n" +
-		"- Examples: https://github.com/MichaelKinsy/PiG/tree/main/examples (extensions, custom tools, SDK)\n" +
-		"- When reading pig docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n" +
-		"- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)\n" +
-		"- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.\n</docs>"
+	// µPi: microPi's short docs section, without the examples PiG publishes in its repository.
+	docs := "<docs>\nOnly for questions about pi itself (extensions, SDK, themes, skills, TUI, models, packages, MCP): read " + filepath.Join(docsRoot, "README.md") +
+		" and the docs in " + docsRoot + ", following their links; docs/... paths are under that folder, not the working folder.\n</docs>"
 	const toolsTail = "\n\nAdditional tools may be available.\n</tools>"
-	const rulesTail = "\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>"
+	// µPi: microPi's ordered-calls rule comes before the closing rules.
+	const rulesTail = "\n- " + orderedCallsRule + "\n- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>"
 	const skills = `<skills>
 The following skills provide specialized instructions for specific tasks.
 Use bash to load a skill's file when the task matches its description.

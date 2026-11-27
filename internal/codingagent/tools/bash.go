@@ -50,9 +50,15 @@ type BashTool struct {
 	// BackgroundJobs manages backgrounded bash commands and wakeup notifications.
 	BackgroundJobs *jobs.Manager
 	// Remote routes execution over SSH when active.
-	Remote  *remote.Manager
+	Remote *remote.Manager
+	// Tracker, given, takes the files a command printed whole with `cat` as read, and the files it changed as edit
+	// or write would as read and edited (µPi: microPi's fileTracker option).
 	Tracker *filetracking.Tracker
 	Checks  *checks.BackgroundChecks
+	// EditToolActive reports whether the edit tool is there: then a command that changes a file as edit or write
+	// would (`sed -i`, text redirected into a file) is watched here and refused on a remote machine
+	// (bash_file_writes.go). Nil is false. µPi: microPi's editToolActive option.
+	EditToolActive func() bool
 }
 
 func (t *BashTool) Name() string  { return "bash" }
@@ -62,13 +68,32 @@ func (t *BashTool) Label() string { return "" }
 // completed command.
 func (t *BashTool) OutputSchema() json.RawMessage { return json.RawMessage(shellOutputSchema) }
 
-func (t *BashTool) Schema() ai.ToolSchema {
-	return shellToolSchema("bash", "bash", !t.HideSessionEnvironment, false)
-}
+func (t *BashTool) Schema() ai.ToolSchema { return t.schema(false) }
 
 // BorrowedSchema is Schema with the parameters shared, not copied: the caller reads them and never modifies them.
-func (t *BashTool) BorrowedSchema() ai.ToolSchema {
-	return shellToolSchema("bash", "bash", !t.HideSessionEnvironment, true)
+func (t *BashTool) BorrowedSchema() ai.ToolSchema { return t.schema(true) }
+
+func (t *BashTool) schema(borrow bool) ai.ToolSchema {
+	var guidelines []string
+	if !t.HideSessionEnvironment {
+		// µPi: microPi's bashToolSystemPromptContribution.guidelines.
+		guidelines = []string{sessionGuideline, bashBackgroundGuideline}
+	}
+	return shellToolSchema("bash", "bash", guidelines, t.autoBackgroundSeconds(), borrow)
+}
+
+// autoBackgroundSeconds is after how long a command goes on in the background: 0 without background jobs.
+func (t *BashTool) autoBackgroundSeconds() float64 {
+	if t.BackgroundJobs == nil {
+		return 0
+	}
+	return autoBackgroundSeconds()
+}
+
+// PrepareArguments implements agent.ArgumentPreparer: Claude Code's run_in_background and Qwen Code's is_background
+// are background (µPi: microPi's prepareArguments, argument-aliases.ts).
+func (t *BashTool) PrepareArguments(raw json.RawMessage) (json.RawMessage, error) {
+	return NormalizeToolArguments(raw, BashAliases), nil
 }
 
 // µPi: sequential, as microPi's: a response's calls run in order when one of them changes files or runs a command, so an edit and the
@@ -80,6 +105,10 @@ func (t *BashTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolMo
 // bash, the settings command prefix, and pig-bash temp files).
 func (t *BashTool) Execute(ctx context.Context, _ string, rawParams json.RawMessage, onUpdate agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
 	operations := t.Operations
+	local := operations == nil
+	if remoteOps, ok := operations.(*RemoteBashOperations); ok {
+		local = remoteOps.Remote == nil || !remoteOps.Remote.Active()
+	}
 	if operations == nil {
 		operations = &LocalShellOperations{ShellName: "bash", ResolveShell: func() (ShellConfig, error) { return resolveShellConfig(t.Settings) }}
 	}
@@ -88,6 +117,9 @@ func (t *BashTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 		shellName:                "bash",
 		tempFilePrefix:           "pi-bash",
 		operations:               operations,
+		local:                    local,
+		autoBackgroundSeconds:    t.autoBackgroundSeconds(),
+		editToolActive:           t.EditToolActive,
 		commandPrefix:            t.CommandPrefix,
 		exposeSessionEnvironment: !t.HideSessionEnvironment,
 		binDir:                   t.BinDir,

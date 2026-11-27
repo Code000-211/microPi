@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +42,9 @@ type shellToolConfig struct {
 	// operations executes the command (upstream options.operations, default
 	// createLocalShellOperations).
 	operations BashOperations
+	// local reports that the command runs on this machine (microPi's `options.operations === undefined`, or the remote
+	// operations while no remote machine is connected).
+	local bool
 	// commandPrefix is prepended with "\n" to every command.
 	commandPrefix string
 	// exposeSessionEnvironment mirrors upstream exposeSessionEnvironment.
@@ -49,6 +54,12 @@ type shellToolConfig struct {
 	// spawnHook adjusts the command, working directory and environment before the shell runs (upstream options.spawnHook).
 	spawnHook      BashSpawnHook
 	backgroundJobs *jobs.Manager
+	// autoBackgroundSeconds is microPi's autoBackgroundSeconds: after how long a command goes on in the background
+	// when backgroundJobs is set; 0 only when the call asks.
+	autoBackgroundSeconds float64
+	// editToolActive is microPi's editToolActive: while it reports true, a command that changes a file as edit or
+	// write would is watched here and refused on a remote machine (bash-file-writes.ts). Nil is false.
+	editToolActive func() bool
 	remote         *remote.Manager
 	tracker        *filetracking.Tracker
 	checks         *checks.BackgroundChecks
@@ -70,25 +81,28 @@ type PowerShellSpawnContext = BashSpawnContext
 // PowerShellSpawnHook is upstream's PowerShellSpawnHook, an alias of BashSpawnHook (powershell.ts:25).
 type PowerShellSpawnHook = BashSpawnHook
 
-// shellToolSchema mirrors createShellToolDefinition's name, description,
-// parameters, guidelines, and constrained sampling request.
-func shellToolSchema(name, shellName string, exposeSessionEnvironment, borrow bool) ai.ToolSchema {
-	var guidelines []string
-	if exposeSessionEnvironment {
-		guidelines = []string{sessionGuideline}
+// bashBackgroundGuideline is microPi's second bash prompt guideline (bashToolSystemPromptContribution): from
+// deepseek-harness and oh-my-pi. In Pi's sessions, 97 `sleep` calls waited 3.2 h for other commands.
+const bashBackgroundGuideline = "Commands still running after two minutes continue in the background and report when they end: do other work meanwhile, never sleep or poll."
+
+// shellToolSchema mirrors createShellToolDefinition's name, description, parameters, guidelines, and constrained
+// sampling request. µPi: the description names the kept head (microPi's BASH_HEAD_LINES) and, where commands go on in
+// the background (autoBackgroundSeconds > 0 with background jobs), after how long.
+func shellToolSchema(name, shellName string, guidelines []string, autoBackgroundSeconds float64, borrow bool) ai.ToolSchema {
+	description := "Execute a " + shellName + " command in the current working directory. Returns stdout and stderr; long output keeps its first " +
+		strconv.Itoa(shellHeadLines) + " lines and its end, the full output is saved to a file. Optional timeout in seconds."
+	if autoBackgroundSeconds > 0 {
+		description += " Commands running over " + jsNumber(autoBackgroundSeconds) + " s continue in the background and report their end."
 	}
 	return toolSchemaWithParameters(ai.ToolSchema{
-		Name:             name,
-		PromptGuidelines: guidelines,
-		Description: "Execute a " + shellName + " command in the current working directory. Returns stdout and stderr. " +
-			"Output is truncated to last " + strconv.Itoa(DefaultMaxLinesUpstream) + " lines or " +
-			strconv.Itoa(DefaultMaxBytesUpstream/1024) + "KB (whichever is hit first). " +
-			"If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
+		Name:                name,
+		PromptGuidelines:    guidelines,
+		Description:         description,
 		ConstrainedSampling: strictToolSampling(),
 	}, `{"type":"object","required":["command"],"properties":{
 		"command":{"type":"string","description":"Shell command to execute"},
-		"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"},
-		"background":{"type":"boolean","description":"Run the command in the background and return its job ID immediately"}
+		"timeout":{"type":"number","description":"Seconds to wait for the command (optional, no default). Where background jobs are, a command still running then goes on in the background and reports its end; otherwise it is ended"},
+		"background":{"type":"boolean","description":"Start in the background at once; a message reports its end"}
 	}}`, borrow)
 }
 
@@ -158,10 +172,134 @@ func appendShellStatus(text, status string) string {
 	return text + "\n\n" + status
 }
 
+// MovedToBackgroundNote is microPi's MOVED_TO_BACKGROUND_NOTE: words every result of the bash tool that moved its
+// command to the background carries, whatever started the move.
+const MovedToBackgroundNote = "moved to the background as job"
+
+// backgroundDoneTailChars is microPi's BACKGROUND_DONE_TAIL_CHARS: how much of a background job's output its report
+// carries.
+const backgroundDoneTailChars = 2048
+
+// backgroundAfter is microPi's backgroundAfterMs: after how long a call's command goes to the background: 0 when
+// asked, ok=false when it never does (no jobs, or turned off). A timeout before the time to background it moves it
+// then, rather than ending it: in Terminal-Bench 7 of 8 timeouts ended a loop waiting for a build (915 s of waiting
+// lost), and in Pi's sessions 16 timeouts ended builds and runs after 7 minutes on average.
+func backgroundAfter(backgroundJobs *jobs.Manager, background bool, timeout *float64, autoBackgroundSeconds float64) (seconds float64, ok bool) {
+	if backgroundJobs == nil {
+		return 0, false
+	}
+	if background {
+		return 0, true
+	}
+	if autoBackgroundSeconds <= 0 {
+		return 0, false
+	}
+	if timeout != nil && *timeout > 0 {
+		return math.Min(*timeout, autoBackgroundSeconds), true
+	}
+	return autoBackgroundSeconds, true
+}
+
+// refuseOrWatch is microPi's refuseOrWatch: the checks before a command runs: a fixed sleep that would only go on in
+// the background, a command that changes files as edit and write would on a remote machine, and a pkill that would end
+// this process. It returns the refusal, or the files the command writes as edit and write would (watched when it runs
+// here, see CheckChangedFiles).
+func refuseOrWatch(command string, cfg shellToolConfig, background bool) ([]FileWrite, string) {
+	if cfg.backgroundJobs != nil && !background {
+		// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
+		if sleep := fixedSleepSeconds(command); sleep > math.Max(maxFixedSleepSeconds, cfg.autoBackgroundSeconds) {
+			return nil, fixedSleepRefusal(sleep, cfg.autoBackgroundSeconds)
+		}
+	}
+	// From oh-my-pi's bash interceptor. On this machine the command runs and gets the edit tool's checks afterwards
+	// (see CheckChangedFiles); on a remote machine what changed is not known here: such a command is refused.
+	var writes []FileWrite
+	if cfg.editToolActive != nil && cfg.editToolActive() {
+		writes = FileWritesInCommand(command)
+	}
+	if !cfg.local && len(writes) > 0 {
+		return nil, FileWriteRefusal(writes)
+	}
+	// On this machine only: a remote pkill does not reach this process.
+	if cfg.local {
+		if pattern, ok := selfKillPattern(command); ok {
+			return nil, selfKillRefusal(pattern)
+		}
+	}
+	return writes, ""
+}
+
+// sleepUntilJobEnds is microPi's sleepUntilJobEnds: it sleeps up to seconds for a command, and less when a background
+// job ends (as wait does): what a fixed sleep before a look at a job's progress waits for. It returns the note to put
+// before the command's output: how long it slept, and the report of the jobs that ended, which the call gives rather
+// than a message after it.
+func sleepUntilJobEnds(ctx context.Context, backgroundJobs *jobs.Manager, seconds float64) (string, error) {
+	start := time.Now()
+	outcome := backgroundJobs.WaitForEnd(ctx, time.Duration(seconds*float64(time.Second)))
+	if outcome == jobs.OutcomeAborted {
+		return "", errors.New("Command aborted")
+	}
+	ended := backgroundJobs.TakeUnreported(jobs.ReportedBash)
+	if len(ended) == 0 {
+		return "", nil
+	}
+	slept := strconv.FormatFloat(time.Since(start).Seconds(), 'f', 1, 64)
+	return "[The sleep of " + jsNumber(seconds) + " s ended after " + slept + " s: a background job ended.]\n" + jobs.FormatJobReport(ended) + "\n\n", nil
+}
+
+// expandHome is microPi's expandHome for the paths of a leading `cd` and the files cat printed.
+func expandHome(path string) string {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home + path[1:]
+		}
+	}
+	return path
+}
+
+// markCatFilesRead is microPi's markCatFilesRead: files a command printed whole with `cat`: the model saw them, so
+// editing or rewriting them needs no extra read.
+func markCatFilesRead(command, cwd string, tracker *filetracking.Tracker) {
+	dir, files := FilesShownByCat(command)
+	base := expandHome(dir)
+	if !filepath.IsAbs(base) {
+		base = filepath.Join(cwd, base)
+	}
+	for _, file := range files {
+		path := expandHome(file)
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(base, path)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		tracker.OnFileRead(path, string(data), float64(info.ModTime().UnixNano())/1e6, cwd, data, true)
+	}
+}
+
+// lastChars is the end of text, at most n characters (JavaScript's text.slice(-n), by code points here).
+func lastChars(text string, n int) string {
+	if len(text) <= n {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= n {
+		return text
+	}
+	return string(runes[len(runes)-n:])
+}
+
 // executeShellTool mirrors upstream createShellToolDefinition.execute: an
 // initial empty update, then one operations.exec call whose raw output feeds
 // an OutputAccumulator, with throttled streaming updates and upstream's
-// abort, timeout, and exit-code statuses.
+// abort, timeout, and exit-code statuses. µPi: with background jobs, a command
+// still running after a while (or at once, when the call asks) goes on in the
+// background as a job.
 func executeShellTool(ctx context.Context, cwd string, cfg shellToolConfig, rawParams json.RawMessage, onUpdate agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
 	var p shellParams
 	if err := json.Unmarshal(rawParams, &p); err != nil {
@@ -171,251 +309,263 @@ func executeShellTool(ctx context.Context, cwd string, cfg shellToolConfig, rawP
 	if err != nil {
 		return agent.AgentToolResult{}, err
 	}
-	if cfg.name == "bash" && cfg.remote != nil && cfg.remote.Active() {
-		lowerCmd := strings.ToLower(p.Command)
-		if strings.Contains(lowerCmd, "sed -i") || strings.Contains(lowerCmd, "perl -i") {
-			return shellToolError("Cannot run in-place file edit (`sed -i` / `perl -i`) over /remote; use the edit tool instead."), nil
-		}
+	background := p.Background != nil && *p.Background
+	command := p.Command
+	writes, refusal := refuseOrWatch(command, cfg, background)
+	if refusal != "" {
+		return shellToolError(refusal), nil
 	}
-	var watchedSnapshots []FileSnapshot
-	if cfg.name == "bash" && (cfg.remote == nil || !cfg.remote.Active()) && (cfg.tracker != nil || cfg.checks != nil) {
-		if writes := FileWritesInCommand(p.Command); len(writes) > 0 {
-			watchedSnapshots = WatchFiles(cwd, writes)
-		}
-	}
-
-	// Long-sleep guard and sleep-shortening for bash when BackgroundJobs is wired.
-	sleepNote := ""
-	effectiveRawCmd := p.Command
-	if cfg.name == "bash" && cfg.backgroundJobs != nil && (p.Background == nil || !*p.Background) {
-		if dur, sep, rest, ok := parseLeadingSleep(p.Command); ok {
-			running := cfg.backgroundJobs.Running()
-			if len(running) == 0 && sep == "" && dur >= 30*time.Second {
-				return shellToolError("Long sleep blocked: no background jobs are running. Use background jobs with the wait tool, or run the next command directly."), nil
+	// A command that sleeps a while before looking at a job's progress: the tool sleeps for it, and stops when a job
+	// ends. Only after the refusals above: a command refused after its sleep lost the sleep.
+	sleptNote := ""
+	if cfg.backgroundJobs != nil && !background && len(cfg.backgroundJobs.Running()) > 0 {
+		if seconds, rest, ok := leadingSleep(command); ok && seconds > maxFixedSleepSeconds && seconds <= cfg.autoBackgroundSeconds {
+			note, err := sleepUntilJobEnds(ctx, cfg.backgroundJobs, seconds)
+			if err != nil {
+				return shellToolError(err.Error()), nil
 			}
-			if len(running) > 0 {
-				outcome := cfg.backgroundJobs.WaitForEnd(ctx, dur)
-				if outcome == jobs.OutcomeAborted {
-					return shellToolError("Command aborted"), nil
-				}
-				if outcome == jobs.OutcomeEnded {
-					ended := cfg.backgroundJobs.TakeUnreported(jobs.ReportedBash)
-					if len(ended) > 0 {
-						sleepNote = jobs.FormatJobReport(ended)
-					}
-					if rest == "" {
-						if sleepNote == "" {
-							sleepNote = "Sleep shortened: background job finished."
-						}
-						return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: sleepNote}}}, nil
-					}
-					effectiveRawCmd = rest
-				}
+			sleptNote = note
+			command = rest
+			if command == "" {
+				command = "true"
 			}
 		}
 	}
 
-	command := effectiveRawCmd
+	fullCommand := command
 	if cfg.commandPrefix != "" {
-		command = cfg.commandPrefix + "\n" + command
+		fullCommand = cfg.commandPrefix + "\n" + command
 	}
 	// upstream: bash.ts resolveSpawnContext runs the hook after the session variables are in the environment.
-	spawn := BashSpawnContext{Command: command, CWD: cwd, Env: sessionEnvironment(ctx, cfg.exposeSessionEnvironment, cfg.binDir)}
+	spawn := BashSpawnContext{Command: fullCommand, CWD: cwd, Env: sessionEnvironment(ctx, cfg.exposeSessionEnvironment, cfg.binDir)}
 	if cfg.spawnHook != nil {
 		spawn = cfg.spawnHook(spawn)
 	}
-	command, cwd, env := spawn.Command, spawn.CWD, spawn.Env
+	fullCommand, cwd = spawn.Command, spawn.CWD
 	output := newShellOutputAccumulator(cfg.tempFilePrefix)
 	updates := startShellUpdates(ctx, output, onUpdate)
 	var acceptingOutput atomic.Bool
 	acceptingOutput.Store(true)
+	onData := func(data []byte) {
+		if !acceptingOutput.Load() {
+			return
+		}
+		if err := output.Append(data); err != nil {
+			return
+		}
+		if updates.ready(ctx) {
+			updates.schedule()
+		}
+	}
+	if sleptNote != "" {
+		onData([]byte(sleptNote))
+	}
 	finishOutput := func() OutputSnapshot {
 		acceptingOutput.Store(false)
 		output.Finish()
-		if updates.started() {
-			updates.finish()
-		}
+		updates.finish()
 		snapshot := output.Snapshot(true)
 		_ = output.CloseTempFile()
 		return snapshot
 	}
+	var watched []FileSnapshot
+	if cfg.local {
+		watched = WatchFiles(cwd, writes)
+	}
+	finish := func(result BashOperationsResult, err error, startedAt time.Time) (agent.AgentToolResult, error) {
+		res, fErr := finishForegroundShell(startedAt, result, err, output, finishOutput)
+		return finalizeForegroundShell(command, fullCommand, res, fErr, cwd, watched, cfg)
+	}
 
 	startedAt := time.Now()
+	after, backgroundable := backgroundAfter(cfg.backgroundJobs, background, p.Timeout, cfg.autoBackgroundSeconds)
+	if !backgroundable {
+		result, err := cfg.operations.Exec(ctx, fullCommand, cwd, BashOperationsExecOptions{OnData: onData, Timeout: p.Timeout, Env: spawn.Env})
+		return finish(result, err, startedAt)
+	}
 
-	// Backgroundable execution path when cfg.backgroundJobs != nil && cfg.name == "bash".
-	if cfg.name == "bash" && cfg.backgroundJobs != nil {
-		explicitBG := p.Background != nil && *p.Background
-		bgCtx, bgCancel := context.WithCancel(context.Background())
+	// The command's own abort: the tool call's, until the command goes to the background.
+	commandCtx, abortCommand := context.WithCancel(context.Background())
+	// A command the call starts in the background keeps its timeout; another one goes there at it.
+	execTimeout := p.Timeout
+	if !background {
+		execTimeout = nil
+	}
+	doneCh := make(chan shellExecDone, 1)
+	// The command goes to the background only once its process exists: it has to be known to end it.
+	spawned := make(chan struct{})
+	var spawnOnce sync.Once
+	var pid atomic.Int64
+	go func() {
+		result, err := cfg.operations.Exec(commandCtx, fullCommand, cwd, BashOperationsExecOptions{
+			OnData:  onData,
+			Timeout: execTimeout,
+			Env:     spawn.Env,
+			OnSpawn: func(processID int) {
+				pid.Store(int64(processID))
+				spawnOnce.Do(func() { close(spawned) })
+			},
+		})
+		doneCh <- shellExecDone{result: result, err: err}
+	}()
 
-		type execDone struct {
-			result BashOperationsResult
-			err    error
-		}
-		doneCh := make(chan execDone, 1)
-		var detached atomic.Bool
-		var handleMu sync.Mutex
-		var handle *jobs.JobHandle
-
-		registerBG := func() *jobs.JobHandle {
-			handleMu.Lock()
-			defer handleMu.Unlock()
-			if handle != nil {
-				return handle
-			}
-			logPath := output.EnsureBackgroundLog()
-			handle = cfg.backgroundJobs.Add(jobs.JobSpec{
-				Command:    effectiveRawCmd,
-				CWD:        cwd,
-				StartedAt:  startedAt,
-				OutputFile: logPath,
-				Output: func() string {
-					return output.Snapshot(false).Content
-				},
-				Kill: func() {
-					bgCancel()
-				},
-			}, time.Now())
-			return handle
-		}
-
-		go func() {
-			res, execErr := cfg.operations.Exec(bgCtx, command, cwd, BashOperationsExecOptions{
-				OnData: func(data []byte) {
-					if !acceptingOutput.Load() {
-						return
-					}
-					if err := output.Append(data); err != nil {
-						return
-					}
-					if !detached.Load() && updates.ready(ctx) {
-						updates.schedule()
-					}
-				},
-				Timeout: p.Timeout,
-				Env:     env,
-			})
-			if detached.Load() {
-				snap := finishOutput()
-				h := registerBG()
-				status := jobs.StatusDone
-				var codePtr *int
-				if res.ExitCode != nil {
-					c := *res.ExitCode
-					codePtr = &c
-					if c != 0 {
-						status = jobs.StatusFailed
-					}
-				}
-				if execErr != nil {
-					msg := execErr.Error()
-					switch {
-					case msg == "aborted":
-						status = jobs.StatusKilled
-					case strings.HasPrefix(msg, "timeout:"):
-						status = jobs.StatusTimedOut
-					default:
-						status = jobs.StatusFailed
-					}
-				}
-				h.End(status, codePtr, snap.Content)
-				bgCancel()
-				return
-			}
-			doneCh <- execDone{result: res, err: execErr}
-		}()
-
-		if explicitBG {
-			detached.Store(true)
-			h := registerBG()
-			msg := fmt.Sprintf("Background job %s started (`%s`). Continue with other work or call wait; you will be notified when it finishes.\n\n[Full output: %s]", h.Job.ID, effectiveRawCmd, h.Job.OutputFile)
-			return agent.AgentToolResult{
-				Content: []ai.ToolResultMessageContent{ai.TextContent{Text: msg}},
-				Details: map[string]any{"jobId": h.Job.ID, "outputFile": h.Job.OutputFile},
-			}, nil
-		}
-
-		bgTimer := time.NewTimer(backgroundThreshold())
-		defer bgTimer.Stop()
-
+	var timer <-chan time.Time
+	spawnedCh := (<-chan struct{})(spawned)
+	for {
 		select {
 		case done := <-doneCh:
-			bgCancel()
-			res, fErr := finishForegroundShell(startedAt, done.result, done.err, output, finishOutput, sleepNote)
-			return finalizeForegroundShell(command, res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
-		case <-bgTimer.C:
-			detached.Store(true)
-			h := registerBG()
-			msg := fmt.Sprintf("Command moved to background as job %s (`%s`). Continue with other work or call wait; you will be notified when it finishes.\n\n[Full output: %s]", h.Job.ID, effectiveRawCmd, h.Job.OutputFile)
-			return agent.AgentToolResult{
-				Content: []ai.ToolResultMessageContent{ai.TextContent{Text: msg}},
-				Details: map[string]any{"jobId": h.Job.ID, "outputFile": h.Job.OutputFile},
-			}, nil
+			abortCommand()
+			return finish(done.result, done.err, startedAt)
 		case <-ctx.Done():
-			bgCancel()
+			abortCommand()
 			done := <-doneCh
-			res, fErr := finishForegroundShell(startedAt, done.result, done.err, output, finishOutput, sleepNote)
-			return finalizeForegroundShell(command, res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
+			return finish(done.result, done.err, startedAt)
+		case <-spawnedCh:
+			spawnedCh = nil
+			t := time.NewTimer(time.Duration(after * float64(time.Second)))
+			defer t.Stop()
+			timer = t.C
+		case <-timer:
+			return moveToBackground(moveToBackgroundParams{
+				cfg: cfg, command: command, cwd: cwd, pid: int(pid.Load()), done: doneCh, output: output,
+				updates: updates, acceptingOutput: &acceptingOutput, startedAt: startedAt, kill: abortCommand,
+				background: background, timeout: p.Timeout, after: after,
+			}), nil
 		}
 	}
-
-	result, err := cfg.operations.Exec(ctx, command, cwd, BashOperationsExecOptions{
-		OnData: func(data []byte) {
-			if !acceptingOutput.Load() {
-				return
-			}
-			if err := output.Append(data); err != nil {
-				return
-			}
-			if updates.ready(ctx) {
-				updates.schedule()
-			}
-		},
-		Timeout: p.Timeout,
-		Env:     env,
-	})
-	res, fErr := finishForegroundShell(startedAt, result, err, output, finishOutput, sleepNote)
-	return finalizeForegroundShell(command, res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
 }
 
-func finalizeForegroundShell(command string, res agent.AgentToolResult, err error, cwd string, snapshots []FileSnapshot, tracker *filetracking.Tracker, bgChecks *checks.BackgroundChecks) (agent.AgentToolResult, error) {
-	if cwd != "" && !IsReadOnlyCommand(command) {
+// shellExecDone is how a command's operations.Exec call ended.
+type shellExecDone struct {
+	result BashOperationsResult
+	err    error
+}
+
+type moveToBackgroundParams struct {
+	cfg             shellToolConfig
+	command         string
+	cwd             string
+	pid             int
+	done            <-chan shellExecDone
+	output          *OutputAccumulator
+	updates         *shellUpdates
+	acceptingOutput *atomic.Bool
+	startedAt       time.Time
+	kill            func()
+	background      bool
+	timeout         *float64
+	after           float64
+}
+
+// moveToBackground is microPi's moveToBackground: a command still running at its time to go to the background is kept
+// running as a job, whose end is recorded when it ends. The call's result: the output so far, and where the rest goes.
+func moveToBackground(p moveToBackgroundParams) agent.AgentToolResult {
+	p.updates.stop()
+	file := p.output.EnsureBackgroundLog()
+	text, details := formatShellOutput(p.output.Snapshot(true), p.output.LastLineBytes(), "")
+	output := p.output
+	handle := p.cfg.backgroundJobs.Add(jobs.JobSpec{
+		Command:    p.command,
+		CWD:        p.cwd,
+		PID:        p.pid,
+		StartedAt:  p.startedAt,
+		OutputFile: file,
+		Output:     func() string { return output.Snapshot(false).Content },
+		Kill:       p.kill,
+	}, time.Now())
+	go func() {
+		done := <-p.done
+		status := jobs.StatusFailed
+		var code *int
+		if done.err != nil {
+			if strings.HasPrefix(done.err.Error(), "timeout:") {
+				status = jobs.StatusTimedOut
+			}
+		} else if done.result.ExitCode != nil {
+			c := *done.result.ExitCode
+			code = &c
+			if c == 0 {
+				status = jobs.StatusDone
+			}
+		}
+		p.kill()
+		InvalidateSearchCache(p.cwd)
+		p.acceptingOutput.Store(false)
+		output.Finish()
+		snapshot := output.Snapshot(true)
+		_ = output.CloseTempFile()
+		handle.End(status, code, lastChars(snapshot.Content, backgroundDoneTailChars))
+	}()
+	id := handle.Job.ID
+	stop := ""
+	if p.pid > 0 {
+		how := "kill -- -" + strconv.Itoa(p.pid)
+		if runtime.GOOS == "windows" {
+			how = "taskkill /T /F /PID " + strconv.Itoa(p.pid)
+		}
+		stop = " (pid " + strconv.Itoa(p.pid) + "; stop it with: " + how + ")"
+	}
+	atTimeout := !p.background && p.timeout != nil && p.after == *p.timeout
+	var status string
+	switch {
+	case p.background:
+		status = "Started in the background as job " + id + stop + "."
+	case atTimeout:
+		status = "Command still running at its timeout of " + jsNumber(*p.timeout) + " seconds: " + MovedToBackgroundNote + " " + id + stop + ", not stopped."
+	default:
+		status = "Command still running after " + jsNumber(p.after) + " seconds: " + MovedToBackgroundNote + " " + id + stop + "."
+	}
+	goesOn, into, stillEnds := "on ", file, ""
+	if p.background {
+		goesOn = ""
+		if p.timeout != nil {
+			stillEnds = "; its timeout of " + jsNumber(*p.timeout) + " seconds still ends it"
+		}
+	}
+	if into == "" {
+		into = "memory"
+	}
+	text = appendShellStatus(text, status+" Its output goes "+goesOn+"into "+into+stillEnds+". "+
+		"A message reports when it ends, with its exit code and the end of its output: go on with other work, and call wait only when nothing else is left.")
+	result := agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: text}}}
+	if details != nil {
+		result.Details = details
+	}
+	return result
+}
+
+// finalizeForegroundShell is what microPi's execute does after the command ended in the foreground: the search
+// caches learn of the change, a watched file the command changed is reported and taken as read and edited, and files
+// a successful command printed whole with `cat` count as read.
+func finalizeForegroundShell(command, fullCommand string, res agent.AgentToolResult, err error, cwd string, snapshots []FileSnapshot, cfg shellToolConfig) (agent.AgentToolResult, error) {
+	if cwd != "" && !IsReadOnlyCommand(fullCommand) {
 		InvalidateSearchCache(cwd)
 	}
-	if len(snapshots) > 0 {
-		changes := CheckChangedFiles(snapshots, tracker)
-		if len(changes) > 0 {
-			var sb strings.Builder
+	if err != nil || res.Thrown {
+		return res, err
+	}
+	if changes := CheckChangedFiles(snapshots, cfg.tracker); len(changes) > 0 {
+		if cfg.checks != nil {
 			for _, ch := range changes {
-				if bgChecks != nil {
-					bgChecks.OnEdited(ch.AbsolutePath)
-				}
-				fmt.Fprintf(&sb, "\n[Updated %s lines %d-%d]", ch.Target, ch.StartLine, ch.EndLine)
-				if data, rErr := os.ReadFile(ch.AbsolutePath); rErr == nil {
-					lines := strings.Split(normalizeToLF(string(data)), "\n")
-					start := max(1, ch.StartLine)
-					end := min(len(lines), ch.EndLine)
-					if end-start > 30 {
-						end = start + 30
-					}
-					for ln := start; ln <= end; ln++ {
-						fmt.Fprintf(&sb, "\n%d: %s", ln, lines[ln-1])
-					}
-				}
+				cfg.checks.OnEdited(ch.AbsolutePath)
 			}
-			if len(res.Content) > 0 {
-				if tc, ok := res.Content[0].(ai.TextContent); ok {
-					tc.Text += sb.String()
-					res.Content[0] = tc
-				}
-			} else {
-				res.Content = []ai.ToolResultMessageContent{ai.TextContent{Text: strings.TrimPrefix(sb.String(), "\n")}}
+		}
+		if len(res.Content) > 0 {
+			if tc, ok := res.Content[0].(ai.TextContent); ok {
+				tc.Text += FormatChangedFiles(changes)
+				res.Content[0] = tc
 			}
 		}
 	}
-	return res, err
+	if cfg.tracker != nil && !res.IsError {
+		if details, ok := res.Details.(*BashDetails); !ok || details == nil || details.Truncation == nil {
+			markCatFilesRead(command, cwd, cfg.tracker)
+		}
+	}
+	return res, nil
 }
 
-func finishForegroundShell(startedAt time.Time, result BashOperationsResult, err error, output *OutputAccumulator, finishOutput func() OutputSnapshot, sleepNote string) (agent.AgentToolResult, error) {
+func finishForegroundShell(startedAt time.Time, result BashOperationsResult, err error, output *OutputAccumulator, finishOutput func() OutputSnapshot) (agent.AgentToolResult, error) {
 	if err != nil {
 		snapshot := finishOutput()
 		text, _ := formatShellOutput(snapshot, output.LastLineBytes(), "")
@@ -444,13 +594,6 @@ func finishForegroundShell(startedAt time.Time, result BashOperationsResult, err
 			return shellToolError(NodeFSError(pathError.Err, pathError.Op, pathError.Path)), nil
 		}
 		return shellToolError(err.Error()), nil
-	}
-	if sleepNote != "" {
-		if text == "(no output)" {
-			text = sleepNote
-		} else {
-			text = sleepNote + "\n\n" + text
-		}
 	}
 	structured := shellStructuredContent{
 		Output:          fullOutput.Content,
@@ -523,6 +666,8 @@ type shellUpdates struct {
 
 	mu        sync.Mutex
 	scheduler *shellUpdateScheduler
+	// stopped: the call returned (its command went on in the background): no more updates for it.
+	stopped bool
 }
 
 func startShellUpdates(ctx context.Context, output *OutputAccumulator, onUpdate agent.ToolUpdateCallback) *shellUpdates {
@@ -542,6 +687,9 @@ func startShellUpdates(ctx context.Context, output *OutputAccumulator, onUpdate 
 func (u *shellUpdates) ready(ctx context.Context) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.stopped {
+		return false
+	}
 	if u.scheduler == nil && u.onUpdate != nil && agent.ToolUpdatesObserved(ctx, u.onUpdate) {
 		u.scheduler = newShellUpdateScheduler(u.output, u.onUpdate)
 	}
@@ -551,19 +699,34 @@ func (u *shellUpdates) ready(ctx context.Context) bool {
 func (u *shellUpdates) schedule() {
 	u.mu.Lock()
 	scheduler := u.scheduler
+	stopped := u.stopped
 	u.mu.Unlock()
-	scheduler.schedule()
+	if scheduler != nil && !stopped {
+		scheduler.schedule()
+	}
 }
 
-func (u *shellUpdates) started() bool {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.scheduler != nil
-}
-
+// finish sends the last update, if the updates were not stopped.
 func (u *shellUpdates) finish() {
 	u.mu.Lock()
 	scheduler := u.scheduler
+	stopped := u.stopped
+	u.stopped = true
 	u.mu.Unlock()
-	scheduler.finish()
+	if scheduler != nil && !stopped {
+		scheduler.finish()
+	}
+}
+
+// stop ends the updates without a last one (microPi's CallOutput.stopUpdates).
+func (u *shellUpdates) stop() {
+	u.mu.Lock()
+	scheduler := u.scheduler
+	stopped := u.stopped
+	u.stopped = true
+	u.mu.Unlock()
+	if scheduler != nil && !stopped {
+		close(scheduler.stop)
+		<-scheduler.done
+	}
 }

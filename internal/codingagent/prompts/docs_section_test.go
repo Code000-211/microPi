@@ -27,12 +27,19 @@ func TestBuildDefaultPromptMatchesUpstreamLayout(t *testing.T) {
 		"- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n\n" +
 		"Additional tools may be available.\n</tools>\n\n<rules>\n" +
 		"- Use bash for file operations like ls, rg, find\n- Use read to examine files instead of cat or sed.\n- Use write only for new files or complete rewrites.\n" +
+		"- " + orderedCallsRule + "\n" + // µPi: microPi's ordered-calls rule.
 		"- Be concise in your responses\n- Show file paths clearly when working with files\n</rules>\n\n<docs>\n" + docsSectionAt(docs, "", "") + "\n</docs>\n\n<cwd>\n/work/app\n</cwd>"
 	if got != want {
 		t.Fatalf("prompt mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
-	if !strings.Contains(got, "- Main documentation: "+filepath.Join(docs, "README.md")+"\n- Additional docs: "+docs+"\n") {
+	// µPi: microPi's short docs section, pointing at the bundled documentation only.
+	wantDocs := "<docs>\nOnly for questions about pi itself (extensions, SDK, themes, skills, TUI, models, packages, MCP): read " + filepath.Join(docs, "README.md") +
+		" and the docs in " + docs + ", following their links; docs/... paths are under that folder, not the working folder.\n</docs>"
+	if !strings.Contains(got, wantDocs) {
 		t.Errorf("docs section does not point at the local bundle:\n%s", got)
+	}
+	if strings.Contains(got, "github.com") {
+		t.Errorf("the prompt links to a repository:\n%s", got)
 	}
 }
 
@@ -49,7 +56,7 @@ func TestStripDocsOmitsDocsSection(t *testing.T) {
 	if got := sectionNames(stripped); strings.Join(got, ",") != "preamble,tools,rules,cwd" {
 		t.Fatalf("stripped sections = %v", got)
 	}
-	if prompt := BuildDefaultPrompt(opts); strings.Contains(prompt, "<docs>") || strings.Contains(prompt, "PiG documentation") {
+	if prompt := BuildDefaultPrompt(opts); strings.Contains(prompt, "<docs>") || strings.Contains(prompt, "Only for questions about pi itself") {
 		t.Fatalf("stripped prompt names the docs:\n%s", prompt)
 	}
 }

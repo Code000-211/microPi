@@ -83,7 +83,7 @@ func (t *EditTool) BorrowedSchema() ai.ToolSchema { return t.schema(true) }
 func (t *EditTool) schema(borrow bool) ai.ToolSchema {
 	return toolSchemaWithParameters(ai.ToolSchema{
 		Name:                "edit",
-		Description:         "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+		Description:         "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes. A command that tests the edit can follow it in the same response: the calls run in order.",
 		ConstrainedSampling: strictToolSampling(),
 		PromptGuidelines: []string{
 			"Use edit for targeted changes. Batch changes to one file in a single call.",

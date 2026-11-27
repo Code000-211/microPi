@@ -18,7 +18,8 @@ func TestToolSystemPromptContributionsPort(t *testing.T) {
 		guidelines    []string
 	}{
 		{"read", "Read file contents", []string{"Use read to examine files instead of cat or sed."}},
-		{"bash", "Execute bash commands (ls, grep, find, etc.)", []string{"You can inspect PI_* environment variables for current model and session details."}},
+		// µPi: microPi's second bash guideline (bashToolSystemPromptContribution).
+		{"bash", "Execute bash commands (ls, grep, find, etc.)", []string{"You can inspect PI_* environment variables for current model and session details.", bashBackgroundGuideline}},
 		{"powershell", "Execute PowerShell commands", []string{"You can inspect PI_* environment variables for current model and session details."}},
 		{"edit", "Make precise file edits with exact text replacement, including multiple disjoint edits in one call", []string{
 			"Use edit for targeted changes. Batch changes to one file in a single call.",

@@ -126,3 +126,30 @@ func TestJobReporterBatchesAndSends(t *testing.T) {
 		t.Fatalf("unexpected reporter batches: %+v", got)
 	}
 }
+
+// µPi: background-jobs.ts seconds(): JavaScript number text, tenths rounded, minutes from 60 s on.
+func TestFormatSecondsMatchesMicroPi(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{12 * time.Second, "12 s"},
+		{1540 * time.Millisecond, "1.5 s"},
+		{1550 * time.Millisecond, "1.6 s"},
+		{0, "0 s"},
+		{59960 * time.Millisecond, "1 min 0 s"},
+		{125400 * time.Millisecond, "2 min 5 s"},
+		{125600 * time.Millisecond, "2 min 6 s"},
+	} {
+		if got := formatSeconds(tc.d); got != tc.want {
+			t.Errorf("formatSeconds(%v) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+	end := time.Now()
+	start := end.Add(-12 * time.Second)
+	code := 0
+	report := FormatJobReport([]Job{{ID: "bg1", Command: "make", StartedAt: start, EndedAt: &end, ExitCode: &code, Status: StatusDone}})
+	if report != "Background job bg1 (`make`) ended with exit code 0 after 12 s." {
+		t.Fatalf("report = %q", report)
+	}
+}

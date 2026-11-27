@@ -194,6 +194,8 @@ type BashToolOptions struct {
 	Remote         *remote.Manager
 	Tracker        *filetracking.Tracker
 	Checks         *checks.BackgroundChecks
+	// EditToolActive is BashTool.EditToolActive (µPi: microPi's editToolActive).
+	EditToolActive func() bool
 }
 
 // WaitToolOptions configures the wait tool.
@@ -302,6 +304,7 @@ func CreateBashTool(cwd string, options *BashToolOptions) *BashTool {
 		Remote:         o.Remote,
 		Tracker:        o.Tracker,
 		Checks:         o.Checks,
+		EditToolActive: o.EditToolActive,
 	}
 }
 

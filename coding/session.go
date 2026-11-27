@@ -842,16 +842,30 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		// New errors after an edit come as a displayed check-report message, steered into the run (agent-session.ts _sendCheckReport).
 		sess.backgroundChecks.SetReport(sess.sendCheckReport)
 	}
+	// µPi: agent-session.ts _jobReporter: the report is a steer (delivered in the running turn before its next request, or as a
+	// new turn when the agent is idle), with the ended jobs' ids as its details.
 	sess.jobReporter = jobs.NewJobReporter(sess.backgroundJobs, func(ended []jobs.Job) {
+		ids := make([]string, len(ended))
+		for i, job := range ended {
+			ids[i] = job.ID
+		}
 		_ = sess.SendCustomMessage(context.Background(), extension.CustomMessageRef{
 			CustomType: jobs.BackgroundJobMessageType,
 			Content:    jobs.FormatJobReport(ended),
 			Display:    true,
+			Details:    map[string]any{"jobs": ids},
 		}, &extension.SendMessageOptions{
 			TriggerTurn: new(true),
-			DeliverAs:   extension.DeliverAsFollowUp,
+			DeliverAs:   extension.DeliverAsSteer,
 		})
 	})
+	// µPi: agent-session.ts _editToolActive: bash treats commands that change files as edit would (bash-file-writes.ts)
+	// only while the edit tool is active.
+	for _, tool := range sess.tools {
+		if bash, ok := tool.(*tools.BashTool); ok && bash.EditToolActive == nil {
+			bash.EditToolActive = func() bool { return slices.Contains(sess.ActiveToolNames(), "edit") }
+		}
+	}
 	sess.inner.Store(inner)
 	sess.noSession.Store(opts.NoSession)
 	sess.resourceLoader.Store(resourceLoader)

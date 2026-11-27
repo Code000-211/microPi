@@ -80,7 +80,8 @@ func TestUpstreamSystemPrompt(t *testing.T) {
 		// .upstream/v0.87.1/packages/coding-agent/test/system-prompt.test.ts:97 — bash and powershell row.
 		{"uses shell-specific guidance for bash and powershell", Options{Cwd: cwd, Tools: []string{"bash", "powershell"}}, []string{"Use bash or PowerShell for file operations"}, nil, ""},
 		// .upstream/v0.99.1/packages/coding-agent/test/system-prompt.test.ts:111-121 — D22 owns only the product/docs literals; 0.99.1 adds the MCP servers (docs/mcp.md) destination.
-		{"instructs models to resolve pi docs and examples under absolute base paths", Options{Cwd: cwd}, []string{"- When reading pig docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory", "environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md)"}, nil, ""},
+		// µPi: microPi's test/system-prompt.test.ts:115: the short docs section; PiG ships no examples folder beside the docs.
+		{"instructs models to resolve pi docs and examples under absolute base paths", Options{Cwd: cwd}, []string{"docs/... paths are under that folder, not the working folder.", "MCP): read "}, nil, ""},
 		// .upstream/v0.87.1/packages/coding-agent/test/system-prompt.test.ts:126
 		{"includes custom tools in available tools section when promptSnippet is provided", Options{Cwd: cwd, Tools: []string{"read", "dynamic_tool"}, ToolHints: map[string]string{"dynamic_tool": "Run dynamic test behavior"}}, []string{"- dynamic_tool: Run dynamic test behavior"}, nil, ""},
 		// .upstream/v0.87.1/packages/coding-agent/test/system-prompt.test.ts:140
@@ -128,8 +129,8 @@ func TestUpstreamSystemPrompt(t *testing.T) {
 	})
 	// Pi 705d047c packages/coding-agent/test/system-prompt.test.ts:51
 	t.Run("keeps the default and custom prompt prefixes exact", func(t *testing.T) {
-		// D22 substitutes pig for pi in the default product preamble, not in custom text.
-		if prompt := BuildDefaultPrompt(Options{Cwd: "/tmp", Tools: []string{}}); !strings.HasPrefix(prompt, "You are a coding assistant running inside pig, a coding agent harness.") {
+		// µPi: microPi's test/system-prompt.test.ts:55, with µPi's preamble.
+		if prompt := BuildDefaultPrompt(Options{Cwd: "/tmp", Tools: []string{}}); !strings.HasPrefix(prompt, "You are an expert coding assistant operating inside µPi, a build of pi (a coding agent harness) in Go.") {
 			t.Fatal(prompt)
 		}
 		if prompt := BuildDefaultPrompt(Options{Cwd: "/tmp", Tools: []string{}, CustomPrompt: "You are Exact.", AppendMode: "replace"}); !strings.HasPrefix(prompt, "You are Exact.\n\n<cwd>") {

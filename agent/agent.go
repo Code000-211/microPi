@@ -1494,6 +1494,50 @@ func (a *Agent) StreamFunction() StreamFn {
 	return a.opts.StreamFn
 }
 
+// ProviderRequest is the request a run of this agent sends for the context messages to model, thinking at thinking: the provider
+// messages after the transformContext hook, convertToLlm, the TransformLLMMessages hook, the image limit and the system prompt override,
+// and the run's request options without its callbacks (thinking, thinking budgets, session id, transport, identity), as
+// streamAssistantResponse builds them. µPi (a4146262): compaction asks its summary as the continuation of this request, so the provider
+// reads it from its prompt cache (compaction.ts compactOnCachedPrefix).
+func (a *Agent) ProviderRequest(ctx context.Context, messages []AgentMessage, model *ai.Model, thinking ai.ModelThinkingLevel) ([]ai.Message, ai.StreamOptions, error) {
+	cfg := a.createLoopConfig(false)
+	if cfg.TransformContext != nil {
+		var err error
+		if messages, err = cfg.TransformContext(ctx, messages); err != nil {
+			return nil, ai.StreamOptions{}, err
+		}
+	}
+	var llmMsgs []ai.Message
+	if convert := cfg.ConvertToLlm; convert != nil {
+		var err error
+		if llmMsgs, err = convert(messages); err != nil {
+			return nil, ai.StreamOptions{}, err
+		}
+	} else {
+		llmMsgs = a.llm.convert(messages)
+	}
+	if transform := cfg.TransformLLMMessages; transform != nil {
+		llmMsgs = transform(llmMsgs)
+	}
+	llmMsgs = limitImagesPerRequest(llmMsgs, model)
+	if cfg.SystemPromptOverride != nil {
+		if prompt := cfg.SystemPromptOverride(); prompt != nil {
+			llmMsgs = projectSystemPrompt(llmMsgs, *prompt)
+		}
+	}
+	options := ai.StreamOptions{
+		Thinking:        thinking.ReasoningOption(),
+		ThinkingBudgets: cfg.StreamOptions.ThinkingBudgets,
+		SessionID:       cfg.StreamOptions.SessionID,
+		Transport:       cfg.StreamOptions.Transport,
+		MaxRetryDelayMs: cfg.StreamOptions.MaxRetryDelayMs,
+		Identity:        ai.MergeClientIdentity(&DefaultAgentIdentity, cfg.StreamOptions.Identity),
+		RepairToolFlow:  true,
+		IsReasoning:     model != nil && model.Capabilities.MaxThinking != "",
+	}
+	return llmMsgs, options, nil
+}
+
 // EffectiveStreamFunction returns the function every run sends provider requests through: the caller's override, else the default stream. Mirrors upstream Agent.streamFunction (`runtimeOptions.streamFn ?? getDefaultStreamFn()`), which summarization passes to compact and generateBranchSummary so those requests take the same request path as the agent's. Unlike [Agent.StreamFunction], it is never the nil that stands for the stock stream.
 func (a *Agent) EffectiveStreamFunction() StreamFn {
 	a.stateMu.RLock()

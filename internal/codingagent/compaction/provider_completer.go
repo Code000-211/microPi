@@ -55,20 +55,59 @@ func (c ProviderCompleter) CompleteSimple(
 		SystemPrompt: systemPrompt,
 		Messages:     llmMessages,
 	})
-	var stream *ai.AssistantMessageEventStream
-	var err error
-	if c.StreamFn != nil {
-		stream, err = c.StreamFn(ctx, model, transcript, options)
-	} else {
-		// completeSimple is a simple stream (compaction.ts completeSummarization): a provider the model runtime built prepares the options of one, as its StreamSimple does.
-		if simple, ok := model.Provider.(simpleStreamOptionsProvider); ok {
-			options = simple.SimpleStreamOptions(model, transcript, options)
-		}
-		stream, err = model.Provider.Stream(ctx, transcript, options)
-	}
+	stream, err := streamSummary(ctx, c.StreamFn, model, transcript, options)
 	if err != nil {
 		return "", nil, fmt.Errorf("compaction completer: stream: %w", err)
 	}
+	message := collectSummary(ctx, stream)
+	if ctx.Err() != nil {
+		return "", nil, ctx.Err()
+	}
+	if message.StopReason == ai.StopReasonError {
+		detail := message.ErrorMessage
+		if detail == "" {
+			detail = "Unknown error"
+		}
+		return "", nil, errors.New(detail)
+	}
+	if message.StopReason == ai.StopReasonLength {
+		usage := message.Usage
+		return "", &usage, ErrSummaryTokenCap
+	}
+	for _, block := range message.Content {
+		if _, ok := block.(ai.ToolCall); ok {
+			return "", nil, ErrSummarizationToolCall
+		}
+	}
+	usage := message.Usage
+	return summaryText(message.Content), &usage, nil
+}
+
+// summaryText is the text blocks of a summary response, joined (compaction.ts contentText).
+func summaryText(content []ai.AssistantContentBlock) string {
+	var text strings.Builder
+	for _, block := range content {
+		if block, ok := block.(ai.TextContent); ok {
+			text.WriteString(block.Text)
+		}
+	}
+	return text.String()
+}
+
+// streamSummary sends a summary request through streamFn, or, without one, the model's provider.
+func streamSummary(ctx context.Context, streamFn agent.StreamFn, model *ai.Model, transcript ai.TranscriptContext, options ai.StreamOptions) (*ai.AssistantMessageEventStream, error) {
+	if streamFn != nil {
+		return streamFn(ctx, model, transcript, options)
+	}
+	// completeSimple is a simple stream (compaction.ts completeSummarization): a provider the model runtime built prepares the options of one, as its StreamSimple does.
+	if simple, ok := model.Provider.(simpleStreamOptionsProvider); ok {
+		options = simple.SimpleStreamOptions(model, transcript, options)
+	}
+	return model.Provider.Stream(ctx, transcript, options)
+}
+
+// collectSummary reads a summary response to its end.
+func collectSummary(ctx context.Context, stream *ai.AssistantMessageEventStream) *ai.AssistantMessage {
 	if progress := compactprogress.From(ctx); progress != nil {
 		// pig divergence (D652): the interactive compaction line shows the size of the summary as it streams. The events are only counted; the result below is what Result returned before, the caller's context cancels the iteration as it ends the request.
 		progress.Reset()
@@ -81,31 +120,5 @@ func (c ProviderCompleter) CompleteSimple(
 			}
 		}
 	}
-	message := stream.Result()
-	if ctx.Err() != nil {
-		return "", nil, ctx.Err()
-	}
-	if message.StopReason == ai.StopReasonError {
-		detail := message.ErrorMessage
-		if detail == "" {
-			detail = "Unknown error"
-		}
-		return "", nil, errors.New(detail)
-	}
-	if message.StopReason == ai.StopReasonLength {
-		return "", nil, errors.New("generation hit the token cap and the summary is incomplete")
-	}
-	for _, block := range message.Content {
-		if _, ok := block.(ai.ToolCall); ok {
-			return "", nil, ErrSummarizationToolCall
-		}
-	}
-	var text strings.Builder
-	for _, block := range message.Content {
-		if block, ok := block.(ai.TextContent); ok {
-			text.WriteString(block.Text)
-		}
-	}
-	usage := message.Usage
-	return text.String(), &usage, nil
+	return stream.Result()
 }

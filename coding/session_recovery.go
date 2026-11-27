@@ -493,11 +493,18 @@ func (s *Session) compactionSettings() (compaction.CompactionSettings, error) {
 	if err != nil {
 		return compaction.CompactionSettings{}, err
 	}
+	// µPi (a4146262): the summary's output cap, set or scaled with the summarizer's window (settings-manager.ts getCompactionSettings).
+	summaryMax, scaleSummary, err := s.SettingsManager().GetCompactionSummaryMaxTokens(s.Model())
+	if err != nil {
+		return compaction.CompactionSettings{}, err
+	}
 	return compaction.CompactionSettings{
-		Enabled:          cfg.Enabled,
-		ReserveTokens:    cfg.ReserveTokens,
-		KeepRecentTokens: cfg.KeepRecentTokens,
-		MaxContextTokens: maxContext,
+		Enabled:                       cfg.Enabled,
+		ReserveTokens:                 cfg.ReserveTokens,
+		KeepRecentTokens:              cfg.KeepRecentTokens,
+		MaxContextTokens:              maxContext,
+		SummaryMaxTokens:              summaryMax,
+		ScaleSummaryWithContextWindow: scaleSummary,
 	}, nil
 }
 

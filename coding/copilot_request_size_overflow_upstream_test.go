@@ -17,6 +17,9 @@ import (
 // request-size limit is context overflow, so the agent compacts an image-heavy history and retries instead of dying on the error.
 // The harness provider is the faux provider whatever Pi's test names it: the classifier is provider-agnostic.
 func TestCopilotRequestSizeOverflowRecoveryUpstream(t *testing.T) {
+	// µPi (8f722e90): the history is just below the threshold, where a summary would start ahead and take a scripted response
+	// (copilot-request-size-overflow.test.ts).
+	withoutCompactionAhead(t)
 	const (
 		copilot413   = `github-copilot API error (413): {"message":"failed to parse request","code":""}`
 		requestLimit = 32 * 1024 * 1024

@@ -130,9 +130,10 @@ func TestCompactionOfARefreshedCopilotFableModelSendsTheModelRequest(t *testing.
 	if request.path != "/v1/messages" || request.authorization != "Bearer copilot-token" {
 		t.Fatalf("path=%q authorization=%q", request.path, request.authorization)
 	}
-	// The summary request names the refreshed model, asks for the output limit of the model (Pi 6fcb4867: no fixed cap), sends adaptive thinking at the
-	// clamped level, and carries no tools.
-	want := map[string]any{"model": "zz-fixture-claude-fable-6", "max_tokens": float64(128000), "stream": true, "thinking": map[string]any{"type": "adaptive", "display": "summarized"}, "output_config": map[string]any{"effort": "low"}}
+	// The summary request names the refreshed model, asks for the summary's output cap (µPi a4146262: 80% of the reserve, as the window's
+	// 3.2% share of the 128,000 tokens maxContextTokens caps it at is less; Pi 6fcb4867 asks for the model's output limit), sends adaptive
+	// thinking at the clamped level, and carries no tools.
+	want := map[string]any{"model": "zz-fixture-claude-fable-6", "max_tokens": float64(13107), "stream": true, "thinking": map[string]any{"type": "adaptive", "display": "summarized"}, "output_config": map[string]any{"effort": "low"}}
 	for key, value := range want {
 		if fmt.Sprint(request.body[key]) != fmt.Sprint(value) {
 			t.Errorf("%s=%v, want %v", key, request.body[key], value)
@@ -163,7 +164,8 @@ func TestCompactionFaultsOfARefreshedCopilotFableModelShowTheProviderText(t *tes
 			w.Header().Set("Retry-After", "1")
 			reply(429, "text/plain", "429 too many requests\n")(n, w)
 		}, "429 429 too many requests", 3},
-		{"prompt token count over the window", reply(400, "application/json", promptCount), "400 " + promptCount, 1},
+		// µPi (a4146262): an overflow of the summary on the cached prefix falls back to the standalone request, which meets it too.
+		{"prompt token count over the window", reply(400, "application/json", promptCount), "400 " + promptCount, 2},
 		{"503 high demand", reply(503, "text/plain", overloaded), "503 " + overloaded, 3},
 		{"expired token", reply(401, "application/json", `{"type":"error","error":{"type":"authentication_error","message":"Unauthorized: token expired"}}`), "Unauthorized: token expired", 1},
 	} {

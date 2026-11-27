@@ -202,6 +202,8 @@ type Session struct {
 	compactAbortRequested bool                                     // cancellation arrived before compactCancel was installed
 	branchSumCancel       context.CancelFunc                       // non-nil while tree navigation owns its abortable operation
 	branchSumDone         chan struct{}                            // closed when the current tree navigation releases ownership
+	// compactionAhead is the summary made in the background near the compaction threshold (µPi compaction-ahead.ts).
+	compactionAhead compaction.CompactionAhead
 
 	// overflowRecoveryAttempted prevents recursive overflow compaction.
 	// Set to true on the first overflow recovery attempt; any subsequent
@@ -1683,6 +1685,7 @@ func (s *Session) Dispose() {
 	}
 	s.AbortRetry()
 	s.AbortCompaction()
+	s.compactionAhead.Cancel()
 	s.AbortBranchSummary()
 	s.AbortBash()
 	s.RequestAbort()
@@ -1725,6 +1728,9 @@ func (s *Session) Close() error {
 	s.AbortRetry()
 	s.AbortBash()
 	s.AbortCompaction()
+	// The summary made ahead is work the Session owns: it is cancelled and drained.
+	s.compactionAhead.Cancel()
+	s.compactionAhead.Wait(context.Background())
 	s.AbortBranchSummary()
 	s.closeCacheWarming()
 	s.closeOnce.Do(func() {
@@ -3605,10 +3611,43 @@ func (s *Session) checkCompactionDecision(ctx context.Context, assistantMsg *age
 	if contextWindow <= 0 {
 		return false, nil
 	}
+	// µPi (8f722e90): near the threshold when a run ends, the summary is made while the user reads and writes; above it, while the agent
+	// goes on.
+	if sameModel && s.compactAhead(contextTokens, contextWindow, settings) {
+		return false, nil
+	}
 	if compaction.ShouldCompact(contextTokens, contextWindow, settings) {
 		return compact(ctx, "threshold", false)
 	}
 	return false, nil
+}
+
+// compactAhead makes the summary of what the compaction would cut in the background near the compaction threshold (see
+// compaction.CompactionAhead), for the session's current branch of contextTokens. Not when an extension makes or vets compactions
+// (session_before_compact). It reports whether the compaction is to wait: a summary is being made, and the context is below where it
+// stops. µPi (agent-session.ts _compactAhead).
+func (s *Session) compactAhead(contextTokens, contextWindow int, settings compaction.CompactionSettings) bool {
+	if !compaction.AheadEnabled() || !settings.Enabled {
+		return false
+	}
+	model := s.Model()
+	if model == nil {
+		return false
+	}
+	if runner := s.currentRunner(); runner != nil && runner.HasHandlers(icodingagent.EventSessionBeforeCompact) {
+		return false
+	}
+	return s.compactionAhead.Update(compaction.AheadUpdate{
+		ContextTokens: contextTokens,
+		ContextWindow: contextWindow,
+		Session:       s.inner.Load(),
+		Branch:        s.currentBranch,
+		Settings:      settings,
+		Summarize: func(prep compaction.CompactionPreparation) func(context.Context) (compaction.CompactionResult, error) {
+			s.keepUserMessages(&prep)
+			return s.defaultCompaction(context.Background(), prep, model, "", "threshold", true)
+		},
+	})
 }
 
 // assistantRecovery describes how a checked assistant message relates to the
@@ -3737,11 +3776,25 @@ func (s *Session) runAutoCompaction(ctx context.Context, reason string, willRetr
 	result, fromExtension, err = s.extensionCompaction(compactCtx, prep, entries, "", reason, willRetry)
 	cancelledByExtension := isCompactionCancelled(err)
 	if err == nil && result == nil {
-		// upstream: agent-session.ts:3034-3080 (_runDefaultCompaction after the session_before_compact hook).
-		generated, compactErr := s.runDefaultCompaction(compactCtx, *prep, model, "", reason)
-		err = compactErr
-		if compactErr == nil {
-			result = generatedCompactionData(generated)
+		// µPi (8f722e90): the summary made ahead keeps more (what came after it started); the default one otherwise, which is shared with
+		// manual compaction.
+		var ahead *compaction.CompactionResult
+		if reason == "threshold" {
+			ahead = s.compactionAhead.Take(compactCtx, s.inner.Load(), entries, settings)
+		}
+		switch {
+		case compactCtx.Err() != nil:
+			err = errCompactionCancelled
+		case ahead != nil:
+			result = generatedCompactionData(*ahead)
+			result.TokensBefore = prep.TokensBefore
+		default:
+			// upstream: agent-session.ts:3034-3080 (_runDefaultCompaction after the session_before_compact hook).
+			generated, compactErr := s.runDefaultCompaction(compactCtx, *prep, model, "", reason)
+			err = compactErr
+			if compactErr == nil {
+				result = generatedCompactionData(generated)
+			}
 		}
 	}
 	if err == nil && compactCtx.Err() != nil {

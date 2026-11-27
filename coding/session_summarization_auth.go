@@ -27,27 +27,120 @@ type summarizationRequest struct {
 	thinkingLevel ai.ModelThinkingLevel
 }
 
+// runDefaultCompaction generates Pi's built-in compaction summary for manual and automatic compaction (agent-session.ts
+// _runDefaultCompaction).
 func (s *Session) runDefaultCompaction(ctx context.Context, prep compaction.CompactionPreparation, model *ai.Model, customInstructions, reason string) (compaction.CompactionResult, error) {
-	request, err := s.prepareSummarizationRequest(ctx, model)
-	if err != nil {
-		return compaction.CompactionResult{}, err
+	return s.defaultCompaction(ctx, prep, model, customInstructions, reason, false)(ctx)
+}
+
+// defaultCompaction is [Session.runDefaultCompaction] in two parts: the call reads the session's next request, which the summary on the
+// cached prefix continues, and the function it returns makes the summary. ahead is a summary made while the agent works
+// (compaction-ahead.ts): its retries are not shown, and its second part runs in the background.
+func (s *Session) defaultCompaction(ctx context.Context, prep compaction.CompactionPreparation, model *ai.Model, customInstructions, reason string, ahead bool) func(context.Context) (compaction.CompactionResult, error) {
+	var next *nextRequest
+	var nextErr error
+	if reason != "overflow" && compaction.CachedPrefixEnabled() {
+		next, nextErr = s.nextRequest(ctx, prep)
 	}
-	// µPi: Pi's own summary sits beside the user's messages (session-manager.ts userMessagesBefore): it need not restate them
-	// (agent-session.ts _runDefaultCompaction, keptUserMessagesInstruction).
-	if kept := compaction.KeptUserMessagesInstruction(prep); kept != "" {
-		if customInstructions != "" {
-			customInstructions += "\n\n" + kept
-		} else {
-			customInstructions = kept
+	return func(ctx context.Context) (compaction.CompactionResult, error) {
+		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
+		request, err := s.prepareSummarizationRequest(ctx, model)
+		if err != nil {
+			return compaction.CompactionResult{}, err
+		}
+		// µPi: Pi's own summary sits beside the user's messages (session-manager.ts userMessagesBefore): it need not restate them
+		// (agent-session.ts _runDefaultCompaction, keptUserMessagesInstruction).
+		if kept := compaction.KeptUserMessagesInstruction(prep); kept != "" {
+			if customInstructions != "" {
+				customInstructions += "\n\n" + kept
+			} else {
+				customInstructions = kept
+			}
+		}
+		retry, retryCallbacks := s.summarizationRetryOptions("compaction", reason)
+		if ahead {
+			retryCallbacks = ai.RetryCallbacks{}
+		}
+		if nextErr != nil {
+			return compaction.CompactionResult{}, nextErr
+		}
+		if next != nil {
+			cached, err := s.compactOnCachedPrefix(ctx, prep, request, next, customInstructions, retry, retryCallbacks)
+			if err != nil {
+				return compaction.CompactionResult{}, err
+			}
+			if cached != nil {
+				return *cached, nil
+			}
+			if ctx.Err() != nil {
+				return compaction.CompactionResult{}, errCompactionCancelled
+			}
+		}
+		// upstream compact(preparation, model, apiKey, headers, customInstructions, signal, thinkingLevel, this.agent.streamFunction, env, retry, callbacks, sessionId): request.completer holds the Agent's stream function.
+		streamFn := request.streamFn
+		if streamFn == nil {
+			streamFn = compaction.CompleterStreamFn(request.completer)
+		}
+		return compaction.Compact(ctx, prep, request.model, request.apiKey, request.headers, customInstructions, request.thinkingLevel, streamFn, request.env, retry, retryCallbacks, "")
+	}
+}
+
+// nextRequest is the session's next request, as the summary on the cached prefix continues it.
+type nextRequest struct {
+	model    *ai.Model
+	thinking ai.ModelThinkingLevel
+	messages []ai.Message
+	options  ai.StreamOptions
+	// keptQuote is the first kept message as the instruction quotes it.
+	keptQuote string
+}
+
+// nextRequest reads the messages, model and options the session's next request would send (agent-session.ts _compactOnCachedPrefix: the
+// projection after the context hook and convertToLlm, so tool-result pruning too). nil when the summary cannot continue it: a virtual
+// selection routes each request to a model of its choice, which has no cache of this conversation.
+//
+// pig divergence: a summary completer or stream function the tests inject stands in for the standalone summary request only, so a session
+// with one sends that request.
+func (s *Session) nextRequest(ctx context.Context, prep compaction.CompactionPreparation) (*nextRequest, error) {
+	model := s.agent.Model()
+	if model == nil || IsVirtualModel(model) || s.completer != nil || s.streamFn != nil {
+		return nil, nil
+	}
+	// As the requests it continues think: less after responses cut off at the output limit (agent-session.ts _requestThinkingLevel, a37b2029).
+	thinking := s.requestThinkingLevel()
+	messages := s.contextFromProjection(s.inner.Load().BuildSessionProjectionView())
+	llmMessages, options, err := s.agent.ProviderRequest(ctx, messages, model, thinking)
+	if err != nil {
+		return nil, err
+	}
+	next := &nextRequest{model: model, thinking: s.agent.ThinkingLevel(), messages: llmMessages, options: options}
+	if kept, ok := s.inner.Load().GetEntry(prep.FirstKeptEntryID); ok && kept.Base().Type == "message" {
+		if message, ok := icodingagent.AsMessage(kept); ok {
+			next.keptQuote = compaction.DescribeKeptMessage(message.Message)
 		}
 	}
-	retry, retryCallbacks := s.summarizationRetryOptions("compaction", reason)
-	// upstream compact(preparation, model, apiKey, headers, customInstructions, signal, thinkingLevel, this.agent.streamFunction, env, retry, callbacks, sessionId): request.completer holds the Agent's stream function.
-	streamFn := request.streamFn
-	if streamFn == nil {
-		streamFn = compaction.CompleterStreamFn(request.completer)
+	return next, nil
+}
+
+// compactOnCachedPrefix asks the summary as the continuation of the session's own request, read from the provider's prompt cache (see
+// compaction.CompactOnCachedPrefix). Only when the summary is asked of the session's own model and thinking level (another model has no
+// cache of this conversation); nil to fall back to the standalone summary request (agent-session.ts _compactOnCachedPrefix).
+func (s *Session) compactOnCachedPrefix(ctx context.Context, prep compaction.CompactionPreparation, request summarizationRequest, next *nextRequest, customInstructions string, retry *ai.RetryPolicy, callbacks ai.RetryCallbacks) (*compaction.CompactionResult, error) {
+	if request.model == nil || providerID(request.model) != providerID(next.model) || request.model.ID != next.model.ID || request.thinkingLevel != next.thinking {
+		return nil, nil
 	}
-	return compaction.Compact(ctx, prep, request.model, request.apiKey, request.headers, customInstructions, request.thinkingLevel, streamFn, request.env, retry, retryCallbacks, "")
+	options := next.options
+	options.APIKey = request.apiKey
+	options.Headers = ai.ProviderHeadersFromStrings(request.headers)
+	options.Env = maps.Clone(request.env)
+	return compaction.CompactOnCachedPrefix(ctx, prep, compaction.CachedPrefixRequest{
+		Messages:  next.messages,
+		Model:     request.model,
+		Options:   options,
+		StreamFn:  s.agent.EffectiveStreamFunction(),
+		Retry:     retry,
+		Callbacks: callbacks,
+	}, next.keptQuote, customInstructions)
 }
 
 // keepUserMessages records on prep the user's messages that go verbatim beside the summary, read from the whole branch: the context

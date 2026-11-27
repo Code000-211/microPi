@@ -20,6 +20,12 @@ type CompactionSettings struct {
 	KeepRecentTokens int  `json:"keepRecentTokens"` // tokens to keep from recent history; default 20000
 	// MaxContextTokens also caps the threshold, whatever the window; 0 is no cap (µPi compaction.ts maxContextTokens, default 128000).
 	MaxContextTokens int `json:"maxContextTokens,omitempty"`
+	// SummaryMaxTokens is the output cap of the summary (a split turn's prefix summary gets half); 0 derives it from ReserveTokens (µPi
+	// compaction.ts summaryMaxTokens).
+	SummaryMaxTokens int `json:"summaryMaxTokens,omitempty"`
+	// ScaleSummaryWithContextWindow lets the summary cap derived from ReserveTokens grow with the summarizer's context window: to 3.2% of
+	// it (1.6% for a split turn's prefix), the window capped at MaxContextTokens (µPi compaction.ts scaleSummaryWithContextWindow).
+	ScaleSummaryWithContextWindow bool `json:"scaleSummaryWithContextWindow,omitempty"`
 }
 
 // FileOperations tracks files read/written/edited during a session segment.

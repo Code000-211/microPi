@@ -46,6 +46,8 @@ var DefaultCompactionSettings = CompactionSettings{
 	ReserveTokens:    16384,
 	KeepRecentTokens: 20000,
 	MaxContextTokens: 128000,
+	// µPi (a4146262): the summary cap grows with the summarizer's window (compaction.ts DEFAULT_COMPACTION_SETTINGS).
+	ScaleSummaryWithContextWindow: true,
 }
 
 // CutPointResult from FindCutPoint.
@@ -665,9 +667,7 @@ func bashExecutionToText(custom map[string]any) string {
 	return text.String()
 }
 
-// generateSummary calls the LLM to summarize messagesToSummarize.
-// Uses UPDATE_SUMMARIZATION_PROMPT when previousSummary is non-empty.
-// Mirrors upstream generateSummary (compaction.ts:547).
+// capMaxTokens bounds budget by the model's output limit, when it has one.
 func capMaxTokens(budget int, model *ai.Model) int {
 	if budget < 0 {
 		budget = 0
@@ -678,12 +678,58 @@ func capMaxTokens(budget int, model *ai.Model) int {
 	return budget
 }
 
-// createSummarizationOptions builds the request options for one summary
-// call. The thinking level applies only to reasoning-capable models. No
-// maxTokens: summaries use the model's output limit (#9512, Pi 6fcb4867).
-// Mirrors upstream createSummarizationOptions (compaction.ts).
-func createSummarizationOptions(model *ai.Model, apiKey string, headers, env map[string]string, thinkingLevel ai.ModelThinkingLevel, sessionID string) ai.StreamOptions {
-	options := ai.StreamOptions{APIKey: apiKey, Headers: ai.ProviderHeadersFromStrings(headers), Env: env, SessionID: sessionID}
+// minSummaryOutputTokens is the smallest summary output budget, so a zero or tiny reserveTokens still allows a summary.
+const minSummaryOutputTokens = 4096
+
+// GetSummaryMaxTokens is the output cap of a summary, capped by the model's output limit (compaction.ts getSummaryMaxTokens). An explicit
+// SummaryMaxTokens is used as set (half of it, rounded up, for a split turn's prefix). Otherwise the cap is 80% of ReserveTokens (50% for
+// the prefix), at least 4096, and with ScaleSummaryWithContextWindow at least 3.2% of the model's context window capped at
+// MaxContextTokens (1.6% for the prefix).
+//
+// µPi (a4146262): Pi 6fcb4867 (#9512) sends no cap and lets a summary use the model's output limit; µPi keeps the cap, so a summary
+// asked as the continuation of the session's request is bounded as the standalone one is, and a summary whose reasoning used the cap
+// is asked again without reasoning (completeSummarization).
+func GetSummaryMaxTokens(model *ai.Model, settings CompactionSettings, turnPrefix bool) int {
+	var budget int
+	if settings.SummaryMaxTokens > 0 {
+		budget = settings.SummaryMaxTokens
+		if turnPrefix {
+			budget = (settings.SummaryMaxTokens + 1) / 2
+		}
+	} else {
+		share := 0.8
+		if turnPrefix {
+			share = 0.5
+		}
+		budget = max(int(math.Floor(share*float64(settings.ReserveTokens))), minSummaryOutputTokens)
+		if window := modelContextWindow(model); settings.ScaleSummaryWithContextWindow && window > 0 {
+			perMille := 32
+			if turnPrefix {
+				perMille = 16
+			}
+			if settings.MaxContextTokens > 0 {
+				window = min(window, settings.MaxContextTokens)
+			}
+			budget = max(budget, window*perMille/1000)
+		}
+	}
+	if model != nil && model.Capabilities.MaxOutputTokens > 0 {
+		return min(budget, model.Capabilities.MaxOutputTokens)
+	}
+	return budget
+}
+
+func modelContextWindow(model *ai.Model) int {
+	if model == nil {
+		return 0
+	}
+	return model.Capabilities.ContextWindow
+}
+
+// createSummarizationOptions builds the request options for one summary call: maxTokens (0 sets none), the auth, the routing session, and
+// the thinking level, which applies only to reasoning-capable models. Mirrors upstream createSummarizationOptions (compaction.ts).
+func createSummarizationOptions(model *ai.Model, maxTokens int, apiKey string, headers, env map[string]string, thinkingLevel ai.ModelThinkingLevel, sessionID string) ai.StreamOptions {
+	options := ai.StreamOptions{MaxTokens: maxTokens, APIKey: apiKey, Headers: ai.ProviderHeadersFromStrings(headers), Env: env, SessionID: sessionID}
 	if model != nil && model.Capabilities.MaxThinking != "" {
 		options.IsReasoning = true
 		options.Thinking = thinkingLevel.ReasoningOption()
@@ -721,19 +767,47 @@ func completeSummarization(
 		}
 		requestOptions.SessionID = id
 	}
-	return completeSimpleWithRetries(ctx, retry, callbacks, func() (string, *ai.Usage, error) {
-		if streamFn != nil {
-			text, usage, err := streamFn(ctx, model, systemPrompt, messages, requestOptions)
-			if err != nil {
-				if completer, ok := errors.AsType[*completerError](err); ok {
-					return "", nil, completer.err
+	// cutOffUsage is the usage of an answer cut off at its output cap, which the request without reasoning adds to its own.
+	var cutOffUsage *ai.Usage
+	produce := func(options ai.StreamOptions) func() (string, *ai.Usage, error) {
+		return func() (string, *ai.Usage, error) {
+			var text string
+			var usage *ai.Usage
+			var err error
+			if streamFn != nil {
+				if text, usage, err = streamFn(ctx, model, systemPrompt, messages, options); err != nil {
+					if completer, ok := errors.AsType[*completerError](err); ok {
+						err = completer.err
+					} else {
+						err = &summarizationCallError{err}
+					}
 				}
-				return "", nil, &summarizationCallError{err}
+			} else {
+				text, usage, err = completer.CompleteSimple(ctx, model, systemPrompt, messages, options)
+			}
+			cutOffUsage = nil
+			if err != nil {
+				if errors.Is(err, ErrSummaryTokenCap) {
+					cutOffUsage = usage
+				}
+				return "", nil, err
 			}
 			return text, usage, nil
 		}
-		return completer.CompleteSimple(ctx, model, systemPrompt, messages, requestOptions)
-	})
+	}
+	text, usage, err := completeSimpleWithRetries(ctx, retry, callbacks, produce(requestOptions))
+	// µPi (#9512): reasoning shares the summary's output cap on some providers and can use all of it. Summarize once more without
+	// reasoning instead of failing the compaction (compaction.ts completeSummarization).
+	if err == nil || !errors.Is(err, ErrSummaryTokenCap) || requestOptions.Thinking == "" {
+		return text, usage, err
+	}
+	first := cutOffUsage
+	withoutReasoning := requestOptions
+	withoutReasoning.Thinking = ""
+	if text, usage, err = completeSimpleWithRetries(ctx, retry, callbacks, produce(withoutReasoning)); err != nil {
+		return "", nil, err
+	}
+	return text, combineUsage(first, usage), nil
 }
 
 // GenerateSummary generates or updates a conversation summary with the model's provider and returns its text (compaction.ts:645 generateSummary, which
@@ -814,6 +888,24 @@ func withTokenRatio(ctx context.Context, ratio float64) context.Context {
 func tokenRatioFromContext(ctx context.Context) float64 {
 	ratio, _ := ctx.Value(tokenRatioKey{}).(float64)
 	return ratio
+}
+
+type summaryMaxTokensKey struct{}
+
+// withSummaryMaxTokens carries the output cap of a history summary from the compaction's settings (compaction.ts compact passes
+// getSummaryMaxTokens(model, settings) to generateHistorySummary) to [GenerateSummaryWithUsageUsing], whose signature is Pi's
+// generateSummary and has only reserveTokens.
+func withSummaryMaxTokens(ctx context.Context, maxTokens int) context.Context {
+	return context.WithValue(ctx, summaryMaxTokensKey{}, maxTokens)
+}
+
+// summaryMaxTokensFromContext is the cap withSummaryMaxTokens carries, else the one reserveTokens alone gives (compaction.ts
+// generateSummaryWithUsage: getSummaryMaxTokens(model, { reserveTokens })).
+func summaryMaxTokensFromContext(ctx context.Context, model *ai.Model, reserveTokens int) int {
+	if maxTokens, ok := ctx.Value(summaryMaxTokensKey{}).(int); ok {
+		return maxTokens
+	}
+	return GetSummaryMaxTokens(model, CompactionSettings{ReserveTokens: reserveTokens}, false)
 }
 
 // generateSummaryChunked is [GenerateSummaryWithUsageUsing] with the measured ratio of real to estimated tokens of the session (0: none measured).
@@ -1134,7 +1226,7 @@ func generateSummaryChunk(
 		},
 	}
 
-	options := createSummarizationOptions(model, apiKey, headers, env, thinkingLevel, sessionID)
+	options := createSummarizationOptions(model, summaryMaxTokensFromContext(ctx, model, reserveTokens), apiKey, headers, env, thinkingLevel, sessionID)
 	result, usage, err := completeSummarization(ctx, model, completer, streamFn, retry, callbacks, SummarizationSystemPrompt, req, options)
 	if err != nil {
 		return "", nil, summarizationFailure("Summarization", err)
@@ -1148,7 +1240,7 @@ func generateTurnPrefixSummary(
 	ctx context.Context,
 	messages []agent.AgentMessage,
 	model *ai.Model,
-	reserveTokens int,
+	maxTokens int,
 	apiKey string,
 	headers map[string]string,
 	env map[string]string,
@@ -1177,13 +1269,17 @@ func generateTurnPrefixSummary(
 			},
 		},
 	}
-	options := createSummarizationOptions(model, apiKey, headers, env, thinkingLevel, sessionID)
+	options := createSummarizationOptions(model, maxTokens, apiKey, headers, env, thinkingLevel, sessionID)
 	result, usage, err := completeSummarization(ctx, model, completer, streamFn, retry, callbacks, SummarizationSystemPrompt, req, options)
 	if err != nil {
 		return "", nil, summarizationFailure("Turn prefix summarization", err)
 	}
 	return result, usage, nil
 }
+
+// ErrSummaryTokenCap is the failure of a summary cut off at its output cap: its partial text must not become a session checkpoint
+// (compaction.ts getSummarizationFailure). A completer returns it with the answer's usage.
+var ErrSummaryTokenCap = errors.New("generation hit the token cap and the summary is incomplete")
 
 // ErrSummarizationToolCall rejects a provider response containing a tool call;
 // standalone summarization requests never provide executable tools.
@@ -1200,7 +1296,7 @@ func CompleterStreamFn(completer SimpleCompleter) StreamFn {
 	return func(ctx context.Context, model *ai.Model, systemPrompt string, messages []agent.AgentMessage, options ai.StreamOptions) (string, *ai.Usage, error) {
 		text, usage, err := completer.CompleteSimple(ctx, model, systemPrompt, messages, options)
 		if err != nil {
-			return "", nil, &completerError{err}
+			return "", usage, &completerError{err}
 		}
 		return text, usage, nil
 	}
@@ -1249,6 +1345,7 @@ func Compact(
 	completer := ProviderCompleter{}
 	var summary string
 	var usage *ai.Usage
+	historyCtx := withSummaryMaxTokens(withTokenRatio(ctx, compactiontypes.TokenRatioOf(prep)), GetSummaryMaxTokens(model, prep.Settings, false))
 
 	if prep.IsSplitTurn && len(prep.TurnPrefixMessages) > 0 {
 		history, prefix := prep.MessagesToSummarize, prep.TurnPrefixMessages
@@ -1262,13 +1359,13 @@ func Compact(
 		var historyUsage *ai.Usage
 		if len(history) > 0 {
 			var err error
-			historySummary, historyUsage, err = GenerateSummaryWithUsageUsing(withTokenRatio(ctx, compactiontypes.TokenRatioOf(prep)), history, model, prep.Settings.ReserveTokens, apiKey, headers, customInstructions, prep.PreviousSummary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
+			historySummary, historyUsage, err = GenerateSummaryWithUsageUsing(historyCtx, history, model, prep.Settings.ReserveTokens, apiKey, headers, customInstructions, prep.PreviousSummary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
 			if err != nil {
 				return CompactionResult{}, err
 			}
 		}
 
-		prefixSummary, prefixUsage, err := generateTurnPrefixSummary(ctx, prefix, model, prep.Settings.ReserveTokens, apiKey, headers, env, thinkingLevel, completer, streamFn, retry, callbacks, sessionID, customInstructions)
+		prefixSummary, prefixUsage, err := generateTurnPrefixSummary(ctx, prefix, model, GetSummaryMaxTokens(model, prep.Settings, true), apiKey, headers, env, thinkingLevel, completer, streamFn, retry, callbacks, sessionID, customInstructions)
 		if err != nil {
 			return CompactionResult{}, err
 		}
@@ -1276,7 +1373,7 @@ func Compact(
 		usage = combineUsage(historyUsage, prefixUsage)
 	} else {
 		var err error
-		summary, usage, err = GenerateSummaryWithUsageUsing(withTokenRatio(ctx, compactiontypes.TokenRatioOf(prep)), prep.MessagesToSummarize, model, prep.Settings.ReserveTokens, apiKey, headers, customInstructions, prep.PreviousSummary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
+		summary, usage, err = GenerateSummaryWithUsageUsing(historyCtx, prep.MessagesToSummarize, model, prep.Settings.ReserveTokens, apiKey, headers, customInstructions, prep.PreviousSummary, thinkingLevel, completer, streamFn, env, retry, callbacks, sessionID)
 		if err != nil {
 			return CompactionResult{}, err
 		}

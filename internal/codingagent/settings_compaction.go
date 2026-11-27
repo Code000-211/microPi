@@ -10,6 +10,7 @@ import (
 	"maps"
 	"math"
 
+	"github.com/MichaelKinsy/PiG/ai"
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
 )
 
@@ -190,7 +191,35 @@ func getCompactionMaxContextTokens(settings *CompactionSettingsJSON, provider, i
 	if settings == nil {
 		return defaultMaxContextTokens, nil
 	}
-	const field = "maxContextTokens"
+	explicit, err := explicitCompactionRangeSetting(settings, "maxContextTokens", settings.MaxContextTokens, provider, id)
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case explicit != nil:
+		return int(*explicit), nil
+	case explicitCompactionReserve(settings, provider, id):
+		return 0, nil
+	}
+	return defaultMaxContextTokens, nil
+}
+
+// explicitCompactionReserve reports whether reserveTokens is set for the model, in its override or the ordinary setting, valid or not.
+func explicitCompactionReserve(settings *CompactionSettingsJSON, provider, id string) bool {
+	if settings.ReserveTokens != nil || settings.extra["reserveTokens"] != nil {
+		return true
+	}
+	if provider == "" && id == "" {
+		return false
+	}
+	entry, ok := settings.ModelOverrides[provider+"/"+id]
+	return ok && entry.invalidEntry == nil && (entry.ReserveTokens != nil || entry.extra["reserveTokens"] != nil)
+}
+
+// explicitCompactionRangeSetting is the integer from 1 to Number.MAX_SAFE_INTEGER the user set for field, from the model's override or the
+// ordinary setting (ordinary when the settings hold it as a field, else read from their other members); nil when neither sets it. µPi
+// (settings-manager.ts getExplicitCompactionSetting with COMPACTION_SETTING_RANGES maxContextTokens and summaryMaxTokens).
+func explicitCompactionRangeSetting(settings *CompactionSettingsJSON, field string, ordinary *float64, provider, id string) (*float64, error) {
 	valid := func(value float64) bool {
 		return !math.IsNaN(value) && !math.IsInf(value, 0) && math.Trunc(value) == value && value >= 1 && value <= (1<<53-1)
 	}
@@ -204,38 +233,71 @@ func getCompactionMaxContextTokens(settings *CompactionSettingsJSON, provider, i
 		}
 		return nil
 	}
-	explicit := settings.MaxContextTokens
-	if err := check("compaction."+field, explicit, settings.extra[field]); err != nil {
-		return 0, err
+	// readMember reads field from the members a settings object keeps as written.
+	readMember := func(path string, members map[string]json.RawMessage) (*float64, error) {
+		raw, present := members[field]
+		if !present || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return nil, nil
+		}
+		var value float64
+		if json.Unmarshal(raw, &value) != nil {
+			return nil, check(path, nil, raw)
+		}
+		if err := check(path, &value, nil); err != nil {
+			return nil, err
+		}
+		return &value, nil
 	}
-	explicitReserve := settings.ReserveTokens != nil || settings.extra["reserveTokens"] != nil
+	explicit := ordinary
+	if ordinary != nil || field == "maxContextTokens" {
+		if err := check("compaction."+field, ordinary, settings.extra[field]); err != nil {
+			return nil, err
+		}
+	} else {
+		value, err := readMember("compaction."+field, settings.extra)
+		if err != nil {
+			return nil, err
+		}
+		explicit = value
+	}
 	if provider != "" || id != "" {
 		if entry, ok := settings.ModelOverrides[provider+"/"+id]; ok {
 			path := fmt.Sprintf("compaction.modelOverrides[%q]", provider+"/"+id)
 			if entry.invalidEntry != nil {
-				return 0, fmt.Errorf("Invalid %s setting: %s. Expected an object.", path, compactionJSONText(entry.invalidEntry))
+				return nil, fmt.Errorf("Invalid %s setting: %s. Expected an object.", path, compactionJSONText(entry.invalidEntry))
 			}
-			// An override keeps maxContextTokens in its members as written (CompactionModelOverride.extra).
-			if raw, present := entry.extra[field]; present && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-				var value float64
-				if json.Unmarshal(raw, &value) != nil {
-					return 0, check(path+"."+field, nil, raw)
-				}
-				if err := check(path+"."+field, &value, nil); err != nil {
-					return 0, err
-				}
-				explicit = &value
+			// An override keeps these settings in its members as written (CompactionModelOverride.extra).
+			value, err := readMember(path+"."+field, entry.extra)
+			if err != nil {
+				return nil, err
 			}
-			explicitReserve = explicitReserve || entry.ReserveTokens != nil || entry.extra["reserveTokens"] != nil
+			if value != nil {
+				explicit = value
+			}
 		}
 	}
-	switch {
-	case explicit != nil:
-		return int(*explicit), nil
-	case explicitReserve:
-		return 0, nil
+	return explicit, nil
+}
+
+// GetCompactionSummaryMaxTokens resolves compaction.summaryMaxTokens for the optional model (0: unset, the cap is derived from
+// reserveTokens), and whether that derived cap grows with the summarizer's context window: only while neither reserveTokens nor
+// summaryMaxTokens is set. µPi (settings-manager.ts getCompactionSettings summaryMaxTokens, scaleSummaryWithContextWindow).
+func (sm *SettingsManager) GetCompactionSummaryMaxTokens(model ...*ai.Model) (summaryMaxTokens int, scaleWithContextWindow bool, err error) {
+	provider, id := compactionModelKey(model)
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	settings := sm.merged.Compaction
+	if settings == nil {
+		return 0, true, nil
 	}
-	return defaultMaxContextTokens, nil
+	explicit, err := explicitCompactionRangeSetting(settings, "summaryMaxTokens", nil, provider, id)
+	if err != nil {
+		return 0, false, err
+	}
+	if explicit != nil {
+		return int(*explicit), false, nil
+	}
+	return 0, !explicitCompactionReserve(settings, provider, id), nil
 }
 
 func mergeCompactionNumber(current **float64, extra map[string]json.RawMessage, key string, incoming *float64, incomingExtra map[string]json.RawMessage) {

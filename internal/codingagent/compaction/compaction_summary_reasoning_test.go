@@ -236,7 +236,7 @@ func TestGenerateSummaryLeavesRefusalFallbackToModelMetadata(t *testing.T) {
 	}
 }
 
-func TestCompactSummariesSetNoMaxTokens(t *testing.T) {
+func TestCompactSummariesClampMaxTokensToTheModelOutputCap(t *testing.T) {
 	recorder := &summaryRecorder{}
 	prep := CompactionPreparation{
 		FirstKeptEntryID:    "entry-keep",
@@ -259,9 +259,10 @@ func TestCompactSummariesSetNoMaxTokens(t *testing.T) {
 	for _, call := range recorder.calls {
 		maxTokens = append(maxTokens, call.options.MaxTokens)
 	}
-	// Pi 6fcb4867 (#9512): neither summary of a split turn sets maxTokens; both use the model's output limit.
-	if !reflect.DeepEqual(maxTokens, []int{0, 0}) {
-		t.Fatalf("maxTokens = %v, want none set on either summary", maxTokens)
+	// µPi (a4146262): both summaries of a split turn are capped, at the model's output limit here (compaction-summary-reasoning.test.ts
+	// "clamps compaction summary maxTokens to the model output cap"); Pi 6fcb4867 (#9512) sets none.
+	if !reflect.DeepEqual(maxTokens, []int{128000, 128000}) {
+		t.Fatalf("maxTokens = %v, want 128000 on both summaries", maxTokens)
 	}
 }
 

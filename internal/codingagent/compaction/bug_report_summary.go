@@ -108,7 +108,7 @@ func GenerateBugReportSummary(ctx context.Context, opts GenerateBugReportSummary
 		maxTokens = min(maxTokens, model.Capabilities.MaxOutputTokens)
 	}
 	// bug-report.ts keeps its own 4096 cap on the summary (Pi 6fcb4867 dropped maxTokens only from compaction summaries).
-	options := createSummarizationOptions(model, opts.APIKey, opts.Headers, opts.Env, opts.ThinkingLevel, opts.SessionID)
+	options := createSummarizationOptions(model, 0, opts.APIKey, opts.Headers, opts.Env, opts.ThinkingLevel, opts.SessionID)
 	options.MaxTokens = maxTokens
 	text, _, err := completeSummarization(ctx, model, opts.Completer, opts.StreamFn, opts.Retry, ai.RetryCallbacks{}, bugSummarySystemPrompt, request, options)
 	if ctx.Err() != nil {

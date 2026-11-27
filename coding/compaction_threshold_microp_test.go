@@ -64,6 +64,7 @@ func thresholdDecision(t *testing.T, s *Session, message *agent.AssistantMessage
 // in steps of 4 once there are 8: the request after the eighth result clears four, about 20k tokens, which the size of the request
 // before it (52k) does not show. (PiG has no thresholdPercent: reserveTokens sets the 50k threshold of the 100k window.)
 func TestCompactionThresholdIsCheckedAfterToolResultPruning(t *testing.T) {
+	withoutCompactionAhead(t) // as compaction-after-pruning.test.ts does
 	for _, pruning := range []bool{true, false} {
 		settings := `{"compaction":{"enabled":true,"reserveTokens":50000},"toolResultPruning":{"enabled":` + map[bool]string{true: "true", false: "false"}[pruning] + `,"triggerTokens":10000,"keepRecent":4,"minChars":2000}}`
 		s := thresholdSession(t, settings, 100_000)
@@ -100,6 +101,7 @@ func TestCompactionThresholdIsCheckedAfterToolResultPruning(t *testing.T) {
 // µPi (710e4993): maxContextTokens (default 128000) caps the compaction threshold, not the window: a 150k context of a 200k window
 // compacts at the threshold and is no overflow; an explicit reserveTokens gives the default way.
 func TestMaxContextTokensCapsTheThresholdNotTheWindow(t *testing.T) {
+	withoutCompactionAhead(t) // as compaction-window-scaling.test.ts does
 	cases := []struct {
 		name, settings string
 		tokens         int

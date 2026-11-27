@@ -161,6 +161,8 @@ func (p *summaryRoutingProvider) Stream(_ context.Context, request ai.Transcript
 // _runDefaultCompaction, summarizeForBugReport).
 // Pi: packages/coding-agent/src/core/agent-session.ts:4307 (Session.summarizeForBugReport).
 func TestSessionSummarizationRoutingAndThinkingLevel(t *testing.T) {
+	// µPi (a4146262): this pins Pi's standalone summary request; the summary on the cached prefix continues the session's routing.
+	withoutCachedPrefix(t)
 	provider := &summaryRoutingProvider{}
 	model := fakeModelWithProvider(provider)
 	model.Capabilities.MaxThinking = ai.ThinkingLevelHigh

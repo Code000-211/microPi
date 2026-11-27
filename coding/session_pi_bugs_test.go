@@ -83,6 +83,8 @@ func TestClearQueueKeepsExtensionCustomMessages(t *testing.T) {
 // so the post-run check compacts a completed run (the control) and must skip the aborted one. The aborted case fails when the post-run
 // loop's abort checks (runPostAgentRunsWith's loop condition and handlePostAgentRun's early returns) are removed.
 func TestAbortInOverThresholdSessionDoesNotCompactBeforeSettling(t *testing.T) {
+	// µPi (8f722e90): the pre-prompt check is near the threshold, where a summary made ahead would take a scripted response.
+	withoutCompactionAhead(t)
 	for _, abort := range []bool{false, true} {
 		t.Run(map[bool]string{false: "completed run compacts", true: "aborted run does not compact"}[abort], func(t *testing.T) {
 			h := newRecoveryHarness(t, harnessOptions{settings: `{"compaction":{"enabled":true,"keepRecentTokens":1,"reserveTokens":100}}`, contextWindow: 10_000, maxTokens: 100}, nil)

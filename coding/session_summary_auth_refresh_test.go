@@ -568,7 +568,9 @@ func TestAutoCompactionSurfacesRefreshFailureOnce(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if len(ends) != 1 || !strings.HasPrefix(ends[0].ErrorMessage, "Auto-compaction failed: ") || !strings.Contains(ends[0].ErrorMessage, "summarization failed: OAuth refresh failed for "+shape.credentialProvider) {
+			// µPi (a4146262): the summary on the cached prefix is the request that fails, "Summarization failed: …"; the standalone split-turn
+			// request said "Turn prefix summarization failed: …".
+			if len(ends) != 1 || !strings.HasPrefix(ends[0].ErrorMessage, "Auto-compaction failed: ") || !strings.Contains(strings.ToLower(ends[0].ErrorMessage), strings.ToLower("summarization failed: OAuth refresh failed for "+shape.credentialProvider)) {
 				t.Fatalf("end events = %+v", ends)
 			}
 			if bearers := world.bearers(); len(bearers) != 0 {

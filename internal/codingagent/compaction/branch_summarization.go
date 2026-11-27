@@ -493,6 +493,6 @@ func summarizeBranchMessages(ctx context.Context, messages []agent.AgentMessage,
 
 	// No maxTokens: the summary uses the model's output limit (#9512, Pi 6fcb4867; branch-summarization.ts
 	// generateBranchSummary). The request has no routing session: completeSummarization gives it a fresh one.
-	options := createSummarizationOptions(opts.Model, opts.APIKey, opts.Headers, opts.Env, opts.ThinkingLevel, "")
+	options := createSummarizationOptions(opts.Model, 0, opts.APIKey, opts.Headers, opts.Env, opts.ThinkingLevel, "")
 	return completeSummarization(ctx, opts.Model, opts.Completer, opts.StreamFn, opts.Retry, opts.Callbacks, SummarizationSystemPrompt, req, options)
 }

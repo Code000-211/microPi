@@ -298,16 +298,18 @@ func (s *Session) exceedsCompactionThreshold(model *ai.Model, projection codinga
 	if model == nil || model.Capabilities.ContextWindow <= 0 {
 		return false, nil
 	}
-	window := model.Capabilities.ContextWindow
-	// µPi (8f722e90): the threshold is checked against what the next request sends, after tool-result pruning
-	// (agent-session.ts _contextTokenEstimate nextRequestTokens).
-	estimate := compaction.EstimateProjectedContextTokens(projection, s.currentBranch())
-	tokens := compaction.TokensAfterPruning(estimate.Tokens, projection.Messages, estimate.LastUsageIndex, s.SettingsManager().GetToolResultPruningSettings())
 	settings, err := s.compactionSettings()
 	if err != nil {
 		return false, err
 	}
-	return compaction.ShouldCompact(tokens, window, settings), nil
+	return compaction.ShouldCompact(s.nextRequestTokens(projection), model.Capabilities.ContextWindow, settings), nil
+}
+
+// nextRequestTokens is the size of what the next request sends for projection, the current session projection, which the compaction
+// threshold is checked against. µPi (8f722e90): after tool-result pruning (agent-session.ts _contextTokenEstimate nextRequestTokens).
+func (s *Session) nextRequestTokens(projection codingagent.SessionProjection) int {
+	estimate := compaction.EstimateProjectedContextTokens(projection, s.currentBranch())
+	return compaction.TokensAfterPruning(estimate.Tokens, projection.Messages, estimate.LastUsageIndex, s.SettingsManager().GetToolResultPruningSettings())
 }
 
 // prepareNextTurn compacts before the next assistant response of a run when
@@ -319,12 +321,15 @@ func (s *Session) prepareNextTurn(ctx context.Context, turn agent.PrepareNextTur
 	// The projection is the session's own messages, as Pi's buildSessionContext returns the entries' objects: the loop reads them and the request that follows projects the session again, so a deep copy of every message before each request only grows with the history.
 	projection := s.inner.Load().BuildSessionProjectionView()
 	// A virtual selection is checked in prepareRequest, against the model the request is routed to.
-	if model := s.Model(); model != nil && !IsVirtualModel(model) {
-		exceeds, err := s.exceedsCompactionThreshold(model, projection)
+	if model := s.Model(); model != nil && !IsVirtualModel(model) && model.Capabilities.ContextWindow > 0 {
+		settings, err := s.compactionSettings()
 		if err != nil {
 			return nil, err
 		}
-		if exceeds {
+		tokens := s.nextRequestTokens(projection)
+		// µPi (8f722e90): above the threshold too, while a summary is being made ahead and the context is below its limit
+		// (agent-session.ts _compactBeforeNextAssistantResponse, _compactAhead).
+		if !s.compactAhead(tokens, model.Capabilities.ContextWindow, settings) && compaction.ShouldCompact(tokens, model.Capabilities.ContextWindow, settings) {
 			if _, err := s.runAutoCompaction(ctx, "threshold", false); err != nil {
 				return nil, err
 			}

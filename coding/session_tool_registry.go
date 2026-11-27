@@ -133,6 +133,12 @@ func (tool *sessionBoundTool) MayTakeFileMutationQueue() bool {
 	return ok && mayTake.MayTakeFileMutationQueue()
 }
 
+// StartsEarly passes on the wrapped tool's answer (agent.EarlyStarter); a tool without one never starts early.
+func (tool *sessionBoundTool) StartsEarly(args json.RawMessage) bool {
+	starter, ok := tool.AgentTool.(agent.EarlyStarter)
+	return ok && starter.StartsEarly(args)
+}
+
 func (tool *sessionBoundTool) RegistersInFileMutationQueue() bool {
 	registers, ok := tool.AgentTool.(agent.RegistersInFileMutationQueue)
 	return ok && registers.RegistersInFileMutationQueue()

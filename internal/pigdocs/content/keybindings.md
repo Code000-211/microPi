@@ -99,6 +99,20 @@ tables.
 | `app.tree.toggleLabelTimestamp` | `shift+t` | Toggle tree label timestamps |
 | `app.tree.unfoldOrDown` | `alt+right, ctrl+right` | Unfold tree branch or move down |
 
+### Background jobs
+
+| Action | Default key | Effect |
+|---|---|---|
+| `app.jobs.down` | `j` | Select the job below in the job hub |
+| `app.jobs.hub` | `alt+j` | Open background jobs |
+| `app.jobs.stop` | `x` | Stop the selected job in the job hub |
+| `app.jobs.up` | `k` | Select the job above in the job hub |
+
+The job hub (`alt+j` or `/jobs`) lists the session's background jobs, newest
+first, with the selected job's details and the end of its output. `enter` shows
+the whole output, `x` stops a running job, `escape` closes the hub. `j`, `k` and
+`x` apply only inside the hub.
+
 Several actions share a key, such as `ctrl+s` for `app.session.toggleSort`,
 `app.models.save` and `app.thinking.save`. Each one applies only in its own
 selector, so they do not conflict.

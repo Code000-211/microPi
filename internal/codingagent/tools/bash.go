@@ -71,9 +71,9 @@ func (t *BashTool) BorrowedSchema() ai.ToolSchema {
 	return shellToolSchema("bash", "bash", !t.HideSessionEnvironment, true)
 }
 
-// ExecutionMode is parallel: upstream's shell tool definition sets no
-// executionMode.
-func (t *BashTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
+// µPi: sequential, as microPi's: a response's calls run in order when one of them changes files or runs a command, so an edit and the
+// command that tests it can come in one response (the system prompt's rule).
+func (t *BashTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeSequential }
 
 // Execute runs the command through the shared shell tool execution (upstream
 // createShellToolDefinition with the bash config: getShellConfig-resolved

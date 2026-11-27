@@ -98,9 +98,9 @@ func (t *EditTool) schema(borrow bool) ai.ToolSchema {
 	}}`, borrow)
 }
 
-// ExecutionMode is parallel: upstream's edit definition sets no
-// executionMode, and the file mutation queue serialises edits to one file.
-func (t *EditTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
+// µPi: sequential, as microPi's: a response's calls run in order when one of them changes files or runs a command, so an edit and the
+// command that tests it can come in one response (the system prompt's rule).
+func (t *EditTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeSequential }
 
 // RegistersInFileMutationQueue implements agent.RegistersInFileMutationQueue: the parallel dispatcher registers this call in the queue after the extension
 // tools before it in the batch started, as Pi runs their synchronous prefixes first.
@@ -445,6 +445,9 @@ func (t *EditTool) editLocked(ctx context.Context, cwd, absPath string, p editPa
 	final := bom + applied.newContent
 	if content != normalized {
 		final = bom + applyReplacementsToOriginal(content, applied.replacements)
+	}
+	if t.Checks != nil {
+		t.Checks.AwaitBaseline(ctx, absPath)
 	}
 	if err := ops.WriteFile(absPath, final); err != nil {
 		return editError(NodeFSError(err, "open", absPath))

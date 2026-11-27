@@ -770,6 +770,8 @@ type InteractiveMode struct {
 	// activeSelectorToken identifies the model selector still shown while its change settles, and activeSelectorDispose closes it (interactive-mode.ts:469-470).
 	activeSelectorToken   *int
 	activeSelectorDispose func()
+	// jobHub is the job hub while it is shown (interactive-mode.ts jobHub). Owner loop only.
+	jobHub *JobHubComponent
 	// reloadTailInput holds the keys the owner loop took after the last awaited step of a /reload had completed (awaitReloadStep). The input loop dispatches them to the editor in order before any chunk routed later. Owner loop only.
 	reloadTailInput [][]byte
 }
@@ -2068,14 +2070,7 @@ func (m *InteractiveMode) Init(ctx context.Context) (err error) {
 	m.addKeyPressListener(func(data string) bool {
 		return m.tuiInst != nil && m.tuiInst.ConsumeDebugKey(data)
 	})
-	m.addKeyPressListener(func(data string) bool {
-		if !tui.MatchesKeyID(data, "alt+j") {
-			return false
-		}
-		sc := m.buildSlashContext(ctx)
-		_ = jobsHandler(sc)
-		return true
-	})
+	m.subscribeJobStatus()
 
 	// Wire steering/follow-up queue modes from settings.
 	if sm := m.opts.SettingsManager; sm != nil {

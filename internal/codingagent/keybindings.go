@@ -84,6 +84,10 @@ var appKeybindingRows = [...]appKeybindingRow{
 	{id: "app.clipboard.pasteImage", description: "Paste files on macOS, images, or text from clipboard", platform: &tui.PlatformKeys{Other: []KeyID{"ctrl+v"}, Windows: []KeyID{"alt+v", "ctrl+v"}}},
 	{id: "app.session.new", description: "Start a new session"},
 	{id: "app.session.tree", description: "Open session tree"},
+	{id: "app.jobs.hub", description: "Open background jobs", keys: []KeyID{"alt+j"}},
+	{id: "app.jobs.up", description: "Select the job above in the job hub", keys: []KeyID{"k"}},
+	{id: "app.jobs.down", description: "Select the job below in the job hub", keys: []KeyID{"j"}},
+	{id: "app.jobs.stop", description: "Stop the selected job in the job hub", keys: []KeyID{"x"}},
 	{id: "app.session.fork", description: "Fork current session"},
 	{id: "app.session.resume", description: "Resume a session"},
 	{id: "app.tree.foldOrUp", description: "Fold tree branch or move up", platform: &tui.PlatformKeys{Other: []KeyID{"ctrl+left", "alt+left"}, Darwin: []KeyID{"alt+left", "ctrl+left"}}},
@@ -151,7 +155,8 @@ var appKeybindingOrder = []string{
 	"app.model.cycleForward", "app.model.cycleBackward", "app.model.select", "app.tools.expand",
 	"app.thinking.toggle", "app.session.toggleNamedFilter", "app.editor.external", "app.message.copy",
 	"app.message.followUp", "app.message.dequeue", "app.clipboard.pasteImage", "app.session.new", "app.session.tree",
-	"app.session.fork", "app.session.resume", "app.tree.foldOrUp", "app.tree.unfoldOrDown",
+	"app.jobs.hub", "app.jobs.up", "app.jobs.down", "app.jobs.stop", "app.session.fork", "app.session.resume",
+	"app.tree.foldOrUp", "app.tree.unfoldOrDown",
 	"app.tree.editLabel", "app.tree.toggleLabelTimestamp", "app.session.togglePath",
 	"app.session.toggleSort", "app.session.rename", "app.session.delete", "app.session.deleteNoninvasive",
 	"app.models.save", "app.models.enableAll", "app.models.clearAll", "app.models.toggleProvider",
@@ -216,6 +221,7 @@ var legacyKeybindingNameMigrations = sync.OnceValue(func() map[string]string {
 		"pasteImage":               "app.clipboard.pasteImage",
 		"newSession":               "app.session.new",
 		"tree":                     "app.session.tree",
+		"jobHub":                   "app.jobs.hub",
 		"fork":                     "app.session.fork",
 		"resume":                   "app.session.resume",
 		"treeFoldOrUp":             "app.tree.foldOrUp",
@@ -606,12 +612,15 @@ func (km *KeybindingsManager) Matches(input, action string) bool {
 	return false
 }
 
-// isGenericPrintableKeyID reports whether keyID is alt+<single printable
-// char> (e.g. alt+v) or shift+<letter> (e.g. shift+l, the uppercase letter in
-// legacy mode, keys.ts:1184), the forms upstream decodes generically. Named
-// keys such as alt+enter or shift+tab have a multi-rune suffix and are
-// excluded.
+// isGenericPrintableKeyID reports whether keyID is a single printable char
+// (e.g. x, the job hub's stop key), alt+<single printable char> (e.g. alt+v)
+// or shift+<letter> (e.g. shift+l, the uppercase letter in legacy mode,
+// keys.ts:1184), the forms upstream decodes generically. Named keys such as
+// alt+enter or shift+tab have a multi-rune suffix and are excluded.
 func isGenericPrintableKeyID(keyID string) bool {
+	if len([]rune(keyID)) == 1 {
+		return true
+	}
 	if rest, ok := strings.CutPrefix(keyID, "alt+"); ok {
 		return len([]rune(rest)) == 1
 	}

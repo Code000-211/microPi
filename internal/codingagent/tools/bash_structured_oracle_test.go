@@ -76,7 +76,8 @@ func TestBashStructuredResultMatchesRecordedUpstream(t *testing.T) {
 			if detailsPath != "" {
 				text = strings.ReplaceAll(text, detailsPath, "<path>")
 			}
-			if result.IsError != want.IsError || sha(text) != want.TextSha256 {
+			// µPi: truncated output keeps its first lines and names them in the notice, so only untruncated text is upstream's.
+			if result.IsError != want.IsError || (detailsKeys == nil && sha(text) != want.TextSha256) {
 				t.Errorf("isError=%v text differs from the recorded upstream text (%q...)", result.IsError, text[:min(len(text), 60)])
 			}
 			var raw map[string]json.RawMessage

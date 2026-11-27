@@ -46,6 +46,8 @@ type unitState struct {
 	running         bool
 	runningForEdits bool
 	timer           *time.Timer
+	// runDone is closed when the running check ends; nil while none runs.
+	runDone chan struct{}
 }
 
 // BackgroundChecksOptions configures BackgroundChecks.
@@ -179,6 +181,53 @@ func (b *BackgroundChecks) OnRead(path string) {
 	}
 }
 
+// AwaitBaseline is called before path is written. It waits, up to ChecksWaitDuration, for the baseline check of each of path's units that has
+// none yet, and starts a baseline that is still scheduled.
+//
+// Without it, an edit that lands while the baseline started by a read still runs makes that run's result stale, so it is dropped. The check after
+// the edit then has no baseline, and every error in the edited file counts as new: an error the file had before the edit is reported as "New
+// errors after your changes".
+func (b *BackgroundChecks) AwaitBaseline(ctx context.Context, path string) {
+	wait := ChecksWaitDuration()
+	if wait <= 0 {
+		return
+	}
+	b.mu.Lock()
+	if b.disposed || b.ctx.Err() != nil {
+		b.mu.Unlock()
+		return
+	}
+	var pending []chan struct{}
+	for _, state := range b.unitsForLocked(path) {
+		if state.hasErrors || len(state.editedEver) > 0 {
+			continue
+		}
+		if !state.running && state.timer != nil {
+			state.timer.Stop()
+			state.timer = nil
+			b.startLocked(state)
+		}
+		if state.running && !state.runningForEdits {
+			pending = append(pending, state.runDone)
+		}
+	}
+	b.mu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-timer.C:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // OnEdited marks path as edited and schedules a debounced check after SettleDelay (150ms).
 func (b *BackgroundChecks) OnEdited(path string) {
 	b.mu.Lock()
@@ -222,6 +271,7 @@ func (b *BackgroundChecks) startLocked(state *unitState) {
 	}
 	state.running = true
 	state.runningForEdits = len(edited) > 0
+	state.runDone = make(chan struct{})
 
 	go b.runUnit(state, edited)
 }
@@ -273,6 +323,8 @@ func (b *BackgroundChecks) runUnit(state *unitState, edited map[string]struct{})
 
 	state.running = false
 	state.runningForEdits = false
+	close(state.runDone)
+	state.runDone = nil
 	shouldRestart := state.dirty && !b.disposed && b.ctx.Err() == nil
 	if shouldRestart {
 		b.startLocked(state)

@@ -10,18 +10,24 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/MichaelKinsy/PiG/internal/outputfiles"
+	pitext "github.com/MichaelKinsy/PiG/internal/text"
 	"github.com/MichaelKinsy/PiG/internal/truncate"
 	"github.com/MichaelKinsy/PiG/internal/utf8stream"
 )
 
 // OutputSnapshot mirrors upstream OutputSnapshot.
 type OutputSnapshot struct {
-	Content        string
+	// Content is the output, or when truncated its head (if kept), an omission line, and its tail.
+	Content string
+	// Truncation is what Content shows: with a head, its lines and bytes count the head and the tail, not the omission line.
 	Truncation     TruncationResult
 	FullOutputPath string
+	// HeadLines is the number of head lines before the omission line, when the output is truncated and a head is kept.
+	HeadLines int
 }
 
 // OutputAccumulator incrementally tracks streaming output with bounded
@@ -37,6 +43,20 @@ type OutputAccumulator struct {
 	maxRollingBytes int
 	tempFilePrefix  string
 	decoder         utf8stream.Decoder
+
+	// µPi: clean keeps the output as a terminal shows it (no escape sequences or control characters, a line rewritten after a carriage
+	// return only as last written); counts, snapshots and the full-output file then all hold the cleaned text. headLineLimit and
+	// headByteLimit keep the first lines of truncated output before its tail. Ports microPi's output-accumulator.ts.
+	clean         bool
+	headLineLimit int
+	headByteLimit int
+	// pendingANSI is an unfinished escape sequence at the end of the last chunk, openLine the cleaned line not yet ended.
+	pendingANSI   string
+	openLine      string
+	headText      strings.Builder
+	headLineCount int
+	headFull      bool
+	pendingHead   string
 
 	// raw holds the raw bytes until the full-output file exists. Append copies a chunk into it, since the caller's slice is only lent for the call.
 	raw []byte
@@ -81,7 +101,46 @@ func newOutputAccumulator(maxLines, maxBytes int, tempFilePrefix string) *Output
 		tempFilePrefix:           tempFilePrefix,
 		tailStartsAtLineBoundary: true,
 		decoder:                  utf8stream.Decoder{StripBOM: true},
+		headFull:                 true,
 	}
+}
+
+// µPi: what the model gets of a shell command's output: its first lines (the first error) and its end (the summary).
+const (
+	shellMaxBytes  = 32 * 1024
+	shellHeadLines = 40
+	shellHeadBytes = 4 * 1024
+)
+
+// newShellOutputAccumulator is microPi's shell tool accumulator: cleaned output, at most shellMaxBytes, with the first shellHeadLines lines
+// (up to shellHeadBytes) kept before the tail of truncated output.
+func newShellOutputAccumulator(tempFilePrefix string) *OutputAccumulator {
+	a := newOutputAccumulator(DefaultMaxLinesUpstream, shellMaxBytes, tempFilePrefix)
+	a.clean = true
+	a.headLineLimit, a.headByteLimit = shellHeadLines, shellHeadBytes
+	a.headFull = false
+	return a
+}
+
+// maxOpenLineChars: an open line longer than this is passed on without waiting for its end; only its last rewrite is kept.
+const maxOpenLineChars = 16 * 1024
+
+// collapseCarriageReturns keeps each line as it was last written: CRLF is a newline, text before a lone carriage return was overwritten.
+func collapseCarriageReturns(text string) string {
+	if !strings.Contains(text, "\r") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if i < len(lines)-1 {
+			line = strings.TrimRight(line, "\r")
+		}
+		if j := strings.LastIndexByte(line, '\r'); j >= 0 {
+			line = line[j+1:]
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
 }
 
 // errAppendAfterFinish is the error output-accumulator.ts:66 throws.
@@ -97,8 +156,18 @@ func (a *OutputAccumulator) Append(data []byte) error {
 	if a.finished {
 		return errAppendAfterFinish
 	}
+	if a.clean {
+		a.appendCleaned(a.decoder.Decode(data, true), false)
+		return nil
+	}
 	a.totalRawBytes += len(data)
 	a.decodeOntoTail(data, true)
+	a.store(data)
+	return nil
+}
+
+// store keeps data for the full output: in the full-output file once it is needed, else in memory.
+func (a *OutputAccumulator) store(data []byte) {
 	if a.tempFile != nil || a.shouldUseTempFile() {
 		a.ensureTempFile()
 		if a.tempWriter != nil {
@@ -107,7 +176,68 @@ func (a *OutputAccumulator) Append(data []byte) error {
 	} else {
 		a.raw = append(a.raw, data...)
 	}
-	return nil
+}
+
+// appendCleaned passes on the complete lines of text (all of it at the end), cleaned, as if the command had printed them.
+func (a *OutputAccumulator) appendCleaned(text string, end bool) {
+	complete := a.pendingANSI + text
+	a.pendingANSI = ""
+	if !end {
+		complete, a.pendingANSI = SplitIncompleteAnsiSuffix(complete)
+	}
+	line := a.openLine + pitext.SanitizeBinaryOutput(pitext.StripANSIString(complete))
+	ready := ""
+	if end {
+		ready = strings.TrimRight(line, "\r")
+		line = ""
+	} else if i := strings.LastIndexByte(line, '\n'); i >= 0 {
+		ready, line = line[:i+1], line[i+1:]
+	}
+	if len(line) > maxOpenLineChars {
+		// A line rewritten without end (a progress bar) or very long: keep its last rewrite, or pass it on.
+		line = collapseCarriageReturns(strings.TrimRight(line, "\r"))
+		if len(line) > maxOpenLineChars {
+			ready += line
+			line = ""
+		}
+	}
+	a.openLine = line
+	ready = collapseCarriageReturns(ready)
+	if ready == "" {
+		return
+	}
+	a.totalRawBytes += len(ready)
+	a.appendTextOntoTail([]byte(ready))
+	a.store([]byte(ready))
+}
+
+// appendHead keeps the first complete lines of the output, as many as fit in the head limits.
+func (a *OutputAccumulator) appendHead(text []byte) {
+	start := 0
+	for !a.headFull {
+		i := bytes.IndexByte(text[start:], '\n')
+		if i < 0 {
+			// The rest of a line still open: kept once it ends and fits.
+			a.pendingHead += string(text[start:])
+			if len(a.pendingHead) > a.headByteLimit {
+				a.headFull = true
+			}
+			return
+		}
+		line := a.pendingHead + string(text[start:start+i])
+		a.pendingHead = ""
+		if a.headText.Len()+len(line)+1 > a.headByteLimit {
+			a.headFull = true
+			return
+		}
+		a.headText.WriteString(line)
+		a.headText.WriteByte('\n')
+		a.headLineCount++
+		if a.headLineCount >= a.headLineLimit {
+			a.headFull = true
+		}
+		start += i + 1
+	}
 }
 
 // Finish flushes the decoder; later appends fail.
@@ -118,7 +248,11 @@ func (a *OutputAccumulator) Finish() {
 		return
 	}
 	a.finished = true
-	a.decodeOntoTail(nil, false)
+	if a.clean {
+		a.appendCleaned(a.decoder.Decode(nil, false), true)
+	} else {
+		a.decodeOntoTail(nil, false)
+	}
 	if a.shouldUseTempFile() {
 		a.ensureTempFile()
 	}
@@ -134,10 +268,23 @@ func (a *OutputAccumulator) Snapshot(persistIfTruncated bool) OutputSnapshot {
 		a.ensureTempFile()
 	}
 	a.flushTempFile()
-	if a.hasSnapshot && a.snapshotBytes == a.totalDecodedBytes && a.snapshot.FullOutputPath == a.tempFilePath {
+	if a.hasSnapshot && a.snapshotBytes == a.totalDecodedBytes && a.snapshot.FullOutputPath == a.tempFilePath && a.openLine == "" {
 		return a.snapshot
 	}
-	tr := truncationResult(truncate.TruncateTailBytes(a.snapshotText(), a.maxBytes, a.maxLines), a.maxBytes, a.maxLines)
+	head := ""
+	if truncated {
+		head = a.headText.String()
+	}
+	headLines := 0
+	if head != "" {
+		headLines = a.headLineCount
+	}
+	text := a.snapshotText()
+	if a.openLine != "" {
+		// While streaming, a line not yet ended shows as it was last written.
+		text = append(append([]byte(nil), text...), collapseCarriageReturns(strings.TrimRight(a.openLine, "\r"))...)
+	}
+	tr := truncationResult(truncate.TruncateTailBytes(text, max(1, a.maxBytes-len(head)), max(1, a.maxLines-headLines)), a.maxBytes, a.maxLines)
 	truncatedBy := ""
 	if truncated {
 		truncatedBy = tr.TruncatedBy
@@ -152,6 +299,16 @@ func (a *OutputAccumulator) Snapshot(persistIfTruncated bool) OutputSnapshot {
 	tr.TruncatedBy = truncatedBy
 	tr.TotalLines = a.totalLines
 	tr.TotalBytes = a.totalDecodedBytes
+	if head != "" {
+		omitted := a.totalLines - headLines - tr.OutputLines
+		content := head + "\n[... " + strconv.Itoa(omitted) + " lines omitted ...]\n\n" + tr.Content
+		tr.Content = content
+		tr.OutputLines += headLines
+		tr.OutputBytes += len(head)
+		a.snapshot = OutputSnapshot{Content: content, Truncation: tr, FullOutputPath: a.tempFilePath, HeadLines: headLines}
+		a.snapshotBytes, a.hasSnapshot = a.totalDecodedBytes, true
+		return a.snapshot
+	}
 	a.snapshot = OutputSnapshot{Content: tr.Content, Truncation: tr, FullOutputPath: a.tempFilePath}
 	a.snapshotBytes, a.hasSnapshot = a.totalDecodedBytes, true
 	return a.snapshot
@@ -191,10 +348,25 @@ func (a *OutputAccumulator) LastLineBytes() int {
 func (a *OutputAccumulator) decodeOntoTail(data []byte, stream bool) {
 	start := len(a.tail)
 	a.tail = a.decoder.AppendDecode(a.tail, data, stream)
+	a.countTail(start)
+}
+
+// appendTextOntoTail appends already decoded text to the tail and counts it.
+func (a *OutputAccumulator) appendTextOntoTail(text []byte) {
+	start := len(a.tail)
+	a.tail = append(a.tail, text...)
+	a.countTail(start)
+}
+
+// countTail counts the text the tail gained after start.
+func (a *OutputAccumulator) countTail(start int) {
 	text := a.tail[start:]
 	size := len(text)
 	if size == 0 {
 		return
+	}
+	if !a.headFull {
+		a.appendHead(text)
 	}
 	a.totalDecodedBytes += size
 	newlines := bytes.Count(text, newline)

@@ -160,8 +160,9 @@ func TestAppKeybindingIsTheClosedSetOfAppKeybindingDefinitions(t *testing.T) {
 			t.Errorf("%q has no keybinding definition", id)
 		}
 	}
-	if len(seen) != 43 {
-		t.Errorf("%d app keybindings, want the 43 properties of upstream AppKeybindings", len(seen))
+	// µPi: upstream's 43 plus the four job hub keybindings (app.jobs.hub, up, down, stop).
+	if len(seen) != 47 {
+		t.Errorf("%d app keybindings, want the 43 properties of upstream AppKeybindings and µPi's 4 job hub keybindings", len(seen))
 	}
 	for id := range appKeybindingDefinitions {
 		if !seen[AppKeybinding(id)] {

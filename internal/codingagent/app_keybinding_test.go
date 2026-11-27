@@ -12,7 +12,7 @@ func TestAppKeybindingConstantsAreTheAppKeybindingTable(t *testing.T) {
 	constants := []AppKeybinding{
 		AppInterrupt, AppClear, AppExit, AppSuspend, AppThinkingCycle, AppThinkingSave, AppModelCycleForward, AppModelCycleBackward,
 		AppModelSelect, AppToolsExpand, AppThinkingToggle, AppSessionToggleNamedFilter, AppEditorExternal, AppMessageCopy, AppMessageFollowUp,
-		AppMessageDequeue, AppClipboardPasteImage, AppSessionNew, AppSessionTree, AppSessionFork, AppSessionResume, AppTreeFoldOrUp,
+		AppMessageDequeue, AppClipboardPasteImage, AppSessionNew, AppSessionTree, AppJobsHub, AppJobsUp, AppJobsDown, AppJobsStop, AppSessionFork, AppSessionResume, AppTreeFoldOrUp,
 		AppTreeUnfoldOrDown, AppTreeEditLabel, AppTreeToggleLabelTimestamp, AppSessionTogglePath, AppSessionToggleSort, AppSessionRename,
 		AppSessionDelete, AppSessionDeleteNoninvasive, AppModelsSave, AppModelsEnableAll, AppModelsClearAll, AppModelsToggleProvider,
 		AppModelsReorderUp, AppModelsReorderDown, AppTreeFilterDefault, AppTreeFilterNoTools, AppTreeFilterUserOnly, AppTreeFilterLabeledOnly,

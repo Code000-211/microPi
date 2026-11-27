@@ -23,17 +23,17 @@ import (
 )
 
 const (
-	treeCacheVerifyWindow  = 2 * time.Second
-	maxVerifiedDirs        = 4096
-	maxContentCacheBytes   = 64 << 20 // 64 MB
-	maxCachedFileBytes     = 512 << 10 // 512 KB
-	contentCacheStatFree   = 1500 * time.Millisecond
-	wholeFileBytes         = 2 << 20 // 2 MB
-	pieceBytes             = 1 << 20 // 1 MB
-	maxIgnoreFileBytes     = 4 << 20 // 4 MiB
-	maxBraceExpansions     = 1024
-	fuzzyFallbackLimit     = 20
-	walkBatchConcurrency   = 32
+	treeCacheVerifyWindow = 2 * time.Second
+	maxVerifiedDirs       = 4096
+	maxContentCacheBytes  = 64 << 20  // 64 MB
+	maxCachedFileBytes    = 512 << 10 // 512 KB
+	contentCacheStatFree  = 1500 * time.Millisecond
+	wholeFileBytes        = 2 << 20 // 2 MB
+	pieceBytes            = 1 << 20 // 1 MB
+	maxIgnoreFileBytes    = 4 << 20 // 4 MiB
+	maxBraceExpansions    = 1024
+	fuzzyFallbackLimit    = 20
+	walkBatchConcurrency  = 32
 )
 
 type entryKind uint8
@@ -496,11 +496,11 @@ func walkTree(ctx context.Context, root string, requireGit bool) (*cachedTreeEnt
 	}
 
 	type dirTask struct {
-		abs      string
-		rel      string
-		rules    []taggedIgnoreRule
-		gitRoot  string
-		inGit    bool
+		abs     string
+		rel     string
+		rules   []taggedIgnoreRule
+		gitRoot string
+		inGit   bool
 	}
 
 	var (

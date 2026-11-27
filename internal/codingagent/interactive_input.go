@@ -943,7 +943,7 @@ func (m *InteractiveMode) setupKeyHandlers(editor *CustomEditor) {
 	for _, action := range []AppKeybinding{
 		AppClear, AppSuspend, AppThinkingCycle, AppModelCycleForward, AppModelCycleBackward, AppModelSelect,
 		AppToolsExpand, AppThinkingToggle, AppEditorExternal, AppMessageCopy, AppMessageFollowUp, AppMessageDequeue,
-		AppSessionNew, AppSessionTree, AppSessionFork, AppSessionResume,
+		AppSessionNew, AppSessionTree, AppJobsHub, AppSessionFork, AppSessionResume,
 	} {
 		key, _ := appActionKey(action)
 		editor.OnAction(action, func() { m.runEditorAction(key, "") })
@@ -1126,6 +1126,11 @@ func (m *InteractiveMode) handleEditorAction(ctx context.Context, action keyActi
 	case outcomeSessionTree:
 		// app.session.tree: mirrors upstream onAction("app.session.tree")
 		m.dispatchSlash(ctx, "/tree")
+		return nil
+
+	case outcomeJobHub:
+		// app.jobs.hub: mirrors microPi onAction("app.jobs.hub", () => this.showJobHub())
+		m.showJobHub()
 		return nil
 
 	case outcomeSessionFork:

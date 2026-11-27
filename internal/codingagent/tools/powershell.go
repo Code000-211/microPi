@@ -146,9 +146,9 @@ func (t *PowerShellTool) BorrowedSchema() ai.ToolSchema {
 	return shellToolSchema("powershell", "PowerShell", !t.HideSessionEnvironment, true)
 }
 
-// ExecutionMode is parallel: upstream's shell tool definition sets no
-// executionMode.
-func (t *PowerShellTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
+// µPi: sequential, as microPi's: a response's calls run in order when one of them changes files or runs a command, so an edit and the
+// command that tests it can come in one response (the system prompt's rule).
+func (t *PowerShellTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeSequential }
 
 func (t *PowerShellTool) Execute(ctx context.Context, _ string, rawParams json.RawMessage, onUpdate agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
 	return executeShellTool(ctx, t.CWD, t.shellConfig(), rawParams, onUpdate)

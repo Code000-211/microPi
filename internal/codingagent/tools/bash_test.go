@@ -369,17 +369,17 @@ func TestBashShellPathHonored(t *testing.T) {
 	}
 }
 
-// Upstream's bash tool hands the model the decoded output unchanged; only the
-// renderer and user bash strip ANSI and control characters.
-func TestBashToolOutputIsRaw(t *testing.T) {
+// Upstream's bash tool hands the model the decoded output unchanged. µPi's hands it the output as a terminal shows it: no escape sequences or
+// control characters, and a line rewritten after a carriage return only as it was last written.
+func TestBashToolOutputIsCleaned(t *testing.T) {
 	bt := &BashTool{CWD: t.TempDir()}
-	args, _ := json.Marshal(bashParams{Command: `printf '\033[31mERR\033[0m\r\x01'`})
+	args, _ := json.Marshal(bashParams{Command: `printf '\033[31mERR\033[0m\r\x01'; printf '\n10%%\r50%%\r100%%\ndone\r\n'`})
 	res, err := bt.Execute(context.Background(), "", args, nil)
 	if err != nil || res.IsError {
 		t.Fatalf("execute: %v %s", err, res.Text())
 	}
-	if res.Text() != "\x1b[31mERR\x1b[0m\r\x01" {
-		t.Errorf("tool output = %q, want the raw bytes", res.Text())
+	if res.Text() != "ERR\n100%\ndone\n" {
+		t.Errorf("tool output = %q, want the cleaned text", res.Text())
 	}
 }
 

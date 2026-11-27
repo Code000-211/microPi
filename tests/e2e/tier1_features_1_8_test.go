@@ -677,7 +677,8 @@ func TestT1_F08_PreExistingErrorsFilteredOut(t *testing.T) {
 
 	req, _ := env.MockLLM.LastRequest()
 	msgText := allMessagesText(req)
-	assertNotContains(t, msgText, "preExistingErr", "pre-existing error should be filtered out")
+	// The read and edit results quote the file, so only the check report itself shows whether the old error was filtered.
+	assertNotContains(t, msgText, "New errors after your changes", "pre-existing error should be filtered out")
 }
 
 func TestT1_F08_PIChecksFilterAndOffSwitch(t *testing.T) {

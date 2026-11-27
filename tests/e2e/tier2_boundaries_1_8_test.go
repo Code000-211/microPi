@@ -19,10 +19,14 @@ func TestT2_F01_InvalidModeFlagExitsNonZero(t *testing.T) {
 	assertExitNonZero(t, res)
 }
 
-func TestT2_F01_MissingModelReturnsErrorCleanly(t *testing.T) {
+// Pi 1.6.0 (model-resolver.ts) keeps an unknown model id of a known provider as a custom id and only warns.
+func TestT2_F01_UnknownModelOfKnownProviderWarns(t *testing.T) {
 	env := NewTestEnv(t)
+	env.MockLLM.EnqueueText("CUSTOM_ID_OK")
 	res := env.RunUPI("-p", "--provider", "mock", "--model", "nonexistent-model-999", "hi")
-	assertExitNonZero(t, res)
+	assertExitZero(t, res)
+	assertContains(t, res.Stderr, `Model "nonexistent-model-999" not found for provider "mock". Using custom model id.`, "unknown model warning")
+	assertContains(t, res.Stdout, "CUSTOM_ID_OK", "reply from the custom model id")
 }
 
 func TestT2_F01_EmptyPromptInPrintMode(t *testing.T) {
@@ -39,10 +43,16 @@ func TestT2_F01_MissingExtensionPathFailsEarly(t *testing.T) {
 	assertExitNonZero(t, res)
 }
 
-func TestT2_F01_NonExistentSessionPathErrors(t *testing.T) {
+// Pi 1.6.0 (SessionManager.open) starts a new session at a --session path that does not exist yet.
+func TestT2_F01_NonExistentSessionPathStartsNewSession(t *testing.T) {
 	env := NewTestEnv(t)
-	res := env.RunUPI("-p", "--session", filepath.Join(env.SessionDir, "missing.jsonl"), "--provider", "mock", "--model", "mock-coder", "hi")
-	assertExitNonZero(t, res)
+	env.MockLLM.EnqueueText("NEW_SESSION_OK")
+	path := filepath.Join(env.SessionDir, "missing.jsonl")
+	res := env.RunUPI("-p", "--session", path, "--provider", "mock", "--model", "mock-coder", "hi")
+	assertExitZero(t, res)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected a new session file at %s: %v", path, err)
+	}
 }
 
 // ============================================================================
@@ -55,17 +65,17 @@ func TestT2_F02_UnknownFlagExitsNonZero(t *testing.T) {
 	assertExitNonZero(t, res)
 }
 
-func TestT2_F02_MicropiHomeCreatedIfMissing(t *testing.T) {
+// upi runs when MICROPI_HOME does not exist yet. It creates the directory only when it writes there, so nothing here requires it to exist afterwards.
+func TestT2_F02_MissingMicropiHomeIsNotRequired(t *testing.T) {
 	env := NewTestEnv(t)
-	freshHome := filepath.Join(t.TempDir(), "nested", "micropi")
-	env.Env["MICROPI_HOME"] = freshHome
-	env.MockLLM.EnqueueText("CREATED_HOME")
+	env.Env["MICROPI_HOME"] = filepath.Join(t.TempDir(), "nested", "micropi")
+	// The agent directory, and its models.json, otherwise moves with MICROPI_HOME.
+	env.Env["MICROPI_CODING_AGENT_DIR"] = filepath.Join(env.MicropiHome, "agent")
+	env.MockLLM.EnqueueText("MISSING_HOME_OK")
 
 	res := env.RunUPI("-p", "--provider", "mock", "--model", "mock-coder", "hi")
 	assertExitZero(t, res)
-	if _, err := os.Stat(freshHome); err != nil {
-		t.Fatalf("expected MICROPI_HOME %s to be created: %v", freshHome, err)
-	}
+	assertContains(t, res.Stdout, "MISSING_HOME_OK", "reply with a missing MICROPI_HOME")
 }
 
 func TestT2_F02_DoctorHandlesMissingOptionalTools(t *testing.T) {
@@ -520,7 +530,8 @@ func TestT2_F08_RapidSuccessiveEditsDebouncedToLatestCheck(t *testing.T) {
 	assertExitZero(t, res)
 
 	req, _ := env.MockLLM.LastRequest()
-	assertNotContains(t, allMessagesText(req), "brokenCall", "overtaken broken edit should not report stale error")
+	// The first edit's result quotes brokenCall(), so only a check report would show a stale error.
+	assertNotContains(t, allMessagesText(req), "New errors after your changes", "overtaken broken edit should not report stale error")
 }
 
 func TestT2_F08_PIChecksWaitZeroDoesNotBlockOnSlowCheck(t *testing.T) {

@@ -37,6 +37,7 @@ const (
 	actionCycleModelBackward                  // Shift+Ctrl+P: cycle to previous model
 	actionSessionNew                          // app.session.new: start fresh conversation
 	actionSessionTree                         // app.session.tree: open tree selector
+	actionJobHub                              // app.jobs.hub: open the job hub
 	actionSessionFork                         // app.session.fork: open user-message fork selector
 	actionSessionResume                       // app.session.resume: open session resume selector
 	actionMessageCopy                         // app.message.copy: copy last agent message (Ctrl+X)
@@ -94,6 +95,8 @@ func classifyKeyWithBindings(data string, kb *KeybindingsManager) keyAction {
 			return actionSessionNew
 		case "app.session.tree":
 			return actionSessionTree
+		case "app.jobs.hub":
+			return actionJobHub
 		case "app.session.fork":
 			return actionSessionFork
 		case "app.session.resume":
@@ -153,6 +156,7 @@ const (
 	outcomeCycleModelBackward // Shift+Ctrl+P: state-invariant
 	outcomeSessionNew         // app.session.new: start fresh conversation
 	outcomeSessionTree        // app.session.tree: open tree selector
+	outcomeJobHub             // app.jobs.hub: open the job hub
 	outcomeSessionFork        // app.session.fork: open fork selector
 	outcomeSessionResume      // app.session.resume: open resume selector
 	outcomeCopyMessage        // app.message.copy: copy last agent message to clipboard
@@ -230,6 +234,9 @@ func resolveOutcome(action keyAction, idle, editorEmpty bool) dispatchOutcome {
 		return outcomeSessionNew
 	case actionSessionTree:
 		return outcomeSessionTree
+	case actionJobHub:
+		// app.jobs.hub opens the hub in any state, as microPi's onAction("app.jobs.hub").
+		return outcomeJobHub
 	case actionSessionFork:
 		return outcomeSessionFork
 	case actionSessionResume:

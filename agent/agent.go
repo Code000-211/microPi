@@ -2139,7 +2139,7 @@ func (h *loopHost) consumeStreamWithEarly(ctx context.Context, stream *ai.Assist
 		}
 		if early != nil {
 			if tcEnd, ok := event.(ai.ToolCallEndEvent); ok {
-				early.maybeStartFromEvent(tcEnd.ToolCall)
+				early.maybeStartFromEvent(tcEnd.ContentIndex, tcEnd.Partial, tcEnd.ToolCall)
 			}
 		}
 		if partial, update := assistantUpdatePartial(event); update && !h.messageUpdateObserved() {

@@ -11,9 +11,6 @@ import (
 
 const (
 	defaultBashBackgroundAfter = 120 * time.Second
-	microBashHeadLines         = 40
-	microBashMaxLines          = 2000
-	microBashMaxBytes          = 32 * 1024
 )
 
 var shellBuiltins = map[string]struct{}{
@@ -181,51 +178,6 @@ func parseSleepDuration(tok string) (time.Duration, error) {
 		return 0, strconv.ErrSyntax
 	}
 	return time.Duration(val * float64(mult)), nil
-}
-
-// truncateHeadAndTail keeps up to headLines from the start plus the tail fitting within maxLines and maxBytes.
-func truncateHeadAndTail(content string, headLines, maxLines, maxBytes int) (string, bool, int) {
-	lines := strings.Split(content, "\n")
-	totalLines := len(lines)
-	if totalLines <= maxLines && len(content) <= maxBytes {
-		return content, false, totalLines
-	}
-	if headLines <= 0 {
-		headLines = microBashHeadLines
-	}
-	if headLines >= totalLines {
-		tr := TruncateTail(content, TruncationOptions{MaxLines: &maxLines, MaxBytes: &maxBytes})
-		return tr.Content, tr.Truncated, totalLines
-	}
-
-	var headParts []string
-	headBytes := 0
-	for i := 0; i < headLines && i < totalLines; i++ {
-		lineBytes := len(lines[i]) + 1
-		if headBytes+lineBytes > maxBytes/3 && len(headParts) > 0 {
-			break
-		}
-		headParts = append(headParts, lines[i])
-		headBytes += lineBytes
-	}
-	headText := strings.Join(headParts, "\n")
-
-	remLines := maxLines - len(headParts)
-	if remLines < 1 {
-		remLines = 1
-	}
-	remBytes := maxBytes - len(headText) - 80
-	if remBytes < 1024 {
-		remBytes = 1024
-	}
-	tailSource := strings.Join(lines[len(headParts):], "\n")
-	tr := TruncateTail(tailSource, TruncationOptions{MaxLines: &remLines, MaxBytes: &remBytes})
-	tailLinesCount := len(strings.Split(tr.Content, "\n"))
-	omitted := totalLines - len(headParts) - tailLinesCount
-	if omitted <= 0 {
-		return content, false, totalLines
-	}
-	return headText + "\n... (" + strconv.Itoa(omitted) + " lines omitted) ...\n" + tr.Content, true, totalLines
 }
 
 func backgroundThreshold() time.Duration {

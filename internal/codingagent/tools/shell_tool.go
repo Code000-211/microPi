@@ -20,7 +20,6 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/codingagent/jobs"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/remote"
 	"github.com/MichaelKinsy/PiG/internal/jsnumber"
-	pitext "github.com/MichaelKinsy/PiG/internal/text"
 )
 
 // shellParams is the shell tool input (upstream bashSchema): a command and an
@@ -226,7 +225,7 @@ func executeShellTool(ctx context.Context, cwd string, cfg shellToolConfig, rawP
 		spawn = cfg.spawnHook(spawn)
 	}
 	command, cwd, env := spawn.Command, spawn.CWD, spawn.Env
-	output := NewOutputAccumulator(cfg.tempFilePrefix)
+	output := newShellOutputAccumulator(cfg.tempFilePrefix)
 	updates := startShellUpdates(ctx, output, onUpdate)
 	var acceptingOutput atomic.Bool
 	acceptingOutput.Store(true)
@@ -378,26 +377,8 @@ func executeShellTool(ctx context.Context, cwd string, cfg shellToolConfig, rawP
 	return finalizeForegroundShell(command, res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
 }
 
-func isReadOnlyShellCommand(command string) bool {
-	cmd := strings.TrimSpace(command)
-	if cmd == "" || strings.ContainsAny(cmd, ">;<&\n|`") || strings.Contains(cmd, "$(") {
-		return false
-	}
-	for _, prefix := range []string{
-		"ls", "cat ", "head ", "tail ", "wc ", "grep ", "rg ", "find ",
-		"pwd", "which ", "echo ", "env", "printenv", "uname", "whoami",
-		"git status", "git diff", "git log", "git show", "git branch", "git rev-parse",
-		"go version", "go list", "go env",
-	} {
-		if cmd == strings.TrimSpace(prefix) || strings.HasPrefix(cmd, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
 func finalizeForegroundShell(command string, res agent.AgentToolResult, err error, cwd string, snapshots []FileSnapshot, tracker *filetracking.Tracker, bgChecks *checks.BackgroundChecks) (agent.AgentToolResult, error) {
-	if cwd != "" && !isReadOnlyShellCommand(command) {
+	if cwd != "" && !IsReadOnlyCommand(command) {
 		InvalidateSearchCache(cwd)
 	}
 	if len(snapshots) > 0 {
@@ -464,15 +445,6 @@ func finishForegroundShell(startedAt time.Time, result BashOperationsResult, err
 		}
 		return shellToolError(err.Error()), nil
 	}
-	// Apply head+tail truncation so both the first 40 lines and the tail are preserved when output is long.
-	if snapshot.Truncation.Truncated && fullOutput.Content != "" {
-		if ht, ok, totalLines := truncateHeadAndTail(fullOutput.Content, microBashHeadLines, microBashMaxLines, microBashMaxBytes); ok {
-			text = ht + fmt.Sprintf("\n\n[Showing head+tail of %d lines. Full output: %s]", totalLines, snapshot.FullOutputPath)
-		}
-	}
-	if text != "" && text != "(no output)" {
-		text = pitext.StripANSIString(text)
-	}
 	if sleepNote != "" {
 		if text == "(no output)" {
 			text = sleepNote
@@ -520,18 +492,24 @@ func formatShellOutput(snapshot OutputSnapshot, lastLineBytes int, emptyText str
 		return sharedOutput(nil, text), nil
 	}
 	details := &BashDetails{Truncation: &tr, FullOutputPath: snapshot.FullOutputPath}
-	startLine := tr.TotalLines - tr.OutputLines + 1
+	// µPi: the kept head is named before the tail (microPi bash.ts CallOutput.format).
+	startLine := tr.TotalLines - (tr.OutputLines - snapshot.HeadLines) + 1
 	endLine := tr.TotalLines
+	head, lines := "", "lines "
+	if snapshot.HeadLines > 0 {
+		head = fmt.Sprintf("lines 1-%d and ", snapshot.HeadLines)
+		lines = head
+	}
 	switch {
 	case tr.LastLinePartial:
-		text += fmt.Sprintf("\n\n[Showing last %s of line %d (line is %s). Full output: %s]",
-			FormatSize(tr.OutputBytes), endLine, FormatSize(lastLineBytes), snapshot.FullOutputPath)
+		text += fmt.Sprintf("\n\n[Showing %sthe last %s of line %d (line is %s). Full output: %s]",
+			head, FormatSize(tr.OutputBytes), endLine, FormatSize(lastLineBytes), snapshot.FullOutputPath)
 	case tr.TruncatedBy == "lines":
-		text += fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Full output: %s]",
-			startLine, endLine, tr.TotalLines, snapshot.FullOutputPath)
+		text += fmt.Sprintf("\n\n[Showing %s%d-%d of %d. Full output: %s]",
+			lines, startLine, endLine, tr.TotalLines, snapshot.FullOutputPath)
 	default:
-		text += fmt.Sprintf("\n\n[Showing lines %d-%d of %d (%s limit). Full output: %s]",
-			startLine, endLine, tr.TotalLines, FormatSize(DefaultMaxBytesUpstream), snapshot.FullOutputPath)
+		text += fmt.Sprintf("\n\n[Showing %s%d-%d of %d (%s limit). Full output: %s]",
+			lines, startLine, endLine, tr.TotalLines, FormatSize(tr.MaxBytes), snapshot.FullOutputPath)
 	}
 	shareTruncatedContent(details.Truncation, text)
 	return text, details

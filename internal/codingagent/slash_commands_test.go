@@ -753,7 +753,7 @@ func TestBuiltinSlashCommandsFollowUpstreamOrder(t *testing.T) {
 	want := []string{
 		"settings", "model", "tree", "thinking", "scoped-models", "export", "import", "share", "bug",
 		"copy", "name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout",
-		"new", "compact", "resume", "reload", "docs", "quit",
+		"new", "compact", "resume", "reload", "docs", "jobs", "remote", "quit", // µPi: /jobs and /remote
 	}
 	want = slices.DeleteFunc(want, strippedFeatureCommand) // a build that strips the changelog has no /changelog
 	var got []string

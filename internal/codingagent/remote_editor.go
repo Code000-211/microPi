@@ -492,6 +492,7 @@ var appActionKeys = []struct {
 	{AppMessageDequeue, actionDequeue},
 	{AppSessionNew, actionSessionNew},
 	{AppSessionTree, actionSessionTree},
+	{AppJobsHub, actionJobHub},
 	{AppSessionFork, actionSessionFork},
 	{AppSessionResume, actionSessionResume},
 }

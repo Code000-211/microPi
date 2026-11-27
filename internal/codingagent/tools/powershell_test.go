@@ -284,10 +284,11 @@ func TestShellToolPreservesTruncationSnapshot(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(d.FullOutputPath) })
 	tr := d.Truncation
-	if !tr.Truncated || tr.TotalLines != 12000 || tr.TotalBytes != 252000 || tr.OutputLines != 2000 || tr.TruncatedBy != "lines" {
+	// µPi: the 32 KB shell limit cuts by bytes; the first 40 lines (840 bytes) are kept before the 1520-line tail.
+	if !tr.Truncated || tr.TotalLines != 12000 || tr.TotalBytes != 252000 || tr.OutputLines != 1560 || tr.TruncatedBy != "bytes" {
 		t.Fatalf("snapshot = %+v", *tr)
 	}
-	if !strings.Contains(res.Text(), "[Showing lines 10001-12000 of 12000. Full output:") {
+	if !strings.Contains(res.Text(), "[Showing lines 1-40 and 10481-12000 of 12000 (32.0KB limit). Full output:") {
 		t.Fatalf("missing whole-stream footer: %q", res.Text()[len(res.Text())-200:])
 	}
 }

@@ -87,7 +87,7 @@ func TestShellResultAndUpdateDetailsWire(t *testing.T) {
 	_ = json.Unmarshal(data, &details)
 	tr, ok := details["truncation"].(map[string]any)
 	path, hasPath := details["fullOutputPath"].(string)
-	if !ok || !hasPath || len(details) != 2 || tr["totalBytes"] != float64(60000) || tr["outputBytes"] != float64(51200) || tr["lastLinePartial"] != true {
+	if !ok || !hasPath || len(details) != 2 || tr["totalBytes"] != float64(60000) || tr["outputBytes"] != float64(32768) /* µPi: 32 KB shell output limit */ || tr["lastLinePartial"] != true {
 		t.Fatalf("shell details=%s", data)
 	}
 	if err := os.Remove(path); err != nil {

@@ -206,12 +206,14 @@ type SlashContext struct {
 	ForkToNewSession func(userMsgEntryID string) error
 	// WriteDebugLog writes the current frame and message history to a debug
 	// log file and returns its path. Backs /debug and the ctrl+shift+d hotkey.
-	WriteDebugLog func() (path string, err error)
+	WriteDebugLog  func() (path string, err error)
 	CloneCurrent   func() (newPath string, err error)
 	ListSessions   func() ([]SessionInfo, error)
 	RenderTree     func() string
 	BackgroundJobs *jobs.Manager
-	Remote         *remote.Manager
+	// OpenJobHub shows the interactive job hub; /jobs without arguments calls it. Nil outside interactive mode, where /jobs lists the jobs as text.
+	OpenJobHub func()
+	Remote     *remote.Manager
 
 	// File-based prompt templates loaded from
 	// <agentDir>/prompts and <cwd>/.pig/prompts. Read-only snapshot;
@@ -753,6 +755,10 @@ func jobsHandler(sc *SlashContext) error {
 		return nil
 	}
 	fields := strings.Fields(strings.TrimSpace(sc.Args))
+	if len(fields) == 0 && sc.OpenJobHub != nil {
+		sc.OpenJobHub()
+		return nil
+	}
 	if len(fields) >= 2 && fields[0] == "kill" {
 		id := fields[1]
 		if sc.BackgroundJobs.Kill(id) {

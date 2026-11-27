@@ -242,6 +242,7 @@ func (m *InteractiveMode) buildSlashContext(ctx context.Context) *SlashContext {
 	var sc *SlashContext
 	sc = &SlashContext{
 		BackgroundJobs: m.opts.BackgroundJobs,
+		OpenJobHub:     m.showJobHub,
 		Remote:         m.opts.Remote,
 		Append: func(s string) {
 			block := tui.NewMarkdown(s)

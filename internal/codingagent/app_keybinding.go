@@ -23,6 +23,10 @@ const (
 	AppClipboardPasteImage      AppKeybinding = "app.clipboard.pasteImage"
 	AppSessionNew               AppKeybinding = "app.session.new"
 	AppSessionTree              AppKeybinding = "app.session.tree"
+	AppJobsHub                  AppKeybinding = "app.jobs.hub"
+	AppJobsUp                   AppKeybinding = "app.jobs.up"
+	AppJobsDown                 AppKeybinding = "app.jobs.down"
+	AppJobsStop                 AppKeybinding = "app.jobs.stop"
 	AppSessionFork              AppKeybinding = "app.session.fork"
 	AppSessionResume            AppKeybinding = "app.session.resume"
 	AppTreeFoldOrUp             AppKeybinding = "app.tree.foldOrUp"
@@ -70,6 +74,10 @@ var appKeybindingIDs = []AppKeybinding{
 	AppClipboardPasteImage,
 	AppSessionNew,
 	AppSessionTree,
+	AppJobsHub,
+	AppJobsUp,
+	AppJobsDown,
+	AppJobsStop,
 	AppSessionFork,
 	AppSessionResume,
 	AppTreeFoldOrUp,

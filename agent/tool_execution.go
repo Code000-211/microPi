@@ -61,10 +61,10 @@ func (r *loopRun) executeToolCalls(assistant *AssistantMessage, calls []pendingT
 
 func (r *loopRun) executeToolCallsWithEarly(assistant *AssistantMessage, calls []pendingToolCall, early *earlyToolExecutor) executedToolCallBatch {
 	if r.h.cfg.ToolExecution == ToolModeSequential || r.hasSequentialToolCall(calls) {
-		early.cancelAll()
+		defer early.cancelAll()
 		// The hooks of these calls run one at a time, so they receive the run's own messages, as Pi's hooks do (hookView).
 		ctx := WithToolCallHookContext(r.toolCtx(), r.toolCallHookContext(assistant, hookView(r.context)))
-		return r.executeToolCallsSequential(ctx, calls)
+		return r.executeToolCallsSequential(ctx, calls, early)
 	}
 	return r.executeToolCallsParallel(r.toolCtx(), assistant, calls, early)
 }
@@ -83,16 +83,25 @@ func (r *loopRun) hasSequentialToolCall(calls []pendingToolCall) bool {
 // as the call is finalized. An aborted run does not end the batch early: the
 // calls it had not reached are still started and answered (prepareToolCall),
 // so no call is left without a result (Pi 4438c58ba, #9986).
-func (r *loopRun) executeToolCallsSequential(ctx context.Context, calls []pendingToolCall) executedToolCallBatch {
+//
+// A call that started early while the message streamed (earlyToolExecutor) uses that run in place of executing the tool. Only a prefix of the
+// message's calls starts early, so a sequential batch still runs every call after the calls before it.
+func (r *loopRun) executeToolCallsSequential(ctx context.Context, calls []pendingToolCall, early *earlyToolExecutor) executedToolCallBatch {
 	finalized := make([]finalizedToolCall, 0, len(calls))
 	messages := make([]ToolResultMessage, 0, len(calls))
 	for _, call := range calls {
 		r.h.emitToolExecutionStart(call)
 		var f finalizedToolCall
 		if outcome := r.h.prepareToolCall(ctx, call); outcome.prepared != nil {
-			executed, err := r.h.executePreparedToolCall(ctx, *outcome.prepared)
-			if err != nil {
-				panic(runFailure{err: err})
+			executed, ok := early.takeResult(call.id)
+			if ok {
+				r.h.timings.RecordTool(call.name, executed.duration)
+			} else {
+				var err error
+				executed, err = r.h.executePreparedToolCall(ctx, *outcome.prepared)
+				if err != nil {
+					panic(runFailure{err: err})
+				}
 			}
 			f = r.h.finalizeExecutedToolCall(ctx, *outcome.prepared, executed)
 		} else {
@@ -200,13 +209,10 @@ func (r *loopRun) executeToolCallsParallel(ctx context.Context, assistant *Assis
 					defer window.Close()
 				}
 				callCtx := enterRegistrationOrder(callCtx, outcome.prepared.call.id)
-				if spec, ok := early.take(outcome.prepared.call.id); ok {
-					<-spec.done
-					if spec.err == nil && spec.executed != nil {
-						r.h.timings.RecordTool(outcome.prepared.call.name, spec.executed.duration)
-						finalized[i] = r.h.finalizeExecutedToolCall(callCtx, *outcome.prepared, *spec.executed)
-						return
-					}
+				if executed, ok := early.takeResult(outcome.prepared.call.id); ok {
+					r.h.timings.RecordTool(outcome.prepared.call.name, executed.duration)
+					finalized[i] = r.h.finalizeExecutedToolCall(callCtx, *outcome.prepared, executed)
+					return
 				}
 				var err error
 				finalized[i], err = r.h.runPreparedToolCall(callCtx, *outcome.prepared)

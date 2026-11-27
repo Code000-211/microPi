@@ -183,7 +183,8 @@ func TestToolsBashPort(t *testing.T) {
 				})}
 				result := bashPort(t, tool, "chatty-fail")
 				assertBashPortError(t, result, regexp.QuoteMeta(tc.want))
-				if !regexp.MustCompile(`\[Showing lines \d+-\d+ of \d+\. Full output: `).MatchString(result.Text()) || strings.Contains(result.Text(), "Full output: undefined") {
+				// µPi: the notice names the kept head before the tail.
+				if !regexp.MustCompile(`\[Showing lines 1-\d+ and \d+-\d+ of \d+\. Full output: `).MatchString(result.Text()) || strings.Contains(result.Text(), "Full output: undefined") {
 					t.Fatal(result.Text())
 				}
 				match := regexp.MustCompile(`Full output: ([^\]\n]+)`).FindStringSubmatch(result.Text())
@@ -322,13 +323,16 @@ func TestToolsBashPort(t *testing.T) {
 		if result.IsError {
 			t.Fatalf("tool failed: %s", result.Text())
 		}
-		for _, want := range []string{"line-2001", "line-4000", "[Showing lines 2001-4000 of 4000. Full output: <full-output-path>]"} {
+		// µPi: the first 40 lines stay before the tail, which gets the rest of the 2000 lines.
+		for _, want := range []string{"line-0001\n", "line-0040\n\n[... 2000 lines omitted ...]\n\nline-2041\n", "line-4000", "[Showing lines 1-40 and 2041-4000 of 4000. Full output: <full-output-path>]"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("output %q lacks %q", text, want)
 			}
 		}
-		if strings.Contains(text, "4001") {
-			t.Errorf("output %q contains %q", text, "4001")
+		for _, unwanted := range []string{"line-0041", "line-2040", "4001"} {
+			if strings.Contains(text, unwanted) {
+				t.Errorf("output %q contains %q", text, unwanted)
+			}
 		}
 	})
 	// .upstream/v0.87.1/packages/coding-agent/test/tools.test.ts:746
@@ -367,7 +371,8 @@ func TestToolsBashPort(t *testing.T) {
 		if !ok || details.Truncation == nil || !details.Truncation.Truncated || details.Truncation.TruncatedBy != "lines" {
 			t.Fatalf("details = %+v", result.Details)
 		}
-		if !regexp.MustCompile(`\[Showing lines \d+-\d+ of \d+\. Full output: `).MatchString(result.Text()) || strings.Contains(result.Text(), "Full output: undefined") {
+		// µPi: the notice names the kept head before the tail.
+		if !regexp.MustCompile(`\[Showing lines 1-40 and \d+-\d+ of \d+\. Full output: `).MatchString(result.Text()) || strings.Contains(result.Text(), "Full output: undefined") {
 			t.Fatal(result.Text())
 		}
 		assertFullBashOutput(t, details.FullOutputPath)

@@ -330,4 +330,3 @@ func TestEditDiffHelpersAndDescribeClosestText(t *testing.T) {
 		t.Fatalf("expected empty closest text for unrelated input, got %q", none)
 	}
 }
-

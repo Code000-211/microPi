@@ -346,3 +346,82 @@ func TestChecksWaitZeroDoesNotBlockSettle(t *testing.T) {
 		t.Fatal("expected BackgroundChecks to still be Busy while slow check is in-flight")
 	}
 }
+
+// An edit that follows a read before the read's baseline check has finished must not report the file's pre-existing errors as new.
+func TestAwaitBaselineKeepsSlowBaselineForImmediateEdit(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "broken.go")
+	release := make(chan struct{})
+	var runs atomic.Int32
+	checker := &stubChecker{
+		name:    "stub",
+		matches: func(p string) bool { return strings.HasSuffix(p, ".go") },
+		runFn: func(ctx context.Context, _ *CheckUnit) ([]Diagnostic, error) {
+			if runs.Add(1) == 1 {
+				// The baseline is slower than the edit that follows the read.
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return []Diagnostic{{File: file, Line: 3, Column: 17, Severity: SeverityError, Message: "undefined: preExistingErr"}}, nil
+		},
+	}
+	bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: dir, Checkers: []Checker{checker}})
+	t.Cleanup(bc.Dispose)
+
+	bc.OnRead(file)
+	awaited := make(chan struct{})
+	go func() {
+		bc.AwaitBaseline(context.Background(), file)
+		close(awaited)
+	}()
+	select {
+	case <-awaited:
+		t.Fatal("AwaitBaseline returned while the baseline check was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-awaited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("AwaitBaseline did not return after the baseline check ended")
+	}
+
+	bc.OnEdited(file)
+	if report := bc.Settle(context.Background(), nil); report != "" {
+		t.Fatalf("pre-existing error reported as new:\n%s", report)
+	}
+	if got := runs.Load(); got != 2 {
+		t.Fatalf("checker ran %d times, want 2 (baseline, then the edit's check)", got)
+	}
+}
+
+func TestAwaitBaselineReturnsAtOnceWithChecksWaitZero(t *testing.T) {
+	t.Setenv("PI_CHECKS_WAIT", "0")
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.go")
+	block := make(chan struct{})
+	checker := &stubChecker{
+		name:    "stub",
+		matches: func(p string) bool { return strings.HasSuffix(p, ".go") },
+		runFn: func(ctx context.Context, _ *CheckUnit) ([]Diagnostic, error) {
+			select {
+			case <-block:
+			case <-ctx.Done():
+			}
+			return nil, nil
+		},
+	}
+	bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: dir, Checkers: []Checker{checker}})
+	t.Cleanup(func() { close(block); bc.Dispose() })
+	bc.OnRead(file)
+	done := make(chan struct{})
+	go func() { bc.AwaitBaseline(context.Background(), file); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AwaitBaseline blocked although PI_CHECKS_WAIT=0")
+	}
+}

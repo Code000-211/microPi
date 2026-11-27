@@ -43,7 +43,8 @@ func TestBashToolShowsTheEndOfAnOverLongLastLineAfterAShortLine(t *testing.T) {
 	if !strings.Contains(output, "yyyyEND") {
 		t.Fatalf("output lacks the end of the long line: %.80q", output)
 	}
-	if !regexp.MustCompile(`\[Showing last 50\.0KB of line 2 `).MatchString(output) {
+	// µPi: the kept first line is named before the end of the long line, within the 32 KB shell limit.
+	if !regexp.MustCompile(`\[Showing lines 1-1 and the last 32\.0KB of line 2 `).MatchString(output) {
 		t.Fatalf("output lacks the partial-line notice: %.200q", output[max(0, len(output)-200):])
 	}
 }

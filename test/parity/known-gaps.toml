@@ -18,3 +18,27 @@
 
 pi_version = "1.6.0"
 
+
+[[gap]]
+scope = "app-keybindings"
+key = "keybinding:app.jobs.hub"
+tracking = "µPi addition: the background job hub (microPi job-hub.ts)"
+why = "µPi adds the job hub and its keys (alt+j, k, j, x); Pi has no background jobs."
+
+[[gap]]
+scope = "app-keybindings"
+key = "keybinding:app.jobs.up"
+tracking = "µPi addition: the background job hub (microPi job-hub.ts)"
+why = "µPi adds the job hub and its keys (alt+j, k, j, x); Pi has no background jobs."
+
+[[gap]]
+scope = "app-keybindings"
+key = "keybinding:app.jobs.down"
+tracking = "µPi addition: the background job hub (microPi job-hub.ts)"
+why = "µPi adds the job hub and its keys (alt+j, k, j, x); Pi has no background jobs."
+
+[[gap]]
+scope = "app-keybindings"
+key = "keybinding:app.jobs.stop"
+tracking = "µPi addition: the background job hub (microPi job-hub.ts)"
+why = "µPi adds the job hub and its keys (alt+j, k, j, x); Pi has no background jobs."

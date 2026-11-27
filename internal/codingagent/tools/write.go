@@ -123,9 +123,9 @@ func (t *WriteTool) schema(borrow bool) ai.ToolSchema {
 	}}`, borrow)
 }
 
-// ExecutionMode is parallel: upstream's write definition sets no
-// executionMode, and the file mutation queue serialises writes to one file.
-func (t *WriteTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeParallel }
+// µPi: sequential, as microPi's: a response's calls run in order when one of them changes files or runs a command, so an edit and the
+// command that tests it can come in one response (the system prompt's rule).
+func (t *WriteTool) ExecutionMode() agent.ToolExecutionMode { return agent.ToolModeSequential }
 
 // RegistersInFileMutationQueue implements agent.RegistersInFileMutationQueue: the parallel dispatcher registers this call in the queue after the extension
 // tools before it in the batch started, as Pi runs their synchronous prefixes first.
@@ -252,6 +252,9 @@ func (t *WriteTool) Execute(ctx context.Context, _ string, rawParams json.RawMes
 		if ctx.Err() != nil {
 			failure = "Operation aborted"
 			return nil
+		}
+		if t.Checks != nil {
+			t.Checks.AwaitBaseline(ctx, path)
 		}
 		if err := ops.WriteFile(path, p.Content); err != nil {
 			failure = NodeFSError(err, "open", path)

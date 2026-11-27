@@ -1,107 +1,187 @@
-node_modules
-dist/
-.artifacts/
-*.log
-.DS_Store
-*.tsbuildinfo
-# packages/*/node_modules/
-packages/*/dist/
-packages/*/dist-chrome/
-packages/*/dist-firefox/
-packages/ai/src/providers/.model-generation-*/
-# Generated from packages/ai/src/providers/data by every build (packages/ai/scripts/model-catalog-modules.ts).
-packages/ai/src/providers/*.catalog.generated.ts
-*.cpuprofile
-
-# Environment
-.env
-# Local gh CLI session state
-.local/
-
-# Editor files
-.vscode/
-.zed/
-.idea/
-.claude/
-*.swp
-*.swo
-*~
-
-# Package specific
-.npm/
-coverage/
-.nyc_output/
-.pi_config/
-tui-debug.log
-compaction-results/
-.opencode/
-syntax.jsonl
-out.jsonl
-pi-*.html
-out.html
-packages/coding-agent/binaries/
-todo.md
-plans/
-.pi/hf-sessions/
-.pi/hf-sessions-backup/
-.pi/settings.json
-collect.sh
-packages/agent/docs/extensions/pi-server-artifact/index.md
-
-# --- µPi ---
-# Sources, toolchains and builds made by the scripts (see docs/BUILDING.md)
-/.work/
-/.toolchain/
-/out/
-/dist/
-
-# Staged by scripts/build-pi.sh --plugins inside a Pi checkout
-.pibolt-plugins/
-
-# Benchmark and test output (the published results in bench/results/ are kept)
-*.jsonl
-!bench/results/**/*.jsonl
-/results/
-tmux-*.out
-*.order.tmp
-
-# Python
-__pycache__/
-*.pyc
-.venv/
-
-# Editors and systems
-.DS_Store
-.idea/
-.vscode/
-*.swp
-*~
-
-# Copied from install.sh when the npm package is packed
-npm/install.sh
-
-# gh runtime state
-.local/
-
-# --- Go / PiG ---
 bin/
+/out/
 /build/
-tmp/
-*.exe
+/dist/
+# durable/core/probe/build.sh writes the probe core here; it is a build output, regenerated on demand.
+/durable/core/dist/
+/coverage/
+/evidence/
+# No trailing slash: a worktree's node_modules is often a symlink, which a directory-only pattern does not match.
+node_modules
+**/target/
+**/__pycache__/
+**/*.py[cod]
+**/.cache/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/coverage.xml
 *.test
 *.out
 *.prof
 *.pprof
 *.trace
+*.log
+*.pid
+*.sock
+
+# Developer-specific environment and editor state.
+.envrc
+.direnv/
+.env
+.env.*
+!.env.example
+*.local
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Common local credential files. Committed non-secret fixtures require an
+# explicit exception next to the owning fixture below.
+/*.npmrc
+/.netrc
+/.pypirc
+*.pem
+# The public key that verifies signed self-update manifests (docs/project/RELEASING.md).
+!automation/release/update-trust.pem
+# Public CA certificates (no private keys) of the October 2026 eMudhra incident, the test data of internal/tlsdistrust.
+!internal/tlsdistrust/tlsdistrusttest/testdata/*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+credentials.json
+secrets.json
+
+# Tmux captures and other ad-hoc test artefacts.
+tmp/
+test/parity/artifacts/
+.pig-faux-tool-started
+
+# Live-integration test bookkeeping (in case anyone overrides PIG_HOME
+# into the repo: we never want auth.json committed).
+.pig/
+auth.json
+# Exception: a hermetic, non-secret auth.json fixture for the
+# 02-list-models-oauth-builtins parity scenario. It stages a placeholder
+# openai-codex OAuth credential (refresh-token presence gates registration;
+# the access token is never validated for listing) and carries no real secret.
+!test/parity/scenarios/providers-registry/testdata/oauth-agent/auth.json
+# Exception: the print-extension-tool-bridge parity scenario's echo_bridge
+# extension lives under a .pig/ dir otherwise caught by the broad .pig/ rule.
+!test/parity/scenarios/tools/testdata/.pig/
+!test/parity/scenarios/tools/testdata/.pig/extensions/
+!test/parity/scenarios/tools/testdata/.pig/extensions/parity-echo.mjs
+!test/parity/scenarios/footer/testdata/multi-pig-agent/auth.json
+!test/parity/scenarios/footer/testdata/multi-pi-agent/auth.json
+# Exception: 05-footer-experimental-indicator needs a configured provider in
+# both agent dirs, and without these two the scenario fails on a clean
+# checkout. Placeholder OAuth values only: presence gates provider
+# registration and the tokens are never validated offline.
+!test/parity/scenarios/footer/testdata/pi-agent/auth.json
+!test/parity/scenarios/footer/testdata/pig-agent/auth.json
+# Exception: model-expiry and login-selector scenarios use placeholder OAuth
+# values to exercise stored and expired credential state without network access.
+!test/parity/scenarios/model-resolver-selector/testdata/pi-agent-expired/auth.json
+!test/parity/scenarios/model-resolver-selector/testdata/pig-agent-expired/auth.json
+!test/parity/scenarios/selectors/testdata/pi-agent/auth.json
+!test/parity/scenarios/selectors/testdata/pig-home/agent/auth.json
+# Exception: the project-trust scenarios need an auto-discovered project
+# extension in the fixture project itself, which the broad .pig/ rule (and the
+# repo-root .pi/ rule) would otherwise swallow. These register a probe provider
+# that must not execute before trust is granted; they hold no credentials.
+# Without the exception the fixtures stay local to whoever wrote them and the
+# scenarios fail on a clean checkout.
+!test/parity/scenarios/project-trust/testdata/project-*/.pig/
+!test/parity/scenarios/project-trust/testdata/project-*/.pig/**
+!test/parity/scenarios/project-trust/testdata/project-*/.pi/
+!test/parity/scenarios/project-trust/testdata/project-*/.pi/**
+# Exception: the extension load-order scenario's fixture project holds project
+# settings and an auto-discovered extension under .pig/; they hold no
+# credentials.
+!test/parity/scenarios/extensions-runtime/testdata/load-order/project/.pig/
+!test/parity/scenarios/extensions-runtime/testdata/load-order/project/.pig/**
+# Exception: this named fixture directory represents the Session target cwd. It
+# is source data, not Rust build output.
+!test/parity/scenarios/project-trust/testdata/session-target-cwd/target/
+!test/parity/scenarios/project-trust/testdata/session-target-cwd/target/README.txt
+
+# Side-by-side mirror of upstream pi sources, materialised by
+# automation/gen/mirror-upstream.sh. Read-only reference material, not vendored.
+# .upstream/pin is the committed upstream pin (automation/pin/pinlib.py).
+.upstream/*
+!.upstream/pin
+
 /pig
-/upi
-/gopi
 /gen-models
 .gopi/
-/durable/core/dist/
-coding/extension/host/runtimecell/cache/
+
+# Runtime session traces written into testdata dirs during parity runs.
+# Parity runner snapshots testdata to ephemeral temp dirs before launch,
+# so these are leftover from older runs and never affect correctness.
+test/parity/scenarios/*/testdata/pig-home/agent/sessions/--Users-*/
+test/parity/scenarios/*/testdata/pig-home/agent/sessions/--tmp-*/
+
+# Conformance fixture build/cache output.
+test/extension-conformance/testdata/python-sdk-fixture/**/__pycache__/
+test/extension-conformance/testdata/python-sdk-fixture/**/*.py[cod]
+
+# Example extension build artifacts.
+examples/extensions/rust-factory/Cargo.lock
+examples/extensions/python-factory/**/__pycache__/
+examples/extensions/python-factory/**/*.py[cod]
+
+# SDK staging content-hash markers are derived runtime state. They may appear
+# when a source SDK directory is used as a staging target, but are never inputs.
 extensions/sdk*/.pig-sdk-version
+
+# Python SDK build/cache output. The Python SDK ships as source and is
+# loaded into generated packed/standalone runners via PIG_SDK_PY_ROOT;
+# we never want bytecode caches, build artefacts, or virtual envs in git.
+extensions/sdk-py/**/__pycache__/
+extensions/sdk-py/**/*.py[cod]
+extensions/sdk-py/**/*.egg-info/
+extensions/sdk-py/build/
+extensions/sdk-py/dist/
+extensions/sdk-py/.pytest_cache/
+extensions/sdk-py/.ruff_cache/
+extensions/sdk-py/.mypy_cache/
+extensions/sdk-py/.venv/
+
+# Generated packed-cell artefacts. These are rebuilt deterministically
+# from extension/SDK sources; we never want the cache contents in git.
+# The cache lives under the resolved pig home (PIG_HOME / ~/.pig) or a
+# test-temp cache root, so this guard catches accidental in-tree builds.
+coding/extension/host/runtimecell/cache/
+coding/extension/host/runtimecell/**/__pycache__/
+coding/extension/host/runtimecell/**/*.py[cod]
+
+# Stray local builds of the pig binary (the Makefile installs to ~/.local/bin/pig)
+/gopi
+
+# npm launcher source (automation/release/npm), not a build output.
+!automation/release/npm/launcher/bin/
+# Exception: 31-extension-module-loading resolves a CommonJS dependency and a
+# dual package from the fixture extension's own node_modules.
+!test/parity/scenarios/extensions-runtime/testdata/module-loading/node_modules/
+
+# node_modules symlinks to a shared checkout are not directories, so node_modules/ does not match them.
+node_modules
+# Exception: Pi's chord runtime dependencies vendored for the plugins component's Node subprocess
+# (automation/gen/vendor-chord-plugins-node.sh): a package resolves from a directory named node_modules.
+!chord/nextnode/plugins/node/pi/node_modules
+!chord/nextnode/surfaces/client/pi/node_modules
+internal/evals/.eval/
+
+# built tool binary of test/parity/interface-closure/autobind
 /test/parity/interface-closure/autobind/autobind
+
+# A `go build` in a command directory writes its binary there.
 /durable/core/contracttest/cmd/*/benchhost
 /durable/core/contracttest/cmd/*/replayhost
 /durable/core/contracttest/cmd/*/countgate
@@ -109,3 +189,22 @@ extensions/sdk*/.pig-sdk-version
 /result
 /result-*
 
+# pin.py sync keeps only the active pin and reviewed baseline eligible for tracking.
+# BEGIN PINNED INTERFACE SNAPSHOTS
+/test/parity/interfaces/*-v*.json
+!/test/parity/interfaces/*-v1.6.0.json
+!/test/parity/interfaces/*-v0.84.0.json
+# END PINNED INTERFACE SNAPSHOTS
+
+# --- µPi ---
+# Sources, toolchains and builds made by scripts/ (see docs/BUILDING.md)
+/.work/
+/.toolchain/
+/results/
+/upi
+.claude/
+.pi/settings.json
+.pi/hf-sessions/
+.pi/hf-sessions-backup/
+# Copied from install.sh when the npm package is packed
+npm/install.sh

@@ -48,6 +48,8 @@ func TestSessionExtendsItsLoaderFromResourcesDiscover(t *testing.T) {
 	type start struct{ sessionStart, discoverReason string }
 	for _, c := range []start{{"startup", "startup"}, {"reload", "reload"}, {"new", "startup"}, {"resume", "startup"}, {"fork", "startup"}} {
 		t.Run(c.sessionStart, func(t *testing.T) {
+			// µPi: the system prompt's project listing names the fixture's files, the skill's among them.
+			t.Setenv("PI_PROJECT_SNAPSHOT", "off")
 			fx := newResourcesDiscoverFixture(t, newResourceLoaderFixture(t), func(l *DefaultResourceLoader) ResourceLoader { return l })
 			if !fx.session.HasExtensionHandlers("resources_discover") {
 				t.Fatal("the Session's runner does not hold the extensions the loader found")

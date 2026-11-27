@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/MichaelKinsy/PiG/agent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/internal/jsloop"
 )
 
@@ -75,6 +76,11 @@ func (s *Session) endEventTask() { s.eventRegions.task.End() }
 //
 // The message of a message_end or turn_end event is the object the transcript and the saved entry hold, which a later handler (turn_end's, agent_end's) may replace in place while a consumer of Events, reading on its own goroutine, still holds the event. Pi's listeners run at the event, so a listener sees the message as it is then: the event carries its EventView, taken here on the goroutine that publishes, before anything can replace the message. Nothing is copied while no consumer called Events.
 func (s *Session) publishAgentEvent(ev agent.AgentEvent) {
+	// µPi: a tool other than the built-in ones (an extension's or an MCP server's) may have written files the search caches do not know of;
+	// the next search rechecks them instead of trusting its cache for its short verify window. The built-in tools report their own changes.
+	if end, ok := ev.(agent.ToolExecutionEndEvent); ok && !searchAwareTools[end.ToolName] {
+		tools.NotifySearchExternalChange()
+	}
 	if s.eventsSubscribed.Load() {
 		switch event := ev.(type) {
 		case agent.MessageEndEvent:
@@ -214,3 +220,6 @@ func (b *sessionEventBarrier) AcknowledgeEvent() {
 	}
 	b.once.Do(func() { close(b.done) })
 }
+
+// searchAwareTools are the built-in tools that read only or tell the search caches of what they change.
+var searchAwareTools = map[string]bool{"read": true, "grep": true, "find": true, "ls": true, "bash": true, "powershell": true, "edit": true, "write": true, "project_search": true, "wait": true}

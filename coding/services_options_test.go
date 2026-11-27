@@ -107,7 +107,7 @@ func TestServicesShareAnInjectedModelRuntimeAndDoNotCloseIt(t *testing.T) {
 // Pi: packages/coding-agent/src/core/agent-session-services.ts:44 (CreateAgentSessionServicesOptions.resourceLoaderOptions); packages/coding-agent/src/core/agent-session-services.ts:45 (CreateAgentSessionServicesOptions.resourceLoaderReloadOptions).
 func TestServicesLoadResourcesWithTheirOptionsAndTheSessionUsesTheLoader(t *testing.T) {
 	cwd, agentDir := t.TempDir(), t.TempDir()
-	skill := filepath.Join(cwd, ".pig", "skills", "local", "SKILL.md")
+	skill := filepath.Join(cwd, ".micropi", "skills", "local", "SKILL.md") // µPi: the project dir is .micropi
 	if err := os.MkdirAll(filepath.Dir(skill), 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -120,7 +120,7 @@ func TestServicesSettingsReflectsProjectOverlay(t *testing.T) {
 	// internal/codingagent.mergeSettings only overrides string/slice
 	// fields today: bools always come from the global layer. (Tracked
 	// as a separate parity follow-up; not in F2 scope.)
-	projSettingsDir := filepath.Join(cwd, ".pig")
+	projSettingsDir := filepath.Join(cwd, ".micropi") // µPi: the project dir is .micropi
 	if err := os.MkdirAll(projSettingsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

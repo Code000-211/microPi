@@ -5,18 +5,21 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"regexp/syntax"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/MichaelKinsy/PiG/internal/ignorerules"
@@ -188,7 +191,10 @@ func storeContentLocked(key string, mtimeNanos, size int64, raw []byte, owned bo
 		return false
 	}
 	var stored []byte
-	if bytes.IndexByte(raw, 0) == -1 {
+	if decoded, ok := decodeUTF16BOM(raw); ok {
+		stored = decoded
+		contentCacheSize += int64(len(stored))
+	} else if bytes.IndexByte(raw, 0) == -1 {
 		if owned {
 			stored = raw[:len(raw):len(raw)]
 		} else {
@@ -912,10 +918,9 @@ func compileGrepGlob(glob string) (*globMatcherSet, error) {
 		glob = rest
 	}
 	glob = strings.TrimPrefix(glob, "./")
+	// A glob with a slash is matched against the whole path relative to the search path, anchored there (microPi native-search.ts
+	// globFilter; Pi #11807): "migrations/*.js" does not match nested/migrations/a.js, "**/migrations/*.js" does.
 	hasSlash := strings.Contains(glob, "/")
-	if hasSlash && !strings.HasPrefix(glob, "/") && !strings.HasPrefix(glob, "**/") && glob != "**" {
-		glob = "**/" + glob
-	}
 	glob = strings.TrimPrefix(glob, "/")
 	expanded, err := expandBraces(glob)
 	if err != nil {
@@ -1161,8 +1166,19 @@ func nativeFindDetailed(ctx context.Context, pattern, searchPath string, limit i
 	}
 	isPathPattern := strings.Contains(effPattern, "/")
 	ignoreCase := effPattern == strings.ToLower(effPattern)
-	if isPathPattern && !strings.HasPrefix(effPattern, "**/") && effPattern != "**" {
-		effPattern = strings.TrimPrefix(effPattern, "/")
+	// An absolute pattern is matched against absolute paths (fd --full-path); one under the search path becomes relative to it.
+	absoluteRoot := ""
+	if isPathPattern && filepath.IsAbs(filepath.FromSlash(effPattern)) {
+		root := filepath.ToSlash(searchPath)
+		if !strings.HasSuffix(root, "/") {
+			root += "/"
+		}
+		if strings.HasPrefix(effPattern, root) {
+			effPattern = effPattern[len(root):]
+			isPathPattern = strings.Contains(effPattern, "/")
+		} else {
+			absoluteRoot = root
+		}
 	}
 	if strings.HasSuffix(effPattern, "/**") {
 		effPattern = strings.TrimSuffix(effPattern, "**") + "**/*"
@@ -1187,7 +1203,9 @@ func nativeFindDetailed(ctx context.Context, pattern, searchPath string, limit i
 			return nativeFindResult{}, ctx.Err()
 		}
 		target := e.rel
-		if !isPathPattern {
+		if absoluteRoot != "" {
+			target = absoluteRoot + e.rel
+		} else if !isPathPattern {
 			if idx := strings.LastIndexByte(e.rel, '/'); idx >= 0 {
 				target = e.rel[idx+1:]
 			}
@@ -1416,6 +1434,11 @@ func buildLineMatcher(pattern string, ignoreCase, literal bool) (lineMatcher, er
 	}
 	re, err := regexp.Compile(expr)
 	if err != nil {
+		// Worded as ripgrep words it, so a model that knows rg's message recognizes it.
+		var syntaxErr *syntax.Error
+		if errors.As(err, &syntaxErr) {
+			return nil, fmt.Errorf("regex parse error: %s: `%s`", syntaxErr.Code, syntaxErr.Expr)
+		}
 		return nil, err
 	}
 	var pre []byte
@@ -1494,13 +1517,16 @@ func nativeGrep(ctx context.Context, opts nativeGrepOpts, emit func(nativeGrepEv
 							return
 						}
 						var evs []nativeGrepEvent
+						// The lines are copied (a pooled read buffer is reused once grepOneFile returns) into one growing buffer per file, not
+						// one allocation per line: 200 lines of context cost about what 2 do. A slice taken before the buffer grows keeps the old
+						// array alive and unchanged.
+						var lineBuf []byte
 						localCount := 0
 						localLimit := false
 						_, _ = grepOneFile(ctx, files[idx].abs, matcher, opts, &localCount, &localLimit, func(ev nativeGrepEvent) bool {
-							// Copy lineText since cached/piece buffers may not outlive if piece-searched.
-							cp := make([]byte, len(ev.lineText))
-							copy(cp, ev.lineText)
-							ev.lineText = cp
+							start := len(lineBuf)
+							lineBuf = append(lineBuf, ev.lineText...)
+							ev.lineText = lineBuf[start:len(lineBuf):len(lineBuf)]
 							evs = append(evs, ev)
 							return matchCount+localCount >= opts.Limit
 						})
@@ -1566,7 +1592,9 @@ func grepOneFile(
 			return false, err
 		}
 		buf := []byte(content)
-		if bytes.IndexByte(buf, 0) != -1 {
+		if decoded, ok := decodeUTF16BOM(buf); ok {
+			buf = decoded
+		} else if bytes.IndexByte(buf, 0) != -1 {
 			return false, nil
 		}
 		return searchBufferLines(absPath, buf, matcher, opts, matchCount, matchLimitReached, emit), nil
@@ -1661,6 +1689,16 @@ func grepOneFile(
 		}
 		return false, err
 	}
+	if decoded, ok := decodeUTF16BOM(raw); ok {
+		if admit {
+			searchCacheMu.Lock()
+			storeContentLocked(key, mtime, int64(len(raw)), raw, false, now)
+			searchCacheMu.Unlock()
+		} else if pooled != nil {
+			readBufPool.Put(pooled)
+		}
+		return searchBufferLines(absPath, decoded, matcher, opts, matchCount, matchLimitReached, emit), nil
+	}
 	if admit {
 		searchCacheMu.Lock()
 		storeContentLocked(key, mtime, int64(len(raw)), raw, true, now)
@@ -1754,15 +1792,21 @@ func searchBufferLines(
 			isM := isMatchSet[cur]
 			if isM {
 				if *matchCount >= opts.Limit {
+					// A match inside the last allowed match's trailing context is shown as context, as microPi's native-search.ts
+					// (context from the file's lines) and rg do.
 					*matchLimitReached = true
-					return true
+					isM = false
+				} else {
+					*matchCount++
 				}
-				*matchCount++
 			}
 			if emit(nativeGrepEvent{absPath: absPath, lineNumber: cur, lineText: lines[cur-1], isMatch: isM}) {
 				return true
 			}
 			lastEmitted = cur
+		}
+		if *matchLimitReached {
+			return true
 		}
 	}
 	return false
@@ -1922,16 +1966,24 @@ planning:
 			plan = append(plan, plannedLine{stop: true})
 			break
 		}
+		overLimit := false
 		for cur := max(1, m.lineNumber-opts.Context, lastEmitted+1); cur <= m.lineNumber+opts.Context; cur++ {
-			if isMatch[cur] {
+			lineIsMatch := isMatch[cur]
+			if lineIsMatch {
 				if count >= opts.Limit {
-					plan = append(plan, plannedLine{stop: true})
-					break planning
+					// A match past the limit inside the window is the last allowed match's context.
+					overLimit = true
+					lineIsMatch = false
+				} else {
+					count++
 				}
-				count++
 			}
-			plan = append(plan, plannedLine{lineNumber: cur, isMatch: isMatch[cur]})
+			plan = append(plan, plannedLine{lineNumber: cur, isMatch: lineIsMatch})
 			lastEmitted = cur
+		}
+		if overLimit {
+			plan = append(plan, plannedLine{stop: true})
+			break planning
 		}
 	}
 
@@ -2000,3 +2052,32 @@ func readPieceLine(reader *bufio.Reader, keep bool) (line []byte, ok bool, err e
 // unused guard for utf8/strconv if needed by future helpers
 var _ = utf8.RuneCount
 var _ = strconv.Itoa
+
+// decodeUTF16BOM decodes raw to UTF-8 when it starts with a UTF-16 byte order mark, as ripgrep does by default; the mark itself is dropped.
+func decodeUTF16BOM(raw []byte) ([]byte, bool) {
+	if len(raw) < 2 {
+		return nil, false
+	}
+	var order binary.ByteOrder
+	switch {
+	case raw[0] == 0xFF && raw[1] == 0xFE:
+		order = binary.LittleEndian
+	case raw[0] == 0xFE && raw[1] == 0xFF:
+		order = binary.BigEndian
+	default:
+		return nil, false
+	}
+	body := raw[2:]
+	units := make([]uint16, len(body)/2)
+	for i := range units {
+		units[i] = order.Uint16(body[2*i:])
+	}
+	out := make([]byte, 0, len(body))
+	for _, r := range utf16.Decode(units) {
+		out = utf8.AppendRune(out, r)
+	}
+	if len(body)%2 == 1 {
+		out = utf8.AppendRune(out, utf8.RuneError)
+	}
+	return out, true
+}

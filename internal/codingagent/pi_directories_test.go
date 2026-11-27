@@ -19,7 +19,7 @@ func TestPiDirectoriesOptIn(t *testing.T) {
 	for _, value := range []string{"", "0", "false", "true", "1"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("PIG_USE_PI_DIRS", value)
-			wantAgent, wantProject := filepath.Join(home, "pig-agent"), filepath.Join(cwd, ".pig")
+			wantAgent, wantProject := filepath.Join(home, "pig-agent"), filepath.Join(cwd, CONFIG_DIR_NAME)
 			if value == "1" {
 				wantAgent, wantProject = filepath.Join(home, ".pi", "agent"), filepath.Join(cwd, ".pi")
 			}
@@ -49,7 +49,8 @@ func TestPiDirectoriesProjectSettingsAndSessions(t *testing.T) {
 	t.Setenv("PIG_USE_PI_DIRS", "1")
 	agentDir, cwd := t.TempDir(), t.TempDir()
 	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
-	for name, theme := range map[string]string{".pi": "light", ".pig": "dark"} {
+	// µPi: the project dir is CONFIG_DIR_NAME (.micropi).
+	for name, theme := range map[string]string{".pi": "light", CONFIG_DIR_NAME: "dark"} {
 		writeSettingsFixture(t, filepath.Join(cwd, name, "settings.json"), `{"theme":"`+theme+`"}`)
 	}
 	sm := NewSettingsManager(cwd, AgentDir())
@@ -59,7 +60,7 @@ func TestPiDirectoriesProjectSettingsAndSessions(t *testing.T) {
 	if err := sm.SetProjectPackages([]PackageSource{{Source: "./shared-package"}}); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(filepath.Join(cwd, ".pig", "settings.json"))
+	data, err := os.ReadFile(filepath.Join(cwd, CONFIG_DIR_NAME, "settings.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

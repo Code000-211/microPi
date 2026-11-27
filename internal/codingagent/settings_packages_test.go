@@ -15,7 +15,7 @@ func TestSettingsPackagesPreserveEmpty(t *testing.T) {
 		path := filepath.Join(agentDir, "settings.json")
 		set := sm.SetPackages
 		if local {
-			path = filepath.Join(cwd, ".pig", "settings.json")
+			path = filepath.Join(cwd, CONFIG_DIR_NAME, "settings.json")
 			set = sm.SetProjectPackages
 		}
 		for _, packages := range [][]PackageSource{{{Source: "npm:fixture"}}, {}, nil} {

@@ -204,7 +204,7 @@ func TestSettingsManager_SetProjectPackages(t *testing.T) {
 	if got[0].Source != "npm:@foo/bar" || got[1].Source != "git:https://example.com/repo" {
 		t.Fatalf("got = %+v", got)
 	}
-	data, err := os.ReadFile(filepath.Join(cwd, ".pig", "settings.json"))
+	data, err := os.ReadFile(filepath.Join(cwd, CONFIG_DIR_NAME, "settings.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,10 +580,10 @@ func TestSettingsManager_DrainErrorsOnInvalidSettingsFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "settings.json"), []byte(`{"defaultModel":`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(cwd, ".pig"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(cwd, CONFIG_DIR_NAME), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cwd, ".pig", "settings.json"), []byte(`{"theme":`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cwd, CONFIG_DIR_NAME, "settings.json"), []byte(`{"theme":`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1795,13 +1795,13 @@ func TestSettingsClosedUnionsAreTypedAndKeepTheirDefaults(t *testing.T) {
 // Pi 8bc94b19: selfUpdateCommand is an argv read from the global settings only, so a project's settings cannot inject a command.
 func TestSelfUpdateCommandSettingIsReadFromGlobalSettingsOnly(t *testing.T) {
 	dir, cwd := t.TempDir(), t.TempDir()
-	if err := os.MkdirAll(filepath.Join(cwd, ".pig"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(cwd, CONFIG_DIR_NAME), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"selfUpdateCommand":["nix","profile","upgrade","pi"]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cwd, ".pig", "settings.json"), []byte(`{"selfUpdateCommand":["project","injected"]}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cwd, CONFIG_DIR_NAME, "settings.json"), []byte(`{"selfUpdateCommand":["project","injected"]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	sm := NewSettingsManagerWithProjectTrust(cwd, dir, true)

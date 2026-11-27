@@ -627,25 +627,20 @@ func TestChallenger2_ConcurrencyAndContextCancellation(t *testing.T) {
 		t.Fatalf("pre-canceled find: err=%v res=%#v", err, fRes)
 	}
 
-	// Mid-search cancellation via Operations.ReadFile hook on grep
+	// Cancellation after the search started, from the operations' isDirectory hook. µPi: with custom operations grep runs ripgrep as Pi
+	// does and never calls the deprecated readFile hook (TestGrepOperationsAcceptsADeprecatedReadFileHookWithoutCallingIt), so the
+	// cancellation comes from the hook it does call.
 	midCtx, midCancel := context.WithCancel(context.Background())
-	var reads atomic.Int32
 	gtMid := &GrepTool{
 		CWD: dir,
 		Operations: &GrepOperations{
 			IsDirectory: func(p string) (bool, error) {
+				midCancel()
 				fi, err := os.Stat(p)
 				if err != nil {
 					return false, err
 				}
 				return fi.IsDir(), nil
-			},
-			ReadFile: func(p string) (string, error) {
-				if reads.Add(1) == 2 {
-					midCancel()
-				}
-				b, err := os.ReadFile(p)
-				return string(b), err
 			},
 		},
 	}

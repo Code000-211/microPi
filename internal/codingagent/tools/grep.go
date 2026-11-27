@@ -110,6 +110,11 @@ var grepLeadingDotSlash = lazyregexp.New(`^(!?)(?:\./)+`)
 // readline), take the context lines from rg's own `context` events, stop rg once the match limit is proved to have cut results off,
 // surface rg's stderr on failure, then apply byte truncation and upstream's notices.
 func (t *GrepTool) Execute(ctx context.Context, _ string, rawParams json.RawMessage, _ agent.ToolUpdateCallback) (agent.AgentToolResult, error) {
+	// µPi: with custom operations grep runs ripgrep as Pi does (microPi grep.ts: native only without them), so an extension that
+	// supplies them gets Pi's semantics; otherwise the in-process search.
+	if t.Operations != nil {
+		return t.executeRipgrep(ctx, rawParams)
+	}
 	var p grepParams
 	if err := json.Unmarshal(NormalizeToolArguments(rawParams, GrepAliases), &p); err != nil {
 		return agent.AgentToolResult{}, fmt.Errorf("grep: invalid params: %w", err)
@@ -154,6 +159,8 @@ func (t *GrepTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 		readFileFn = t.Operations.ReadFile
 	}
 
+	var lastPath string
+	var lastPathBytes []byte
 	matchCount, matchLimitReached, err := nativeGrep(ctx, nativeGrepOpts{
 		Pattern:     p.Pattern,
 		SearchPath:  searchPath,
@@ -165,8 +172,12 @@ func (t *GrepTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 		Limit:       int(effectiveLimit),
 		ReadFile:    readFileFn,
 	}, func(ev nativeGrepEvent) bool {
+		// One []byte per file, not per row.
+		if ev.absPath != lastPath {
+			lastPath, lastPathBytes = ev.absPath, []byte(ev.absPath)
+		}
 		length := f.emit(grepEvent{
-			path:       []byte(ev.absPath),
+			path:       lastPathBytes,
 			lineNumber: ev.lineNumber,
 			lineText:   ev.lineText,
 			isMatch:    ev.isMatch,
@@ -180,6 +191,196 @@ func (t *GrepTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 	}
 	if err != nil {
 		return grepError(err.Error()), nil
+	}
+	if matchCount == 0 {
+		return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "No matches found"}}}, nil
+	}
+
+	tr := joined.Result()
+	tr.TotalLines = outputLineCount
+	tr.TotalBytes = outputBytes - 1
+	output := tr.Content
+	var notices []string
+	details := &GrepDetails{}
+	if matchLimitReached {
+		notices = append(notices, fmt.Sprintf("%s matches limit reached. Use limit=%s for more, or refine pattern",
+			jsNumber(effectiveLimit), jsNumber(effectiveLimit*2)))
+		details.MatchLimitReached = effectiveLimit
+	}
+	if tr.Truncated {
+		notices = append(notices, FormatSize(DefaultMaxBytes)+" limit reached")
+		trc := tr
+		details.Truncation = &trc
+	}
+	if f.linesTruncated {
+		notices = append(notices, fmt.Sprintf("Some lines truncated to %d chars. Use read tool to see full lines", GrepMaxLineLength))
+		details.LinesTruncated = true
+	}
+	if len(notices) > 0 {
+		output += "\n\n[" + strings.Join(notices, ". ") + "]"
+	}
+	output = sharedOutput(details.Truncation, output)
+	result := agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: output}}}
+	if len(notices) > 0 {
+		result.Details = details
+	}
+	return result, nil
+}
+
+// executeRipgrep is PiG's grep (upstream grep.ts execute): resolve the path, stream `rg --json` events with no line-length cap (upstream reads with
+// readline), take the context lines from rg's own `context` events, stop rg once the match limit is proved to have cut results off,
+// surface rg's stderr on failure, then apply byte truncation and upstream's notices.
+func (t *GrepTool) executeRipgrep(ctx context.Context, rawParams json.RawMessage) (agent.AgentToolResult, error) {
+	var p grepParams
+	if err := json.Unmarshal(rawParams, &p); err != nil {
+		return agent.AgentToolResult{}, fmt.Errorf("grep: invalid params: %w", err)
+	}
+	if ctx.Err() != nil {
+		return grepError("Operation aborted"), nil
+	}
+	rgPath := ensureSearchTool(ctx, t.RgPath, t.Tools, "rg")
+	if rgPath == "" {
+		return grepError("ripgrep (rg) is not available and could not be downloaded"), nil
+	}
+
+	searchDir := p.Path
+	if searchDir == "" {
+		searchDir = "."
+	}
+	cwd, err := toolCWD(ctx, t.CWD)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+	searchPath, err := resolvePath(cwd, searchDir)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+	ops := t.operations()
+	isDirectory, err := ops.IsDirectory(searchPath)
+	if err != nil {
+		return grepError("Path not found: " + searchPath), nil
+	}
+
+	// Clamp so the number never takes exponent notation, which rg rejects.
+	contextValue := 0.0
+	if p.Context != nil && *p.Context > 0 {
+		contextValue = math.Min(math.Floor(*p.Context), maxSafeInteger)
+	}
+	effectiveLimit := float64(grepDefaultLimit)
+	if p.Limit != nil {
+		effectiveLimit = math.Floor(*p.Limit)
+	}
+	effectiveLimit = math.Max(1, effectiveLimit)
+
+	// --no-config: the tool contract (literal, glob, limit, ...) must not depend
+	// on ambient user config like RIPGREP_CONFIG_PATH.
+	args := []string{"--no-config", "--json", "--line-number", "--color=never", "--hidden"}
+	if p.IgnoreCase {
+		args = append(args, "--ignore-case")
+	}
+	if p.Literal {
+		args = append(args, "--fixed-strings")
+	}
+	if p.Glob != "" {
+		// rg never matches a leading "./" ("./src/*.ts" finds nothing), so drop it; "!" negates.
+		args = append(args, "--glob", grepLeadingDotSlash.ReplaceAllString(p.Glob, "$1"))
+	}
+	// rg emits the surrounding lines as `context` events, so no matched file is ever read here (#9276).
+	if contextValue > 0 {
+		args = append(args, "--context", jsNumber(contextValue))
+	}
+	// rg roots --glob at its own cwd, so a directory search runs inside searchPath (#11807). It searches "." because rg canonicalizes
+	// its cwd: with an absolute path, a symlinked searchPath would no longer lie under the glob root.
+	runDir, target := cwd, searchPath
+	if isDirectory {
+		runDir, target = searchPath, "."
+	}
+	args = append(args, "--", p.Pattern, target)
+
+	f := grepFormatter{searchPath: searchPath, isDirectory: isDirectory}
+	// No line limit: the match limit already capped rows.
+	// Number.MAX_SAFE_INTEGER is observable in the truncation details, even though only bytes cap this tool.
+	// The output is collected head-first: lines past the 50KB the result can show are counted, not built (#9276).
+	joined := newHeadJoin(truncationLimits(DefaultMaxBytes, 1<<53-1))
+	// The size of the full output, including lines past the byte cap that are counted but not stored.
+	outputBytes, outputLineCount := 0, 0
+	matchCount := 0
+	matchLimitReached := false
+	var lastFile, lastFileBuf []byte
+	// Set at the last allowed match. rg still sends that match's trailing context, kept up to trailingContextEnd, and the limit notice
+	// waits for proof of one more match.
+	limitHit := false
+	trailingContextEnd := 0.0
+	done := false
+	pushLine := func(e grepEvent) {
+		lastFileBuf = append(lastFileBuf[:0], e.path...)
+		lastFile = lastFileBuf
+		length := f.emit(e, joined)
+		// outputBytes counts a newline after every line; the joined output has one fewer.
+		outputBytes += length + 1
+		outputLineCount++
+	}
+	var parser grepEventParser
+	handle := func(line []byte) (finish bool) {
+		if done || isBlankLine(line) {
+			return false
+		}
+		e, ok := parser.parse(line)
+		if !ok {
+			return false
+		}
+		if !limitHit {
+			pushLine(e)
+			if !e.isMatch {
+				return false
+			}
+			matchCount++
+			if float64(matchCount) >= effectiveLimit {
+				limitHit = true
+				trailingContextEnd = float64(e.lineNumber) + contextValue
+			}
+			return false
+		}
+		inWindow := bytes.Equal(e.path, lastFile) && float64(e.lineNumber) <= trailingContextEnd
+		// A match inside the last match's trailing context is shown as context.
+		isMatch := e.isMatch
+		if inWindow {
+			e.isMatch = false
+			pushLine(e)
+		}
+		// Only another match proves that the limit cut results off, whether or not it was shown as context.
+		if isMatch {
+			matchLimitReached = true
+		}
+		if matchLimitReached && !(inWindow && float64(e.lineNumber) < trailingContextEnd) {
+			done = true
+			return true
+		}
+		return false
+	}
+
+	run, err := runRipgrep(ctx, rgPath, runDir, args, handle)
+	if err != nil && ctx.Err() != nil {
+		// Aborted before rg could start (upstream checks signal.aborted after each await): Pi's abort message, not the spawn error.
+		return grepError("Operation aborted"), nil
+	}
+	if err != nil {
+		// Upstream's catch rejects with an error spawn throws unchanged; only
+		// the child's error event adds the prefix.
+		if spawnErr, ok := errors.AsType[*nodespawn.Error](err); ok && spawnErr.Thrown {
+			return grepError(err.Error()), nil
+		}
+		return grepError("Failed to run ripgrep: " + err.Error()), nil
+	}
+	if ctx.Err() != nil {
+		return grepError("Operation aborted"), nil
+	}
+	if !run.killedDueToLimit && run.exitCode != 0 && run.exitCode != 1 {
+		msg := jsstring.Trim(run.stderr)
+		if msg == "" {
+			msg = fmt.Sprintf("ripgrep exited with code %d", run.exitCode)
+		}
+		return grepError(msg), nil
 	}
 	if matchCount == 0 {
 		return agent.AgentToolResult{Content: []ai.ToolResultMessageContent{ai.TextContent{Text: "No matches found"}}}, nil

@@ -623,3 +623,28 @@ func (t *agentTool) Execute(ctx context.Context, _ string, rawParams json.RawMes
 	}
 	return ExecuteTool(ctx, t.cwd, p)
 }
+
+// NotifyFileChanged tells the open indexes that cover path that it changed (the agent wrote it): their next search checks for changes at
+// once instead of after refreshThrottle.
+func NotifyFileChanged(path string) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+	enginesMu.Lock()
+	open := make([]*Engine, 0, len(engines))
+	for _, eng := range engines {
+		open = append(open, eng)
+	}
+	enginesMu.Unlock()
+	for _, eng := range open {
+		for _, root := range eng.roots {
+			if rel, err := filepath.Rel(root, abs); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				eng.mu.Lock()
+				eng.lastCheck = time.Time{}
+				eng.mu.Unlock()
+				break
+			}
+		}
+	}
+}

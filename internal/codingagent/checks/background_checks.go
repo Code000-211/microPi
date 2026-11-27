@@ -201,18 +201,15 @@ func (b *BackgroundChecks) OnRead(path string) {
 	}
 }
 
-// maxBaselineWait caps AwaitBaseline: a slow checker (cargo check of a large crate) must not hold up the edit. Past it the edit goes on as in
-// microPi, whose edits never wait.
-const maxBaselineWait = 3 * time.Second
-
-// AwaitBaseline is called before path is written. It waits, up to ChecksWaitDuration and at most maxBaselineWait, for the baseline check of each
-// of path's units that has none yet, and starts a baseline that is still scheduled.
+// AwaitBaseline is called before path is written. It waits, up to ChecksWaitDuration, for the baseline check of each of path's units that has
+// none yet, and starts a baseline that is still scheduled. It is not capped lower: an edit that does not wait for a slow baseline gets the
+// file's old errors reported as new, and the model then chases errors it did not make.
 //
 // Without it, an edit that lands while the baseline started by a read still runs makes that run's result stale, so it is dropped. The check after
 // the edit then has no baseline, and every error in the edited file counts as new: an error the file had before the edit is reported as "New
 // errors after your changes".
 func (b *BackgroundChecks) AwaitBaseline(ctx context.Context, path string) {
-	wait := min(ChecksWaitDuration(), maxBaselineWait)
+	wait := ChecksWaitDuration()
 	if wait <= 0 {
 		return
 	}

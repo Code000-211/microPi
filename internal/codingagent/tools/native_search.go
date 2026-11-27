@@ -237,13 +237,8 @@ func contentCacheAdmitsLocked(n int64, now time.Time) bool {
 // readBufPool holds buffers for files a search reads without caching them.
 var readBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 64<<10); return &b }}
 
-// readWholeFile reads the size bytes of path into buf's storage when it is large enough, else into a new buffer.
-func readWholeFile(path string, size int64, buf []byte) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
+// readWholeFile reads the size bytes of f into buf's storage when it is large enough, else into a new buffer.
+func readWholeFile(f *os.File, size int64, buf []byte) ([]byte, error) {
 	if int64(cap(buf)) < size+1 {
 		buf = make([]byte, 0, size+512)
 	}
@@ -1573,7 +1568,20 @@ func grepOneFile(
 	}
 	searchCacheMu.Unlock()
 
-	fi, err := os.Stat(absPath)
+	// A file the cache holds is checked by its path (a hit needs no open); any other is opened at once and checked on its handle, one path
+	// lookup instead of two.
+	searchCacheMu.Lock()
+	_, known := contentCacheMap[key]
+	searchCacheMu.Unlock()
+	var file *os.File
+	var fi os.FileInfo
+	var err error
+	if known {
+		fi, err = os.Stat(absPath)
+	} else if file, err = os.Open(absPath); err == nil {
+		defer func() { _ = file.Close() }()
+		fi, err = file.Stat()
+	}
 	if err != nil || !fi.Mode().IsRegular() {
 		return false, err
 	}
@@ -1611,7 +1619,16 @@ func grepOneFile(
 		pooled = readBufPool.Get().(*[]byte)
 		scratch = *pooled
 	}
-	raw, err := readWholeFile(absPath, size, scratch)
+	if file == nil {
+		if file, err = os.Open(absPath); err != nil {
+			if pooled != nil {
+				readBufPool.Put(pooled)
+			}
+			return false, err
+		}
+		defer func() { _ = file.Close() }()
+	}
+	raw, err := readWholeFile(file, size, scratch)
 	if err != nil {
 		if pooled != nil {
 			readBufPool.Put(pooled)

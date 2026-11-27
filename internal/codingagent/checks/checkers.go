@@ -295,15 +295,33 @@ var goChecker Checker = &simpleChecker{
 		} else {
 			relPkg = "./" + filepath.ToSlash(relPkg)
 		}
+		// go vet runs beside go build rather than after it, so the check takes the longer of the two, not their sum; go's build
+		// cache takes both at once. A package that does not build reports the build's errors (all of them, -gcflags=-e), as before,
+		// and its vet run is stopped.
+		vetCtx, stopVet := context.WithCancel(ctx)
+		defer stopVet()
+		type vetResult struct {
+			ran cmdOutput
+			err error
+		}
+		vetDone := make(chan vetResult, 1)
+		go func() {
+			ran, err := runCommand(vetCtx, []string{"go", "vet", relPkg}, unit.CWD, nil, 0)
+			vetDone <- vetResult{ran, err}
+		}()
 		ran, err := runCommand(ctx, []string{"go", "build", "-gcflags=-e", "-o", os.DevNull, relPkg}, unit.CWD, nil, 0)
 		if err != nil {
 			return nil, err
 		}
 		if ran.code == 0 {
-			ran, err = runCommand(ctx, []string{"go", "vet", relPkg}, unit.CWD, nil, 0)
-			if err != nil {
-				return nil, err
+			vet := <-vetDone
+			if vet.err != nil {
+				return nil, vet.err
 			}
+			ran = vet.ran
+		} else {
+			stopVet()
+			<-vetDone
 		}
 		var out []Diagnostic
 		for _, line := range strings.Split(ran.stderr+"\n"+ran.stdout, "\n") {

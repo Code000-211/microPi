@@ -142,6 +142,8 @@ type Engine struct {
 	generation uint64
 	lastCheck  time.Time
 	lastChange time.Time
+	// lastScan is how long the last change check's walk took (refreshThrottle).
+	lastScan   atomic.Int64
 	building   atomic.Bool
 	refreshing atomic.Bool
 
@@ -340,13 +342,7 @@ func (e *Engine) MaybeRefresh() {
 	if v == nil || v.Base == nil {
 		return
 	}
-	throttle := checkEvery
-	if v.Base.BuildMs < 100 {
-		memThrottle := time.Duration(v.Base.BuildMs*5) * time.Millisecond
-		if memThrottle > throttle {
-			throttle = memThrottle
-		}
-	}
+	throttle := e.refreshThrottle()
 	now := time.Now()
 	if now.Sub(lastCheck) < throttle {
 		return
@@ -356,7 +352,9 @@ func (e *Engine) MaybeRefresh() {
 	e.lastCheck = now
 	e.mu.Unlock()
 
+	scanStart := time.Now()
 	files, err := ScanExtensions(e.roots, e.extensions, DefaultMaxFileBytes, DefaultMaxFiles)
+	e.lastScan.Store(int64(time.Since(scanStart)))
 	if err != nil {
 		return
 	}
@@ -392,6 +390,12 @@ func (e *Engine) MaybeRefresh() {
 	}
 }
 
+// refreshThrottle is how long a change check waits after the last one: checkEvery, or five times the last check's walk when that is
+// longer, so checking a large tree takes at most about a fifth of a CPU while the agent searches.
+func (e *Engine) refreshThrottle() time.Duration {
+	return max(checkEvery, 5*time.Duration(e.lastScan.Load()))
+}
+
 // MaybeRefreshAsync triggers MaybeRefresh in the background if the throttle window has elapsed.
 func (e *Engine) MaybeRefreshAsync() {
 	if e.closed.Load() {
@@ -404,13 +408,7 @@ func (e *Engine) MaybeRefreshAsync() {
 	if v == nil || v.Base == nil {
 		return
 	}
-	throttle := checkEvery
-	if v.Base.BuildMs < 100 {
-		memThrottle := time.Duration(v.Base.BuildMs*5) * time.Millisecond
-		if memThrottle > throttle {
-			throttle = memThrottle
-		}
-	}
+	throttle := e.refreshThrottle()
 	if time.Since(lastCheck) < throttle {
 		return
 	}

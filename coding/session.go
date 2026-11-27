@@ -516,6 +516,7 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		// C, C++ and HIP after the other checkers, with the tools' file state (agent-session.ts constructor).
 		opts.fileTracker = filetracking.NewTracker(filetracking.WithSearchTouchHook(func(path string, content []byte, mtimeMs float64) {
 			tools.NotifySearchFileTouched(path, content, time.UnixMilli(int64(mtimeMs)))
+			docsearch.NotifyFileChanged(path)
 		}))
 		opts.BackgroundChecks = checks.NewBackgroundChecks(checks.BackgroundChecksOptions{CWD: svcs.CWD(), Checkers: checks.SessionCheckers(opts.fileTracker.StateTracker(), svcs.CWD())})
 	}

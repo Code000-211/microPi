@@ -233,11 +233,7 @@ func (s *Session) prepareRequest(ctx context.Context, request agent.PrepareReque
 	// prepare projects the Session and passes the projection through the hook the supplied Agent had before the Session installed its own.
 	prepare := func() (previous *agent.AgentRequestUpdate, requestContext *agent.AgentContext, projection codingagent.SessionProjection, err error) {
 		projection = s.inner.Load().BuildSessionProjectionView()
-		projected := s.contextFromProjection(projection)
-		if rep := s.pendingCheckReport.Swap(nil); rep != nil {
-			projected = appendCheckReportToProjected(projected, *rep)
-		}
-		requestContext = s.executableContext(projected)
+		requestContext = s.executableContext(s.contextFromProjection(projection))
 		if s.previousPrepareRequest == nil {
 			return nil, requestContext, projection, nil
 		}
@@ -255,7 +251,9 @@ func (s *Session) prepareRequest(ctx context.Context, request agent.PrepareReque
 	if err != nil {
 		return nil, err
 	}
-	model, thinking := s.agent.Model(), s.agent.ThinkingLevel()
+	// µPi: the request thinks one level less for each response in a row cut off at the output limit (agent-session.ts
+	// _requestThinkingLevel); the session's own level stays.
+	model, thinking := s.agent.Model(), s.requestThinkingLevel()
 	if previous != nil && previous.Model != nil {
 		model = previous.Model
 	}
@@ -338,12 +336,6 @@ func (s *Session) prepareNextTurn(ctx context.Context, turn agent.PrepareNextTur
 		}
 	}
 	projected := s.contextFromProjection(projection)
-	if s.backgroundChecks != nil && s.backgroundChecks.Enabled() && (s.remoteMgr == nil || !s.remoteMgr.Active()) {
-		if report := s.backgroundChecks.Settle(ctx, s.agent.HasQueuedMessages); report != "" {
-			s.pendingCheckReport.Store(&report)
-			projected = appendCheckReportToProjected(projected, report)
-		}
-	}
 	// The hook the supplied Agent had before the Session installed its own sees the refreshed context and may replace it and add messages (agent-session.ts _installAgentNextTurnRefresh).
 	var previous *agent.AgentLoopTurnUpdate
 	if s.previousPrepareNextTurn != nil {
@@ -381,29 +373,4 @@ func (s *Session) prepareNextTurn(ctx context.Context, turn agent.PrepareNextTur
 		update.Messages = append(update.Messages, agent.AgentMessage{System: system})
 	}
 	return update, nil
-}
-
-func appendCheckReportToProjected(projected []agent.AgentMessage, report string) []agent.AgentMessage {
-	if report == "" || len(projected) == 0 {
-		return projected
-	}
-	out := slices.Clone(projected)
-	for i := len(out) - 1; i >= 0; i-- {
-		if out[i].ToolResult != nil {
-			tr := *out[i].ToolResult
-			tr.Content = slices.Clone(tr.Content)
-			if len(tr.Content) > 0 {
-				if tc, ok := tr.Content[0].(ai.TextContent); ok {
-					tc.Text += "\n\n" + report
-					tr.Content[0] = tc
-					out[i].ToolResult = &tr
-					return out
-				}
-			}
-			tr.Content = append(tr.Content, ai.TextContent{Text: report})
-			out[i].ToolResult = &tr
-			return out
-		}
-	}
-	return out
 }

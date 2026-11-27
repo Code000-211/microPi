@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/MichaelKinsy/PiG/agent"
 	"github.com/MichaelKinsy/PiG/ai"
@@ -16,6 +15,7 @@ import (
 	"github.com/MichaelKinsy/PiG/extensions/sdk/json"
 	"github.com/MichaelKinsy/PiG/internal/boundarywire"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/checks"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/compaction"
 )
 
@@ -39,41 +39,23 @@ func (s *Session) installAgentBoundaryHooks() {
 		if decision != nil && decision.Action == agent.AgentTurnEnd {
 			return decision, nil
 		}
-		if turn.Message != nil && turn.Message.StopReason == ai.StopReasonLength && len(turn.ToolResults) == 0 && s.cutOffRetries < 3 {
-			s.cutOffRetries++
-			s.stepDownThinkingLevel()
-			s.agent.FollowUp(agent.AgentMessage{User: &agent.UserMessage{
-				Role:      agent.RoleUser,
-				Content:   ai.UserText("Your previous response was cut off at the output limit. Continue concisely from where you stopped."),
-				Timestamp: time.Now().UnixMilli(),
-			}})
-			return &agent.AgentTurnDecision{Action: agent.AgentTurnContinue}, nil
+		// µPi: before the other reasons to go on: a run that goes on anyway (a queued job report, an extension) still needs the notice and
+		// the lower thinking level, or the next response thinks to the limit again (agent-session.ts _installAgentBoundaryHooks).
+		var maxTokens int
+		if model := s.agent.Model(); model != nil {
+			maxTokens = model.Capabilities.MaxOutputTokens
 		}
-		if continued || decision != nil && decision.Action == agent.AgentTurnContinue {
+		notice := s.cutOffResponses.answer(turn.Message, maxTokens)
+		if notice != nil {
+			// Ahead of other queued messages (a job report): steering goes one message a turn, and a notice one turn late lets the next
+			// response think to the limit again.
+			s.agent.SteerFirst(*notice)
+		}
+		if notice != nil || continued || decision != nil && decision.Action == agent.AgentTurnContinue {
 			return &agent.AgentTurnDecision{Action: agent.AgentTurnContinue}, nil
 		}
 		return nil, nil
 	})
-}
-
-func (s *Session) stepDownThinkingLevel() {
-	cur := s.agent.ThinkingLevel()
-	var next ai.ModelThinkingLevel
-	switch cur {
-	case ai.ThinkingXHigh:
-		next = ai.ThinkingHigh
-	case ai.ThinkingHigh:
-		next = ai.ThinkingMedium
-	case ai.ThinkingMedium:
-		next = ai.ThinkingLow
-	case ai.ThinkingLow:
-		next = ai.ThinkingMinimal
-	case ai.ThinkingMinimal:
-		next = ai.ThinkingOff
-	default:
-		return
-	}
-	s.agent.SetThinkingLevel(next)
 }
 
 // handleAgentEvent is the Session's awaited Agent subscription. Queue consumption notifies listeners before message_start handlers. Synthetic failed turns have no FinishTurn dispatch, so their boundary runs here before public listeners.
@@ -90,6 +72,7 @@ func (s *Session) handleAgentEvent(ctx context.Context, event agent.AgentEvent) 
 	case agent.MessageStartEvent:
 		if event.Message.User != nil {
 			s.overflowRecoveryAttempted.Store(false)
+			s.cutOffResponses.reset()
 			if update, removed := s.consumeQueuedMessage(event.Message); removed {
 				s.notifyAgentEventListeners(update)
 				s.publishQueueEvent(update)
@@ -98,7 +81,6 @@ func (s *Session) handleAgentEvent(ctx context.Context, event agent.AgentEvent) 
 		}
 	case agent.AgentStartEvent:
 		s.boundaryTurnIndex = 0
-		s.cutOffRetries = 0
 	case agent.TurnEndEvent:
 		if event.Message.Assistant != nil && event.Message.Assistant != s.boundaryDispatchedMessage {
 			if _, err := s.dispatchTurnEndBoundary(ctx, event); err != nil {
@@ -198,6 +180,32 @@ func (s *Session) dispatchTurnEndBoundary(ctx context.Context, event agent.TurnE
 		return false, nil
 	}
 	return true, nil
+}
+
+// waitForChecks runs before a run ends: the errors of its edits' checks, or else the lint findings (BackgroundChecks.Settle), come as
+// check-report messages, which are queued and make the run go on (agent-session.ts _waitForChecks). The caller holds s.mu; it is released
+// while the checks are waited for, so the run's other work is not held for that time.
+func (s *Session) waitForChecks(ctx context.Context) {
+	if s.backgroundChecks == nil || !s.backgroundChecks.Enabled() {
+		return
+	}
+	s.mu.Unlock()
+	lint := s.backgroundChecks.Settle(ctx, s.agent.HasQueuedMessages)
+	s.mu.Lock()
+	if lint != "" {
+		s.sendCheckReport(lint)
+	}
+}
+
+// sendCheckReport sends a report of the background checks as a displayed check-report message: steered into a running run, saved at once
+// when none runs (agent-session.ts _sendCheckReport).
+func (s *Session) sendCheckReport(text string) {
+	//portlint:allow ctxbackground the report comes from a check that ended in the background; Pi's _sendCheckReport takes no signal
+	_ = s.SendCustomMessage(context.Background(), extension.CustomMessageRef{
+		CustomType: checks.CheckReportMessageType,
+		Content:    text,
+		Display:    true,
+	}, &extension.SendMessageOptions{DeliverAs: extension.DeliverAsSteer})
 }
 
 func (s *Session) runBeforeSettleBoundary(ctx context.Context) (bool, error) {

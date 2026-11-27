@@ -610,16 +610,26 @@ func TestT2_F08_FixedAndReintroducedErrorReportedAgain(t *testing.T) {
 		t.Fatalf("expected at least 4 LLM requests, got %d", len(reqs))
 	}
 	lastReq := reqs[len(reqs)-1]
-	results := toolResultMessages(lastReq)
-	if len(results) < 3 {
+	if results := toolResultMessages(lastReq); len(results) < 3 {
 		t.Fatalf("expected at least 3 tool results in final request, got %d", len(results))
 	}
-	lastResult := strings.ToLower(results[len(results)-1])
-	if !strings.Contains(lastResult, "check-report") &&
-		!strings.Contains(lastResult, "syntax error") &&
-		!strings.Contains(lastResult, "unexpected end of file") &&
-		!strings.Contains(lastResult, "unexpected eof") {
-		t.Fatalf("expected reintroduced shell syntax diagnostic in final tool result after re-breaking reintro.sh, got:\n%s", lastResult)
+	// µPi: the report is a check-report message after the last tool result (agent-session.ts _sendCheckReport), not text pasted into
+	// that result; the run that would end after the third edit waits for its check and goes on with the report.
+	var afterTools strings.Builder
+	for _, m := range lastReq.Messages {
+		if m.Role == "tool" {
+			afterTools.Reset()
+			continue
+		}
+		afterTools.WriteString(m.ContentText())
+		afterTools.WriteString("\n")
+	}
+	reported := strings.ToLower(afterTools.String())
+	if !strings.Contains(reported, "new errors after your changes") ||
+		(!strings.Contains(reported, "syntax error") &&
+			!strings.Contains(reported, "unexpected end of file") &&
+			!strings.Contains(reported, "unexpected eof")) {
+		t.Fatalf("expected the reintroduced shell syntax error reported after the last tool result, got:\n%s", reported)
 	}
 }
 

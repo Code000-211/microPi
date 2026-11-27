@@ -22,15 +22,21 @@ const (
 	DefaultChecksWait = 30 * time.Second
 )
 
-// ChecksWaitDuration returns the configured PI_CHECKS_WAIT duration (seconds), defaulting to 30s.
-// An explicit 0 disables waiting in Settle.
+// ChecksWaitDuration is how long a run that would end waits for the checks of its edits (PI_CHECKS_WAIT, seconds): long enough for a warm
+// `cargo check` or `tsc`, short enough that a cold one on a large project does not hold the run.
+//
+// µPi: as background-checks.ts `(Number(process.env.PI_CHECKS_WAIT) || 30) * 1000`: unset, empty, 0 and a value that is not a number all
+// mean the default 30 s; a negative value waits not at all (a timer with a negative delay fires at once).
 func ChecksWaitDuration() time.Duration {
-	if raw := strings.TrimSpace(os.Getenv("PI_CHECKS_WAIT")); raw != "" {
-		if secs, err := strconv.ParseFloat(raw, 64); err == nil && !math.IsNaN(secs) && !math.IsInf(secs, 0) && secs >= 0 {
-			return time.Duration(secs * float64(time.Second))
-		}
+	raw := strings.TrimSpace(os.Getenv("PI_CHECKS_WAIT"))
+	secs, err := strconv.ParseFloat(raw, 64)
+	if err != nil || secs == 0 || math.IsNaN(secs) || math.IsInf(secs, 0) {
+		return DefaultChecksWait
 	}
-	return DefaultChecksWait
+	if secs < 0 {
+		return 0
+	}
+	return time.Duration(secs * float64(time.Second))
 }
 
 type unitState struct {
@@ -57,21 +63,26 @@ type BackgroundChecksOptions struct {
 	Checkers []Checker
 }
 
-// BackgroundChecks runs language checkers asynchronously after file reads and edits,
-// diffing diagnostics against pre-edit baselines.
+// BackgroundChecks runs language checkers after file reads and edits, so that no tool call waits for them, and reports what is new against
+// the state before (background-checks.ts).
+//
+// Errors are reported through Report as soon as a check finds them, against the unit's errors at its check before. Lint findings are
+// collected against the unit's findings before the agent first changed it and reported once, when the model would end its run (Settle).
 type BackgroundChecks struct {
 	cwd      string
-	report   func(text string)
 	checkers []Checker
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu                  sync.Mutex
-	units               map[string]*unitState
-	idleWaiters         []chan struct{}
-	pendingErrorReports []string
-	disposed            bool
+	mu     sync.Mutex
+	report func(text string)
+	units  map[string]*unitState
+	// order holds the units in the order they were first seen, as the Map of background-checks.ts iterates them: lint reports list
+	// their findings in that order.
+	order       []*unitState
+	idleWaiters []chan struct{}
+	disposed    bool
 }
 
 // NewBackgroundChecks creates a BackgroundChecks coordinator.
@@ -89,6 +100,14 @@ func NewBackgroundChecks(opts BackgroundChecksOptions) *BackgroundChecks {
 		cancel:   cancel,
 		units:    make(map[string]*unitState),
 	}
+}
+
+// SetReport sets the callback that receives each report of new errors: the session's check-report message (agent-session.ts
+// _sendCheckReport). A Session sets it on the BackgroundChecks it is given, which are made before it.
+func (b *BackgroundChecks) SetReport(report func(text string)) {
+	b.mu.Lock()
+	b.report = report
+	b.mu.Unlock()
 }
 
 // Enabled reports whether any checker is enabled.
@@ -160,6 +179,7 @@ func (b *BackgroundChecks) unitsForLocked(path string) []*unitState {
 				dirty:      true,
 			}
 			b.units[unit.Key] = state
+			b.order = append(b.order, state)
 		}
 		states = append(states, state)
 	}
@@ -312,13 +332,17 @@ func (b *BackgroundChecks) runUnit(state *unitState, edited map[string]struct{})
 				fresh := newAgainst(errs, errorsBefore, hadErrorsBefore, edited)
 				if len(fresh) > 0 {
 					reportMsg = b.format(fmt.Sprintf("New errors after your changes (%s check):", state.unit.Checker.Name()), fresh)
-					if b.report == nil {
-						b.pendingErrorReports = append(b.pendingErrorReports, reportMsg)
-						reportMsg = ""
-					}
 				}
 			}
 		}
+	}
+	if report := b.report; reportMsg != "" && report != nil && !b.disposed {
+		// The report is sent before the check counts as done, so a run that waits for its checks (Settle) finds it queued, as the
+		// setImmediate in background-checks.ts settle lets it reach the queue first. The unit still counts as running meanwhile, so no
+		// check of it starts.
+		b.mu.Unlock()
+		report(reportMsg)
+		b.mu.Lock()
 	}
 
 	state.running = false
@@ -332,10 +356,6 @@ func (b *BackgroundChecks) runUnit(state *unitState, edited map[string]struct{})
 		b.notifyIfIdleLocked()
 	}
 	b.mu.Unlock()
-
-	if reportMsg != "" && b.report != nil {
-		b.report(reportMsg)
-	}
 }
 
 func (b *BackgroundChecks) format(title string, diags []Diagnostic) string {
@@ -365,7 +385,7 @@ func (b *BackgroundChecks) TakeLintReport() string {
 	var findings []Diagnostic
 	var linters []string
 	seenLinter := make(map[string]struct{})
-	for _, state := range b.units {
+	for _, state := range b.order {
 		if len(state.lint) == 0 {
 			continue
 		}
@@ -447,48 +467,17 @@ func (b *BackgroundChecks) WaitForIdle(ctx context.Context, timeout time.Duratio
 	}
 }
 
-func (b *BackgroundChecks) flushPendingTimersLocked() {
-	if b.disposed || b.ctx.Err() != nil {
-		return
-	}
-	for _, state := range b.units {
-		if state.timer != nil {
-			if state.timer.Stop() {
-				state.timer = nil
-				if !state.running {
-					b.startLocked(state)
-				}
-			} else {
-				state.timer = nil
-			}
-		}
-	}
-}
-
-// Settle waits for pending edit checks (up to ChecksWaitDuration), then returns TakeLintReport()
-// if hasQueued is nil or returns false.
+// Settle runs before a run ends: it waits for the checks of the run's edits, up to ChecksWaitDuration, so their errors (sent through
+// Report) still reach it. Then, when hasQueued says nothing is waiting for the agent, it returns the lint findings the agent's changes
+// brought, which wait until the run would end so as not to interrupt it; "" when there are none (background-checks.ts settle).
 func (b *BackgroundChecks) Settle(ctx context.Context, hasQueued func() bool) string {
-	b.mu.Lock()
-	b.flushPendingTimersLocked()
-	b.mu.Unlock()
 	if wait := ChecksWaitDuration(); wait > 0 && b.Busy() {
 		b.WaitForIdle(ctx, wait)
 	}
 	if hasQueued != nil && hasQueued() {
 		return ""
 	}
-	b.mu.Lock()
-	errReports := b.pendingErrorReports
-	b.pendingErrorReports = nil
-	b.mu.Unlock()
-	lintReport := b.TakeLintReport()
-	if len(errReports) == 0 {
-		return lintReport
-	}
-	if lintReport != "" {
-		errReports = append(errReports, lintReport)
-	}
-	return strings.Join(errReports, "\n\n")
+	return b.TakeLintReport()
 }
 
 // Dispose cancels all running/pending checks and wakes any WaitForIdle callers.

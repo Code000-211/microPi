@@ -29,6 +29,7 @@ import (
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/checks"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/compaction"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/filetracking"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/jobs"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/remote"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
@@ -153,12 +154,12 @@ type Session struct {
 	// extensionBindings are the mode bindings the last BindExtensions call supplied; a reload applies them to the rebuilt runner.
 	extensionBindings atomic.Pointer[ExtensionBindings]
 
-	backgroundJobs     *jobs.Manager
-	jobReporter        *jobs.JobReporter
-	backgroundChecks   *checks.BackgroundChecks
-	pendingCheckReport atomic.Pointer[string]
-	remoteMgr          *remote.Manager
-	cutOffRetries  int
+	backgroundJobs   *jobs.Manager
+	jobReporter      *jobs.JobReporter
+	backgroundChecks *checks.BackgroundChecks
+	remoteMgr        *remote.Manager
+	// cutOffResponses answers responses cut off at the output limit with nothing done (session_cut_off.go).
+	cutOffResponses cutOffResponses
 	// extensionsBound is set by BindExtensions, with any bindings: a reload restarts the extensions only for a host that bound them (agent-session.ts _extensionsBound).
 	extensionsBound           atomic.Bool
 	extensionBindingsMu       sync.Mutex
@@ -329,10 +330,12 @@ type SessionOptions struct {
 
 	skipExtensionTools bool
 	toolRegistry       *sessionToolRegistry
-	BackgroundJobs     *jobs.Manager
-	BackgroundChecks   *checks.BackgroundChecks
-	Remote             *remote.Manager
-	RemoteTarget       string
+	// fileTracker is the file state the built-in tools share with the C/C++/HIP check, which finds the source a header is checked in from it.
+	fileTracker      *filetracking.Tracker
+	BackgroundJobs   *jobs.Manager
+	BackgroundChecks *checks.BackgroundChecks
+	Remote           *remote.Manager
+	RemoteTarget     string
 
 	// Services is the dependency container (settings, resources, model runtime, working directory) NewAgentSession builds the Session against;
 	// NewSession takes it as its first argument and ignores this field.
@@ -508,7 +511,11 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		opts.Remote = remote.NewManager(svcs.CWD())
 	}
 	if opts.BackgroundChecks == nil && opts.RemoteTarget == "" && os.Getenv("PI_REMOTE") == "" && svcs.CWD() != "" {
-		opts.BackgroundChecks = checks.NewBackgroundChecks(checks.BackgroundChecksOptions{CWD: svcs.CWD()})
+		// C, C++ and HIP after the other checkers, with the tools' file state (agent-session.ts constructor).
+		opts.fileTracker = filetracking.NewTracker(filetracking.WithSearchTouchHook(func(path string, content []byte, mtimeMs float64) {
+			tools.NotifySearchFileTouched(path, content, time.UnixMilli(int64(mtimeMs)))
+		}))
+		opts.BackgroundChecks = checks.NewBackgroundChecks(checks.BackgroundChecksOptions{CWD: svcs.CWD(), Checkers: checks.SessionCheckers(opts.fileTracker.StateTracker(), svcs.CWD())})
 	}
 	if opts.RemoteTarget == "" && os.Getenv("PI_REMOTE") == "" && svcs.CWD() != "" && !docsearch.IsDisabled() {
 		warmCWD := svcs.CWD()
@@ -830,6 +837,10 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 		if _, err := sess.remoteMgr.Connect(remoteTarget); err != nil {
 			return nil, err
 		}
+	}
+	if sess.backgroundChecks != nil {
+		// New errors after an edit come as a displayed check-report message, steered into the run (agent-session.ts _sendCheckReport).
+		sess.backgroundChecks.SetReport(sess.sendCheckReport)
 	}
 	sess.jobReporter = jobs.NewJobReporter(sess.backgroundJobs, func(ended []jobs.Job) {
 		_ = sess.SendCustomMessage(context.Background(), extension.CustomMessageRef{

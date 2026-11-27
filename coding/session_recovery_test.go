@@ -15,6 +15,7 @@ import (
 	"github.com/MichaelKinsy/PiG/coding/extension"
 	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	icodingagent "github.com/MichaelKinsy/PiG/internal/codingagent"
+	"github.com/MichaelKinsy/PiG/internal/codingagent/checks"
 )
 
 // Ports of the packages/coding-agent/test/suite/agent-session-boundaries.test.ts
@@ -137,6 +138,8 @@ type harnessOptions struct {
 	provider ai.Provider
 	// transport is the Session's SessionOptions.Transport, the caller's own choice that outranks the settings'.
 	transport ai.Transport
+	// backgroundChecks is the Session's SessionOptions.BackgroundChecks; nil makes the Session's own.
+	backgroundChecks *checks.BackgroundChecks
 }
 
 type recoveryHarness struct {
@@ -192,6 +195,7 @@ func newRecoveryHarness(t *testing.T, opts harnessOptions, responses ...scripted
 	}
 	options := SessionOptions{Model: model, SkipBuiltinTools: !opts.defaultTools, Tools: opts.tools, Runner: runner, SystemPromptResources: opts.resources, AllowedTools: opts.allowedTools, ExcludedTools: opts.excludedTools}
 	options.Transport = opts.transport
+	options.BackgroundChecks = opts.backgroundChecks
 	if opts.emptySessionManager {
 		options.existing = opts.sessionManager
 		if options.existing == nil {

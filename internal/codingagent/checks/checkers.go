@@ -20,6 +20,8 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"go.yaml.in/yaml/v3"
+
+	"github.com/MichaelKinsy/PiG/internal/codingagent/filetracking"
 )
 
 // DiagnosticSeverity is "error" or "warning" (linter finding).
@@ -1425,7 +1427,8 @@ var cppLintChecker = makeLinter(
 	},
 )
 
-// DefaultCheckers returns all built-in language checkers and linters (without the stateful C++ checker).
+// DefaultCheckers returns all built-in language checkers and linters, in the order of checkers.ts CHECKERS (with Go first), without the
+// C/C++/HIP checker, which a session adds (SessionCheckers).
 func DefaultCheckers() []Checker {
 	return []Checker{
 		goChecker,
@@ -1451,6 +1454,20 @@ func DefaultCheckers() []Checker {
 func EnabledCheckersFromEnv() []Checker {
 	val, _ := os.LookupEnv("PI_CHECKS")
 	return EnabledCheckers(val, DefaultCheckers())
+}
+
+// SessionCheckers returns the checkers a session runs, as PI_CHECKS allows them: DefaultCheckers, then C, C++ and HIP (CppChecker) where
+// clang is there, as agent-session.ts registers `[...CHECKERS, cpp]`. state is the session's file state, which finds the source a header is
+// checked in.
+//
+// µPi: the C/C++/HIP check runs the clang binary (-fsyntax-only) instead of libclang through a native bridge.
+func SessionCheckers(state *filetracking.FileStateTracker, workspaceCwd string) []Checker {
+	all := DefaultCheckers()
+	if cpp := CppChecker(state, workspaceCwd); cpp != nil {
+		all = append(all, cpp)
+	}
+	val, _ := os.LookupEnv("PI_CHECKS")
+	return EnabledCheckers(val, all)
 }
 
 // EnabledCheckers filters all by a PI_CHECKS setting:

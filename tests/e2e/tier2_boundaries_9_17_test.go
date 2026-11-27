@@ -501,7 +501,8 @@ func TestT2_F13_ProjectSnapshotEmptyDirHandledCleanly(t *testing.T) {
 
 func TestT2_F13_CutOffWithThinkingOffDoesNotLoopForever(t *testing.T) {
 	env := NewTestEnv(t)
-	env.MockLLM.EnqueueLengthCutOff("", "truncated")
+	// Cut off below the output limit (no usage): the context ran out, which compact-and-retry handles.
+	env.MockLLM.Enqueue(MockTurn{FinishReason: "length", TextChunks: []string{"truncated"}})
 	env.MockLLM.EnqueueText("recovered")
 
 	res := env.RunUPI("-p", "--thinking", "off", "--provider", "mock", "--model", "mock-coder", "cutoff with thinking off")
@@ -509,6 +510,20 @@ func TestT2_F13_CutOffWithThinkingOffDoesNotLoopForever(t *testing.T) {
 	if len(env.MockLLM.CapturedRequests()) > 4 {
 		t.Fatalf("unexpected retry loop")
 	}
+}
+
+// µPi: a response cut off at the output limit in its answer text ends the run as in Pi; only one that did nothing but think gets the
+// cut-off notice (cut-off-response.ts).
+func TestT2_F13_CutOffMidAnswerTextEndsTheRunAsPi(t *testing.T) {
+	env := NewTestEnv(t)
+	env.MockLLM.EnqueueLengthCutOff("", "truncated mid-answer")
+	env.MockLLM.EnqueueText("never reached")
+
+	res := env.RunUPI("-p", "--thinking", "high", "--provider", "mock", "--model", "mock-coder", "answer at length")
+	if got := len(env.MockLLM.CapturedRequests()); got != 1 {
+		t.Fatalf("expected 1 request for a response cut off in its text, got %d", got)
+	}
+	assertContains(t, res.Stderr, "output token limit", "the run ends on the truncated response")
 }
 
 func TestT2_F13_CutOffWithToolCallDoesNotTriggerThinkingStepDown(t *testing.T) {

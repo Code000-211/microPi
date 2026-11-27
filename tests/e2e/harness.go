@@ -174,6 +174,9 @@ type MockTurn struct {
 	FinishReason    string
 	Delay           time.Duration
 	Usage           *MockUsage
+	// AtOutputLimit makes a turn without Usage report the model's output limit as its completion tokens: a response cut off at the
+	// output limit, not one cut off below it because the context ran out (µPi cut-off-response.ts tells them apart by the usage).
+	AtOutputLimit bool
 }
 
 // MockModel defines an entry returned by GET /v1/models.
@@ -297,10 +300,11 @@ func (m *MockLLM) EnqueueToolCalls(calls ...MockToolCall) {
 	})
 }
 
-// EnqueueLengthCutOff appends a turn with reasoning_content and finish_reason: "length".
+// EnqueueLengthCutOff appends a turn with reasoning_content and finish_reason: "length", cut off at the model's output limit.
 func (m *MockLLM) EnqueueLengthCutOff(reasoning, partialText string) {
 	turn := MockTurn{
-		FinishReason: "length",
+		FinishReason:  "length",
+		AtOutputLimit: true,
 	}
 	if reasoning != "" {
 		turn.ReasoningChunks = []string{reasoning}
@@ -533,6 +537,17 @@ func (m *MockLLM) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	modelName := parsed.Model
 	if modelName == "" {
 		modelName = "mock-coder"
+	}
+	if turn.AtOutputLimit && turn.Usage == nil {
+		limit := parsed.MaxTokens
+		m.mu.Lock()
+		for _, mdl := range m.models {
+			if mdl.ID == modelName && mdl.MaxTokens > limit {
+				limit = mdl.MaxTokens
+			}
+		}
+		m.mu.Unlock()
+		turn.Usage = &MockUsage{PromptTokens: 100, CompletionTokens: limit, TotalTokens: 100 + limit}
 	}
 
 	if !parsed.Stream {

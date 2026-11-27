@@ -1708,6 +1708,9 @@ func (a *Agent) IsStreaming() bool {
 // allowing the user to redirect the agent mid-turn.
 func (a *Agent) Steer(msg AgentMessage) { a.steeringQueue.Enqueue(msg) }
 
+// SteerFirst is Steer ahead of the messages already queued: delivered first, also one at a time in one-at-a-time mode (agent.ts steerFirst).
+func (a *Agent) SteerFirst(msg AgentMessage) { a.steeringQueue.EnqueueFirst(msg) }
+
 // FollowUp enqueues a follow-up message. Follow-up messages are delivered
 // only after the agent has no more tool calls AND no steering messages,
 // starting a fresh outer-loop iteration.

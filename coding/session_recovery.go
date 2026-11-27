@@ -252,6 +252,12 @@ func (s *Session) runPostAgentRunsWith(ctx context.Context, messages []agent.Age
 			return messages, err
 		}
 		if !continueRun && !s.agentRunAborted(ctx) {
+			// µPi: errors the checks of this run's edits report come as queued messages, which make the run go on (agent-session.ts
+			// _startRun, _waitForChecks).
+			s.waitForChecks(ctx)
+			if s.agentRunAborted(ctx) {
+				break
+			}
 			continueRun, err = s.runBeforeSettleBoundary(ctx)
 			if err != nil {
 				return messages, err

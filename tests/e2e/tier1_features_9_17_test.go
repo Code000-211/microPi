@@ -488,6 +488,11 @@ func TestT1_F13_CutOffResponseRetriesWithLowerThinking(t *testing.T) {
 	if len(reqs) < 2 {
 		t.Fatalf("expected >= 2 requests on cut-off recovery, got %d", len(reqs))
 	}
+	// µPi: the next request carries the cut-off notice and thinks one level less (cut-off-response.ts).
+	assertContains(t, allMessagesText(reqs[1]), "Your last response reached the output limit while you were still working it out, so nothing was done.", "cut-off notice")
+	if reqs[0].ReasoningEffort != "high" || reqs[1].ReasoningEffort != "medium" {
+		t.Fatalf("reasoning effort = %q then %q, want high then medium", reqs[0].ReasoningEffort, reqs[1].ReasoningEffort)
+	}
 }
 
 func TestT1_F13_CutOffResponseCapsAt3Retries(t *testing.T) {

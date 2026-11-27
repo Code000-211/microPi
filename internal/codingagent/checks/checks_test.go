@@ -251,11 +251,12 @@ func TestJSONTOMLYAMLAndGoCheckers(t *testing.T) {
 		if err := os.WriteFile(errFile, []byte("package main\n\nfunc run() {\n\tmissingHelperFunc()\n}\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: goDir, Checkers: []Checker{goChecker}})
+		var reports reportLog
+		bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: goDir, Checkers: []Checker{goChecker}, Report: reports.add})
 		bc.OnEdited(errFile)
-		rep := bc.Settle(context.Background(), nil)
+		bc.Settle(context.Background(), nil)
 		bc.Dispose()
-		if !strings.Contains(rep, "missingHelperFunc") {
+		if rep := strings.Join(reports.all(), "\n"); !strings.Contains(rep, "missingHelperFunc") {
 			t.Fatalf("BackgroundChecks Go compile error report = %q, want missingHelperFunc", rep)
 		}
 	}
@@ -277,20 +278,26 @@ func TestSanitizeCompileFlags(t *testing.T) {
 	}
 }
 
-func TestChecksWaitZeroDoesNotBlockSettle(t *testing.T) {
+// µPi: PI_CHECKS_WAIT is read as background-checks.ts reads it, `(Number(process.env.PI_CHECKS_WAIT) || 30) * 1000`: 0 and what is not a
+// number mean the default; a negative value does not wait.
+func TestChecksWaitNegativeDoesNotBlockSettle(t *testing.T) {
 	t.Setenv("PI_CHECKS_WAIT", "")
 	if got := ChecksWaitDuration(); got != DefaultChecksWait {
 		t.Fatalf("unset PI_CHECKS_WAIT = %v, want %v", got, DefaultChecksWait)
 	}
-	for _, invalid := range []string{"-1", "NaN", "Inf", "abc"} {
-		t.Setenv("PI_CHECKS_WAIT", invalid)
+	for _, fallback := range []string{"0", "NaN", "Inf", "abc"} {
+		t.Setenv("PI_CHECKS_WAIT", fallback)
 		if got := ChecksWaitDuration(); got != DefaultChecksWait {
-			t.Fatalf("PI_CHECKS_WAIT=%q = %v, want %v", invalid, got, DefaultChecksWait)
+			t.Fatalf("PI_CHECKS_WAIT=%q = %v, want %v", fallback, got, DefaultChecksWait)
 		}
 	}
-	t.Setenv("PI_CHECKS_WAIT", "0")
+	t.Setenv("PI_CHECKS_WAIT", " 2.5 ")
+	if got := ChecksWaitDuration(); got != 2500*time.Millisecond {
+		t.Fatalf("PI_CHECKS_WAIT=2.5 = %v, want 2.5s", got)
+	}
+	t.Setenv("PI_CHECKS_WAIT", "-1")
 	if got := ChecksWaitDuration(); got != 0 {
-		t.Fatalf("PI_CHECKS_WAIT=0 = %v, want 0", got)
+		t.Fatalf("PI_CHECKS_WAIT=-1 = %v, want 0", got)
 	}
 
 	dir := t.TempDir()
@@ -340,7 +347,7 @@ func TestChecksWaitZeroDoesNotBlockSettle(t *testing.T) {
 		t.Fatalf("expected empty lint report while check still running, got %q", report)
 	}
 	if elapsed >= 250*time.Millisecond {
-		t.Fatalf("Settle blocked for %v with PI_CHECKS_WAIT=0; expected immediate return", elapsed)
+		t.Fatalf("Settle blocked for %v with PI_CHECKS_WAIT=-1; expected immediate return", elapsed)
 	}
 	if !bc.Busy() {
 		t.Fatal("expected BackgroundChecks to still be Busy while slow check is in-flight")
@@ -368,7 +375,8 @@ func TestAwaitBaselineKeepsSlowBaselineForImmediateEdit(t *testing.T) {
 			return []Diagnostic{{File: file, Line: 3, Column: 17, Severity: SeverityError, Message: "undefined: preExistingErr"}}, nil
 		},
 	}
-	bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: dir, Checkers: []Checker{checker}})
+	var reports reportLog
+	bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: dir, Checkers: []Checker{checker}, Report: reports.add})
 	t.Cleanup(bc.Dispose)
 
 	bc.OnRead(file)
@@ -390,16 +398,17 @@ func TestAwaitBaselineKeepsSlowBaselineForImmediateEdit(t *testing.T) {
 	}
 
 	bc.OnEdited(file)
-	if report := bc.Settle(context.Background(), nil); report != "" {
-		t.Fatalf("pre-existing error reported as new:\n%s", report)
+	bc.Settle(context.Background(), nil)
+	if all := reports.all(); len(all) != 0 {
+		t.Fatalf("pre-existing error reported as new:\n%s", strings.Join(all, "\n"))
 	}
 	if got := runs.Load(); got != 2 {
 		t.Fatalf("checker ran %d times, want 2 (baseline, then the edit's check)", got)
 	}
 }
 
-func TestAwaitBaselineReturnsAtOnceWithChecksWaitZero(t *testing.T) {
-	t.Setenv("PI_CHECKS_WAIT", "0")
+func TestAwaitBaselineReturnsAtOnceWithNegativeChecksWait(t *testing.T) {
+	t.Setenv("PI_CHECKS_WAIT", "-1")
 	dir := t.TempDir()
 	file := filepath.Join(dir, "a.go")
 	block := make(chan struct{})
@@ -422,6 +431,118 @@ func TestAwaitBaselineReturnsAtOnceWithChecksWaitZero(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("AwaitBaseline blocked although PI_CHECKS_WAIT=0")
+		t.Fatal("AwaitBaseline blocked although PI_CHECKS_WAIT=-1")
+	}
+}
+
+// reportLog collects the reports a BackgroundChecks sends.
+type reportLog struct {
+	mu      sync.Mutex
+	reports []string
+}
+
+func (r *reportLog) add(text string) {
+	r.mu.Lock()
+	r.reports = append(r.reports, text)
+	r.mu.Unlock()
+}
+
+func (r *reportLog) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.reports...)
+}
+
+// A run that ends right after an edit still gets that edit's errors: Settle returns only after the check's report was sent.
+func TestSettleReturnsAfterTheReportOfTheEditsCheck(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.go")
+	checker := &stubChecker{
+		name:    "stub",
+		matches: func(p string) bool { return strings.HasSuffix(p, ".go") },
+		runFn: func(context.Context, *CheckUnit) ([]Diagnostic, error) {
+			time.Sleep(100 * time.Millisecond)
+			return []Diagnostic{{File: file, Line: 1, Column: 1, Severity: SeverityError, Message: "broken"}}, nil
+		},
+	}
+	reported := make(chan struct{})
+	var reports reportLog
+	bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: dir, Checkers: []Checker{checker}, Report: func(text string) {
+		// The report takes a while to reach the queue; Settle must not look at the queue before it did.
+		time.Sleep(50 * time.Millisecond)
+		reports.add(text)
+		close(reported)
+	}})
+	t.Cleanup(bc.Dispose)
+	bc.OnEdited(file)
+	queued := false
+	if lint := bc.Settle(context.Background(), func() bool {
+		select {
+		case <-reported:
+			queued = true
+		default:
+		}
+		return queued
+	}); lint != "" {
+		t.Fatalf("lint = %q", lint)
+	}
+	if !queued {
+		t.Fatal("Settle looked at the queue before the report of the edit's check was sent")
+	}
+	if got := reports.all(); len(got) != 1 || got[0] != "New errors after your changes (stub check):\n  a.go:1:1: broken" {
+		t.Fatalf("reports = %q", got)
+	}
+}
+
+// Lint findings are listed in the order their units were first seen, as the Map of background-checks.ts iterates them.
+func TestTakeLintReportListsUnitsInTheOrderTheyWereSeen(t *testing.T) {
+	dir := t.TempDir()
+	lintOf := func(name string) *stubChecker {
+		return &stubChecker{
+			name:    name,
+			matches: func(p string) bool { return strings.HasSuffix(p, "."+name) },
+			runFn: func(_ context.Context, unit *CheckUnit) ([]Diagnostic, error) {
+				return []Diagnostic{{File: unit.File, Line: 1, Column: 1, Severity: SeverityWarning, Code: "W", Message: "finding in " + filepath.Base(unit.File)}}, nil
+			},
+		}
+	}
+	names := []string{"zz", "aa", "mm", "bb", "yy", "cc", "xx", "dd"}
+	var checkers []Checker
+	for _, name := range names {
+		checkers = append(checkers, lintOf(name))
+	}
+	for range 5 {
+		bc := NewBackgroundChecks(BackgroundChecksOptions{CWD: dir, Checkers: checkers})
+		for _, name := range names {
+			// One folder per file: the stub's unit is the file's folder.
+			bc.OnEdited(filepath.Join(dir, name, "f."+name))
+		}
+		report := bc.Settle(context.Background(), nil)
+		bc.Dispose()
+		lines := strings.Split(report, "\n")
+		want := "Lint findings in what you changed (" + strings.Join(names, ", ") + ", as this project configures them); fix them, or say why they stay:"
+		if lines[0] != want {
+			t.Fatalf("title = %q, want %q", lines[0], want)
+		}
+		for i, name := range names {
+			if !strings.HasSuffix(lines[i+1], "finding in f."+name) {
+				t.Fatalf("line %d = %q, want the finding of %s", i+1, lines[i+1], name)
+			}
+		}
+	}
+}
+
+func TestSessionCheckersRegisterCppLast(t *testing.T) {
+	if clangBinary() == "" {
+		t.Skip("no clang on PATH")
+	}
+	t.Setenv("PI_CHECKS", "")
+	all := SessionCheckers(nil, t.TempDir())
+	if len(all) != len(DefaultCheckers())+1 || all[len(all)-1].Name() != "cpp" {
+		t.Fatalf("session checkers = %d, last %q; want DefaultCheckers then cpp", len(all), all[len(all)-1].Name())
+	}
+	t.Setenv("PI_CHECKS", "cpp")
+	if only := SessionCheckers(nil, t.TempDir()); len(only) != 1 || only[0].Name() != "cpp" {
+		t.Fatalf("PI_CHECKS=cpp gives %d checkers", len(only))
 	}
 }

@@ -39,6 +39,13 @@ func (q *PendingMessageQueue) Enqueue(msg AgentMessage) {
 	q.messages = append(q.messages, msg)
 }
 
+// EnqueueFirst puts a message ahead of the messages already queued (agent.ts PendingMessageQueue.enqueueFirst).
+func (q *PendingMessageQueue) EnqueueFirst(msg AgentMessage) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.messages = append([]AgentMessage{msg}, q.messages...)
+}
+
 // HasItems reports whether the queue has any pending messages.
 func (q *PendingMessageQueue) HasItems() bool {
 	q.mu.Lock()

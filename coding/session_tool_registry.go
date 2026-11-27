@@ -279,6 +279,7 @@ func createSessionToolRegistry(services *AgentSessionServices, opts SessionOptio
 			toolsOpts := tools.ToolsOptionsFromSettings(services.Settings(), filepath.Join(services.AgentDir(), "bin"))
 			toolsOpts.BackgroundJobs = opts.BackgroundJobs
 			toolsOpts.Remote = opts.Remote
+			toolsOpts.Tracker = opts.fileTracker
 			if (opts.Remote == nil || !opts.Remote.Active()) && opts.RemoteTarget == "" && os.Getenv("PI_REMOTE") == "" {
 				toolsOpts.Checks = opts.BackgroundChecks
 			}

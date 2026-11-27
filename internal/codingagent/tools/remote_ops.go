@@ -13,6 +13,8 @@ func RemoteReadOperations(remoteMgr *remote.Manager, base *ReadOperations) *Read
 		return base
 	}
 	return &ReadOperations{
+		remoteActive: remoteMgr.Active,
+		remoteBase:   base,
 		ReadFile: func(p string) ([]byte, error) {
 			if remoteMgr.Active() {
 				return remoteMgr.ReadFile(context.Background(), p)
@@ -50,6 +52,8 @@ func RemoteWriteOperations(remoteMgr *remote.Manager, base *WriteOperations) *Wr
 		return base
 	}
 	return &WriteOperations{
+		remoteActive: remoteMgr.Active,
+		remoteBase:   base,
 		WriteFile: func(p, content string) error {
 			if remoteMgr.Active() {
 				return remoteMgr.WriteFile(context.Background(), p, []byte(content))
@@ -57,11 +61,12 @@ func RemoteWriteOperations(remoteMgr *remote.Manager, base *WriteOperations) *Wr
 			if base != nil && base.WriteFile != nil {
 				return base.WriteFile(p, content)
 			}
-			return os.WriteFile(p, []byte(content), 0o644)
+			return writeFileString(p, content)
 		},
 		Mkdir: func(dir string) error {
 			if remoteMgr.Active() {
-				return remoteMgr.Mkdir(context.Background(), dir)
+				// remoteMgr.WriteFile already runs mkdir -p before writing; skip the extra ssh round-trip.
+				return nil
 			}
 			if base != nil && base.Mkdir != nil {
 				return base.Mkdir(dir)
@@ -94,6 +99,8 @@ func RemoteEditOperations(remoteMgr *remote.Manager, base *EditOperations) *Edit
 		return base
 	}
 	return &EditOperations{
+		remoteActive: remoteMgr.Active,
+		remoteBase:   base,
 		ReadFile: func(p string) ([]byte, error) {
 			if remoteMgr.Active() {
 				return remoteMgr.ReadFile(context.Background(), p)
@@ -110,7 +117,7 @@ func RemoteEditOperations(remoteMgr *remote.Manager, base *EditOperations) *Edit
 			if base != nil && base.WriteFile != nil {
 				return base.WriteFile(p, content)
 			}
-			return os.WriteFile(p, []byte(content), 0o644)
+			return writeFileString(p, content)
 		},
 		Access: func(p string) error {
 			if remoteMgr.Active() {

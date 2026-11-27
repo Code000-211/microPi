@@ -43,6 +43,9 @@ type WriteOperations struct {
 	WriteFile    func(string, string) error
 	Mkdir        func(string) error
 	ReadExisting func(string) (string, bool, error)
+
+	remoteActive func() bool
+	remoteBase   *WriteOperations
 }
 
 // WriteTool creates or overwrites files.
@@ -54,9 +57,16 @@ type WriteTool struct {
 	Checks     *checks.BackgroundChecks
 }
 
+func (t *WriteTool) activeOperations() *WriteOperations {
+	if t.Operations != nil && t.Operations.remoteActive != nil && !t.Operations.remoteActive() {
+		return t.Operations.remoteBase
+	}
+	return t.Operations
+}
+
 func (t *WriteTool) operations() WriteOperations {
-	if t.Operations != nil {
-		return *t.Operations
+	if active := t.activeOperations(); active != nil {
+		return *active
 	}
 	return WriteOperations{WriteFile: writeFileString, Mkdir: func(path string) error { return os.MkdirAll(path, 0o755) }}
 }
@@ -168,6 +178,7 @@ func (t *WriteTool) Execute(ctx context.Context, _ string, rawParams json.RawMes
 		return agent.AgentToolResult{}, err
 	}
 
+	activeOps := t.activeOperations()
 	ops := t.operations()
 	var failure string
 	if err := runQueued(ctx, t.Queue, path, func() error {
@@ -176,7 +187,7 @@ func (t *WriteTool) Execute(ctx context.Context, _ string, rawParams json.RawMes
 			return nil
 		}
 		if t.Tracker != nil {
-			if t.Operations == nil {
+			if activeOps == nil {
 				if existingInfo, statErr := os.Stat(path); statErr == nil {
 					if ctx.Err() != nil {
 						failure = "Operation aborted"
@@ -252,7 +263,7 @@ func (t *WriteTool) Execute(ctx context.Context, _ string, rawParams json.RawMes
 		}
 		if t.Tracker != nil {
 			afterMtimeMs := float64(time.Now().UnixMilli())
-			if t.Operations == nil {
+			if activeOps == nil {
 				if m, ok := statMtimeMs(path); ok {
 					afterMtimeMs = m
 				}

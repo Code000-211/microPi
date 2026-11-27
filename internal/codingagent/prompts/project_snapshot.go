@@ -1,15 +1,11 @@
 package prompts
 
 import (
-	"bytes"
-	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 )
 
 const (
@@ -54,32 +50,50 @@ func BuildProjectSnapshot(cwd string) string {
 }
 
 func computeProjectSnapshot(cwd string) string {
-	if files, ok := gitFiles(cwd); ok && len(files) > 0 {
-		if len(files) <= maxSnapshotFiles {
-			return joinCapped(files)
-		}
-		// Large git repo: summarize top 2 directory levels + root files.
-		return summarizeDirs(cwd, 2)
+	if files, ok := walkSmallRepoFiles(cwd); ok && len(files) > 0 {
+		return joinCapped(files)
 	}
 	return summarizeDirs(cwd, 2)
 }
 
-func gitFiles(cwd string) ([]string, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return nil, false
-	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+func walkSmallRepoFiles(cwd string) ([]string, bool) {
 	var files []string
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l != "" {
-			files = append(files, l)
+	tooMany := false
+	var walk func(dir, rel string)
+	walk = func(dir, rel string) {
+		if tooMany {
+			return
 		}
+		des, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, de := range des {
+			if tooMany {
+				return
+			}
+			name := de.Name()
+			if name == ".git" || name == "node_modules" || name == ".work" || name == "target" || name == ".cache" {
+				continue
+			}
+			p := name
+			if rel != "" {
+				p = rel + "/" + name
+			}
+			if de.IsDir() {
+				walk(filepath.Join(dir, name), p)
+			} else {
+				files = append(files, p)
+				if len(files) > maxSnapshotFiles {
+					tooMany = true
+					return
+				}
+			}
+		}
+	}
+	walk(cwd, "")
+	if tooMany {
+		return nil, false
 	}
 	sort.Strings(files)
 	return files, true

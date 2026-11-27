@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/MichaelKinsy/PiG/internal/ignorerules"
+	"github.com/MichaelKinsy/PiG/internal/procpolicy"
 )
 
 const (
@@ -461,6 +462,7 @@ func getCachedTree(ctx context.Context, root string, requireGit bool) (*cachedTr
 }
 
 func walkTree(ctx context.Context, root string, requireGit bool) (*cachedTreeEntry, error) {
+	defer procpolicy.Widen()()
 	repo := repositoryOf(root)
 	top := root
 	inGit := repo != ""
@@ -1053,6 +1055,7 @@ type nativeFindResult struct {
 }
 
 func nativeFindDetailed(ctx context.Context, pattern, searchPath string, limit int, fuzzyFallback bool) (nativeFindResult, error) {
+	defer procpolicy.Widen()()
 	info, err := os.Stat(searchPath)
 	if err != nil {
 		return nativeFindResult{}, fmt.Errorf("Path not found: %s", searchPath)
@@ -1340,6 +1343,7 @@ func buildLineMatcher(pattern string, ignoreCase, literal bool) (lineMatcher, er
 }
 
 func nativeGrep(ctx context.Context, opts nativeGrepOpts, emit func(nativeGrepEvent) (stop bool)) (matchCount int, matchLimitReached bool, err error) {
+	defer procpolicy.Widen()()
 	matcher, err := buildLineMatcher(opts.Pattern, opts.IgnoreCase, opts.Literal)
 	if err != nil {
 		return 0, false, err
@@ -1372,6 +1376,81 @@ func nativeGrep(ctx context.Context, opts nativeGrepOpts, emit func(nativeGrepEv
 			}
 			sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
 		}
+	}
+
+	if len(files) >= 8 && opts.ReadFile == nil && opts.Limit > 0 {
+		workers := min(max(runtime.GOMAXPROCS(0), 2), 8)
+		type fileBatch struct {
+			events []nativeGrepEvent
+			limit  bool
+		}
+		results := make([]fileBatch, len(files))
+		// Process files in ordered chunks to bound memory and stop early once Limit is reached.
+		chunkSize := max(workers*4, 16)
+		for base := 0; base < len(files); base += chunkSize {
+			if ctx.Err() != nil {
+				return matchCount, matchLimitReached, ctx.Err()
+			}
+			end := min(base+chunkSize, len(files))
+			var nextIdx sync.Mutex
+			cursor := base
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for range workers {
+				go func() {
+					defer wg.Done()
+					for {
+						if ctx.Err() != nil {
+							return
+						}
+						nextIdx.Lock()
+						idx := cursor
+						cursor++
+						nextIdx.Unlock()
+						if idx >= end {
+							return
+						}
+						var evs []nativeGrepEvent
+						localCount := 0
+						localLimit := false
+						_, _ = grepOneFile(ctx, files[idx].abs, matcher, opts, &localCount, &localLimit, func(ev nativeGrepEvent) bool {
+							// Copy lineText since cached/piece buffers may not outlive if piece-searched.
+							cp := make([]byte, len(ev.lineText))
+							copy(cp, ev.lineText)
+							ev.lineText = cp
+							evs = append(evs, ev)
+							return matchCount+localCount >= opts.Limit
+						})
+						if len(evs) > 0 || localLimit {
+							results[idx] = fileBatch{events: evs, limit: localLimit}
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			if ctx.Err() != nil {
+				return matchCount, matchLimitReached, ctx.Err()
+			}
+			for i := base; i < end; i++ {
+				for _, ev := range results[i].events {
+					if ev.isMatch {
+						if matchCount >= opts.Limit {
+							matchLimitReached = true
+							return matchCount, matchLimitReached, nil
+						}
+						matchCount++
+					}
+					if emit(ev) {
+						return matchCount, matchLimitReached, nil
+					}
+				}
+				if results[i].limit || matchCount >= opts.Limit {
+					matchLimitReached = true
+					return matchCount, matchLimitReached, nil
+				}
+			}
+		}
+		return matchCount, matchLimitReached, nil
 	}
 
 	for _, f := range files {
@@ -1484,6 +1563,34 @@ func searchBufferLines(
 	if len(buf) == 0 || !matcher.prefilter(buf) {
 		return false
 	}
+	if opts.Context <= 0 {
+		pos := 0
+		lineNo := 1
+		for pos < len(buf) {
+			relNl := bytes.IndexByte(buf[pos:], '\n')
+			var line []byte
+			if relNl < 0 {
+				line = buf[pos:]
+				pos = len(buf)
+			} else {
+				line = buf[pos : pos+relNl]
+				pos += relNl + 1
+			}
+			clean := bytes.TrimSuffix(line, []byte("\r"))
+			if matcher.matchLine(clean) {
+				if *matchCount >= opts.Limit {
+					*matchLimitReached = true
+					return true
+				}
+				*matchCount++
+				if emit(nativeGrepEvent{absPath: absPath, lineNumber: lineNo, lineText: line, isMatch: true}) {
+					return true
+				}
+			}
+			lineNo++
+		}
+		return false
+	}
 	lines := bytes.Split(buf, []byte("\n"))
 	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
 		lines = lines[:len(lines)-1]
@@ -1498,20 +1605,6 @@ func searchBufferLines(
 		}
 	}
 	if len(matchedLines) == 0 {
-		return false
-	}
-
-	if opts.Context <= 0 {
-		for _, ln := range matchedLines {
-			if *matchCount >= opts.Limit {
-				*matchLimitReached = true
-				return true
-			}
-			*matchCount++
-			if emit(nativeGrepEvent{absPath: absPath, lineNumber: ln, lineText: lines[ln-1], isMatch: true}) {
-				return true
-			}
-		}
 		return false
 	}
 

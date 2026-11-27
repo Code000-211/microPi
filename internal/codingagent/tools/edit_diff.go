@@ -204,8 +204,10 @@ func applyEditsToNormalizedContent(normalizedContent string, edits []editEntry, 
 	// First probe: decide whether any edit needs fuzzy matching.
 	usedFuzzyAny := false
 	original := &fuzzyContent{text: normalizedContent}
-	for _, e := range normEdits {
+	firstMatches := make([]fuzzyMatchResult, len(normEdits))
+	for i, e := range normEdits {
 		m := fuzzyFindText(original, e.OldText)
+		firstMatches[i] = m
 		if m.usedFuzzyMatch {
 			usedFuzzyAny = true
 		}
@@ -220,7 +222,10 @@ func applyEditsToNormalizedContent(normalizedContent string, edits []editEntry, 
 	// Second probe: locate each edit in baseContent (with seek_sequence fallback).
 	matched := make([]matchedEdit, 0, len(normEdits))
 	for i, e := range normEdits {
-		m := fuzzyFindText(base, e.OldText)
+		m := firstMatches[i]
+		if usedFuzzyAny {
+			m = fuzzyFindText(base, e.OldText)
+		}
 		if !m.found {
 			trimmedMatch, ok := findTrimmedLineSequence(baseContent, e.OldText, e.NewText)
 			if !ok {

@@ -56,12 +56,17 @@ func (r *loopRun) toolCtx() context.Context {
 // sequential execution or any call targets a tool whose ExecutionMode is
 // sequential; otherwise in parallel.
 func (r *loopRun) executeToolCalls(assistant *AssistantMessage, calls []pendingToolCall) executedToolCallBatch {
+	return r.executeToolCallsWithEarly(assistant, calls, nil)
+}
+
+func (r *loopRun) executeToolCallsWithEarly(assistant *AssistantMessage, calls []pendingToolCall, early *earlyToolExecutor) executedToolCallBatch {
 	if r.h.cfg.ToolExecution == ToolModeSequential || r.hasSequentialToolCall(calls) {
+		early.cancelAll()
 		// The hooks of these calls run one at a time, so they receive the run's own messages, as Pi's hooks do (hookView).
 		ctx := WithToolCallHookContext(r.toolCtx(), r.toolCallHookContext(assistant, hookView(r.context)))
 		return r.executeToolCallsSequential(ctx, calls)
 	}
-	return r.executeToolCallsParallel(r.toolCtx(), assistant, calls)
+	return r.executeToolCallsParallel(r.toolCtx(), assistant, calls, early)
 }
 
 func (r *loopRun) hasSequentialToolCall(calls []pendingToolCall) bool {
@@ -119,7 +124,7 @@ func (r *loopRun) executeToolCallsSequential(ctx context.Context, calls []pendin
 // once the hooks of every call that settled before it returned or invoked their first extension handler (finalizeCalledTool), so the
 // batch's hooks write the array one at a time. The tools run at the same time, which Pi's never do (one thread): a tool that reads or
 // writes the messages while another call's tool or after hook does shares memory with that code and synchronizes with it.
-func (r *loopRun) executeToolCallsParallel(ctx context.Context, assistant *AssistantMessage, calls []pendingToolCall) executedToolCallBatch {
+func (r *loopRun) executeToolCallsParallel(ctx context.Context, assistant *AssistantMessage, calls []pendingToolCall, early *earlyToolExecutor) executedToolCallBatch {
 	outcomes := make([]toolCallOutcome, 0, len(calls))
 	callCtxs := make([]context.Context, 0, len(calls))
 	var registration registrationOrder
@@ -167,6 +172,7 @@ func (r *loopRun) executeToolCallsParallel(ctx context.Context, assistant *Assis
 		}
 	}
 	failure := func() error {
+		defer early.cancelAll()
 		// pig additive (D174): two or more prepared calls run in a procpolicy parallel section, so their in-process tool work runs at the
 		// runtime default width rather than on the capped Ps. The section closes once the last call has settled.
 		if prepared >= 2 {
@@ -194,6 +200,14 @@ func (r *loopRun) executeToolCallsParallel(ctx context.Context, assistant *Assis
 					defer window.Close()
 				}
 				callCtx := enterRegistrationOrder(callCtx, outcome.prepared.call.id)
+				if spec, ok := early.take(outcome.prepared.call.id); ok {
+					<-spec.done
+					if spec.err == nil && spec.executed != nil {
+						r.h.timings.RecordTool(outcome.prepared.call.name, spec.executed.duration)
+						finalized[i] = r.h.finalizeExecutedToolCall(callCtx, *outcome.prepared, *spec.executed)
+						return
+					}
+				}
 				var err error
 				finalized[i], err = r.h.runPreparedToolCall(callCtx, *outcome.prepared)
 				if err != nil {

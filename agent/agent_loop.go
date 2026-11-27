@@ -315,8 +315,10 @@ type completedTurn struct {
 // FinishTurn, and emits TurnEndEvent. done reports that the run already ended
 // (hard exit on an error or aborted response).
 func (r *loopRun) runTurn() (completedTurn, bool, error) {
-	assistant, toolCalls, err := r.streamAssistantResponse()
+	early := newEarlyToolExecutor(r.toolCtx(), r.h)
+	assistant, toolCalls, err := r.streamAssistantResponseWithEarly(early)
 	if err != nil {
+		early.cancelAll()
 		// Local cancellation finalizes the same aborted turn as a provider's
 		// terminal aborted response. consumeStream already emitted message_end.
 		r.appendAssistant(assistant)
@@ -328,6 +330,7 @@ func (r *loopRun) runTurn() (completedTurn, bool, error) {
 	r.appendAssistant(assistant)
 
 	if assistant.StopReason == ai.StopReasonError || assistant.StopReason == ai.StopReasonAborted {
+		early.cancelAll()
 		// The decision is ignored: error and aborted responses are hard exits.
 		r.finishTurn(r.turnContext(assistant, nil))
 		r.emitTurnEnd(assistant, nil)
@@ -343,13 +346,16 @@ func (r *loopRun) runTurn() (completedTurn, bool, error) {
 		// of executing potentially broken calls.
 		var batch executedToolCallBatch
 		if assistant.StopReason == ai.StopReasonLength {
+			early.cancelAll()
 			batch = r.failToolCallsFromTruncatedMessage(toolCalls)
 		} else {
-			batch = r.executeToolCalls(assistant, toolCalls)
+			batch = r.executeToolCallsWithEarly(assistant, toolCalls, early)
 		}
 		toolResults = batch.messages
 		hasMoreToolCalls = !batch.terminate
 		terminated = batch.terminate
+	} else {
+		early.cancelAll()
 	}
 
 	turn := r.turnContext(assistant, toolResults)
@@ -474,6 +480,10 @@ func (r *loopRun) endRun() {
 // error assistant message, as upstream stream functions encode failures in
 // the stream.
 func (r *loopRun) streamAssistantResponse() (*AssistantMessage, []pendingToolCall, error) {
+	return r.streamAssistantResponseWithEarly(nil)
+}
+
+func (r *loopRun) streamAssistantResponseWithEarly(early *earlyToolExecutor) (*AssistantMessage, []pendingToolCall, error) {
 	h := r.h
 	contextMsgs := r.context
 	if h.cfg.TransformContext != nil {
@@ -538,7 +548,7 @@ func (r *loopRun) streamAssistantResponse() (*AssistantMessage, []pendingToolCal
 	var requestFailure error
 	err := ai.RunStreamContinuation(r.ctx, func(observation *ai.StreamObservation) error {
 		var err error
-		message, calls, requestFailure, err = r.requestStream(observation, streamFn, transcript, streamOpts)
+		message, calls, requestFailure, err = r.requestStream(observation, streamFn, transcript, streamOpts, early)
 		return err
 	})
 	if requestFailure != nil {
@@ -549,7 +559,7 @@ func (r *loopRun) streamAssistantResponse() (*AssistantMessage, []pendingToolCal
 
 // upstream: packages/agent/src/agent-loop.ts:402-413 keeps stream creation and iterator adoption on one continuation, including the await of a synchronously returned stream.
 // A standalone run reports a stream function's error as requestFailure, as upstream runAgentLoop rejects when its streamFn throws.
-func (r *loopRun) requestStream(observation *ai.StreamObservation, streamFn StreamFn, transcript ai.TranscriptContext, streamOpts ai.StreamOptions) (message *AssistantMessage, calls []pendingToolCall, requestFailure, err error) {
+func (r *loopRun) requestStream(observation *ai.StreamObservation, streamFn StreamFn, transcript ai.TranscriptContext, streamOpts ai.StreamOptions, early *earlyToolExecutor) (message *AssistantMessage, calls []pendingToolCall, requestFailure, err error) {
 	h := r.h
 	requestStarted := time.Now()
 	// lazy.ts reads the clock for a setup error's timestamp, then the stream it creates reads its own start: two reads.
@@ -600,7 +610,7 @@ func (r *loopRun) requestStream(observation *ai.StreamObservation, streamFn Stre
 		}
 		return errorAssistant, nil, nil, nil
 	}
-	message, calls, err = h.consumeStream(r.readerContext(), stream, r.model, r.thinking)
+	message, calls, err = h.consumeStreamWithEarly(r.readerContext(), stream, r.model, r.thinking, early)
 	return message, calls, nil, err
 }
 

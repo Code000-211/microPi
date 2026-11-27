@@ -39,6 +39,9 @@ type EditOperations struct {
 	ReadFile  func(string) ([]byte, error)
 	WriteFile func(string, string) error
 	Access    func(string) error
+
+	remoteActive func() bool
+	remoteBase   *EditOperations
 }
 
 // EditTool performs exact-text-replacement edits on files.
@@ -55,9 +58,16 @@ type EditTool struct {
 // computeEditDiff is generateEditDiff; tests replace it to fail the diff.
 var computeEditDiff = generateEditDiff
 
+func (t *EditTool) activeOperations() *EditOperations {
+	if t.Operations != nil && t.Operations.remoteActive != nil && !t.Operations.remoteActive() {
+		return t.Operations.remoteBase
+	}
+	return t.Operations
+}
+
 func (t *EditTool) operations() EditOperations {
-	if t.Operations != nil {
-		return *t.Operations
+	if active := t.activeOperations(); active != nil {
+		return *active
 	}
 	return EditOperations{ReadFile: nodefs.ReadFile, WriteFile: writeFileString, Access: accessReadWrite}
 }
@@ -353,6 +363,7 @@ func (t *EditTool) editLocked(ctx context.Context, cwd, absPath string, p editPa
 	if aborted() {
 		return editError("Operation aborted")
 	}
+	activeOps := t.activeOperations()
 	ops := t.operations()
 	if err := ops.Access(absPath); err != nil {
 		if aborted() {
@@ -387,7 +398,7 @@ func (t *EditTool) editLocked(ctx context.Context, cwd, absPath string, p editPa
 	if t.Tracker != nil {
 		var beforeMtimePtr *float64
 		beforeMtimeMs := float64(time.Now().UnixMilli())
-		if t.Operations == nil {
+		if activeOps == nil {
 			if m, ok := statMtimeMs(absPath); ok {
 				beforeMtimeMs = m
 				beforeMtimePtr = &m
@@ -445,7 +456,7 @@ func (t *EditTool) editLocked(ctx context.Context, cwd, absPath string, p editPa
 	var suffix string
 	if t.Tracker != nil {
 		afterMtimeMs := float64(time.Now().UnixMilli())
-		if t.Operations == nil {
+		if activeOps == nil {
 			if m, ok := statMtimeMs(absPath); ok {
 				afterMtimeMs = m
 			}

@@ -55,6 +55,16 @@ type ReadOperations struct {
 	// lines that will be shown stay in memory; otherwise ReadFile loads the whole file. The read stops consuming the stream and
 	// closes it when ctx is done; an implementation should stop reading then too.
 	CreateReadStream func(ctx context.Context, absolutePath string) (*ReadStream, error)
+
+	remoteActive func() bool
+	remoteBase   *ReadOperations
+}
+
+func (t *ReadTool) activeOperations() *ReadOperations {
+	if t.Operations != nil && t.Operations.remoteActive != nil && !t.Operations.remoteActive() {
+		return t.Operations.remoteBase
+	}
+	return t.Operations
 }
 
 func (t *ReadTool) Name() string  { return "read" }
@@ -322,10 +332,11 @@ func (t *ReadTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 	if err != nil {
 		return agent.AgentToolResult{}, err
 	}
+	activeOps := t.activeOperations()
 	var src readSource
 	var failure string
-	if ops := t.Operations; ops != nil {
-		src, failure = readThroughOperations(ctx, ops, path, p)
+	if activeOps != nil {
+		src, failure = readThroughOperations(ctx, activeOps, path, p)
 	} else {
 		src, failure = readLocalFile(path, isStreamableRange(p))
 	}
@@ -362,7 +373,7 @@ func (t *ReadTool) Execute(ctx context.Context, _ string, rawParams json.RawMess
 	}
 	if t.Tracker != nil {
 		mtimeMs := float64(time.Now().UnixMilli())
-		if t.Operations == nil {
+		if activeOps == nil {
 			if m, ok := statMtimeMs(path); ok {
 				mtimeMs = m
 			}

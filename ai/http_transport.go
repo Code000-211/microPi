@@ -117,7 +117,11 @@ type idleTimeoutConn struct {
 	// socketRead, when set, reads the dialed socket with net.Conn.Read's results but without a blocking system call entry (socketReader).
 	socketRead func([]byte) (int, error)
 	// failure is how the connection ended, as Node's socket reports it.
-	failure socketFailure
+	failure             socketFailure
+	lastReadDeadlineNs  atomic.Int64
+	lastReadTimeoutNs   atomic.Int64
+	lastWriteDeadlineNs atomic.Int64
+	lastWriteTimeoutNs  atomic.Int64
 }
 
 // newIdleTimeoutConn wraps a connection dialed on network for the provider transports.
@@ -242,16 +246,33 @@ func (w *requestBatchWriter) flush() error {
 	return err
 }
 
+const deadlineUpdateGranularity = int64(time.Second)
+
 func (c *idleTimeoutConn) setReadDeadline() {
 	if c.ready != nil && !c.ready.Load() {
 		return
 	}
 	timeout := c.timeout()
 	if timeout <= 0 {
-		_ = c.SetReadDeadline(time.Time{})
+		if c.lastReadDeadlineNs.Swap(0) != 0 {
+			c.lastReadTimeoutNs.Store(0)
+			_ = c.SetReadDeadline(time.Time{})
+		}
 		return
 	}
-	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	now := time.Now()
+	nowNs := now.UnixNano()
+	timeoutNs := int64(timeout)
+	granularity := min(timeoutNs/4, deadlineUpdateGranularity)
+	prev := c.lastReadDeadlineNs.Load()
+	prevTimeout := c.lastReadTimeoutNs.Load()
+	if prev != 0 && prevTimeout == timeoutNs && nowNs-prev < granularity {
+		return
+	}
+	if c.lastReadDeadlineNs.CompareAndSwap(prev, nowNs) {
+		c.lastReadTimeoutNs.Store(timeoutNs)
+		_ = c.SetReadDeadline(now.Add(timeout))
+	}
 }
 
 func (c *idleTimeoutConn) setWriteDeadline() {
@@ -260,10 +281,25 @@ func (c *idleTimeoutConn) setWriteDeadline() {
 	}
 	timeout := c.timeout()
 	if timeout <= 0 {
-		_ = c.SetWriteDeadline(time.Time{})
+		if c.lastWriteDeadlineNs.Swap(0) != 0 {
+			c.lastWriteTimeoutNs.Store(0)
+			_ = c.SetWriteDeadline(time.Time{})
+		}
 		return
 	}
-	_ = c.SetWriteDeadline(time.Now().Add(timeout))
+	now := time.Now()
+	nowNs := now.UnixNano()
+	timeoutNs := int64(timeout)
+	granularity := min(timeoutNs/4, deadlineUpdateGranularity)
+	prev := c.lastWriteDeadlineNs.Load()
+	prevTimeout := c.lastWriteTimeoutNs.Load()
+	if prev != 0 && prevTimeout == timeoutNs && nowNs-prev < granularity {
+		return
+	}
+	if c.lastWriteDeadlineNs.CompareAndSwap(prev, nowNs) {
+		c.lastWriteTimeoutNs.Store(timeoutNs)
+		_ = c.SetWriteDeadline(now.Add(timeout))
+	}
 }
 
 // streamingHTTPClient builds the provider HTTP/1.1 client with environment proxy routing. Connection establishment has the pinned Undici budget; configurable read/write/header idle deadlines apply after GotConn. There is no overall timeout for long-lived SSE requests; the caller context owns cancellation.
@@ -358,6 +394,9 @@ func dialStreamingTLS(ctx context.Context, network, address string, dial func(co
 		}
 		options.ServerName = host
 	}
+	if len(options.NextProtos) == 0 {
+		options.NextProtos = []string{"h2", "http/1.1"}
+	}
 	secure := tls.Client(tracked, options)
 	if err := secure.HandshakeContext(connectCtx); err != nil {
 		_ = conn.Close()
@@ -431,10 +470,11 @@ func newStreamingTransport(insecure bool) http.RoundTripper {
 			//nolint:gosec // G402: opt-in per-provider insecure TLS for self-signed/internal-CA endpoints; never the default.
 			// pig additive (D36): opt-in TLS-skip for self-signed/internal-CA endpoints.
 			InsecureSkipVerify: insecure,
+			ClientSessionCache: tls.NewLRUClientSessionCache(64),
 		}),
 		// A TLS upgrade after proxy CONNECT has its own connector budget, as in Undici. Direct TLS uses DialTLSContext's shared TCP/TLS budget.
 		TLSHandshakeTimeout:   defaultHTTPConnectTimeout,
-		ForceAttemptHTTP2:     false,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   4,
 		IdleConnTimeout:       120 * time.Second,

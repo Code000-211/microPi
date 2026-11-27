@@ -164,7 +164,7 @@ pig: node-runtime ## Build bin/pig from this checkout, with symbols for profilin
 
 upi: node-runtime ## Build static bin/upi from this checkout
 	@mkdir -p bin
-	CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "-s -w -X github.com/MichaelKinsy/PiG/coding/cli.Build=$$(git rev-parse --short HEAD 2>/dev/null || echo dev)" -o bin/upi ./cmd/upi
+	CGO_ENABLED=0 GOEXPERIMENT=jsonv2 GOAMD64=$${GOAMD64:-v3} "$$(go env GOROOT)/bin/go" build -buildvcs=false -trimpath -ldflags "-s -w -X github.com/MichaelKinsy/PiG/coding/cli.Build=$$(git rev-parse --short HEAD 2>/dev/null || echo dev)" -o bin/upi ./cmd/upi
 
 clean: ## Remove bin/ and tmp/ (builds, eval results, profiles, benchmarks)
 	rm -rf bin tmp

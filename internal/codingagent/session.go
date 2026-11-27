@@ -575,6 +575,8 @@ func sessionPersistenceError(err error, operation, path string) error {
 	return sessionFileError{cause: err, message: tools.NodeFSError(err, operation, path)}
 }
 
+var sessionLinePool = sync.Pool{New: func() any { return new([]byte) }}
+
 // appendSessionLine appends a single JSONL record, creating the file if it does not exist (a resumed session always already exists), and
 // returns the file offset after the record, -1 when it is unknown.
 func appendSessionLine(path string, raw []byte) (int64, error) {
@@ -583,10 +585,17 @@ func appendSessionLine(path string, raw []byte) (int64, error) {
 		return -1, sessionPersistenceError(err, "open", path)
 	}
 	defer func() { _ = f.Close() }()
-	line := make([]byte, 0, len(raw)+1)
-	line = append(append(line, raw...), '\n')
-	if _, err := f.Write(line); err != nil {
-		return -1, sessionPersistenceError(err, "write", "")
+	bufPtr := sessionLinePool.Get().(*[]byte)
+	line := append(append((*bufPtr)[:0], raw...), '\n')
+	_, writeErr := f.Write(line)
+	if cap(line) <= 256<<10 {
+		*bufPtr = line[:0]
+	} else {
+		*bufPtr = nil
+	}
+	sessionLinePool.Put(bufPtr)
+	if writeErr != nil {
+		return -1, sessionPersistenceError(writeErr, "write", "")
 	}
 	// The file's size after the write locates the line on every platform; the file position after an O_APPEND write is not specified on all.
 	info, err := f.Stat()

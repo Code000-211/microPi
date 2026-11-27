@@ -2104,6 +2104,10 @@ type pendingToolCall struct {
 // Ports packages/agent/src/agent-loop.ts (the stream consumption of streamAssistantResponse).
 // consumeStream drives one provider response into agent events. thinking is the level the request asked for; it is recorded on the final response, whichever stream function answered (upstream agent-loop.ts:408-409). Partial messages do not carry it.
 func (h *loopHost) consumeStream(ctx context.Context, stream *ai.AssistantMessageEventStream, model *ai.Model, thinking ai.ModelThinkingLevel) (*AssistantMessage, []pendingToolCall, error) {
+	return h.consumeStreamWithEarly(ctx, stream, model, thinking, nil)
+}
+
+func (h *loopHost) consumeStreamWithEarly(ctx context.Context, stream *ai.AssistantMessageEventStream, model *ai.Model, thinking ai.ModelThinkingLevel, early *earlyToolExecutor) (*AssistantMessage, []pendingToolCall, error) {
 	thinking = recordedThinkingLevel(thinking)
 	result := func(final *ai.AssistantMessage) *AssistantMessage {
 		message := agentAssistantMessage(final)
@@ -2131,6 +2135,11 @@ func (h *loopHost) consumeStream(ctx context.Context, stream *ai.AssistantMessag
 			case ai.StartEvent, ai.DoneEvent, ai.ErrorEvent:
 			default:
 				continue
+			}
+		}
+		if early != nil {
+			if tcEnd, ok := event.(ai.ToolCallEndEvent); ok {
+				early.maybeStartFromEvent(tcEnd.ToolCall)
 			}
 		}
 		if partial, update := assistantUpdatePartial(event); update && !h.messageUpdateObserved() {

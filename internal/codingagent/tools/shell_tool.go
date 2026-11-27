@@ -342,7 +342,7 @@ func executeShellTool(ctx context.Context, cwd string, cfg shellToolConfig, rawP
 		case done := <-doneCh:
 			bgCancel()
 			res, fErr := finishForegroundShell(startedAt, done.result, done.err, output, finishOutput, sleepNote)
-			return finalizeForegroundShell(res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
+			return finalizeForegroundShell(command, res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
 		case <-bgTimer.C:
 			detached.Store(true)
 			h := registerBG()
@@ -355,7 +355,7 @@ func executeShellTool(ctx context.Context, cwd string, cfg shellToolConfig, rawP
 			bgCancel()
 			done := <-doneCh
 			res, fErr := finishForegroundShell(startedAt, done.result, done.err, output, finishOutput, sleepNote)
-			return finalizeForegroundShell(res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
+			return finalizeForegroundShell(command, res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
 		}
 	}
 
@@ -375,11 +375,29 @@ func executeShellTool(ctx context.Context, cwd string, cfg shellToolConfig, rawP
 		Env:     env,
 	})
 	res, fErr := finishForegroundShell(startedAt, result, err, output, finishOutput, sleepNote)
-	return finalizeForegroundShell(res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
+	return finalizeForegroundShell(command, res, fErr, cwd, watchedSnapshots, cfg.tracker, cfg.checks)
 }
 
-func finalizeForegroundShell(res agent.AgentToolResult, err error, cwd string, snapshots []FileSnapshot, tracker *filetracking.Tracker, bgChecks *checks.BackgroundChecks) (agent.AgentToolResult, error) {
-	if cwd != "" {
+func isReadOnlyShellCommand(command string) bool {
+	cmd := strings.TrimSpace(command)
+	if cmd == "" || strings.ContainsAny(cmd, ">;<&\n|`") || strings.Contains(cmd, "$(") {
+		return false
+	}
+	for _, prefix := range []string{
+		"ls", "cat ", "head ", "tail ", "wc ", "grep ", "rg ", "find ",
+		"pwd", "which ", "echo ", "env", "printenv", "uname", "whoami",
+		"git status", "git diff", "git log", "git show", "git branch", "git rev-parse",
+		"go version", "go list", "go env",
+	} {
+		if cmd == strings.TrimSpace(prefix) || strings.HasPrefix(cmd, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func finalizeForegroundShell(command string, res agent.AgentToolResult, err error, cwd string, snapshots []FileSnapshot, tracker *filetracking.Tracker, bgChecks *checks.BackgroundChecks) (agent.AgentToolResult, error) {
+	if cwd != "" && !isReadOnlyShellCommand(command) {
 		InvalidateSearchCache(cwd)
 	}
 	if len(snapshots) > 0 {

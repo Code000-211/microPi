@@ -395,9 +395,30 @@ func (b *BackgroundChecks) WaitForIdle(ctx context.Context, timeout time.Duratio
 	}
 }
 
+func (b *BackgroundChecks) flushPendingTimersLocked() {
+	if b.disposed || b.ctx.Err() != nil {
+		return
+	}
+	for _, state := range b.units {
+		if state.timer != nil {
+			if state.timer.Stop() {
+				state.timer = nil
+				if !state.running {
+					b.startLocked(state)
+				}
+			} else {
+				state.timer = nil
+			}
+		}
+	}
+}
+
 // Settle waits for pending edit checks (up to ChecksWaitDuration), then returns TakeLintReport()
 // if hasQueued is nil or returns false.
 func (b *BackgroundChecks) Settle(ctx context.Context, hasQueued func() bool) string {
+	b.mu.Lock()
+	b.flushPendingTimersLocked()
+	b.mu.Unlock()
 	if wait := ChecksWaitDuration(); wait > 0 && b.Busy() {
 		b.WaitForIdle(ctx, wait)
 	}

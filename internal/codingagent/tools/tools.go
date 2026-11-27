@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"golang.org/x/text/unicode/norm"
 
@@ -413,7 +414,9 @@ func CreateCodingTools(cwd string, options *ToolsOptions) []agent.AgentTool {
 	o := orEmpty(options)
 	tracker := o.Tracker
 	if tracker == nil {
-		tracker = filetracking.NewTracker()
+		tracker = filetracking.NewTracker(filetracking.WithSearchTouchHook(func(path string, content []byte, mtimeMs float64) {
+			NotifySearchFileTouched(path, content, time.UnixMilli(int64(mtimeMs)))
+		}))
 	}
 	readOpts := withOption(o.Read, func(r *ReadToolOptions) {
 		if r.Tracker == nil {

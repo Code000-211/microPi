@@ -195,6 +195,7 @@ type Engine struct {
 	lastCheck  time.Time
 	lastChange time.Time
 	building   atomic.Bool
+	refreshing atomic.Bool
 
 	readyOnce sync.Once
 	readyCh   chan struct{}
@@ -433,7 +434,40 @@ func (e *Engine) MaybeRefresh() {
 	}
 }
 
-// Search waits up to waitDur for the initial build (respecting ctx), refreshes if needed, and executes the query.
+// MaybeRefreshAsync triggers MaybeRefresh in the background if the throttle window has elapsed.
+func (e *Engine) MaybeRefreshAsync() {
+	if e.closed.Load() {
+		return
+	}
+	e.mu.RLock()
+	v := e.view
+	lastCheck := e.lastCheck
+	e.mu.RUnlock()
+	if v == nil || v.Base == nil {
+		return
+	}
+	throttle := checkEvery
+	if v.Base.BuildMs < 100 {
+		memThrottle := time.Duration(v.Base.BuildMs*5) * time.Millisecond
+		if memThrottle > throttle {
+			throttle = memThrottle
+		}
+	}
+	if time.Since(lastCheck) < throttle {
+		return
+	}
+	if !e.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	e.bgWG.Add(1)
+	go func() {
+		defer e.bgWG.Done()
+		defer e.refreshing.Store(false)
+		e.MaybeRefresh()
+	}()
+}
+
+// Search waits up to waitDur for the initial build (respecting ctx), triggers async refresh if needed, and executes the query.
 func (e *Engine) Search(ctx context.Context, query string, opts SearchOpts, waitDur time.Duration) (Results, bool) {
 	if waitDur > 0 {
 		wCtx, cancel := context.WithTimeout(ctx, waitDur)
@@ -443,7 +477,7 @@ func (e *Engine) Search(ctx context.Context, query string, opts SearchOpts, wait
 	if e.CurrentView() == nil {
 		return Results{}, false
 	}
-	e.MaybeRefresh()
+	e.MaybeRefreshAsync()
 	v := e.acquireView()
 	if v == nil || v.Base == nil {
 		v.release()

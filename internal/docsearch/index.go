@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MichaelKinsy/PiG/internal/procpolicy"
 )
 
 const (
@@ -215,6 +217,7 @@ func extractDefSymbol(heading string) string {
 
 // Build scans cfg.Roots and builds a full Index in parallel.
 func Build(cfg Config) (*Index, error) {
+	defer procpolicy.Widen()()
 	t0 := time.Now()
 	maxBytes := cfg.MaxFileBytes
 	if maxBytes <= 0 {

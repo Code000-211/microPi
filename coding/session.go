@@ -33,6 +33,7 @@ import (
 	"github.com/MichaelKinsy/PiG/internal/codingagent/remote"
 	"github.com/MichaelKinsy/PiG/internal/codingagent/tools"
 	"github.com/MichaelKinsy/PiG/internal/compactprogress"
+	"github.com/MichaelKinsy/PiG/internal/docsearch"
 	"github.com/MichaelKinsy/PiG/internal/imageprocessing"
 	"github.com/MichaelKinsy/PiG/internal/jsstring"
 )
@@ -508,6 +509,14 @@ func NewSession(svcs *AgentSessionServices, opts SessionOptions) (*Session, erro
 	}
 	if opts.BackgroundChecks == nil && opts.RemoteTarget == "" && os.Getenv("PI_REMOTE") == "" && svcs.CWD() != "" {
 		opts.BackgroundChecks = checks.NewBackgroundChecks(checks.BackgroundChecksOptions{CWD: svcs.CWD()})
+	}
+	if opts.RemoteTarget == "" && os.Getenv("PI_REMOTE") == "" && svcs.CWD() != "" && !docsearch.IsDisabled() {
+		warmCWD := svcs.CWD()
+		go func() {
+			if docsearch.ShouldAutoEnable(warmCWD) {
+				_ = docsearch.SharedEngine(warmCWD)
+			}
+		}()
 	}
 	registry, allTools, err := createSessionToolRegistry(svcs, opts)
 	if err != nil {

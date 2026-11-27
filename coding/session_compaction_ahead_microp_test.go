@@ -298,12 +298,18 @@ func TestCompactionAheadInARunTheAgentWorksOnWhileTheSummaryIsMade(t *testing.T)
 	var requests []string
 	reads := 0
 	release := make(chan struct{})
+	// summaryAsked closes when the summary request arrives: it is sent from its own goroutine, so turn 11 waits for it before releasing it.
+	summaryAsked := make(chan struct{})
+	var askedOnce sync.Once
+	// session is set once the harness exists; the last turn waits on its summary (see below).
+	var session *Session
 	respond := func(messages []ai.Message) *ai.AssistantMessage {
 		last, _ := json.Marshal(messages[len(messages)-1])
 		if strings.Contains(string(last), "being compacted") || strings.Contains(string(last), "summar") {
 			mu.Lock()
 			requests = append(requests, "summary")
 			mu.Unlock()
+			askedOnce.Do(func() { close(summaryAsked) })
 			<-release
 			return &ai.AssistantMessage{Content: []ai.AssistantContentBlock{ai.TextContent{Text: "the summary"}}, Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonStop, Timestamp: time.Now().UnixMilli()}
 		}
@@ -314,7 +320,18 @@ func TestCompactionAheadInARunTheAgentWorksOnWhileTheSummaryIsMade(t *testing.T)
 		mu.Unlock()
 		// The summary is ready from the 11th turn on.
 		if n == 11 {
+			select {
+			case <-summaryAsked:
+			case <-time.After(5 * time.Second):
+			}
 			close(release)
+		}
+		// The summary request answers once turn 11 has released it, but finishes on its own goroutine: the last turn waits for it, so the
+		// threshold check at the end of the run finds it made (as it would in a real run, where the next response takes seconds).
+		if n == 12 && session != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			session.compactionAhead.Wait(ctx)
+			cancel()
 		}
 		message := &ai.AssistantMessage{Content: []ai.AssistantContentBlock{ai.TextContent{Text: "done"}}, Provider: "faux", Model: "faux-1", StopReason: ai.StopReasonStop, Timestamp: time.Now().UnixMilli()}
 		if n <= 11 {
@@ -329,6 +346,7 @@ func TestCompactionAheadInARunTheAgentWorksOnWhileTheSummaryIsMade(t *testing.T)
 		responses[i] = respond
 	}
 	h := newRecoveryHarness(t, harnessOptions{settings: `{"compaction":{"enabled":true,"reserveTokens":1000,"keepRecentTokens":1,"maxContextTokens":50000}}`, contextWindow: 100_000, defaultTools: true}, responses...)
+	session = h.session
 	for n := 1; n <= 12; n++ {
 		if err := os.WriteFile(filepath.Join(h.session.CWD(), fmt.Sprintf("f%d.txt", n)), []byte(strings.Repeat("y", 20_000)), 0o644); err != nil {
 			t.Fatal(err)
@@ -348,8 +366,10 @@ func TestCompactionAheadInARunTheAgentWorksOnWhileTheSummaryIsMade(t *testing.T)
 	if n := len(slices.DeleteFunc(slices.Clone(got), func(r string) bool { return r != "summary" })); n != 1 {
 		t.Fatalf("requests %v: %d summaries", got, n)
 	}
-	if !slices.Contains(got[summary+1:], "turn 11") {
-		t.Fatalf("requests %v: turn 11 not after the summary", got)
+	// The summary is held until turn 11 releases it, so turn 11 coming at all shows the agent worked on while it was made; which of the two
+	// requests arrives first is the scheduler's choice. It was asked for before the last turn.
+	if turn12 := slices.Index(got, "turn 12"); turn12 < 0 || summary > turn12 || !slices.Contains(got, "turn 11") {
+		t.Fatalf("requests %v: the summary was not made while the agent worked on", got)
 	}
 	entries := suiteCompactions(t, h.session)
 	if len(entries) != 1 || !strings.Contains(entries[0].Summary, "the summary") {

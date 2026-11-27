@@ -66,14 +66,29 @@ func TestNativeSearchTreeAndContentCache(t *testing.T) {
 		t.Fatalf("expected tree cache invalidated for new file, got %d entries", len(tree4.entries))
 	}
 
-	// InvalidateSearchCache clears trees under dir.
+	// µPi: InvalidateSearchCache (a command ran) makes the next lookup revalidate the tree: an unchanged tree is kept, one whose folder
+	// changed is walked again.
 	InvalidateSearchCache(dir)
 	tree5, err := getCachedTree(ctx, dir, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tree5 == tree4 {
-		t.Fatalf("expected InvalidateSearchCache to force re-walk")
+	if tree5 != tree4 {
+		t.Fatalf("expected InvalidateSearchCache to keep an unchanged tree")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(dir, "gamma.txt"), []byte("by a command\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(dir, later, later)
+	InvalidateSearchCache(dir)
+	tree6, err := getCachedTree(ctx, dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree6 == tree5 || len(tree6.entries) != 3 {
+		t.Fatalf("expected a walk after a command added a file, got %d entries", len(tree6.entries))
 	}
 }
 

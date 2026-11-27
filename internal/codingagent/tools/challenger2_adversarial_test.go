@@ -121,17 +121,16 @@ func TestChallenger2_TreeCacheTTLAndInvalidationAPIs(t *testing.T) {
 
 	InvalidateSearchCache(sub)
 
+	// µPi: a command no longer drops the cached trees; each is revalidated on its next lookup (native_search_revalidate_test.go covers
+	// what a search then sees).
 	searchCacheMu.Lock()
 	_, hasRoot := treeCache[normalizeCacheKey(root)+"|0"]
 	_, hasSub := treeCache[normalizeCacheKey(sub)+"|0"]
 	_, hasSib := treeCache[normalizeCacheKey(sibling)+"|0"]
 	searchCacheMu.Unlock()
 
-	if hasRoot || hasSub {
-		t.Fatalf("InvalidateSearchCache(sub) should have deleted root and sub, got hasRoot=%v hasSub=%v", hasRoot, hasSub)
-	}
-	if !hasSib {
-		t.Fatalf("InvalidateSearchCache(sub) should NOT have deleted sibling")
+	if !hasRoot || !hasSub || !hasSib {
+		t.Fatalf("InvalidateSearchCache(sub) should keep the trees for revalidation, got hasRoot=%v hasSub=%v hasSib=%v", hasRoot, hasSub, hasSib)
 	}
 
 	// Test NotifySearchFileTouched:

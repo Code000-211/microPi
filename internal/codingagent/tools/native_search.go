@@ -63,8 +63,11 @@ type cachedTreeEntry struct {
 	knownAbsKeys   map[string]struct{}
 	ignoredDirKeys map[string]struct{}
 	dirMtimes      map[string]int64
-	partial        bool
-	timestamp      time.Time
+	// ignoreMtimes holds the ignore files the walk read (.gitignore, .ignore, git's info/exclude and global excludes) with their mtimes:
+	// editing one in place leaves its folder's mtime alone, so a revalidation checks them too.
+	ignoreMtimes map[string]int64
+	partial      bool
+	timestamp    time.Time
 }
 
 type cachedFileBuffer struct {
@@ -113,23 +116,16 @@ func NotifySearchExternalChange() {
 	searchCacheMu.Unlock()
 }
 
-// InvalidateSearchCache invalidates cached trees under cwd (or all trees if cwd == "")
-// and bumps the external change timestamp.
+// InvalidateSearchCache records that a command may have changed files (cwd names where it ran), so the next search revalidates the cached
+// trees and file contents instead of trusting them for treeCacheVerifyWindow.
+//
+// The cached trees are not dropped: the next search revalidates them (getCachedTree), restating their folders and the ignore files they
+// read, and walks again only when one of those changed. Dropping them made every grep after a command such as `go test` walk the whole
+// tree again (µPi: microPi re-checks the trees, 8c2c0bac). A tree past maxVerifiedDirs is walked again, as before.
 func InvalidateSearchCache(cwd string) {
 	searchCacheMu.Lock()
 	defer searchCacheMu.Unlock()
 	externalChangeAt = time.Now()
-	if cwd == "" {
-		treeCache = make(map[string]*cachedTreeEntry)
-		return
-	}
-	normCwd := normalizeCacheKey(cwd)
-	prefix := normCwd + string(filepath.Separator)
-	for k, entry := range treeCache {
-		if entry.rootKey == normCwd || strings.HasPrefix(entry.rootKey, prefix) || strings.HasPrefix(normCwd, entry.rootKey+string(filepath.Separator)) {
-			delete(treeCache, k)
-		}
-	}
 }
 
 // NotifySearchFileTouched updates the content cache (when content != nil) and
@@ -290,6 +286,18 @@ func repositoryOf(root string) string {
 			return ""
 		}
 		cur = parent
+	}
+}
+
+// recordIgnoreFileMtimes adds each of paths that exists to into, with its mtime.
+func recordIgnoreFileMtimes(into map[string]int64, paths ...string) {
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if fi, err := os.Stat(path); err == nil {
+			into[path] = fi.ModTime().UnixNano()
+		}
 	}
 }
 
@@ -489,13 +497,18 @@ func getCachedTree(ctx context.Context, root string, requireGit bool) (*cachedTr
 		}
 		valid := !(changedSince && cached.partial)
 		if valid {
-			for dir, prevMtime := range cached.dirMtimes {
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
+			for _, mtimes := range []map[string]int64{cached.dirMtimes, cached.ignoreMtimes} {
+				for path, prevMtime := range mtimes {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					fi, statErr := os.Stat(path)
+					if statErr != nil || fi.ModTime().UnixNano() != prevMtime {
+						valid = false
+						break
+					}
 				}
-				fi, statErr := os.Stat(dir)
-				if statErr != nil || fi.ModTime().UnixNano() != prevMtime {
-					valid = false
+				if !valid {
 					break
 				}
 			}
@@ -529,7 +542,9 @@ func walkTree(ctx context.Context, root string, requireGit bool) (*cachedTreeEnt
 	applyGit := !requireGit || inGit
 
 	var initRules []taggedIgnoreRule
+	ignoreMtimes := make(map[string]int64)
 	if inGit {
+		recordIgnoreFileMtimes(ignoreMtimes, globalExcludesFile(), excludeFileOf(repo))
 		if gex := globalExcludesFile(); gex != "" {
 			if pats := loadIgnorePatternsFromFile(gex, ""); len(pats) > 0 {
 				initRules = append(initRules, taggedIgnoreRule{isGit: true, root: top, rules: ignorerules.AppendPatterns(nil, pats)})
@@ -545,9 +560,11 @@ func walkTree(ctx context.Context, root string, requireGit bool) (*cachedTreeEnt
 			parts := strings.Split(filepath.ToSlash(rel), "/")
 			cur := repo
 			initRules = appendIgnoreLayer(initRules, cur, top, applyGit)
+			recordIgnoreFileMtimes(ignoreMtimes, filepath.Join(cur, ".gitignore"), filepath.Join(cur, ".ignore"))
 			for i := 0; i < len(parts)-1; i++ {
 				cur = filepath.Join(cur, parts[i])
 				initRules = appendIgnoreLayer(initRules, cur, top, applyGit)
+				recordIgnoreFileMtimes(ignoreMtimes, filepath.Join(cur, ".gitignore"), filepath.Join(cur, ".ignore"))
 			}
 		}
 	}
@@ -617,6 +634,11 @@ func walkTree(ctx context.Context, root string, requireGit bool) (*cachedTreeEnt
 				}
 
 				rules = appendIgnoreLayer(rules, t.abs, curGitRoot, !requireGit || curInGit)
+				localIgnoreFiles := make(map[string]int64, 2)
+				recordIgnoreFileMtimes(localIgnoreFiles, filepath.Join(t.abs, ".gitignore"), filepath.Join(t.abs, ".ignore"))
+				if curGitRoot == t.abs && t.rel != "" {
+					recordIgnoreFileMtimes(localIgnoreFiles, excludeFileOf(t.abs))
+				}
 
 				dirEntries, err := os.ReadDir(t.abs)
 				if err != nil {
@@ -692,6 +714,9 @@ func walkTree(ctx context.Context, root string, requireGit bool) (*cachedTreeEnt
 						dirMtimes[m[0].(string)] = m[1].(int64)
 					}
 				}
+				for path, mtime := range localIgnoreFiles {
+					ignoreMtimes[path] = mtime
+				}
 				nextTasks = append(nextTasks, localSubdirs...)
 				mu.Unlock()
 			}(task)
@@ -720,6 +745,7 @@ func walkTree(ctx context.Context, root string, requireGit bool) (*cachedTreeEnt
 		knownAbsKeys:   knownAbs,
 		ignoredDirKeys: ignoredDirs,
 		dirMtimes:      dirMtimes,
+		ignoreMtimes:   ignoreMtimes,
 		partial:        len(dirMtimes) >= maxVerifiedDirs,
 		timestamp:      time.Now(),
 	}, nil

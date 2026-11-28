@@ -197,7 +197,7 @@ internal/evals/.eval/
 # END PINNED INTERFACE SNAPSHOTS
 
 # --- µPi ---
-# Sources, toolchains and builds made by scripts/ (see docs/BUILDING.md)
+# Local builds and toolchains
 /.work/
 /.toolchain/
 /results/

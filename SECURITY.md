@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest release gets security fixes. Update with `pi-bolt update` (or your package manager) before reporting.
+Only the latest release gets security fixes. Update with `upi update` (or run the installer again) before reporting.
 
 | Version | Supported |
 |---|---|
@@ -11,7 +11,7 @@ Only the latest release gets security fixes. Update with `pi-bolt update` (or yo
 
 ## Reporting a vulnerability
 
-Report privately through GitHub: **[open a private security advisory](https://github.com/opensec-git/Pi-Bolt/security/advisories/new)**.
+Report privately through GitHub: **[open a private security advisory](https://github.com/Code000-211/microPi/security/advisories/new)**.
 Do not open a public issue, pull request or discussion for a vulnerability.
 
 Include:
@@ -19,8 +19,8 @@ Include:
 - what an attacker can do, and what they need first (a repository you open, a model or MCP server response, a network
   position, a local account);
 - steps to reproduce, ideally a minimal proof of concept that only writes a marker file;
-- `pi-bolt --version` and your operating system;
-- whether stock Pi (on Node or Bun) behaves the same.
+- `upi --version` and your operating system;
+- whether [PiG](https://github.com/MichaelKinsy/PiG) or stock [Pi](https://github.com/earendil-works/pi) behaves the same.
 
 ## What happens next
 
@@ -28,23 +28,21 @@ Include:
 - We aim to release a fix within 30 days for high and critical issues, and in the next release for the rest.
 - We agree a disclosure date with you, at most 90 days after the report. We credit you in the release notes and the advisory
   unless you ask us not to.
-- If the problem is also in upstream Pi, Bun or JavaScriptCore, we report it to that project privately, with your consent, and
-  coordinate disclosure with them.
+- If the problem is also in PiG or Pi, we report it to that project privately, with your consent, and coordinate disclosure
+  with them.
 
 ## Scope
 
-In scope: what µPi adds or changes:
+In scope: what µPi adds or changes in PiG:
 
-- the runtime and engine changes (`patches/`) and the release executables;
-- the installers (`install.sh`, `install.ps1`), `pi-bolt update`, the npm packages and the release signing;
-- `pi-bolt compile`, the built-in tools µPi replaces (such as `grep` and `find`), and the other µPi code in this
-  repository.
+- the release executables, the installers (`install.sh`, `install.ps1`) and `upi update`;
+- µPi's built-in features: the background checks, background jobs and `wait`, docsearch (`project_search`), the native
+  `grep`/`find`, early tool starts, bash file-change detection, `/remote`, compaction-ahead and tool-result pruning.
 
 Out of scope here:
 
-- Bugs that stock Pi has too: report them to [Pi](https://github.com/earendil-works/pi/security) (you are welcome to tell us as
-  well).
-- Bugs in upstream Bun or JavaScriptCore that µPi does not change: report them to those projects.
+- Bugs that PiG or stock Pi have too: report them to [PiG](https://github.com/MichaelKinsy/PiG/security) or
+  [Pi](https://github.com/earendil-works/pi/security) (you are welcome to tell us as well).
 - What an extension, skill or model does with the permissions you gave it (see "Extensions and projects" below), and social
   engineering.
 
@@ -53,25 +51,16 @@ accounts, don't access others' data, and give us a reasonable time to fix before
 
 ## Verifying downloads
 
-The installers check every download for you. To check a manual download, verify the signature of `SHA256SUMS` first, then the
-files against it. With OpenSSH 8.1 or later:
+The installers and `upi update` check every download against the release's `SHA256SUMS`. To check a manual download, run
+this in the folder that holds the executable and `SHA256SUMS`:
 
 ```bash
-echo 'pi-bolt namespaces="pi-bolt-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKC26CarSmqCEj6n35NN7x2a/tbEQRt7iESFnijnsPmm' > allowed_signers
-ssh-keygen -Y verify -f allowed_signers -I pi-bolt -n pi-bolt-release -s SHA256SUMS.sshsig < SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-Or with OpenSSL 3, using [`keys/release.pub`](keys/release.pub):
-
-```bash
-openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
-```
-
-Every archive also has a GitHub build attestation: `gh attestation verify <file> -R opensec-git/Pi-Bolt`.
+The checksums come from the same GitHub release as the executables; the releases are not signed yet.
 
 ## Extensions and projects
 
-Extensions run inside Pi with your permissions, whether loaded at run time or compiled in with `pi-bolt compile`. Install only
-extensions you trust. A project's own extensions, skills, prompts and settings load only after you trust that project; answer
-"no" for repositories you don't know.
+Extensions run with your permissions. Install only extensions you trust. A project's own extensions, skills, prompts and
+settings load only after you trust that project; answer "no" for repositories you don't know.

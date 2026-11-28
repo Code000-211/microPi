@@ -2,60 +2,59 @@
 
 Thanks for helping make µPi better. Bug reports, benchmarks on other hardware and fixes are all welcome.
 
-µPi is a fork of [Pi](https://github.com/earendil-works/pi). If something also happens with stock Pi, it belongs upstream.
-This repository takes what µPi adds: the engine patches, the installers and updater, `upi compile`, the tools µPi
-replaces, scripts, benchmarks and docs.
+µPi is [PiG](https://github.com/MichaelKinsy/PiG) (Pi in Go) with µPi's features built in. If something also happens with
+PiG or stock [Pi](https://github.com/earendil-works/pi), it belongs upstream. This repository takes what µPi adds: the
+background checks, jobs, docsearch, search, early tool starts, compaction and pruning, the release and the installers.
 
 Security problems: never in a public issue. See [SECURITY.md](SECURITY.md). Everyone taking part follows the
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Opening an issue
 
-1. Update first (`upi update`) and search [existing issues](https://github.com/opensec-git/Pi-Bolt/issues).
-2. Check whether stock Pi does the same (`npx @earendil-works/pi-coding-agent`). If it does, report it to Pi instead.
-3. Open a [bug report](https://github.com/opensec-git/Pi-Bolt/issues/new?template=bug.yml) or a
-   [feature request](https://github.com/opensec-git/Pi-Bolt/issues/new?template=feature.yml) and fill in the form:
+1. Update first (`upi update`) and search [existing issues](https://github.com/Code000-211/microPi/issues).
+2. Check whether PiG or stock Pi does the same. If it does, report it there instead.
+3. Open a [bug report](https://github.com/Code000-211/microPi/issues/new?template=bug.yml) or a
+   [feature request](https://github.com/Code000-211/microPi/issues/new?template=feature.yml) and fill in the form:
    - what you did, what you expected, what happened, with error messages as text;
    - `upi --version`, your OS and how you installed;
    - the smallest steps that reproduce it.
 
-Questions and ideas that aren't bugs go to [Discussions](https://github.com/opensec-git/Pi-Bolt/discussions).
-
 ## Opening a pull request
 
 1. For anything bigger than a small fix, open an issue first so we can agree on the approach.
-2. Fork, then branch from `pi-bolt`.
-3. Set up and check:
+2. Fork, then branch from `PiG`.
+3. Build and check:
 
    ```bash
-   npm ci --ignore-scripts
-   npm run check      # lint, types, formatting: must be clean
-   ./test.sh          # the tests (no network or API keys needed)
+   go build ./cmd/upi
+   go vet ./...
+   go test ./internal/codingagent/... ./internal/docsearch/   # or the packages you changed
    ```
 
-4. Add a test that fails without your change. For an engine or build change, also run `tests/aot/run.sh` and
-   `tests/pi/run.sh` on a build with it.
-5. If it can affect speed or quality, include before/after numbers from `bench/harness` (same model, runs interleaved).
+   `gofmt -l .` must print nothing. Some parity tests compare with Pi and need its npm package and Node
+   (`make parity-deps`); without them they fail the same way before and after your change.
+4. Add a test that fails without your change. For a change to what `upi` does end to end, also run the e2e suite:
+   `cd tests/e2e && GOWORK=off go test .`
+5. If it can affect speed or memory, include before/after numbers (Buffon, or a benchmark of the code you changed).
 6. Commit with a short message: `fix(coding-agent): what changed`. Types: `feat`, `fix`, `perf`, `docs`, `build`, `test`,
    `chore`. Don't edit `CHANGELOG.md` files; release notes are written at release time.
-7. Open the pull request against `pi-bolt`, link the issue (`Fixes #123`), and fill in the template.
+7. Open the pull request against `PiG`, link the issue (`Fixes #123`), and fill in the template.
 
-A maintainer reviews it. CI must pass and every review comment must be resolved before it can be merged. We merge; you don't
-need to rebase unless asked.
+A maintainer reviews it. CI must pass and every review comment must be resolved before it can be merged.
 
 ## Where things live
 
-| Area | Where | Check with |
-|---|---|---|
-| Pi's code as µPi changes it | `packages/` | `npm run check`, `./test.sh` |
-| Build scripts, tools | `scripts/`, `bench/` | `shellcheck -x scripts/*.sh`, and a build |
-| The engine (JavaScriptCore AOT compiler, runtime) | `.work/webkit`, then regenerate `patches/webkit.patch` | `tests/aot/run.sh` |
-| The executable format | `.work/bun`, then regenerate `patches/bun.patch` | the same |
-| Installers and updater | `install.sh`, `install.ps1`, `npm/` | `tests/installer/run.sh` (and `run.ps1` on Windows) |
+| Area | Where |
+|---|---|
+| Background checks | `internal/codingagent/checks` |
+| Background jobs, `wait`, the job hub | `internal/codingagent/jobs`, `internal/codingagent/job_hub.go`, `internal/codingagent/tools/wait.go` |
+| docsearch (`project_search`, auto-recall) | `internal/docsearch` |
+| Native `grep`/`find`, bash file writes, early starts | `internal/codingagent/tools`, `agent/early_tools.go` |
+| Compaction-ahead, tool-result pruning | `internal/codingagent/compaction` |
+| The session that wires them in | `coding/session*.go` |
+| Release and installers | `.github/workflows/release.yml`, `install.sh`, `install.ps1` |
 
 ## Style
 
-- TypeScript: as the surrounding code; no `any` unless unavoidable; imports at the top.
-- Shell: `bash`, `set -euo pipefail` (via `scripts/lib/common.sh`), clean under `shellcheck -S warning`.
-- Python: standard library only, Python 3.9+.
-- Engine code: WebKit's style.
+- Go: `gofmt`, as the surrounding code. A comment says why, and marks a µPi change with `µPi:`.
+- Shell: POSIX `sh` for the installer, clean under `shellcheck -S warning`.

@@ -1,10 +1,2 @@
 # actionlint (the Workflows step of ci.yml's Lint and types job).
-paths:
-  .github/workflows/publish.yml:
-    ignore:
-      # (The unquoted $(...) is meant to split: nothing, or --tag beta.)
-      - "SC2046:"
-  .github/workflows/release.yml:
-    ignore:
-      # (The error message prints scripts\build-runtime.ps1 with its backslash.)
-      - "SC2028:"
+paths: {}

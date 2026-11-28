@@ -100,28 +100,25 @@ twice each, with the paired ratios of time, cost and turns and their bootstrap i
 
 ## Install
 
-Download the executable for your platform from the [latest release](https://github.com/Code000-211/microPi/releases/latest)
-and put it on your `PATH`. Linux x86-64 (for ARM64 take `upi-linux-arm64`):
+One command. On Linux (x86-64, ARM64) and macOS (Apple silicon, Intel):
 
 ```bash
-mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/upi https://github.com/Code000-211/microPi/releases/latest/download/upi-linux-amd64 && chmod +x ~/.local/bin/upi
+curl -fsSL https://raw.githubusercontent.com/Code000-211/microPi/PiG/install.sh | sh
 ```
 
-macOS on Apple silicon (Intel: `upi-darwin-amd64`):
-
-```bash
-mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/upi https://github.com/Code000-211/microPi/releases/latest/download/upi-darwin-arm64 && chmod +x ~/.local/bin/upi
-```
-
-Windows x64, in PowerShell:
+On Windows x64, in PowerShell:
 
 ```powershell
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.micropi" | Out-Null; Invoke-WebRequest https://github.com/Code000-211/microPi/releases/latest/download/upi-windows-amd64.exe -OutFile "$env:USERPROFILE\.micropi\upi.exe"
+powershell -c "irm https://raw.githubusercontent.com/Code000-211/microPi/PiG/install.ps1 | iex"
 ```
 
-and add `%USERPROFILE%\.micropi` to your user `PATH`. Every release has a `SHA256SUMS` beside the executables
-(`sha256sum -c SHA256SUMS --ignore-missing` in the download folder). Then `upi --version`, and `upi update` updates to
-the next release. The one-line installer of µPi 0.1 (`install.sh`, `install.ps1`) installs the 0.1 builds only.
+The installer downloads the executable for your machine from the [latest release](https://github.com/Code000-211/microPi/releases/latest),
+checks it against the release's `SHA256SUMS`, and installs it as `~/.local/bin/upi` (Windows: `%USERPROFILE%\.micropi\bin\upi.exe`,
+added to your user `PATH`). Pin a version with `MICROPI_VERSION=upi-vX.Y.Z`, choose the folder with `MICROPI_BIN_DIR`. Run it
+again to reinstall; `upi update` updates to the next release.
+
+Or download `upi-<os>-<arch>` from the release yourself, check it with `sha256sum -c SHA256SUMS --ignore-missing`, make it
+executable and put it on your `PATH`.
 
 ## Build from source
 

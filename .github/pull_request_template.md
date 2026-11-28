@@ -10,8 +10,8 @@ Fixes #
 
 **Checklist**
 
-- [ ] `npm run check` is clean and `./test.sh` passes
+- [ ] `gofmt -l .` prints nothing, `go vet ./...` is clean, and the tests of the changed packages pass
 - [ ] A test fails without this change (or: why not)
-- [ ] Speed or memory may change: before/after numbers from `bench/` are above
-- [ ] Engine or build change: patches regenerated, `tests/aot/run.sh` and `tests/pi/run.sh` pass on a build with it
+- [ ] Speed or memory may change: before/after numbers are above
+- [ ] End-to-end behaviour changes: `cd tests/e2e && GOWORK=off go test .` passes
 - [ ] No `CHANGELOG.md` edits

@@ -125,10 +125,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.sha }}
+          persist-credentials: false
+          path: src
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
+      - name: Installers
+        # The one-line installers (README "Install") download from the latest release: each release carries them.
+        run: cp src/install.sh src/install.ps1 dist/
       - name: Checksums
         working-directory: dist
         run: |

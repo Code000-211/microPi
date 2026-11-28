@@ -1347,6 +1347,17 @@ func (m *literalBytesMatcher) matchLine(line []byte) bool {
 type regexLineMatcher struct {
 	re  *regexp.Regexp
 	pre []byte
+	// fold is whether the regex ignores case: pre is then searched for ignoring ASCII case (prefilter).
+	fold bool
+}
+
+// regexMetaChars are the bytes that make a pattern more than its literal text.
+const regexMetaChars = `\.+*?()|[]{}^$`
+
+// foldsBeyondASCII reports whether buf holds one of the two non-ASCII letters Go's (?i) folds to an ASCII one: the Kelvin sign
+// (U+212A, k) and the long s (U+017F, s). An ASCII case-insensitive prefilter cannot rule such a chunk out.
+func foldsBeyondASCII(buf []byte) bool {
+	return bytes.Contains(buf, []byte("\u212a")) || bytes.Contains(buf, []byte("\u017f"))
 }
 
 func requiredLiteral(pat string) []byte {
@@ -1409,10 +1420,18 @@ func (m *regexLineMatcher) prefilter(buf []byte) bool {
 	if len(m.pre) == 0 {
 		return true
 	}
+	if m.fold {
+		return indexFoldASCII(buf, m.pre) >= 0 || foldsBeyondASCII(buf)
+	}
 	return bytes.Index(buf, m.pre) >= 0
 }
 
 func (m *regexLineMatcher) matchLine(line []byte) bool {
+	// µPi: the literal every match holds rules a line out before the regex runs on it: a chunk that holds it once sends all its lines
+	// here, and Go's regexp, above all with (?i), is far slower than the search for the literal.
+	if len(m.pre) > 0 && !m.prefilter(line) {
+		return false
+	}
 	return m.re.Match(line)
 }
 
@@ -1441,11 +1460,21 @@ func buildLineMatcher(pattern string, ignoreCase, literal bool) (lineMatcher, er
 		}
 		return nil, err
 	}
-	var pre []byte
-	if !ignoreCase && !strings.HasPrefix(pattern, "(?i)") && !strings.Contains(pattern, "|") {
-		pre = requiredLiteral(pattern)
+	fold := ignoreCase || strings.HasPrefix(pattern, "(?i)")
+	body := strings.TrimPrefix(pattern, "(?i)")
+	// µPi: a case-sensitive pattern without a regex character is its literal text: searched as bytes, without the regex.
+	if !fold && body != "" && !strings.ContainsAny(body, regexMetaChars) {
+		b := []byte(body)
+		return &literalBytesMatcher{needle: b, ascii: isASCIIBytes(b)}, nil
 	}
-	return &regexLineMatcher{re: re, pre: pre}, nil
+	var pre []byte
+	if !strings.Contains(body, "|") {
+		// With fold, the literal is searched for ignoring ASCII case (µPi: before, a case-insensitive regex had no prefilter and ran on
+		// every line: 4.5 s for a rare word over 27,000 files, rg 0.1 s).
+		pre = requiredLiteral(body)
+	}
+	// An inline flag group ("ab(?i)cd") may turn case-insensitive matching on for the literal: it is then searched for ignoring case.
+	return &regexLineMatcher{re: re, pre: pre, fold: fold || strings.Contains(body, "(?")}, nil
 }
 
 func nativeGrep(ctx context.Context, opts nativeGrepOpts, emit func(nativeGrepEvent) (stop bool)) (matchCount int, matchLimitReached bool, err error) {

@@ -316,34 +316,61 @@ var goChecker Checker = &simpleChecker{
 		if err != nil {
 			return nil, err
 		}
-		if ran.code == 0 {
+		// µPi: a package of test files only has nothing to build; vet type-checks its tests.
+		testOnly := ran.code != 0 && strings.Contains(ran.stderr, "no non-test Go files")
+		compileTests := false
+		if ran.code == 0 || testOnly {
 			vet := <-vetDone
 			if vet.err != nil {
 				return nil, vet.err
 			}
 			ran = vet.ran
+			// vet stops at the first type error, and in a test file it is the only one go build does not see: the tests are compiled
+			// for all of them.
+			compileTests = ran.code != 0 && strings.Contains(ran.stderr+ran.stdout, "vet: ")
 		} else {
 			stopVet()
 			<-vetDone
+			// The build's errors hide those of the test files: the tests are compiled too, which reports both.
+			compileTests = true
 		}
-		var out []Diagnostic
-		for _, line := range strings.Split(ran.stderr+"\n"+ran.stdout, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-				continue
+		if compileTests {
+			// With errors the compile stops before the link, so this costs no test binary.
+			tests, err := runCommand(ctx, []string{"go", "test", "-c", "-o", os.DevNull, "-gcflags=-e", relPkg}, unit.CWD, nil, 0)
+			if err != nil {
+				return nil, err
 			}
-			trimmed = strings.TrimPrefix(trimmed, "vet: ")
-			if m := goVetLineColRE.FindStringSubmatch(trimmed); m != nil {
-				ln, _ := strconv.Atoi(m[2])
-				col, _ := strconv.Atoi(m[3])
-				out = append(out, diag(resolveAbs(unit.CWD, m[1]), ln, col, m[4], "", SeverityError))
-			} else if m := goVetLineRE.FindStringSubmatch(trimmed); m != nil {
-				ln, _ := strconv.Atoi(m[2])
-				out = append(out, diag(resolveAbs(unit.CWD, m[1]), ln, 1, m[3], "", SeverityError))
+			if tests.code != 0 && len(parseGoDiagnostics(tests, unit.CWD)) > 0 {
+				ran = tests
 			}
 		}
-		return out, nil
+		return parseGoDiagnostics(ran, unit.CWD), nil
 	},
+}
+
+// parseGoDiagnostics reads go build, go vet and go test -c output. A line indented with a tab continues the diagnostic above it (go's
+// "\tother declaration of x") and is not one of its own.
+func parseGoDiagnostics(ran cmdOutput, cwd string) []Diagnostic {
+	var out []Diagnostic
+	for _, line := range strings.Split(ran.stderr+"\n"+ran.stdout, "\n") {
+		if strings.HasPrefix(line, "\t") {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		trimmed = strings.TrimPrefix(trimmed, "vet: ")
+		if m := goVetLineColRE.FindStringSubmatch(trimmed); m != nil {
+			ln, _ := strconv.Atoi(m[2])
+			col, _ := strconv.Atoi(m[3])
+			out = append(out, diag(resolveAbs(cwd, m[1]), ln, col, m[4], "", SeverityError))
+		} else if m := goVetLineRE.FindStringSubmatch(trimmed); m != nil {
+			ln, _ := strconv.Atoi(m[2])
+			out = append(out, diag(resolveAbs(cwd, m[1]), ln, 1, m[3], "", SeverityError))
+		}
+	}
+	return out
 }
 
 // ─── Rust: cargo check / clippy ───────────────────────────────────────────────

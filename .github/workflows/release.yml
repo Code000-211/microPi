@@ -2,12 +2,18 @@
 name: release
 
 # µPi on PiG: a tag upi-vX.Y.Z builds the static upi executable (Go, CGO off) for Linux x64/ARM64, macOS ARM64/x64 and
-# Windows x64, runs each Linux and macOS one (--version must report µPi X.Y.Z), and creates a draft GitHub release with the
-# executables and SHA256SUMS. The asset names are the ones `upi update` looks for (internal/codingagent/micropi_update.go).
+# Windows x64, runs the Linux x64 and macOS ARM64 ones (--version must report µPi X.Y.Z), and creates a draft GitHub release with the
+# executables and SHA256SUMS. (Linux ARM64, macOS x64 and Windows are cross-compiled and not run: ARM runners are not
+# available to every repository.) The asset names are the ones `upi update` looks for (internal/codingagent/micropi_update.go).
 # Nothing is published here: a maintainer reviews the draft and publishes it.
+#
+# A push to PiG that changes VERSION (or this workflow) releases the version VERSION names, creating its tag upi-vX.Y.Z on
+# the pushed commit, unless a release of that tag exists already.
 on:
   push:
     tags: ["upi-v*"]
+    branches: [PiG]
+    paths: [VERSION, .github/workflows/release.yml]
   workflow_dispatch:
     inputs:
       tag:
@@ -18,15 +24,46 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.event.inputs.tag || github.sha }}
   cancel-in-progress: false
 
-env:
-  TAG: ${{ github.event.inputs.tag || github.ref_name }}
-
 jobs:
+  tag:
+    name: Tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      release: ${{ steps.tag.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.sha }}
+          persist-credentials: false
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            tag=$INPUT_TAG
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag="upi-v$(cat VERSION)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release of $tag exists already: nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: tag
+    if: needs.tag.outputs.release == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -34,14 +71,14 @@ jobs:
       matrix:
         include:
           - {goos: linux, goarch: amd64, runner: ubuntu-24.04, run: true}
-          - {goos: linux, goarch: arm64, runner: ubuntu-24.04-arm, run: true}
+          - {goos: linux, goarch: arm64, runner: ubuntu-24.04, run: false}
           - {goos: darwin, goarch: arm64, runner: macos-15, run: true}
           - {goos: darwin, goarch: amd64, runner: ubuntu-24.04, run: false}
           - {goos: windows, goarch: amd64, runner: ubuntu-24.04, run: false}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ github.event.inputs.tag || github.sha }}
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -49,6 +86,8 @@ jobs:
           cache: false
       - name: Version matches the tag
         shell: bash
+        env:
+          TAG: ${{ needs.tag.outputs.tag }}
         run: |
           version=$(cat VERSION)
           test "upi-v$version" = "$TAG" || { echo "::error::VERSION is $version, the tag is $TAG"; exit 1; }
@@ -80,7 +119,7 @@ jobs:
 
   draft:
     name: Draft release
-    needs: build
+    needs: [tag, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -98,6 +137,10 @@ jobs:
       - name: Create the draft
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.tag }}
         run: |
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+          # A tag that does not exist yet is created on the built commit (a release from a push to PiG).
+          target=()
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1 || target=(--target "$GITHUB_SHA")
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft "${target[@]}" \
             --title "µPi ${TAG#upi-v}" --generate-notes

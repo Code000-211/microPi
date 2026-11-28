@@ -537,7 +537,7 @@ func printHelp(w io.Writer, color bool, extensionFlags ...extension.ExtensionFla
 			out.WriteString(pigCommands)
 		}
 	}
-	text := stripHelp(out.String())
+	text := microPiHelp(stripHelp(out.String()))
 	if color {
 		lines := strings.Split(text, "\n")
 		for i, line := range lines {
@@ -554,6 +554,26 @@ func printHelp(w io.Writer, color bool, extensionFlags ...extension.ExtensionFla
 }
 
 var helpHeader = lazyregexp.New(`^[A-Z][A-Za-z ]*:$`)
+
+// helpCommandName matches the program name where a help line starts with it: the title and every command and example.
+var helpCommandName = lazyregexp.New(`(?m)^(\s*)pig\b`)
+
+// microPiHelpReplacer renames what Pi's help text (help_upstream.txt, kept as PiG has it for the parity tests) says about PiG where µPi
+// differs: the agent directory and its variable (ResolveDefaultAgentDir reads MICROPI_CODING_AGENT_DIR first), and the update command.
+var microPiHelpReplacer = strings.NewReplacer(
+	"  PIG_CODING_AGENT_DIR             - Config directory (default: ~/.pig/agent)",
+	"  MICROPI_CODING_AGENT_DIR         - Config directory (default: ~/.micropi/agent)",
+	"~/.pig/agent", "~/.micropi/agent",
+	"update [source|self|pig]   Update pig, extensions", "update [source|self|upi]   Update upi, extensions",
+	"Command pig update runs to update pig itself", "Command upi update runs to update upi itself",
+	"µPi / PiG Commands:", "µPi Commands:",
+	"Read the local PiG documentation", "Read the local documentation",
+)
+
+// microPiHelp is the help text as µPi's: the program is upi, and the paths and variables are µPi's (µPi: branding).
+func microPiHelp(text string) string {
+	return microPiHelpReplacer.Replace(helpCommandName.ReplaceAllString(text, "${1}upi"))
+}
 
 // extensionFlagsHelp ports upstream printHelp's extensionFlagsText (args.ts:262-271): the flag column pads to 30 UTF-16 units without truncation, and a flag without a description names its extension.
 func extensionFlagsHelp(flags []extension.ExtensionFlag) string {

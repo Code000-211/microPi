@@ -131,16 +131,16 @@ func TestHelpIsPisHelpWithPiGCommandsAfterPisCommands(t *testing.T) {
 	var out bytes.Buffer
 	printHelp(&out, false)
 	text := out.String()
-	if !strings.HasPrefix(text, "pig - AI coding assistant with read, bash, edit, write tools\n") {
+	if !strings.HasPrefix(text, "upi - AI coding assistant with read, bash, edit, write tools\n") {
 		t.Fatalf("help starts %q", text[:min(80, len(text))])
 	}
-	commands, pig, options := strings.Index(text, "Commands:\n"), strings.Index(text, "PiG Commands:\n"), strings.Index(text, "Options:\n")
+	commands, pig, options := strings.Index(text, "Commands:\n"), strings.Index(text, "µPi Commands:\n"), strings.Index(text, "Options:\n")
 	if commands < 0 || pig < commands || options < pig {
 		t.Fatalf("section order: Commands %d, PiG Commands %d, Options %d", commands, pig, options)
 	}
 	var colored bytes.Buffer
 	printHelp(&colored, true)
-	if !strings.HasPrefix(colored.String(), "\x1b[1mpig\x1b[22m - ") || !strings.Contains(colored.String(), "\x1b[1mOptions:\x1b[22m") {
+	if !strings.HasPrefix(colored.String(), "\x1b[1mupi\x1b[22m - ") || !strings.Contains(colored.String(), "\x1b[1mOptions:\x1b[22m") {
 		t.Fatal("terminal help lacks bold headers")
 	}
 }

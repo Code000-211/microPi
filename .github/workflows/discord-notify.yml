@@ -18,11 +18,11 @@ name: Discord notifications
 #
 # The webhook URL is the repository secret DISCORD_WEBHOOK_URL. A repository without it posts nothing and the run
 # passes, so a fork is unaffected.
+# µPi: disabled on every event; the project announces releases by hand. Re-enable with the push and release triggers below.
+#   push: {branches: [main]}
+#   release: {types: [published]}
 on:
-  push:
-    branches: [main]
-  release:
-    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read

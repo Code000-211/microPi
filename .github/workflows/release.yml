@@ -1,15 +1,10 @@
+# SPDX-License-Identifier: MIT
 name: release
 
-# An upi-vX.Y.Z tag (pushed) builds the release on GitHub's runners: the Linux x86-64 archives (x64, baseline, jit), the
-# Linux ARM64 ones (arm64, jit), the macOS ones (arm64, jit) and the Windows ones (x64, jit), each tested, then a draft
-# GitHub release with every archive, SHA256SUMS and RUNTIME_STAMP. Nothing is signed or published here: publish is run by
-# hand on the draft (docs/RELEASING.md).
-#
-# The runtime: when the engine (patches/, sources.json, the runtime build scripts) is the latest release's, its runtime archives
-# are used again. When it changed, the runtime workflow builds them from pi-bolt and attaches them to the tag's draft release
-# before this runs (gh workflow run runtime.yml -f tag=upi-vX.Y.Z). Either way the prepare job checks each runtime's build
-# provenance attestation and stops the release when one does not verify (docs/RELEASING.md, "Provenance"). Each build job
-# attests the archives it makes.
+# µPi on PiG: a tag upi-vX.Y.Z builds the static upi executable (Go, CGO off) for Linux x64/ARM64, macOS ARM64/x64 and
+# Windows x64, runs each Linux and macOS one (--version must report µPi X.Y.Z), and creates a draft GitHub release with the
+# executables and SHA256SUMS. The asset names are the ones `upi update` looks for (internal/codingagent/micropi_update.go).
+# Nothing is published here: a maintainer reviews the draft and publishes it.
 on:
   push:
     tags: ["upi-v*"]
@@ -18,16 +13,10 @@ on:
       tag:
         description: "The upi-vX.Y.Z tag to build (it must exist)"
         required: true
-      dry_run:
-        description: "Build and test only: no draft release (works for a tag already released)"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
-# (One group for each tag: GitHub keeps only one waiting run per group, so a group shared by all tags would drop a tag's run when
-# another came while one ran.)
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
@@ -36,455 +25,79 @@ env:
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
-  prepare:
-    name: Versions and runtime
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write # (A draft release, and the runtimes uploaded to it, are only visible to a token that may write.)
-      attestations: read # (To check the runtimes' attestations.)
-    outputs:
-      version: ${{ steps.check.outputs.version }}
-      stamp: ${{ steps.check.outputs.stamp }}
-      runtime_from: ${{ steps.check.outputs.runtime_from }}
-      # The SHA-256 of each runtime uploaded to the draft (only when those are used: the build jobs take the draft's runtime when
-      # it is set), checked again where it is used: the build jobs run code from dependencies, with a token that may write to the
-      # draft.
-      runtime_sha_linux: ${{ steps.check.outputs.runtime_sha_linux }}
-      runtime_sha_linux_arm64: ${{ steps.check.outputs.runtime_sha_linux_arm64 }}
-      runtime_sha_darwin: ${{ steps.check.outputs.runtime_sha_darwin }}
-      runtime_sha_win32: ${{ steps.check.outputs.runtime_sha_win32 }}
-    steps:
-      - name: The tag
-        run: |
-          printf '%s' "$TAG" | grep -Eq '^upi-v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a release tag: $TAG"; exit 1; }
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: refs/tags/${{ env.TAG }}
-          persist-credentials: false
-      - id: check
-        run: |
-          version=$(cat VERSION)
-          test "upi-v$version" = "$TAG" || { echo "VERSION is $version, the tag is $TAG"; exit 1; }
-          test "$(python3 -c 'import json; print(json.load(open("npm/package.json"))["version"])')" = "$version"
-          grep -q "^VERSION=$version\$" npm/bin/upi
-          pi=$(python3 -c 'import json; print(json.load(open("sources.json"))["pi"]["tag"][1:])')
-          test -f "profiles/pi-$pi/bytecode.order" || { echo "no training profile for Pi $pi (scripts/train-profile.sh)"; exit 1; }
-          test -f "docs/releases/$version.md" || { echo "no release notes: docs/releases/$version.md"; exit 1; }
-          stamp=$(scripts/runtime-stamp.sh)
-          previous=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
-          released=""
-          runtime_from=""
-          # The previous release's stamp counts only as its signed checksums give it: signed by the release key, for that
-          # version, with RUNTIME_STAMP listed (a release from before 0.8.0 left it out: its runtimes are not reused).
-          if [ -n "$previous" ] && mkdir -p .work/previous &&
-             gh release download "$previous" --repo "$GITHUB_REPOSITORY" --dir .work/previous \
-               --pattern SHA256SUMS --pattern SHA256SUMS.sig --pattern RUNTIME_STAMP 2>/dev/null &&
-             openssl pkeyutl -verify -pubin -inkey keys/release.pub -rawin -in .work/previous/SHA256SUMS \
-               -sigfile .work/previous/SHA256SUMS.sig >/dev/null &&
-             [ "$(head -n 1 .work/previous/SHA256SUMS)" = "# upi ${previous#upi-v}" ] &&
-             (cd .work/previous && grep ' RUNTIME_STAMP$' SHA256SUMS | sha256sum -c --strict --quiet -); then
-            released=$(cat .work/previous/RUNTIME_STAMP)
-            [ "$released" != "$stamp" ] || runtime_from=$previous
-          fi
-          if [ -n "$runtime_from" ]; then
-            echo "the engine is $previous's: its runtime is used again"
-          elif assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null) &&
-               printf '%s\n' "$assets" | grep -qx 'upi-runtime-linux-x64.tar.gz' &&
-               printf '%s\n' "$assets" | grep -qx 'upi-runtime-linux-arm64.tar.gz' &&
-               printf '%s\n' "$assets" | grep -qx 'upi-runtime-darwin-arm64.tar.gz' &&
-               printf '%s\n' "$assets" | grep -qx 'upi-runtime-win32-x64.zip'; then
-            runtime_from=$TAG
-            echo "the engine changed: using the runtimes uploaded to the draft of $TAG"
-            mkdir -p .work/draft
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir .work/draft --pattern 'upi-runtime-*'
-            for platform in linux:linux-x64.tar.gz linux_arm64:linux-arm64.tar.gz darwin:darwin-arm64.tar.gz win32:win32-x64.zip; do
-              sum=$(sha256sum ".work/draft/upi-runtime-${platform#*:}" | cut -c1-64)
-              echo "runtime_sha_${platform%%:*}=$sum" >> "$GITHUB_OUTPUT"
-              echo "upi-runtime-${platform#*:}: $sum" | tee -a "$GITHUB_STEP_SUMMARY"
-            done
-          else
-            if [ -z "$previous" ]; then
-              echo "::error title=Runtime needed::There is no previous µPi release to reuse a runtime from. Build the runtimes first: gh workflow run runtime.yml -R $GITHUB_REPOSITORY -f tag=$TAG (they are attached to a draft release of $TAG), then run this workflow again."
-            else
-              echo "::error title=Runtime needed::The engine changed since $previous (runtime stamp ${released:-not signed}, now $stamp). Build the runtimes with the runtime workflow from pi-bolt (gh workflow run runtime.yml -R $GITHUB_REPOSITORY -f tag=$TAG), which attaches them to a draft release of $TAG, and run this workflow again."
-            fi
-            exit 1
-          fi
-          { echo "version=$version"; echo "stamp=$stamp"; echo "runtime_from=$runtime_from"; } >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ github.token }}
-      # Where each runtime the build jobs will use was built, as its build provenance attestation says (docs/RELEASING.md,
-      # "Provenance"). One uploaded to the draft must be attested by the runtime workflow run from pi-bolt. One of the previous
-      # release is the copy that release's build jobs packaged (package-release.sh archives the runtime again), attested by its
-      # run of this workflow: from pi-bolt or from its tag. A runtime without such an attestation stops the release.
-      - name: Runtime provenance
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUNTIME_FROM: ${{ steps.check.outputs.runtime_from }}
-          # (Set only when the runtimes are the draft's, as in the build jobs.)
-          FROM_DRAFT: ${{ steps.check.outputs.runtime_sha_linux }}
-        run: |
-          if [ -n "$FROM_DRAFT" ]; then
-            dir=.work/draft
-            signers="runtime.yml@refs/heads/pi-bolt"
-          else
-            # (The check above verified this release's SHA256SUMS: its signature, and that it is $RUNTIME_FROM's.)
-            dir=.work/previous
-            gh release download "$RUNTIME_FROM" --repo "$GITHUB_REPOSITORY" --dir "$dir" --pattern 'upi-runtime-*'
-            signers="release.yml@refs/heads/pi-bolt release.yml@refs/tags/$RUNTIME_FROM runtime.yml@refs/heads/pi-bolt"
-          fi
-          echo "### Runtime provenance" >> "$GITHUB_STEP_SUMMARY"
-          failed=0
-          for name in upi-runtime-linux-x64.tar.gz upi-runtime-linux-arm64.tar.gz upi-runtime-darwin-arm64.tar.gz upi-runtime-win32-x64.zip; do
-            sum=$(sha256sum "$dir/$name" | cut -c1-64)
-            if [ -z "$FROM_DRAFT" ] && ! grep -qxF "$sum  $name" "$dir/SHA256SUMS"; then
-              echo "::error::$name ($sum) is not the one $RUNTIME_FROM's signed checksums list"
-              exit 1
-            fi
-            verified=""
-            : > "$RUNNER_TEMP/attestation.log"
-            for signer in $signers; do
-              echo "--- ${signer%%@*} from ${signer#*@}" >> "$RUNNER_TEMP/attestation.log"
-              if gh attestation verify "$dir/$name" --repo "$GITHUB_REPOSITORY" \
-                   --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/${signer%%@*}" --source-ref "${signer#*@}" \
-                   >> "$RUNNER_TEMP/attestation.log" 2>&1; then
-                verified=$signer
-                break
-              fi
-            done
-            if [ -n "$verified" ]; then
-              echo "- $name \`$sum\`: attested by ${verified%%@*} from ${verified#*@}" | tee -a "$GITHUB_STEP_SUMMARY"
-            else
-              cat "$RUNNER_TEMP/attestation.log"
-              echo "::error title=Runtime not attested::$name ($sum, from $RUNTIME_FROM) has no attestation by ${signers// / or }."
-              echo "- $name \`$sum\`: **not attested**" >> "$GITHUB_STEP_SUMMARY"
-              failed=1
-            fi
-          done
-          exit "$failed"
-
   build:
-    name: Build and test on ${{ matrix.name }}
-    needs: prepare
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
         include:
-          - name: Linux x86-64
-            runner: ubuntu-24.04
-            platform: linux-x64
-          - name: Linux ARM64
-            runner: ubuntu-24.04-arm
-            platform: linux-arm64
-          - name: macOS Apple silicon
-            runner: macos-15
-            platform: darwin-arm64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
-    permissions:
-      contents: write # (To download the runtimes from this tag's draft release.)
-      id-token: write # (To attest the archives: actions/attest-build-provenance.)
-      attestations: write
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
-      RUNTIME_FROM: ${{ needs.prepare.outputs.runtime_from }}
-      RUNTIME_SHA: ${{ matrix.platform == 'linux-x64' && needs.prepare.outputs.runtime_sha_linux || matrix.platform == 'linux-arm64' && needs.prepare.outputs.runtime_sha_linux_arm64 || needs.prepare.outputs.runtime_sha_darwin }}
-      # (The engine the executables are built for: build-pi.sh records it in them, and `upi doctor` reports it.)
-      PIBOLT_RUNTIME_STAMP: ${{ needs.prepare.outputs.stamp }}
+          - {goos: linux, goarch: amd64, runner: ubuntu-24.04, run: true}
+          - {goos: linux, goarch: arm64, runner: ubuntu-24.04-arm, run: true}
+          - {goos: darwin, goarch: arm64, runner: macos-15, run: true}
+          - {goos: darwin, goarch: amd64, runner: ubuntu-24.04, run: false}
+          - {goos: windows, goarch: amd64, runner: ubuntu-24.04, run: false}
     steps:
-      # (No token kept in .git: what the build and the tests run, dependencies included, gets none. GH_TOKEN is given to the
-      # one step that downloads.)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ env.TAG }}
+          ref: ${{ env.TAG }}
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          node-version: 24
-          cache: npm
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: "1.4.2"
-      - name: Tools (Linux)
-        if: runner.os == 'Linux'
+          go-version-file: go.mod
+          cache: false
+      - name: Version matches the tag
+        shell: bash
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq tmux xz-utils
-          # Rust (cargo), for the docsearch addon the release compiles into the executable (scripts/build-docsearch.mjs).
-          command -v cargo >/dev/null || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path && echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"; }
-          # The x64 build's code uses what the building CPU has (AVX2, LZCNT, BMI1: what JSC's x86 back end can use). (The arm64
-          # build's is for any ARMv8.0 CPU.)
-          if [ "$(uname -m)" = x86_64 ]; then
-            for flag in avx2 bmi1 abm; do grep -qw "$flag" /proc/cpuinfo || { echo "this runner's CPU has no $flag"; exit 1; }; done
-          fi
-      - name: Tools (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install bash tmux xz
-          # Rust (cargo), for the docsearch addon the release compiles into the executable (scripts/build-docsearch.mjs).
-          command -v cargo >/dev/null || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path && echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"; }
-      - name: Runtime
-        run: |
-          # (By whether prepare hashed a draft's runtime, not by RUNTIME_FROM: a dry run of the latest release has it as its own.)
-          if [ -n "$RUNTIME_SHA" ]; then
-            # Uploaded to this tag's draft by the maintainer.
-            mkdir -p .work/rt .work/runtime
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "upi-runtime-${{ matrix.platform }}.tar.gz" --dir .work/rt
-            # The one the prepare job saw, before any build ran.
-            echo "$RUNTIME_SHA  .work/rt/upi-runtime-${{ matrix.platform }}.tar.gz" | shasum -a 256 -c -
-            tar -C .work/rt -xzf ".work/rt/upi-runtime-${{ matrix.platform }}.tar.gz"
-            install -m 755 ".work/rt/upi-runtime-${{ matrix.platform }}/bun" .work/runtime/bun
-          else
-            scripts/fetch-runtime.sh --version "$RUNTIME_FROM"
-          fi
-          .work/runtime/bun --version
+          version=$(cat VERSION)
+          test "upi-v$version" = "$TAG" || { echo "::error::VERSION is $version, the tag is $TAG"; exit 1; }
+          grep -q "MicroPiVersion = \"$version\"" internal/coding/pigversion/pigversion.go || { echo "::error::pigversion.MicroPiVersion is not $version"; exit 1; }
+      - name: Build
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-      - name: Pi
-        run: scripts/prepare-pi.sh
-      - name: Rust for docsearch
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          cd packages/docsearch
-          # (The addon builds wherever the release built Pi's Unix archives and kits.)
-          PATH="$HOME/.cargo/bin:$PATH" cargo build --release -p docsearch-core -p docsearch-node
-      - name: Build and package
-        run: scripts/package-release.sh
-      - name: Tests on every build, as unpacked from its archive
+          ext=""
+          [ "$GOOS" = windows ] && ext=.exe
+          mkdir -p dist
+          go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -X github.com/MichaelKinsy/PiG/coding/cli.Build=${GITHUB_SHA}" \
+            -o "dist/upi-$GOOS-$GOARCH$ext" ./cmd/upi
+      - name: Run it
+        if: matrix.run
+        shell: bash
         run: |
-          mkdir -p .work/unpacked
-          for archive in "dist/$VERSION/upi-${{ matrix.platform }}"*.tar.xz; do
-            tar -C .work/unpacked -xf "$archive"
-            dir=.work/unpacked/$(basename "$archive" .tar.xz)
-            "$dir/pi" --version | tee /dev/stderr | grep -q "µPi $VERSION"
-            # macOS: the libSystem beside pi-bin (scripts/lib/darwin_libsystem.py) is only for speed, so build-pi.sh goes on
-            # without it; a release without it starts with ~15 M more instructions (1.0.3-1.0.5 shipped so).
-            if [ "${{ matrix.platform }}" = darwin-arm64 ] && [ ! -f "$dir/libsystem/libSystem.B.dylib" ]; then
-              echo "::error::$dir has no libsystem/ (see 'libsystem:' in the build's output)"; exit 1
-            fi
-            tests/pi/run.sh "$PWD/$dir/pi"
-          done
-          # macOS: every executable and library still runs on macOS 13, whatever macOS and Xcode built it.
-          if [ "${{ matrix.platform }}" = darwin-arm64 ]; then scripts/check-macos-floor.sh .work/unpacked; fi
-          # upi compile with this release's own kit and runtime, as a user's machine runs it.
-          python3 tests/pi/compile.py ".work/unpacked/upi-${{ matrix.platform }}/pi" "dist/$VERSION/upi-kit-${{ matrix.platform }}.tar.gz" .work/runtime/bun
-          tests/aot/run.sh
-          tests/runtime/run.sh
-          # Linux ARM64: also as Termux installs it, in an imitation of Android (the runner is thrown away after: it writes /data).
-          if [ "${{ matrix.platform }}" = linux-arm64 ]; then
-            sudo apt-get install -y -qq busybox-static >/dev/null
-            sudo env PATH="$PATH" MICROPI_TERMUX_TEST=1 tests/termux/run.sh --build "$PWD/.work/unpacked/upi-linux-arm64"
-          fi
-          # Termux test above is the last ARM64 extra; µPi slimmed the bench e2e scripts away (commit 7c4d28e6d):
-          # their release steps are gone with them.
-      # A build provenance attestation of every archive, the runtime's included (which a later release reusing it checks):
-      # docs/RELEASING.md, "Provenance". Made in dry runs too.
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            dist/${{ env.VERSION }}/*.tar.gz
-            dist/${{ env.VERSION }}/*.tar.xz
+          version=$(cat VERSION)
+          "dist/upi-${{ matrix.goos }}-${{ matrix.goarch }}" --version | tee /dev/stderr | grep -q "µPi $version"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ matrix.platform }}
-          path: |
-            dist/${{ env.VERSION }}/*.tar.gz
-            dist/${{ env.VERSION }}/*.tar.xz
+          name: upi-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
           if-no-files-found: error
-          retention-days: 14
-
-  build-windows:
-    name: Build and test on Windows x64
-    needs: prepare
-    runs-on: windows-2025
-    timeout-minutes: 180
-    permissions:
-      contents: write # (To download the runtime from this tag's draft release.)
-      id-token: write # (To attest the archives, as in the build job above.)
-      attestations: write
-    defaults:
-      run:
-        # Windows PowerShell 5.1, which the Windows scripts are written for (as Windows 10 has it).
-        shell: powershell
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
-      RUNTIME_FROM: ${{ needs.prepare.outputs.runtime_from }}
-      RUNTIME_SHA: ${{ needs.prepare.outputs.runtime_sha_win32 }}
-      PIBOLT_RUNTIME_STAMP: ${{ needs.prepare.outputs.stamp }}
-    steps:
-      # (No token kept in .git, as in the build job above.)
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: refs/tags/${{ env.TAG }}
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24
-          cache: npm
-      # (Stock Bun: the reference tests\aot compares the compiled programs' output with.)
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: "1.4.2"
-      - name: Tools
-        run: |
-          # The x64 build's code uses what the building CPU has (AVX2: what JSC's x86 back end can use).
-          Add-Type -Namespace Check -Name Cpu -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint feature);'
-          if (-not [Check.Cpu]::IsProcessorFeaturePresent(40)) { Write-Host "this runner's CPU has no AVX2"; exit 1 }
-          # The scripts run Python 3 as `py -3`.
-          if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
-            $shim = Join-Path $env:RUNNER_TEMP 'py-shim'
-            New-Item -ItemType Directory -Force $shim | Out-Null
-            Set-Content -Encoding ascii (Join-Path $shim 'py.cmd') "@if `"%~1`"==`"-3`" (python %2 %3 %4 %5 %6 %7 %8 %9) else (python %*)"
-            Add-Content -Encoding utf8 $env:GITHUB_PATH $shim
-          }
-          python --version
-          # Rust (cargo), for the docsearch addon the release compiles into the executable (scripts/build-docsearch.mjs).
-          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe -OutFile "$env:RUNNER_TEMP\rustup-init.exe"
-            & "$env:RUNNER_TEMP\rustup-init.exe" -y --profile minimal --no-modify-path
-            Add-Content -Encoding utf8 $env:GITHUB_PATH "$env:USERPROFILE\.cargo\bin"
-          }
-      - name: Runtime
-        run: |
-          New-Item -ItemType Directory -Force .work\rt, .work\runtime | Out-Null
-          if ($env:RUNTIME_SHA) {
-            # Uploaded to this tag's draft by the maintainer: the one the prepare job saw, before any build ran.
-            gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern upi-runtime-win32-x64.zip --dir .work\rt
-            $sum = (Get-FileHash .work\rt\upi-runtime-win32-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($sum -ne $env:RUNTIME_SHA) { Write-Host "the draft's runtime changed after the prepare job saw it ($sum)"; exit 1 }
-          } else {
-            # A release's: its checksums, signed by the release key and saying they are that release's, say what it is.
-            gh release download $env:RUNTIME_FROM --repo $env:GITHUB_REPOSITORY --pattern upi-runtime-win32-x64.zip --pattern SHA256SUMS --pattern SHA256SUMS.sig --dir .work\rt
-            $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
-            & $openssl pkeyutl -verify -pubin -inkey keys\release.pub -rawin -in .work\rt\SHA256SUMS -sigfile .work\rt\SHA256SUMS.sig
-            if ($LASTEXITCODE -ne 0) { Write-Host 'the runtime release''s signature does not verify'; exit 1 }
-            $lines = Get-Content -LiteralPath .work\rt\SHA256SUMS
-            if ($lines[0] -ne "# upi $($env:RUNTIME_FROM -replace '^upi-v', '')") { Write-Host "the checksums are not $env:RUNTIME_FROM's"; exit 1 }
-            $sum = (Get-FileHash .work\rt\upi-runtime-win32-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($lines -notcontains "$sum  upi-runtime-win32-x64.zip") { Write-Host 'the runtime is not the one its release lists'; exit 1 }
-          }
-          Expand-Archive .work\rt\upi-runtime-win32-x64.zip -DestinationPath .work\rt -Force
-          Copy-Item .work\rt\upi-runtime-win32-x64\bun.exe .work\runtime\bun.exe
-          & .work\runtime\bun.exe --version
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-        env:
-          GH_TOKEN: ${{ github.token }}
-      - name: Pi
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          # (Offline: the model catalog is the repository's, as in prepare-pi.sh.)
-          npm run build:offline
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-      - name: Build and package
-        run: |
-          # Each build is made twice, and released only if its prebuilt heap is the same both times (-VerifyDeterminism). That
-          # check sometimes fails on one record of the heap (docs/WINDOWS.md, "The release's determinism check"), which package-release.ps1 says with exit code 3:
-          # only that is tried again, up to three times. Any other failure ends the job.
-          for ($try = 1; $try -le 3; $try++) {
-            & scripts\package-release.ps1
-            $status = $LASTEXITCODE
-            if ($status -eq 0) {
-              Add-Content -Encoding utf8 $env:GITHUB_STEP_SUMMARY "Windows builds: the prebuilt heap was the same in both builds on try $try of 3."
-              exit 0
-            }
-            if ($status -ne 3) { exit $status }
-            Write-Host "::warning::the two builds' prebuilt heaps differed (try $try of 3)"
-          }
-          Add-Content -Encoding utf8 $env:GITHUB_STEP_SUMMARY 'Windows builds: the prebuilt heaps differed on all three tries.'
-          exit 1
-      - name: Tests on every build, as unpacked from its archive
-        run: |
-          $failed = 0
-          foreach ($archive in Get-ChildItem "dist\$env:VERSION\upi-win32-x64*.zip") {
-            $dir = Join-Path '.work\unpacked' $archive.BaseName
-            Expand-Archive $archive.FullName -DestinationPath .work\unpacked -Force
-            $exe = (Resolve-Path (Join-Path $dir 'upi.exe')).Path
-            $version = (& $exe --version | Out-String)
-            Write-Host $version
-            # (µ as an escape, and the console's code page first: PowerShell 5.1 reads these scripts as ANSI, not UTF-8.)
-            [Console]::OutputEncoding = [Text.Encoding]::UTF8
-            if ($version -notmatch "\u00B5Pi $([regex]::Escape($env:VERSION))") { Write-Host "$exe is not µPi $env:VERSION"; $failed = 1 }
-            & tests\pi\run.ps1 $exe
-            if ($LASTEXITCODE -ne 0) { $failed = 1 }
-            & scripts\windows-selftest.ps1 -Pi $exe
-            if ($LASTEXITCODE -ne 0) { $failed = 1 }
-          }
-          & tests\runtime\run.ps1
-          if ($LASTEXITCODE -ne 0) { $failed = 1 }
-          & tests\aot\run.ps1
-          if ($LASTEXITCODE -ne 0) { $failed = 1 }
-          exit $failed
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: dist/${{ env.VERSION }}/*.zip
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: win32-x64
-          path: dist/${{ env.VERSION }}/*.zip
-          if-no-files-found: error
-          retention-days: 14
 
   draft:
     name: Draft release
-    needs: [prepare, build, build-windows]
-    if: ${{ !inputs.dry_run }}
+    needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       contents: write
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
-      STAMP: ${{ needs.prepare.outputs.stamp }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: refs/tags/${{ env.TAG }}
-          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: release
+          path: dist
           merge-multiple: true
-      - name: SHA256SUMS, RUNTIME_STAMP and the installers
-        working-directory: release
+      - name: Checksums
+        working-directory: dist
         run: |
-          # The installers of the tagged commit, signed with the rest: `upi update` runs one only once it matches SHA256SUMS.
-          cp ../install.sh ../install.ps1 .
-          # (Signed with the rest: a later release reuses this release's runtimes only if its signed stamp says the same engine.)
-          echo "$STAMP" > RUNTIME_STAMP
-          # The first line says which release this is: install.ps1 and the npm package's Windows install refuse another's.
-          { echo "# upi $VERSION"; sha256sum -- *.tar.gz *.tar.xz *.zip RUNTIME_STAMP install.sh install.ps1; } > SHA256SUMS
-          # Exactly the files of a release (scripts/release-files.txt), each as listed.
-          ../scripts/check-release-files.sh . "$VERSION"
+          sha256sum upi-* > SHA256SUMS
           cat SHA256SUMS
-      - name: Draft
-        run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" != true ]; then
-              echo "::error::$TAG is already published; a published release is not changed (run with dry_run to test)"
-              exit 1
-            fi
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft --notes-file "docs/releases/$VERSION.md"
-            # (A signature of the SHA256SUMS replaced here no longer holds, in either form.)
-            gh release delete-asset "$TAG" SHA256SUMS.sig --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
-            gh release delete-asset "$TAG" SHA256SUMS.sshsig --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
-            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber release/*
-          else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "µPi $VERSION" --notes-file "docs/releases/$VERSION.md" release/*
-          fi
-          sum=$(sha256sum release/SHA256SUMS | cut -c1-64)
-          {
-            echo "### $TAG is a draft, ready to sign"
-            echo
-            echo "SHA256SUMS: \`$sum\`"
-            echo
-            echo '```bash'
-            echo "gh release download $TAG -R $GITHUB_REPOSITORY -p SHA256SUMS -D dist/$VERSION --clobber"
-            echo "scripts/sign-release.sh --key <your key> dist/$VERSION"
-            echo "gh release upload $TAG -R $GITHUB_REPOSITORY dist/$VERSION/SHA256SUMS.sig dist/$VERSION/SHA256SUMS.sshsig"
-            echo '```'
-            echo
-            echo "Then run the **publish** workflow: \`gh workflow run publish.yml -R $GITHUB_REPOSITORY -f tag=$TAG\` (it signs the draft"
-            echo "itself when the release environment has the key)."
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Create the draft
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "µPi ${TAG#upi-v}" --generate-notes

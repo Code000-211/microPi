@@ -5,7 +5,7 @@
 package pigversion
 
 // MicroPiVersion is µPi's own release line.
-const MicroPiVersion = "0.1.0"
+const MicroPiVersion = "0.2.0"
 
 // PigVersion is PiG's release line. It advances independently of the upstream
 // Pi target.

@@ -82,8 +82,9 @@ func TestMicroPiUpdateReleaseManifestAndSemver(t *testing.T) {
 	if _, ok := codingagent.ParseMicroPiReleaseTag("v0.2.0"); ok {
 		t.Fatalf("ParseMicroPiReleaseTag(v0.2.0) = true, want false")
 	}
-	if !codingagent.IsNewerPackageVersion("0.2.0", MicroPiVersion) {
-		t.Fatalf("expected 0.2.0 > %s", MicroPiVersion)
+	// A release after the current one, whatever it is.
+	if !codingagent.IsNewerPackageVersion("999.0.0", MicroPiVersion) {
+		t.Fatalf("expected 999.0.0 > %s", MicroPiVersion)
 	}
 	if codingagent.IsNewerPackageVersion(MicroPiVersion, MicroPiVersion) {
 		t.Fatalf("expected %s not newer than itself", MicroPiVersion)

@@ -6,9 +6,9 @@ name: Publish npm packages
 # release-candidate.yml created, so nothing reaches npm before a human presses
 # Publish. workflow_dispatch re-runs a published release (the job is
 # idempotent: versions already on npm are skipped).
+# µPi: manual only. The npm package is the Bun-based build of the pi-bolt branch; the PiG build ships as GitHub release
+# executables, so publishing a release must not publish to npm.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
